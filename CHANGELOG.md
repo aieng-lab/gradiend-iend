@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-13
+
 ### Added
 
 - **Trainer suites** — [`TrainerSuite`][gradiend.trainer.suite.base.TrainerSuite], [`PositiveTrainerSuite`][gradiend.trainer.suite.positive.PositiveTrainerSuite], [`SymmetricTrainerSuite`][gradiend.trainer.suite.symmetric.SymmetricTrainerSuite], and [`TrainerCollection`][gradiend.trainer.suite.collection.TrainerCollection] for training and comparing multiple GRADIEND models from declarative pair/feature definitions.
@@ -48,5 +50,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 Initial public release of the GRADIEND Python package.
 
-[Unreleased]: https://github.com/aieng-lab/gradiend/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/aieng-lab/gradiend/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/aieng-lab/gradiend/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/aieng-lab/gradiend/releases/tag/v0.1.0
