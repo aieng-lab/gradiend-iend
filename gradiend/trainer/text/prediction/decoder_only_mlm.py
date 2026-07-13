@@ -758,7 +758,7 @@ class DecoderModelWithMLMHead(PreTrainedModel):
 
         if use_cache is None:
             use_cache = False
-        outputs = self.decoder.base_model(
+        outputs = self.get_gradiend_backbone_module()(
             input_ids=input_ids, attention_mask=attention_mask, use_cache=use_cache
         )
         hidden_states = outputs.last_hidden_state
@@ -861,7 +861,7 @@ class DecoderModelWithMLMHead(PreTrainedModel):
 
     def get_gradiend_backbone_module(self):
         """Backbone used for GRADIEND parameter discovery."""
-        return self.decoder.base_model
+        return getattr(self.decoder, "base_model", self.decoder)
 
     def to_original_model(self):
         """
