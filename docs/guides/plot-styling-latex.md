@@ -74,7 +74,7 @@ print(status.text_usetex, status.transition_arrows)
 
 **`Undefined control sequence \rightleftarrows`**
 
-Install a LaTeX distribution that includes `amsmath` and `amssymb` (e.g. `texlive-latex-recommended` on Debian/Ubuntu). GRADIEND adds both packages automatically; if the error persists, run `check_plot_environment()` and confirm `resolved_text_usetex=True` only when the LaTeX smoke test passes.
+Install a LaTeX distribution that includes `amsmath` and `amssymb` (e.g. `texlive-latex-recommended` on Debian/Ubuntu). GRADIEND adds both packages automatically; if the error persists, run [`check_plot_environment()`][gradiend.visualizer.plot_style.check_plot_environment] and confirm `resolved_text_usetex=True` only when the LaTeX smoke test passes.
 
 **Tick labels show broken fragments like `Encoding (`**
 

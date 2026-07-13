@@ -7,6 +7,8 @@ Modality-specific: padding value when batching variable-length tensors (get_padd
 and when caching is used, cache_key_fields (list of batch keys to include in the hash).
 """
 
+from __future__ import annotations
+
 import os
 import queue
 import threading

@@ -10,6 +10,9 @@ requested does the code raise ImportError with comprehensive install instruction
 import sys
 import os
 import builtins
+import re
+import subprocess
+import textwrap
 from unittest.mock import patch
 
 import pytest
@@ -365,6 +368,112 @@ class TestSpacyOptional:
 
 class TestOptionalDependencyIntegration:
     """Integration tests for optional dependencies."""
+
+    def test_optional_import_blocklist_tracks_declared_extras(self):
+        """Keep the import-smoke blocker aligned with pyproject optional extras."""
+        with open("pyproject.toml", encoding="utf-8") as f:
+            pyproject = f.read()
+        optional_section = pyproject.split("[project.optional-dependencies]", 1)[1]
+        optional_section = optional_section.split("[project.urls]", 1)[0]
+        declared = {
+            re.split(r"[<>=!~;\[]", dep.strip().strip('",'), maxsplit=1)[0]
+            for dep in optional_section.splitlines()
+            if dep.strip().startswith('"')
+        }
+        assert declared == {
+            "accelerate",
+            "adjustText",
+            "datasets",
+            "matplotlib",
+            "matplotlib_venn",
+            "mkdocs-material",
+            "mkdocstrings",
+            "plotly",
+            "pre-commit",
+            "pyahocorasick",
+            "pyarrow",
+            "pytest",
+            "pytest-cov",
+            "safetensors",
+            "seaborn",
+            "sentencepiece",
+            "spacy",
+            "venn",
+        }
+
+    def test_lightweight_namespaces_import_with_optional_extras_blocked(self):
+        """Optional extras must not be required for importing lightweight namespaces."""
+        code = r"""
+import builtins
+import importlib
+import sys
+
+blocked = {
+    "accelerate",
+    "adjustText",
+    "ahocorasick",
+    "safetensors",
+    "sentencepiece",
+    "datasets",
+    "spacy",
+    "pyarrow",
+    "matplotlib",
+    "seaborn",
+    "plotly",
+    "venn",
+    "matplotlib_venn",
+    "material",
+    "mkdocs",
+    "mkdocstrings",
+    "pre_commit",
+    "pytest",
+    "pytest_cov",
+    "adjustText",
+}
+original_import = builtins.__import__
+
+def blocked_import(name, *args, **kwargs):
+    if name.split(".")[0] in blocked or name in blocked:
+        raise ImportError(f"blocked optional dependency: {name}")
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = blocked_import
+for module_name in list(sys.modules):
+    if module_name.split(".")[0] in blocked or module_name in blocked:
+        del sys.modules[module_name]
+
+for module_name in [
+    "gradiend",
+    "gradiend.model",
+    "gradiend.data",
+    "gradiend.data.text.prediction.filter_engine",
+    "gradiend.trainer",
+    "gradiend.visualizer",
+    "gradiend.visualizer.plot_optional",
+]:
+    importlib.import_module(module_name)
+
+import gradiend
+for attr_name in [
+    "format_transition_label",
+    "transition_bidi_arrow",
+    "transition_directed_arrow",
+    "check_plot_environment",
+    "PlotStyleConfig",
+]:
+    getattr(gradiend, attr_name)
+"""
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.getcwd() + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(code)],
+            cwd=os.getcwd(),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr + result.stdout
     
     def test_model_saving_with_safetensors_preference(self, mock_model, temp_dir):
         """Test that model saving prefers safetensors when available."""

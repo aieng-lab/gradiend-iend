@@ -1,5 +1,7 @@
 """Expose the existing example smoke runner through the main pytest suite."""
 
+from __future__ import annotations
+
 import subprocess
 import sys
 
