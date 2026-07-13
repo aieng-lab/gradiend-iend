@@ -149,7 +149,7 @@ class TestClassMergeMapCreateTrainingData:
 
     @pytest.fixture(scope="class")
     def tokenizer(self):
-        from tests.conftest import MockTokenizer
+        from tests.testing_mocks import MockTokenizer
         return MockTokenizer()
 
     def test_create_training_data_merged_pipeline(self, tokenizer):
@@ -303,7 +303,7 @@ class TestClassMergeMapSuiteIntegration:
     def test_suite_child_create_training_data_with_merged_pair(self):
         from gradiend.trainer.core.arguments import TrainingArguments
         from gradiend.trainer.suite import SymmetricTrainerSuite, SuitePairDefinition
-        from tests.conftest import MockTokenizer
+        from tests.testing_mocks import MockTokenizer
 
         pair_definitions = [
             SuitePairDefinition(
@@ -347,3 +347,42 @@ class TestClassMergeMapDecoderTargets:
         assert has_overlap is False
         assert "I" in targets["singular"] or "he" in targets["singular"]
         assert "we" in targets["plural"] or "they" in targets["plural"]
+
+
+def _factual_only_four_class_data() -> pd.DataFrame:
+    """Factual-only table like english_pronoun training.csv (_to_merged output)."""
+    return pd.DataFrame([
+        {"masked": "[MASK] here", "split": "train", "label_class": "1SG", "label": "I", "feature_class_id": "1SG"},
+        {"masked": "[MASK] there", "split": "train", "label_class": "1PL", "label": "we", "feature_class_id": "1PL"},
+        {"masked": "[MASK] went", "split": "train", "label_class": "3SG", "label": "he", "feature_class_id": "3SG"},
+        {"masked": "[MASK] left", "split": "train", "label_class": "3PL", "label": "they", "feature_class_id": "3PL"},
+    ])
+
+
+class TestClassMergeMapFactualOnlyTable:
+    """class_merge_map on factual-only CSV tables (no alternative_* columns)."""
+
+    def test_trainer_ensure_data_merges_factual_only_table(self):
+        config = TextPredictionConfig(
+            data=_factual_only_four_class_data(),
+            class_merge_map={"singular": ["1SG", "3SG"], "plural": ["1PL", "3PL"]},
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        trainer._ensure_data()
+        cd = trainer.combined_data
+        assert cd is not None
+        assert set(cd[UNIFIED_FACTUAL_CLASS].unique()) <= {"singular", "plural"}
+        assert set(cd[UNIFIED_ALTERNATIVE_CLASS].unique()) <= {"singular", "plural"}
+
+    def test_collect_unified_test_rows_accepts_merged_pronoun_trainer(self):
+        from gradiend.comparison.cross_encoding import collect_unified_test_rows
+
+        config = TextPredictionConfig(
+            data=_factual_only_four_class_data(),
+            class_merge_map={"singular": ["1SG", "3SG"], "plural": ["1PL", "3PL"]},
+            run_id="pronoun_number_singular_plural",
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        rows = collect_unified_test_rows({"pronoun_number_singular_plural": trainer}, split="train")
+        assert not rows.empty
+        assert "singular" in set(rows[UNIFIED_FACTUAL_CLASS].astype(str))

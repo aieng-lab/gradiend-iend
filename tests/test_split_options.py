@@ -277,7 +277,7 @@ class TestTrainerEarlyVocabularyValidation:
         trainer = TextPredictionTrainer(
             model="distilbert-base-cased",
             target_classes=["positive", "negative"],
-            split_col=None,
+            split_col="heldout",
             split_group_key=[str.casefold],
             split_ratios=(0.34, 0.33, 0.33),
             args=__import__("gradiend").TrainingArguments(seed=1, experiment_dir=None),
@@ -323,7 +323,38 @@ class TestTrainerDefaultSplitCol:
         assert trainer.config.split_col == "split"
         assert trainer._combined_data_template is None
 
-    def test_explicit_split_col_none_still_raises_when_not_viable(self):
+    def test_omitted_split_col_keeps_data_splits_even_when_heldout_is_viable(self):
+        rows = []
+        for cls, tokens in (
+            ("white", [f"white-{i}" for i in range(10)]),
+            ("black", [f"black-{i}" for i in range(10)]),
+        ):
+            other = "black" if cls == "white" else "white"
+            for i, token in enumerate(tokens):
+                rows.append(
+                    {
+                        "masked": f"Person {i} is [MASK].",
+                        "split": ("train", "validation", "test")[i % 3],
+                        "label_class": cls,
+                        "alternative_class": other,
+                        "label": token,
+                        "alternative": f"{other}-{i}",
+                    }
+                )
+
+        trainer = TextPredictionTrainer(
+            model="distilbert-base-cased",
+            data=pd.DataFrame(rows),
+            target_classes=["white", "black"],
+            args=__import__("gradiend").TrainingArguments(seed=1, experiment_dir=None),
+        )
+        trainer._ensure_data()
+
+        assert trainer.config.split_col == "split"
+        assert trainer._combined_data_template is None
+        assert set(trainer.combined_data[UNIFIED_SPLIT]) == {"train", "validation", "test"}
+
+    def test_explicit_heldout_still_raises_when_not_viable(self):
         rows = []
         for cls, tok in (("3SG", "he"), ("3PL", "they")):
             other = "3PL" if cls == "3SG" else "3SG"
@@ -338,19 +369,19 @@ class TestTrainerDefaultSplitCol:
                         "alternative": "they" if other == "3PL" else "he",
                     }
                 )
-        with pytest.raises(ValueError, match="split_col=None requires"):
+        with pytest.raises(ValueError, match="split_col='heldout' requires"):
             trainer = TextPredictionTrainer(
                 model="t5-small",
                 data=pd.DataFrame(rows),
                 target_classes=["3SG", "3PL"],
-                split_col=None,
+                split_col="heldout",
                 args=__import__("gradiend").TrainingArguments(seed=1, experiment_dir=None),
             )
             trainer._ensure_data()
 
 
 class TestTrainerVocabularyResplit:
-    def test_split_col_none_applies_resplit(self):
+    def test_explicit_heldout_applies_resplit(self):
         rows = []
         for cls, toks in (
             ("white", ["White", "white", "w1", "w2", "w3"]),
@@ -374,7 +405,7 @@ class TestTrainerVocabularyResplit:
             model="distilbert-base-cased",
             data=merged,
             target_classes=["white", "black"],
-            split_col=None,
+            split_col="heldout",
             split_group_key=[str.strip, str.casefold],
             split_ratios=(0.34, 0.33, 0.33),
             args=__import__("gradiend").TrainingArguments(seed=7, experiment_dir=None),
@@ -404,7 +435,7 @@ class TestTrainerVocabularyResplit:
         trainer = TextPredictionTrainer(
             model="distilbert-base-cased",
             target_classes=["white", "black"],
-            split_col=None,
+            split_col="heldout",
             split_group_key=[str.casefold],
             split_ratios=(0.34, 0.33, 0.33),
             args=TrainingArguments(seed=5, split_resplit_per_seed=False, experiment_dir=None),
@@ -443,7 +474,7 @@ class TestTrainerVocabularyResplit:
         trainer = TextPredictionTrainer(
             model="distilbert-base-cased",
             target_classes=["white", "black"],
-            split_col=None,
+            split_col="heldout",
             split_group_key=[str.casefold],
             split_ratios=(0.6, 0.2, 0.2),
             args=TrainingArguments(
@@ -513,7 +544,7 @@ class TestEncoderSplitOptions:
         assert "black" in sg["agreement_by_feature_class"]
 
     def test_create_training_data_preserves_data_split_for_split_all(self):
-        from tests.conftest import MockTokenizer
+        from tests.testing_mocks import MockTokenizer
 
         rows = []
         for cls, tok, split in (

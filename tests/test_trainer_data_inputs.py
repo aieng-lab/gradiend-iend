@@ -1,6 +1,5 @@
 """Tests for TextPredictionTrainer data inputs: Path, DataFrame, dict, eval_neutral_data path."""
 
-from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -413,7 +412,7 @@ class TestStandardPipelinePerDataFormat:
     @pytest.fixture(scope="class")
     def tokenizer(self):
         """Use mock tokenizer — pipeline tests only need [MASK] tokenization."""
-        from tests.conftest import MockTokenizer
+        from tests.testing_mocks import MockTokenizer
         return MockTokenizer()
 
     def test_standard_pipeline_per_class_dict(self, tokenizer):
@@ -509,7 +508,7 @@ class TestAddIdentityForOtherClasses:
 
     @pytest.fixture(scope="class")
     def tokenizer(self):
-        from tests.conftest import MockTokenizer
+        from tests.testing_mocks import MockTokenizer
         return MockTokenizer()
 
     def test_add_identity_not_added_when_all_classes_equal_target_classes(self, tokenizer):

@@ -24,7 +24,12 @@ Standalone plot functions (module-level). Trainer convenience wrappers such as
 
 ## Environment
 
-- **[`check_plot_environment`][gradiend.visualizer.plot_style.check_plot_environment]** — Verify matplotlib/seaborn/plotly availability
+- **[`check_plot_environment`][gradiend.visualizer.plot_style.check_plot_environment]** — Verify matplotlib/LaTeX/font setup
+- **[`configure_plot_style`][gradiend.visualizer.plot_style.configure_plot_style]** — Apply GRADIEND matplotlib defaults
+- **[`PlotStyleConfig`][gradiend.visualizer.plot_style_config.PlotStyleConfig]** — LaTeX, font, preamble, and transition-arrow options
+- **[`format_transition_label`][gradiend.visualizer.labels.format_transition_label]** — Render `A -> B` labels for heatmaps
+
+See also [Plot styling & LaTeX guide](../../guides/plot-styling-latex.md).
 
 ## Related
 

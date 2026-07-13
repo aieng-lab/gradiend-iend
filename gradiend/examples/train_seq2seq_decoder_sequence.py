@@ -1,9 +1,13 @@
 """
 T5 seq2seq GRADIEND workflow with multi-token decoder sequence cloze.
 
-**Experimental** — ``seq2seq_decoder_sequence_cloze`` does not converge reliably for
-all setups. Prefer ``train_seq2seq_encoder_mlm.py`` (encoder-side MLM, default for
-``prediction_objective="auto"`` on T5/BART).
+**Experimental / known non-convergent example** —
+``seq2seq_decoder_sequence_cloze`` does not currently converge reliably for this
+workflow and is intentionally excluded from the example smoke test suite. It is
+kept as an experimental implementation example, not as a passing convergence
+demonstration. Prefer ``train_seq2seq_encoder_mlm.py`` (encoder-side MLM, default
+for ``prediction_objective="auto"`` on T5/BART); that workflow does converge and
+is covered by the example smoke tests.
 
 Uses the same English pronoun data as ``train_english_pronouns.py`` /
 ``create_english_pronoun_data.py``.

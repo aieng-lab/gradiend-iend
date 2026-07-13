@@ -36,11 +36,18 @@ import gc
 import json
 import math
 import os
+import re
 import shutil
+import sys
 import time
 from dataclasses import asdict, dataclass, fields
 from itertools import combinations
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import torch
@@ -55,6 +62,8 @@ from gradiend.trainer.core.cache_policy import (
     load_saved_gradiend_input_dim,
 )
 from gradiend.trainer.core.stats import load_training_stats
+from experiments.plot_output import save_figure
+from experiments.pre_prune_mask_recall import dense_pre_topk_grid
 from gradiend.util.logging import get_logger
 from gradiend.util.paths import ARTIFACT_MODEL, resolve_output_path
 from gradiend.util.runtime_monitor import CudaMemorySpan
@@ -78,24 +87,9 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def _save_figure(fig: plt.Figure, output_path: str, **kwargs: Any) -> None:
-    """Save a matplotlib figure; use a fallback path if the target PDF is locked."""
-    _ensure_dir(os.path.dirname(output_path) or ".")
-    save_kwargs = {"bbox_inches": "tight", **kwargs}
-    try:
-        fig.savefig(output_path, **save_kwargs)
-        logger.info("Wrote %s", output_path)
-        fig.show()
-        return
-    except PermissionError:
-        root, ext = os.path.splitext(output_path)
-        fallback = f"{root}_new{ext}"
-        fig.savefig(fallback, **save_kwargs)
-        logger.warning(
-            "Could not overwrite %s (close viewer); wrote %s instead.",
-            output_path,
-            fallback,
-        )
+def _save_figure(fig: plt.Figure, output_path: str, *, show: bool = False, **kwargs: Any) -> str:
+    """Save a matplotlib figure; optionally show it in the IDE viewer."""
+    return save_figure(fig, output_path, show=show, **kwargs)
 
 
 def _clear_cuda_memory() -> None:
@@ -236,10 +230,10 @@ DER_DIE_PAIRS: Tuple[Tuple[str, str], ...] = (
 PRE_SOURCES = ["factual", "alternative", "diff"]
 PRE_N_SAMPLES = [1, 2, 4, 8, 16, 32, 64]
 _N_SAMPLES_MARKERS: Tuple[str, ...] = ("o", "s", "^", "D", "v", "P", "X")
-# Decade pre_topk grid: 1.0 = baseline (no pre-prune), then 0.1, 0.01, ...
+# pre_topk grid: 1.0 = baseline (no pre-prune), then denser steps between decades.
 BASELINE_PRE_TOPK = 1.0
 BASELINE_REF_RECALL = 1.0
-PRE_TOPK_VALUES: List[float] = [1.0, 0.1, 0.01, 0.001]
+PRE_TOPK_VALUES: List[float] = dense_pre_topk_grid()
 
 
 def _is_decade_pre_topk(value: float) -> bool:
@@ -254,6 +248,87 @@ def _is_decade_pre_topk(value: float) -> bool:
 
 def _decade_pre_topk_values(values: Iterable[float]) -> List[float]:
     return sorted({float(v) for v in values if _is_decade_pre_topk(float(v))}, reverse=True)
+
+
+def _pruned_topk_values(values: Iterable[float]) -> List[float]:
+    """Non-baseline pre_topk values from the configured grid (descending)."""
+    return sorted(
+        {float(v) for v in values if not math.isclose(float(v), BASELINE_PRE_TOPK)},
+        reverse=True,
+    )
+
+
+def _matches_pruned_topk(value: float, pruned_topks: Sequence[float]) -> bool:
+    return any(math.isclose(value, topk) for topk in pruned_topks)
+
+
+def _pre_topk_axis_ticks(pre_topk_values: Sequence[float]) -> List[float]:
+    """Sparse decade ticks for readable log axes (not every dense grid cell)."""
+    return _decade_pre_topk_values(pre_topk_values)
+
+
+def _visible_pre_topk_axis_ticks(
+    pre_topk_values: Sequence[float],
+    *,
+    xlim_lo: float,
+    xlim_hi: float,
+) -> List[float]:
+    """Decade tick labels that fall inside the plotted x-range."""
+    return [
+        value
+        for value in _pre_topk_axis_ticks(pre_topk_values)
+        if xlim_lo <= value <= xlim_hi + 1e-15 or math.isclose(value, BASELINE_PRE_TOPK)
+    ]
+
+
+def _ref_recall_plot_xlim_lo(
+    plotted_topks: Sequence[float],
+    *,
+    fallback: float = 0.01,
+) -> float:
+    """Lower x bound from plottable data (not the full configured grid)."""
+    pruned = [
+        float(value)
+        for value in plotted_topks
+        if not math.isclose(float(value), BASELINE_PRE_TOPK)
+    ]
+    return min(pruned) if pruned else fallback
+
+
+def _ref_recall_plot_ylim(y_values: Sequence[float]) -> Tuple[float, float]:
+    """Tight y-limits from plotted recall values (small padding, no forced 0..1)."""
+    ys = [float(y) for y in y_values if y is not None and not math.isnan(y)]
+    if not ys:
+        return 0.0, 1.0
+    lo, hi = min(ys), max(ys)
+    if math.isclose(lo, hi):
+        pad = max(0.01, abs(lo) * 0.05)
+    else:
+        pad = max(0.005, (hi - lo) * 0.08)
+    return lo - pad, hi + pad
+
+
+def _order_pre_sources(sources: Iterable[str]) -> List[str]:
+    """Canonical subplot order: factual, alternative, diff."""
+    present = list(dict.fromkeys(sources))
+    return [source for source in PRE_SOURCES if source in present] + [
+        source for source in present if source not in PRE_SOURCES
+    ]
+
+
+def _format_pre_topk_axis_tick(value: float) -> str:
+    """Compact, unambiguous tick text for log-scaled pre_topk axes."""
+    if math.isclose(value, 1.0):
+        return "1"
+    if value >= 0.01:
+        return f"{value:g}"
+    exponent = int(round(math.log10(value)))
+    mantissa = value / (10.0**exponent)
+    if math.isclose(mantissa, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        return f"1e{exponent}"
+    if math.isclose(mantissa, 3.0, rel_tol=0.0, abs_tol=1e-12):
+        return f"3e{exponent}"
+    return f"{value:g}"
 
 
 def default_pre_topk_values(*, min_topk: float = 0.01) -> List[float]:
@@ -276,6 +351,9 @@ PAIR_ALIASES: Dict[str, Tuple[str, str]] = {
     "fem_acc_fem_dat": ("fem_acc", "fem_dat"),
     "fem_acc_fem_gen": ("fem_acc", "fem_gen"),
 }
+_CELL_INDEX_RE = re.compile(
+    r"^pre_src_(?P<source>alternative|factual|diff)_n_(?P<n_samples>\d+)_topk_(?P<topk>[0-9_]+)\.json$"
+)
 
 
 @dataclass
@@ -493,6 +571,8 @@ def _append_result(results: List[GridResult], result: GridResult, path: str) -> 
 def _is_valid_pruned_result(row: GridResult) -> bool:
     if row.pre_topk is None or math.isclose(row.pre_topk, 1.0):
         return True
+    if row.mask_recall:
+        return row.kept_dim is not None
     if row.kept_dim is None:
         return False
     return row.kept_dim <= STALE_PRUNED_INPUT_DIM_THRESHOLD
@@ -501,6 +581,8 @@ def _is_valid_pruned_result(row: GridResult) -> bool:
 def _is_definitely_stale_result(row: GridResult) -> bool:
     """True only when a row is known-bad (not merely incomplete)."""
     if row.pre_topk is None or math.isclose(row.pre_topk, 1.0):
+        return False
+    if row.mask_recall:
         return False
     if row.kept_dim is not None and row.kept_dim > STALE_PRUNED_INPUT_DIM_THRESHOLD:
         return True
@@ -750,6 +832,36 @@ def _indices_path(output_dir: str, run_id: str) -> str:
     return os.path.join(output_dir, "topk_indices", f"{safe}.json")
 
 
+_TOPK_INDEX_META_HEAD_BYTES = 16_384
+
+
+def _read_topk_index_metrics(path: str) -> Optional[Dict[str, Any]]:
+    """Read mask-recall metrics from the JSON header without loading huge index arrays."""
+    with open(path, "rb") as handle:
+        head = handle.read(_TOPK_INDEX_META_HEAD_BYTES).decode("utf-8", errors="ignore")
+    if '"ref_recall"' not in head:
+        return None
+
+    def _match_number(key: str) -> Optional[float]:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*([-0-9.eE+]+)', head)
+        return float(match.group(1)) if match else None
+
+    def _match_int(key: str) -> Optional[int]:
+        value = _match_number(key)
+        return int(value) if value is not None else None
+
+    ref_recall = _match_number("ref_recall")
+    if ref_recall is None:
+        return None
+    run_id_match = re.search(r'"run_id"\s*:\s*"([^"]+)"', head)
+    return {
+        "run_id": run_id_match.group(1) if run_id_match else None,
+        "ref_recall": ref_recall,
+        "ref_precision": _match_number("ref_precision") or 0.0,
+        "kept_dim": _match_int("kept_dim"),
+    }
+
+
 def _save_topk_indices(path: str, indices: Set[int], *, meta: Dict[str, Any]) -> None:
     _ensure_dir(os.path.dirname(path))
     payload = {**meta, "indices": sorted(indices)}
@@ -761,6 +873,155 @@ def _load_topk_indices(path: str) -> Set[int]:
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
     return {int(x) for x in payload["indices"]}
+
+
+def _parse_topk_token(token: str) -> float:
+    return float(token.replace("_", "."))
+
+
+def _pair_topk_indices_dir(output_dir: str, pair: Tuple[str, str]) -> str:
+    return os.path.join(output_dir, "topk_indices", _pair_child_id(pair))
+
+
+def discover_topk_index_files(output_dir: str, pair: Tuple[str, str]) -> List[str]:
+    index_dir = _pair_topk_indices_dir(output_dir, pair)
+    if not os.path.isdir(index_dir):
+        return []
+    return sorted(
+        os.path.join(index_dir, name)
+        for name in os.listdir(index_dir)
+        if name.endswith(".json") and not name.endswith(".filepart")
+    )
+
+
+def _run_id_for_topk_index_file(pair: Tuple[str, str], name: str) -> Optional[str]:
+    """Derive the grid run_id from a ``topk_indices`` filename (no file I/O)."""
+    if not name.endswith(".json") or name.endswith(".filepart"):
+        return None
+    stem = name[:-5]
+    if stem.startswith("ref_pre_topk_"):
+        return f"{_pair_child_id(pair)}/{stem}"
+    if _CELL_INDEX_RE.match(name) is None:
+        return None
+    return f"{_pair_child_id(pair)}/{stem}"
+
+
+def backfill_results_from_topk_indices(
+    output_dir: str,
+    pair: Tuple[str, str],
+    *,
+    results_path: Optional[str] = None,
+) -> int:
+    """Rebuild ``pair_results`` rows from completed ``topk_indices`` JSON files."""
+    results_path = results_path or _default_pair_results_path(output_dir, pair)
+    pair_key = _pair_slug(pair)
+    index_files = discover_topk_index_files(output_dir, pair)
+    if not index_files:
+        return 0
+
+    baseline_path = os.path.join(
+        _pair_topk_indices_dir(output_dir, pair),
+        f"ref_pre_topk_{_format_topk(1.0)}.json",
+    )
+
+    existing = _load_results(results_path)
+    existing_keys = {(r.pair, r.run_id) for r in existing}
+    n_new = 0
+    ref_topk: Optional[Set[int]] = None
+
+    def _baseline_ref_topk() -> Optional[Set[int]]:
+        nonlocal ref_topk
+        if ref_topk is None and os.path.isfile(baseline_path):
+            ref_topk = _load_topk_indices(baseline_path)
+        return ref_topk
+
+    for path in index_files:
+        name = os.path.basename(path)
+        run_id = _run_id_for_topk_index_file(pair, name)
+        if run_id is None:
+            continue
+        key = (pair_key, run_id)
+        if key in existing_keys:
+            continue
+
+        if name.startswith("ref_pre_topk_"):
+            with open(path, encoding="utf-8") as handle:
+                meta = json.load(handle)
+            run_id = str(meta.get("run_id") or run_id)
+            key = (pair_key, run_id)
+            if key in existing_keys:
+                continue
+            existing.append(
+                GridResult(
+                    pair=pair_key,
+                    run_id=run_id,
+                    pre_topk=1.0,
+                    ref_recall=1.0,
+                    ref_precision=1.0,
+                    topk_indices_file=path,
+                    converged=True,
+                    mask_recall=False,
+                )
+            )
+            existing_keys.add(key)
+            n_new += 1
+            continue
+
+        match = _CELL_INDEX_RE.match(name)
+        if match is None:
+            continue
+        source = match.group("source")
+        n_samples = int(match.group("n_samples"))
+        pre_topk = _parse_topk_token(match.group("topk"))
+        metrics = _read_topk_index_metrics(path)
+        if metrics is not None:
+            ref_recall = float(metrics["ref_recall"])
+            ref_precision = float(metrics.get("ref_precision") or 0.0)
+            kept_dim = metrics.get("kept_dim")
+            if kept_dim is None:
+                with open(path, encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                kept_dim = int(payload.get("kept_dim") or len(payload.get("indices", [])))
+            run_id = str(metrics.get("run_id") or run_id)
+        else:
+            baseline = _baseline_ref_topk()
+            if baseline is None:
+                continue
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            heuristic = {int(x) for x in payload["indices"]}
+            kept_dim = len(heuristic)
+            ref_recall, ref_precision = _ref_recall_metrics(heuristic, baseline)
+            run_id = str(payload.get("run_id") or run_id)
+        key = (pair_key, run_id)
+        if key in existing_keys:
+            continue
+        existing.append(
+            GridResult(
+                pair=pair_key,
+                run_id=run_id,
+                pre_topk=pre_topk,
+                pre_source=source,
+                pre_n_samples=n_samples,
+                kept_dim=int(kept_dim),
+                ref_recall=ref_recall,
+                ref_precision=ref_precision,
+                topk_indices_file=path,
+                converged=True,
+                mask_recall=True,
+            )
+        )
+        existing_keys.add(key)
+        n_new += 1
+
+    if n_new:
+        _save_results(existing, results_path)
+        logger.info(
+            "Backfilled %s result row(s) from topk_indices into %s.",
+            n_new,
+            results_path,
+        )
+    return n_new
 
 
 def _evaluate_oracle_topk(
@@ -1108,7 +1369,7 @@ def _run_grid_cell_recall_only(
             pre_start = time.perf_counter()
             base_model = trainer.get_model()
             base_input_dim = int(base_model.gradiend.input_dim)
-            trainer.pre_prune(inplace=False)
+            trainer.pre_prune(pre_cfg, inplace=False)
             pre_pruning_time_s = time.perf_counter() - pre_start
         model = trainer.get_model()
         heuristic_topk = _all_kept_base_global(model)
@@ -1125,6 +1386,13 @@ def _run_grid_cell_recall_only(
                 "topk_eval": TOPK_EVAL,
                 "part": TOPK_PART,
                 "mask_recall": True,
+                "pre_topk": topk,
+                "pre_source": source,
+                "pre_n_samples": n_samples,
+                "ref_recall": ref_recall,
+                "ref_precision": ref_precision,
+                "kept_dim": kept_dim,
+                "base_input_dim": base_input_dim,
             },
         )
 
@@ -1176,6 +1444,17 @@ def run_full_grid(
     max_size: int,
     recall_only: bool = True,
 ) -> List[GridResult]:
+    for pair in pairs:
+        cell_results_path = (
+            results_path
+            if len(pairs) == 1
+            else _default_pair_results_path(output_dir, pair)
+        )
+        backfill_results_from_topk_indices(
+            output_dir,
+            pair,
+            results_path=cell_results_path,
+        )
     args_base = _base_args(output_dir, max_seeds=max_seeds)
     ref_topk_by_pair: Dict[str, Set[int]] = {}
     pending = _missing_grid_cells(
@@ -1290,9 +1569,10 @@ def _summarize_configs(
     for rows in by_config.values():
         sample = rows[0]
         topk_sets: Dict[str, Set[int]] = {}
-        for row in rows:
-            if _indices_file_exists(row):
-                topk_sets[row.pair] = _load_topk_indices(row.topk_indices_file)
+        if len(rows) >= 2:
+            for row in rows:
+                if _indices_file_exists(row):
+                    topk_sets[row.pair] = _load_topk_indices(row.topk_indices_file)
 
         overlaps: List[float] = []
         pair_keys = sorted(topk_sets)
@@ -1335,9 +1615,10 @@ def _summarize_baseline(results: List[GridResult], *, require_converged: bool = 
         return None
 
     topk_sets: Dict[str, Set[int]] = {}
-    for row in baseline_rows:
-        if _indices_file_exists(row):
-            topk_sets[row.pair] = _load_topk_indices(row.topk_indices_file)
+    if len(baseline_rows) >= 2:
+        for row in baseline_rows:
+            if _indices_file_exists(row):
+                topk_sets[row.pair] = _load_topk_indices(row.topk_indices_file)
 
     overlaps: List[float] = []
     pair_keys = sorted(topk_sets)
@@ -1518,7 +1799,6 @@ def plot_metric_panels(
     fig.colorbar(ims[0], ax=axes.flatten().tolist(), shrink=0.85, label=metric)
     fig.tight_layout()
     _save_figure(fig, output_path)
-    plt.close(fig)
 
 
 def plot_pareto(
@@ -1558,7 +1838,6 @@ def plot_pareto(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save_figure(fig, output_path)
-    plt.close(fig)
 
 
 def _marker_for_n_samples(n_samples: int) -> str:
@@ -1576,10 +1855,10 @@ def plot_ref_recall_vs_pre_topk(
     output_path: str,
     sources: Sequence[str],
     pre_topk_values: Sequence[float],
-) -> None:
-    pruned_topks = _decade_pre_topk_values(
-        v for v in pre_topk_values if not math.isclose(v, BASELINE_PRE_TOPK)
-    )
+    show: bool = False,
+) -> str:
+    sources = _order_pre_sources(sources)
+    pruned_topks = _pruned_topk_values(pre_topk_values)
     n_samples_values = sorted(
         {s.pre_n_samples for s in summaries if s.pre_n_samples is not None}
     )
@@ -1594,13 +1873,29 @@ def plot_ref_recall_vs_pre_topk(
         squeeze=False,
         sharey=True,
     )
+    all_y_values: List[float] = []
+    present_topks = {
+        s.pre_topk
+        for s in summaries
+        if s.pre_topk is not None and not math.isclose(s.pre_topk, BASELINE_PRE_TOPK)
+    }
+    missing_topks = [
+        topk
+        for topk in pruned_topks
+        if not any(math.isclose(topk, present) for present in present_topks)
+    ]
+    if missing_topks:
+        logger.info(
+            "No plottable grid data for pre_topk=%s (re-run --mode run to fill gaps).",
+            ", ".join(f"{value:g}" for value in missing_topks),
+        )
     for ax, source in zip(axes.flatten(), sources):
         subset = [
             s
             for s in summaries
             if s.pre_source == source
             and not math.isclose(s.pre_topk, BASELINE_PRE_TOPK)
-            and _is_decade_pre_topk(s.pre_topk)
+            and _matches_pruned_topk(s.pre_topk, pruned_topks)
         ]
         for n_samples in sorted({s.pre_n_samples for s in subset if s.pre_n_samples is not None}):
             rows = sorted(
@@ -1609,29 +1904,53 @@ def plot_ref_recall_vs_pre_topk(
             )
             xs = [s.pre_topk for s in rows]
             ys = [s.mean_ref_recall for s in rows]
+            if not xs:
+                continue
             xs, ys = _append_baseline_recall_anchor(xs, ys)
+            all_y_values.extend(ys)
+            color = color_by_n_samples[n_samples]
             ax.plot(
                 xs,
                 ys,
                 marker=_marker_for_n_samples(n_samples),
                 linestyle="-",
                 markersize=3,
-                color=color_by_n_samples[n_samples],
+                color=color,
                 label=str(n_samples),
             )
         ax.set_xscale("log")
-        lo = min(pruned_topks) if pruned_topks else 0.01
-        ax.set_xlim(lo * 0.85, BASELINE_PRE_TOPK * 1.05)
-        ax.set_ylim(0.0, 1.03)
-        ax.set_xticks(sorted(set(pruned_topks + [BASELINE_PRE_TOPK])))
-        ax.set_xticklabels(
-            [f"{value:g}" for value in sorted(set(pruned_topks + [BASELINE_PRE_TOPK]))]
-        )
+        plotted_topks = [
+            s.pre_topk
+            for s in subset
+            if s.pre_topk is not None and not math.isclose(s.pre_topk, BASELINE_PRE_TOPK)
+        ]
+        if plotted_topks:
+            lo = _ref_recall_plot_xlim_lo(plotted_topks)
+            x_lo = lo * 0.85
+            x_hi = BASELINE_PRE_TOPK * 1.05
+            ax.set_xlim(x_lo, x_hi)
+            axis_ticks = _visible_pre_topk_axis_ticks(
+                pre_topk_values,
+                xlim_lo=x_lo,
+                xlim_hi=x_hi,
+            )
+            ax.set_xticks(axis_ticks)
+            ax.set_xticklabels(
+                [_format_pre_topk_axis_tick(value) for value in axis_ticks],
+                rotation=45,
+                ha="right",
+                fontsize=8,
+            )
         ax.set_xlabel("Pre-pruning Top-$k$")
         ax.set_title(f"source={source}")
         ax.grid(True, alpha=0.25, linewidth=0.6)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
+
+    if all_y_values:
+        y_lo, y_hi = _ref_recall_plot_ylim(all_y_values)
+        for ax in axes.flatten():
+            ax.set_ylim(y_lo, y_hi)
 
     fig.supylabel("Recall", x=0.05)
     if n_samples_values:
@@ -1661,8 +1980,7 @@ def plot_ref_recall_vs_pre_topk(
             columnspacing=1.1,
         )
     fig.tight_layout(rect=(0.025, 0.0, 1.0, 0.82))
-    _save_figure(fig, output_path)
-    plt.close(fig)
+    return _save_figure(fig, output_path, show=show)
 
 
 def plot_coverage_panels(
@@ -1699,7 +2017,6 @@ def plot_coverage_panels(
     fig.suptitle("Grid coverage (completed convergent pairs per cell)", y=1.02)
     fig.tight_layout()
     _save_figure(fig, output_path)
-    plt.close(fig)
 
 
 def plot_cross_overlap_pareto(
@@ -1737,7 +2054,6 @@ def plot_cross_overlap_pareto(
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     _save_figure(fig, output_path)
-    plt.close(fig)
 
 
 def write_ongoing_report(
@@ -1812,6 +2128,7 @@ def plot_all(
     n_samples_values: Sequence[int],
     pre_topk_values: Sequence[float],
     require_converged: bool = True,
+    show: bool = False,
 ) -> List[ConfigSummary]:
     write_ongoing_report(
         results,
@@ -1878,6 +2195,7 @@ def plot_all(
         output_path=os.path.join(output_dir, "grid_ref_recall_vs_pre_topk_by_source.pdf"),
         sources=sources,
         pre_topk_values=pre_topk_values,
+        show=show,
     )
     logger.info("Refreshed plots in %s", output_dir)
     return summaries
@@ -1885,6 +2203,83 @@ def plot_all(
 
 DEFAULT_OUTPUT_DIR = os.path.join("runs", "gender_de_pre_topk_ablation")
 FULL_GRID_OUTPUT_DIR = os.path.join("runs", "gender_de_pre_topk_ablation_full_grid")
+
+
+def _filter_results_for_pairs(
+    results: List[GridResult],
+    pairs: Sequence[Tuple[str, str]],
+) -> List[GridResult]:
+    pair_slugs = {_pair_slug(p) for p in pairs}
+    return [r for r in results if r.pair in pair_slugs]
+
+
+def _merge_grid_results(
+    primary: List[GridResult],
+    secondary: List[GridResult],
+) -> List[GridResult]:
+    seen = {(r.pair, r.run_id) for r in primary}
+    merged = list(primary)
+    for row in secondary:
+        key = (row.pair, row.run_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return merged
+
+
+def _has_plottable_pruned_summaries(
+    results: List[GridResult],
+    pairs: Sequence[Tuple[str, str]],
+    *,
+    require_converged: bool,
+) -> bool:
+    scoped = _filter_results_for_pairs(results, pairs)
+    summaries = _summarize_configs(scoped, require_converged=require_converged)
+    return any(
+        s.pre_n_samples is not None and not math.isclose(s.pre_topk, BASELINE_PRE_TOPK)
+        for s in summaries
+    )
+
+
+def resolve_plot_grid_results(
+    output_dir: str,
+    pairs: Sequence[Tuple[str, str]],
+    *,
+    explicit_results_path: Optional[str] = None,
+    require_converged: bool = True,
+    fallback_output_dir: Optional[str] = None,
+    allow_fallback: Optional[bool] = None,
+) -> List[GridResult]:
+    """Load grid rows for plotting, optionally merging from the default run dir."""
+    if fallback_output_dir is None:
+        fallback_output_dir = DEFAULT_OUTPUT_DIR
+    if allow_fallback is None:
+        allow_fallback = "pruning_parameter_ablation" not in Path(output_dir).parts
+    discovered = _discover_result_paths(output_dir, explicit_results_path)
+    results = _filter_results_for_pairs(_load_results_many(discovered), pairs)
+    if (
+        allow_fallback
+        and output_dir != fallback_output_dir
+        and os.path.isdir(fallback_output_dir)
+        and not _has_plottable_pruned_summaries(
+            results, pairs, require_converged=require_converged
+        )
+    ):
+        fb_discovered = _discover_result_paths(fallback_output_dir, None)
+        fb_results = _filter_results_for_pairs(
+            _load_results_many(fb_discovered), pairs
+        )
+        if _has_plottable_pruned_summaries(
+            fb_results, pairs, require_converged=require_converged
+        ):
+            logger.info(
+                "No plottable pruned grid data under %s; merging grid results from %s.",
+                output_dir,
+                fallback_output_dir,
+            )
+            results = _merge_grid_results(results, fb_results)
+    return results
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1942,7 +2337,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pre-n-samples", type=_csv_ints, default=PRE_N_SAMPLES)
     parser.add_argument("--pre-sources", type=_csv_strings, default=PRE_SOURCES)
     parser.add_argument("--pre-topk-values", type=_csv_floats, default=PRE_TOPK_VALUES,
-                        help="Default: decade grid 1, 0.1, 0.01, 0.001.")
+                        help="Default: dense grid from 1.0 down to 1e-6 (3×10^n and 10^n).")
     parser.add_argument(
         "--max-seeds",
         type=int,
@@ -2026,7 +2421,18 @@ def main() -> None:
             )
 
     if args.mode == "plot":
-        results = _load_results_many(discovered_paths)
+        for pair in pairs:
+            backfill_results_from_topk_indices(
+                args.output_dir,
+                pair,
+                results_path=_default_pair_results_path(args.output_dir, pair),
+            )
+        results = resolve_plot_grid_results(
+            args.output_dir,
+            pairs,
+            explicit_results_path=args.results_path,
+            require_converged=not args.plot_include_legacy,
+        )
     else:
         results = _load_results(results_path)
     if args.mode in ("run", "both"):
@@ -2052,6 +2458,7 @@ def main() -> None:
             n_samples_values=args.pre_n_samples,
             pre_topk_values=args.pre_topk_values,
             require_converged=not args.plot_include_legacy,
+            show=args.mode == "plot",
         )
 
 

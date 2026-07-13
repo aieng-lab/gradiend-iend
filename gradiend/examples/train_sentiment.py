@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Tuple
 
 import pandas as pd
 
@@ -127,7 +127,7 @@ def apply_vocabulary_held_out_split(
 ) -> pd.DataFrame:
     """Assign train/validation/test by held-out emotion word (canonical lemma).
 
-    Same logic as ``TextPredictionTrainer`` with ``split_col=None``, but applied
+    Same logic as ``TextPredictionTrainer`` with ``split_col="heldout"``, but applied
     explicitly so the split is fixed before trainer / MLM-head setup and can be
     reused from other examples (pass the result with ``split_col="split"``).
     """
@@ -483,7 +483,7 @@ def train(
         data=training_df,
         target_classes=list(TARGET_CLASSES),
         eval_neutral_data=neutral_path,
-        split_col=None, #"split",
+        split_col="split",
         img_format="pdf",
     )
     args = sentiment_training_arguments(
@@ -538,7 +538,7 @@ def train_multi_seed_heldout_targets(
         data=training_path,
         target_classes=list(TARGET_CLASSES),
         eval_neutral_data=neutral_path,
-        split_col=None,
+        split_col="heldout",
         split_group_key=[str.strip, str.casefold],
         split_ratios=(0.6, 0.2, 0.2),
         img_format="pdf",

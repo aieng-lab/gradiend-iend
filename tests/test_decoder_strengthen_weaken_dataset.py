@@ -13,7 +13,7 @@ import pandas as pd
 from unittest.mock import MagicMock
 
 from gradiend.evaluator.decoder import DecoderEvaluator
-from tests.conftest import MockTokenizer, bind_trainer_cache_resolver
+from tests.testing_mocks import MockTokenizer, bind_trainer_cache_resolver
 
 
 class MockModelWithGradiend3SG3PL:

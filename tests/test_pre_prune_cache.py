@@ -1,6 +1,5 @@
 """Tests for pre-prune disk cache helpers."""
 
-import json
 import os
 
 import pytest

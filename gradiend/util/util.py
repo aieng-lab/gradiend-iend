@@ -5,7 +5,6 @@ import hashlib
 from typing import Any
 
 import numpy as np
-import torch
 
 
 def format_count(value, *, sep: str = ",") -> str:
@@ -69,7 +68,7 @@ def restore_tuple_keys_recursively(obj):
         return obj
 
 
-def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+def unwrap_model(model: Any) -> Any:
     while hasattr(model, "module"):
         model = model.module
     return model
@@ -111,6 +110,8 @@ def hash_model_weights(model):
     if hasattr(model, 'hash'):
         model_hash = model.hash()
     else:
+        import torch
+
         # Create a BytesIO buffer to store the model's state_dict
         buffer = io.BytesIO()
         # Save the state_dict to the buffer

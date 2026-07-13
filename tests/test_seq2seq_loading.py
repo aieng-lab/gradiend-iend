@@ -122,7 +122,7 @@ def test_create_masked_pair_skips_standalone_sentencepiece_marker():
 def test_load_t5_small_encoder_mlm():
     model = AutoModelForLM.from_pretrained("t5-small")
     assert getattr(model.config, "is_encoder_decoder", False)
-    assert prediction_eval_kind(model) == "seq2seq_decoder"
+    assert prediction_eval_kind(model) == "seq2seq_encoder_mlm"
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained("t5-small")

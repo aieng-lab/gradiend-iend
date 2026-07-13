@@ -5,14 +5,10 @@ Tests basic training flow, seed handling, and parameter passing/overwriting.
 """
 
 import os
-import tempfile
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
-from typing import Dict, Any
 
 import pytest
 import torch
-import torch.nn as nn
 
 from gradiend.trainer.core.training import format_non_convergence_error, train
 from gradiend.trainer.core.arguments import TrainingArguments
@@ -25,7 +21,7 @@ from gradiend.trainer.core.stats import (
 )
 from gradiend.model import GradiendModel
 from gradiend.trainer.trainer import Trainer
-from tests.conftest import SimpleMockModel, MockTokenizer, set_seed
+from tests.testing_mocks import SimpleMockModel
 
 
 class MockModelWithGradiend:

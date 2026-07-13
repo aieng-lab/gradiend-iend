@@ -8,7 +8,7 @@ disambiguate. Requires: pip install gradiend[data]
 Set download_if_missing=True to auto-download the spacy model if not installed.
 """
 
-from gradiend import TextFilterConfig, TextPreprocessConfig, TextPredictionDataCreator
+from gradiend import TextFilterConfig, TextPredictionDataCreator
 
 # German gendered articles (example-specific; define per use case)
 NEUTRAL_EXCLUDE_GERMAN_ARTICLES = [

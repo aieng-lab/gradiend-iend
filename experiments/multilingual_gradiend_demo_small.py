@@ -43,7 +43,7 @@ from gradiend import (
     plot_cross_encoding_heatmap,
     plot_gradiend_transition_cross_encoding_heatmap,
 )
-from gradiend.comparison.feature_cross_encoding import (
+from gradiend.comparison.cross_encoding import (
     build_cross_task_encoder_summary,
     collect_unified_test_transitions,
 )

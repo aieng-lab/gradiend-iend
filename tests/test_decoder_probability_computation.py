@@ -10,7 +10,7 @@ import pytest
 
 from gradiend.trainer.text.prediction.prediction_objective import PredictionObjective
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
-from tests.conftest import MockTokenizer, SimpleMockModel
+from tests.testing_mocks import MockTokenizer, SimpleMockModel
 
 
 def _with_required_splits(rows):

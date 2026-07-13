@@ -4,7 +4,6 @@ import os
 import shutil
 from unittest.mock import patch
 
-import pytest
 
 from gradiend.comparison.seed_policy import (
     enter_analysis_mode,

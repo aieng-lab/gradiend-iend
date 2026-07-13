@@ -80,7 +80,7 @@ BEST_PRE_SOURCE = "alternative"
 BEST_PRE_N_SAMPLES = 2
 PRE_PRUNE_SEED = 42
 _DENSE_TOPK_MULTIPLIERS = [1, 0.7, 0.5, 0.3, 0.2]
-_DENSE_TOPK_MULTIPLIERS = [1, 0.3]
+#_DENSE_TOPK_MULTIPLIERS = [1, 0.3]
 
 
 def _default_dense_topk_values() -> List[float]:
@@ -1172,7 +1172,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join("runs", "pruning_analysis", "german_de_v7"),
+        default=os.path.join("runs", "pruning_analysis", "german_de_v73"),
     )
     parser.add_argument("--results-path", default=None)
     parser.add_argument("--pair", default="masc_nom:fem_nom")

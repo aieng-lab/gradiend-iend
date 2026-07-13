@@ -5,7 +5,6 @@ This helps capture test failures when running in environments where direct acces
 """
 
 import sys
-import os
 import subprocess
 from pathlib import Path
 from datetime import datetime

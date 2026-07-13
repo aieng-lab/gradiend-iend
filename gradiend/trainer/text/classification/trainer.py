@@ -8,7 +8,6 @@ and same decoder-eval contract (probs_by_dataset, probs_factual).
 from __future__ import annotations
 
 import os
-import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
@@ -35,9 +34,7 @@ from gradiend.trainer.text.classification.data import (
     LABEL_FACTUAL,
     LABEL_ALTERNATIVE,
     FACTUAL_ID,
-    ALTERNATIVE_ID,
     FACTUAL_CLS,
-    ALTERNATIVE_CLS,
 )
 from gradiend.trainer.text.classification.model_with_gradiend import TextClassificationModelWithGradiend
 from gradiend.trainer.text.classification.classification_head import train_classification_head
@@ -254,8 +251,14 @@ class TextClassificationTrainer(Trainer):
             **kwargs: Optional gradient dataset settings such as ``source`` and
                 ``target``.
         """
-        source = kwargs.pop("source", None) or getattr(self.training_args, "source", "factual")
-        target = kwargs.pop("target", None) or getattr(self.training_args, "target", "diff")
+        from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
+
+        source = kwargs.pop("source", GRADIENT_DATASET_KWARG_UNSET)
+        target = kwargs.pop("target", GRADIENT_DATASET_KWARG_UNSET)
+        if source is GRADIENT_DATASET_KWARG_UNSET:
+            source = getattr(self.training_args, "source", "factual")
+        if target is GRADIENT_DATASET_KWARG_UNSET:
+            target = getattr(self.training_args, "target", "diff")
         tokenizer = model_with_gradiend.tokenizer
         pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
 

@@ -50,7 +50,11 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 import pandas as pd
 import torch
 
-from gradiend.comparison.seed_policy import enter_analysis_mode, enter_analysis_mode_for_trainers
+from gradiend.comparison.seed_policy import (
+    enter_analysis_mode,
+    enter_analysis_mode_for_trainers,
+    models_for_comparison,
+)
 from gradiend import (
     SuitePairDefinition,
     SymmetricTrainerSuite,
@@ -59,15 +63,19 @@ from gradiend import (
     TextPredictionTrainer,
     TrainerCollection,
     TrainingArguments,
+    configure_plot_style,
     plot_cross_encoding_heatmap,
     plot_gradiend_transition_cross_encoding_heatmap,
     plot_topk_overlap_heatmap,
     plot_topk_overlap_venn,
 )
-from gradiend.comparison.feature_cross_encoding import (
+from gradiend.comparison.cross_encoding import (
     build_cross_task_encoder_summary,
     collect_unified_test_rows,
     collect_unified_test_transitions,
+    filter_trainers_without_hf_dataset,
+    load_cross_task_transition_order,
+    write_cross_task_transition_order,
 )
 from gradiend.trainer import PrePruneConfig, PostPruneConfig
 from gradiend.examples.create_english_pronoun_data import (
@@ -75,7 +83,16 @@ from gradiend.examples.create_english_pronoun_data import (
     ensure_english_pronoun_data,
 )
 from gradiend.trainer.text.prediction.decoder_only_mlm import train_mlm_head
-from gradiend.util.paths import has_saved_decoder_mlm_head, resolve_decoder_mlm_head_dir
+from gradiend.trainer.core.cache_policy import USE_CACHE_ALWAYS
+from gradiend.visualizer.labels import converged_for_trainer
+from gradiend.visualizer.plot_style_config import PlotStyleConfig
+from gradiend.util.paths import (
+    ARTIFACT_MODEL,
+    has_saved_decoder_mlm_head,
+    has_saved_model,
+    resolve_decoder_mlm_head_dir,
+    resolve_output_path,
+)
 
 
 ENCODER_MODEL = "google-bert/bert-base-multilingual-cased"
@@ -128,7 +145,7 @@ MLM_HEAD_GROUP_BY_PROBLEM = {
 
 # Per-problem GRADIEND training learning rates (encoder / multilingual BERT defaults).
 ENCODER_LEARNING_RATE_BY_PROBLEM: Dict[str, float] = {
-    "gender_de": 1e-5,
+    "gender_de": 1e-6,
     "gender_en": 1e-4,
     "train_race_religion": 1e-5,
     "pronoun": 1e-4,
@@ -159,6 +176,12 @@ DEMO_PROBLEM_KEYS = (
     "gender_en",
     "gender_de",
     "sentiment",
+)
+
+DEMO_PLOT_STYLE = PlotStyleConfig(
+    use_latex=True,
+    font_family="sans-serif",
+    transition_arrows="latex",
 )
 
 DECODER_MLM_HEAD_ARGS = {
@@ -233,8 +256,9 @@ PRONOUN_DATA_DIR = "data/english_pronouns"
 SENTIMENT_DATA_DIR = "data/sentiment_tweets"
 SENTIMENT_GOOD_BAD_DATA_DIR = "data/sentiment_nrc_good_bad"
 SENTIMENT_GOOD_BAD_PAIR = ("good", "bad")
-SENTIMENT_PRE_PRUNE_TOPK = 0.1
+SENTIMENT_PRE_PRUNE_TOPK = 0.01
 SENTIMENT_POST_PRUNE_TOPK = 0.01
+SENTIMENT_TORCH_DTYPE = torch.bfloat16
 FORMALITY_DATA_DIR = "data/formality_gyafc"
 # Re-enable when training.csv and neutral.csv exist under FORMALITY_DATA_DIR.
 ENABLE_FORMALITY = False
@@ -277,6 +301,7 @@ class ExperimentConfig:
     args: TrainingArguments
     mlm_head_args: Dict[str, Any]
     problem_learning_rate_overrides: Dict[str, float]
+    include_sentiment_good_bad: bool
 
     def __init__(
         self,
@@ -287,6 +312,7 @@ class ExperimentConfig:
         args: TrainingArguments,
         mlm_head_args: Dict[str, Any],
         problem_learning_rate_overrides: Optional[Dict[str, float]] = None,
+        include_sentiment_good_bad: bool = False,
     ) -> None:
         self.model_name = model_name
         self.decoder_eval_mode = decoder_eval_mode
@@ -294,6 +320,7 @@ class ExperimentConfig:
         self.args = args
         self.mlm_head_args = mlm_head_args
         self.problem_learning_rate_overrides = dict(problem_learning_rate_overrides or {})
+        self.include_sentiment_good_bad = bool(include_sentiment_good_bad)
 
 
 def parse_args() -> argparse.Namespace:
@@ -366,7 +393,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--plot-only",
         action="store_true",
-        help="Skip training; plot from cached checkpoints in the experiment dir.",
+        help=(
+            "Skip GRADIEND and decoder-MLM-head training; load cached checkpoints "
+            "and regenerate plots. By default, cross-encoding uses cached encoder "
+            "CSVs only; add --repair-encoder-cache to fill missing probe rows or "
+            "--recompute-encoder-cache to force a full re-encode from checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--repair-encoder-cache",
+        action="store_true",
+        help=(
+            "With --plot-only, repair unified cross-task encoder CSVs from cached "
+            "GRADIEND checkpoints by encoding only missing probe rows and merging "
+            "them into the existing cache. This does not train new GRADIEND models "
+            "and avoids recomputing already cached probes."
+        ),
+    )
+    parser.add_argument(
+        "--recompute-encoder-cache",
+        action="store_true",
+        help=(
+            "With --plot-only, force-recompute cross-task encoder CSVs from cached "
+            "GRADIEND checkpoints before plotting. This can be slow, but it must "
+            "not train new GRADIEND models."
+        ),
+    )
+    parser.add_argument(
+        "--plot-incomplete-encoder-cache",
+        action="store_true",
+        help=(
+            "With --plot-only cache-only plotting, draw cross-encoding plots from "
+            "directed but incomplete cached encoder CSVs instead of skipping them. "
+            "This is diagnostic only: missing probes/cells are omitted and the "
+            "script prints a warning. Use --repair-encoder-cache or "
+            "--recompute-encoder-cache for final complete figures."
+        ),
+    )
+    parser.add_argument(
+        "--experiment-dir",
+        default=None,
+        help=(
+            "Override the default runs/... experiment directory. "
+            "Useful with --plot-only to replot an existing run."
+        ),
     )
     parser.add_argument(
         "--problems",
@@ -397,6 +467,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Run stability analysis with min_convergent_seeds=3, keep all convergent "
             "checkpoints, and emit additional std-only heatmap variants."
+        ),
+    )
+    parser.add_argument(
+        "--sent-good-bad",
+        action="store_true",
+        help=(
+            "Opt in to the auxiliary decoder-only sentiment_good_bad run. "
+            "Default is off; the canonical sentiment run is positive<->negative."
         ),
     )
     return parser.parse_args()
@@ -479,7 +557,7 @@ def _assert_selected_problems_runnable(
             gender_de_suite,
             formality_suite,
         )
-    ) or gender_en_trainer is not None or "sentiment" in selected_problems
+    ) or gender_en_trainer is not None or "sentiment" in (selected_problems or set())
     if not has_work:
         raise ValueError(
             f"No runnable problems in --problems {sorted(selected_problems)!r}. "
@@ -522,6 +600,27 @@ def _resolve_decoder_eval_mode(raw: str) -> DecoderEvalMode:
 
 def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
     decoder_eval_mode = _resolve_decoder_eval_mode(cli_args.decoder_eval_mode)
+    repair_encoder_cache = bool(getattr(cli_args, "repair_encoder_cache", False))
+    recompute_encoder_cache = bool(getattr(cli_args, "recompute_encoder_cache", False))
+    plot_incomplete_encoder_cache = bool(getattr(cli_args, "plot_incomplete_encoder_cache", False))
+    if (
+        repair_encoder_cache
+        or recompute_encoder_cache
+        or plot_incomplete_encoder_cache
+    ) and not bool(getattr(cli_args, "plot_only", False)):
+        raise ValueError(
+            "--repair-encoder-cache, --recompute-encoder-cache, and "
+            "--plot-incomplete-encoder-cache require --plot-only."
+        )
+    if repair_encoder_cache and recompute_encoder_cache:
+        raise ValueError("--repair-encoder-cache and --recompute-encoder-cache are mutually exclusive.")
+    if plot_incomplete_encoder_cache and (repair_encoder_cache or recompute_encoder_cache):
+        raise ValueError(
+            "--plot-incomplete-encoder-cache is only for cache-only plotting; "
+            "do not combine it with --repair-encoder-cache or --recompute-encoder-cache."
+        )
+    if bool(getattr(cli_args, "sent_good_bad", False)) and decoder_eval_mode is DecoderEvalMode.NONE:
+        raise ValueError("--sent-good-bad is only supported for decoder-enabled runs.")
     default_model = DECODER_MODEL if decoder_eval_mode is not DecoderEvalMode.NONE else ENCODER_MODEL
     model_name = cli_args.model or default_model
     mode_suffix = "" if decoder_eval_mode is DecoderEvalMode.NONE else f"_{decoder_eval_mode.value}"
@@ -534,9 +633,9 @@ def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
     pre_suffix = "" if pre_prune_topk == 0.01 else f"_pre{pre_prune_topk:g}"
     three_seed = bool(getattr(cli_args, "three_seed", False))
     seed_suffix = "_3seed" if three_seed else ""
-    experiment_dir = (
+    experiment_dir = cli_args.experiment_dir or (
         f"runs/multilingual_gradiend_demo_{model_name.split('/')[-1]}"
-        f"{mode_suffix}{pre_suffix}{seed_suffix}_v7"
+        f"{mode_suffix}{pre_suffix}{seed_suffix}_v42"
     )
 
     base_args = TrainingArguments(
@@ -549,7 +648,7 @@ def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
         decoder_eval_max_size_training_like=100,
         decoder_eval_max_size_neutral=500,
         num_train_epochs=3,
-        max_seeds=20,
+        max_seeds=50 if three_seed else 5,
         min_convergent_seeds=3 if three_seed else 1,
         analyze_seed_stability=three_seed,
         saved_seed_runs="all_convergent",
@@ -557,6 +656,7 @@ def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
         target="diff",
         eval_batch_size=8,
         learning_rate=1e-5,
+        reuse_pre_prune=True,
         torch_dtype=(
             DECODER_MODEL_TORCH_DTYPE
             if decoder_eval_mode is not DecoderEvalMode.NONE
@@ -565,7 +665,7 @@ def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
         pre_prune_config=PrePruneConfig(n_samples=16, topk=pre_prune_topk, source="diff"),
         post_prune_config=PostPruneConfig(topk=post_prune_topk, part="decoder-weight"),
         add_identity_for_other_classes=True,
-        use_cache="only_convergent",
+        use_cache="always",
     )
     mlm_head_args = dict(DECODER_MLM_HEAD_ARGS)
     mlm_head_args["epochs"] = cli_args.mlm_head_epochs
@@ -579,6 +679,7 @@ def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
         problem_learning_rate_overrides=_parse_problem_learning_rate_overrides(
             cli_args.problem_learning_rate
         ),
+        include_sentiment_good_bad=bool(getattr(cli_args, "sent_good_bad", False)),
     )
 
 
@@ -696,16 +797,155 @@ def _train_shared_mlm_head(
     return output_path
 
 
+def _trainer_checkpoint_path(trainer: TextPredictionTrainer) -> Optional[str]:
+    experiment_dir = trainer.experiment_dir
+    if not experiment_dir:
+        return None
+    return resolve_output_path(experiment_dir, None, ARTIFACT_MODEL)
+
+
+def trainer_has_cached_checkpoint(trainer: TextPredictionTrainer) -> bool:
+    """Return True when the trainer has a saved GRADIEND model on disk."""
+    model_path = _trainer_checkpoint_path(trainer)
+    return bool(model_path and has_saved_model(model_path))
+
+
+def discover_cached_run_ids(experiment_dir: str) -> FrozenSet[str]:
+    """Return run_id subdirs under experiment_dir that contain a saved GRADIEND model."""
+    if not experiment_dir or not os.path.isdir(experiment_dir):
+        return frozenset()
+    found: set[str] = set()
+    for name in os.listdir(experiment_dir):
+        if name.startswith("."):
+            continue
+        run_dir = os.path.join(experiment_dir, name)
+        if not os.path.isdir(run_dir):
+            continue
+        model_path = resolve_output_path(run_dir, None, ARTIFACT_MODEL)
+        if model_path and has_saved_model(model_path):
+            found.add(name)
+    return frozenset(found)
+
+
+def _problem_for_run_id(run_id: str) -> str:
+    if run_id.startswith("gender_de_"):
+        return "gender_de"
+    if run_id == "gender_en":
+        return "gender_en"
+    if run_id.startswith("race_") or run_id.startswith("religion_"):
+        return "train_race_religion"
+    if run_id.startswith("pronoun_number_") or run_id.startswith("pronoun_person_"):
+        return "pronoun_merged"
+    if run_id.startswith("pronoun_"):
+        return "pronoun"
+    if run_id.startswith("sentiment_"):
+        return "sentiment"
+    if run_id.startswith("formality_"):
+        return "formality"
+    return "pronoun"
+
+
+def _demo_problem_for_run_id(run_id: str) -> str:
+    problem = _problem_for_run_id(run_id)
+    if problem == "train_race_religion":
+        if run_id.startswith("race_"):
+            return "race"
+        if run_id.startswith("religion_"):
+            return "religion"
+    return problem
+
+
+ENCODER_ANALYSIS_EXCLUDED_RUN_IDS = frozenset(
+    {
+        # Auxiliary lexical sentiment probe used for top-k/decoder comparisons.
+        # Encoder cross-encoding axes are the canonical multilingual feature
+        # classes (positive/negative), so including a second positive/negative
+        # trainer here duplicates the sentiment row with a different data scope.
+        "sentiment_good_bad",
+    }
+)
+
+
+def _is_encoder_analysis_trainer_id(run_id: str) -> bool:
+    return str(run_id) not in ENCODER_ANALYSIS_EXCLUDED_RUN_IDS
+
+
+def _filter_encoder_analysis_trainers(
+    trainers_by_id: Dict[str, TextPredictionTrainer],
+) -> Dict[str, TextPredictionTrainer]:
+    return {
+        str(run_id): trainer
+        for run_id, trainer in trainers_by_id.items()
+        if _is_encoder_analysis_trainer_id(str(run_id))
+    }
+
+
+def _filter_pair_definitions_by_cache(
+    pair_definitions: Sequence[SuitePairDefinition],
+    cached_run_ids: Optional[FrozenSet[str]],
+) -> List[SuitePairDefinition]:
+    if cached_run_ids is None:
+        return list(pair_definitions)
+    return [
+        definition
+        for definition in pair_definitions
+        if definition.child_id in cached_run_ids
+    ]
+
+
+def filter_trainers_with_checkpoints(
+    trainers_by_id: Dict[str, TextPredictionTrainer],
+    *,
+    experiment_dir: str,
+) -> Dict[str, TextPredictionTrainer]:
+    """Keep only trainers whose experiment subdir contains a saved GRADIEND model."""
+    kept: Dict[str, TextPredictionTrainer] = {}
+    skipped: List[str] = []
+    for child_id, trainer in trainers_by_id.items():
+        if trainer_has_cached_checkpoint(trainer):
+            kept[child_id] = trainer
+        else:
+            skipped.append(child_id)
+    for child_id in skipped:
+        print(f"  skipping {child_id}: no cached GRADIEND checkpoint under {experiment_dir}")
+    if not kept:
+        raise FileNotFoundError(
+            f"Plot-only mode found no cached GRADIEND checkpoints under {experiment_dir!r}. "
+            "Train first or pass --experiment-dir pointing at a completed run."
+        )
+    return kept
+
+
+def _require_decoder_mlm_head(path: str, *, context: str) -> None:
+    if not has_saved_decoder_mlm_head(path):
+        raise FileNotFoundError(
+            f"{context}: plot-only mode requires a cached decoder MLM head at {path}"
+        )
+
+
 def prepare_decoder_resources(
     config: ExperimentConfig,
     *,
     problem: str,
     trainers: Sequence[TextPredictionTrainer],
+    plot_only: bool = False,
 ) -> None:
     if not needs_mlm_head_for_problem(config, problem):
         return
     if config.mlm_head_scope is MlmHeadScope.PER_RUN:
         for trainer in trainers:
+            if plot_only:
+                dest = resolve_decoder_mlm_head_dir(trainer.experiment_dir)
+                if dest is None:
+                    raise FileNotFoundError(
+                        f"Plot-only mode could not resolve decoder MLM head directory "
+                        f"for trainer {trainer.run_id!r}"
+                    )
+                _require_decoder_mlm_head(
+                    dest,
+                    context=f"Trainer {trainer.run_id!r}",
+                )
+                continue
             print(f"  training decoder-only custom MLM head for {trainer.run_id}")
             trainer.train_decoder_only_mlm_head(config.model_name, **config.mlm_head_args)
         return
@@ -713,10 +953,18 @@ def prepare_decoder_resources(
         shared_path = shared_mlm_head_path(config, problem=problem)
         if shared_path is None:
             raise ValueError("global MLM-head path could not be resolved")
+        if plot_only:
+            _require_decoder_mlm_head(shared_path, context=f"Problem {problem!r}")
         for trainer in trainers:
             _install_shared_mlm_head(trainer, shared_path)
         return
-    shared_path = _train_shared_mlm_head(config, problem=problem, trainers=trainers)
+    shared_path = shared_mlm_head_path(config, problem=problem)
+    if shared_path is None:
+        raise ValueError("shared MLM-head path requires per_group or global scope")
+    if plot_only:
+        _require_decoder_mlm_head(shared_path, context=f"Problem {problem!r}")
+    else:
+        shared_path = _train_shared_mlm_head(config, problem=problem, trainers=trainers)
     for trainer in trainers:
         _install_shared_mlm_head(trainer, shared_path)
 
@@ -724,6 +972,8 @@ def prepare_decoder_resources(
 def prepare_global_mlm_head(
     config: ExperimentConfig,
     trainers: Sequence[TextPredictionTrainer],
+    *,
+    plot_only: bool = False,
 ) -> None:
     if config.decoder_eval_mode is DecoderEvalMode.NONE:
         return
@@ -740,6 +990,14 @@ def prepare_global_mlm_head(
             if needs_mlm_head_for_problem(config, _problem_for_trainer(trainer))
         ]
     if not relevant:
+        return
+    shared_path = shared_mlm_head_path(config, problem="global")
+    if shared_path is None:
+        raise ValueError("global MLM-head path could not be resolved")
+    if plot_only:
+        _require_decoder_mlm_head(shared_path, context="Global decoder MLM head")
+        for trainer in relevant:
+            _install_shared_mlm_head(trainer, shared_path)
         return
     _train_shared_mlm_head(config, problem="global", trainers=relevant)
 
@@ -1013,6 +1271,13 @@ def _suite_common_kwargs(
     }
 
 
+def _gradiend_model_for_topk_heatmap(trainer: TextPredictionTrainer) -> Any:
+    """Load saved GRADIEND weights only (no HuggingFace base model)."""
+    analysis_trainer = enter_analysis_mode(trainer)
+    model, _, _ = models_for_comparison(analysis_trainer, gradiend_only=True, use_cache=True)
+    return model
+
+
 def _train_suite(
     config: ExperimentConfig,
     *,
@@ -1028,20 +1293,29 @@ def _train_suite(
         ts = stats.get("training_stats", {}) if stats else {}
         print(f"  {child_id}: correlation={ts.get('correlation')}, mean_by_class={ts.get('mean_by_class')}")
         trainer.cpu()
-        analysis_trainer = enter_analysis_mode(trainer)
-        models_for_heatmap[child_id] = analysis_trainer.get_model(gradiend_only=True)
+        models_for_heatmap[child_id] = _gradiend_model_for_topk_heatmap(trainer)
 
 
-def build_gender_de_suite(config: ExperimentConfig, *, retain_models_in_memory: bool) -> SymmetricTrainerSuite:
-    pair_definitions = [
-        SuitePairDefinition(
-            target_classes=pair,
-            child_id=f"gender_de_{pair[0]}_{pair[1]}",
-            label=f"{pair[0]} <-> {pair[1]}",
-        )
-        for pairs in configs_de.values()
-        for pair in pairs
-    ]
+def build_gender_de_suite(
+    config: ExperimentConfig,
+    *,
+    retain_models_in_memory: bool,
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Optional[SymmetricTrainerSuite]:
+    pair_definitions = _filter_pair_definitions_by_cache(
+        [
+            SuitePairDefinition(
+                target_classes=pair,
+                child_id=f"gender_de_{pair[0]}_{pair[1]}",
+                label=f"{pair[0]} <-> {pair[1]}",
+            )
+            for pairs in configs_de.values()
+            for pair in pairs
+        ],
+        cached_run_ids,
+    )
+    if not pair_definitions:
+        return None
     return SymmetricTrainerSuite(
         TextPredictionTrainer,
         data="aieng-lab/de-gender-case-articles",
@@ -1057,7 +1331,8 @@ def build_train_race_religion_suite(
     config: ExperimentConfig,
     *,
     retain_models_in_memory: bool,
-) -> Tuple[SymmetricTrainerSuite, SymmetricTrainerSuite]:
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Tuple[Optional[SymmetricTrainerSuite], Optional[SymmetricTrainerSuite]]:
     pair_definitions = [
         SuitePairDefinition(
             target_classes=pair,
@@ -1066,35 +1341,62 @@ def build_train_race_religion_suite(
         )
         for bias_type, pair, _other_classes in race_configs + religion_configs
     ]
-    return SymmetricTrainerSuite(
-        TextPredictionTrainer,
-        data="aieng-lab/gradiend_race_data",
-        masked_col="masked",
-        split_col="split",
-        eval_neutral_data="aieng-lab/biasneutral",
-        pair_definitions=pair_definitions[:3],
-        **_suite_common_kwargs(config, "train_race_religion", retain_models_in_memory=retain_models_in_memory),
-    ), SymmetricTrainerSuite(
-        TextPredictionTrainer,
-        data="aieng-lab/gradiend_religion_data",
-        masked_col="masked",
-        split_col="split",
-        eval_neutral_data="aieng-lab/biasneutral",
-        pair_definitions=pair_definitions[3:],
-        **_suite_common_kwargs(config, "train_race_religion", retain_models_in_memory=retain_models_in_memory),
+    race_pairs = _filter_pair_definitions_by_cache(pair_definitions[:3], cached_run_ids)
+    religion_pairs = _filter_pair_definitions_by_cache(pair_definitions[3:], cached_run_ids)
+    common_kwargs = _suite_common_kwargs(
+        config,
+        "train_race_religion",
+        retain_models_in_memory=retain_models_in_memory,
     )
-
-
-def build_pronoun_suite(config: ExperimentConfig, *, retain_models_in_memory: bool) -> SymmetricTrainerSuite:
-    training_path, neutral_path = _pronoun_data_paths()
-    pair_definitions = [
-        SuitePairDefinition(
-            target_classes=(c1, c2),
-            child_id=f"pronoun_{c1}_{c2}",
-            label=f"{c1} <-> {c2}",
+    race_suite = (
+        SymmetricTrainerSuite(
+            TextPredictionTrainer,
+            data="aieng-lab/gradiend_race_data",
+            masked_col="masked",
+            split_col="split",
+            eval_neutral_data="aieng-lab/biasneutral",
+            pair_definitions=race_pairs,
+            **common_kwargs,
         )
-        for c1, c2 in pronoun_pairs
-    ]
+        if race_pairs
+        else None
+    )
+    religion_suite = (
+        SymmetricTrainerSuite(
+            TextPredictionTrainer,
+            data="aieng-lab/gradiend_religion_data",
+            masked_col="masked",
+            split_col="split",
+            eval_neutral_data="aieng-lab/biasneutral",
+            pair_definitions=religion_pairs,
+            **common_kwargs,
+        )
+        if religion_pairs
+        else None
+    )
+    return race_suite, religion_suite
+
+
+def build_pronoun_suite(
+    config: ExperimentConfig,
+    *,
+    retain_models_in_memory: bool,
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Optional[SymmetricTrainerSuite]:
+    training_path, neutral_path = _pronoun_data_paths()
+    pair_definitions = _filter_pair_definitions_by_cache(
+        [
+            SuitePairDefinition(
+                target_classes=(c1, c2),
+                child_id=f"pronoun_{c1}_{c2}",
+                label=f"{c1} <-> {c2}",
+            )
+            for c1, c2 in pronoun_pairs
+        ],
+        cached_run_ids,
+    )
+    if not pair_definitions:
+        return None
     suite = SymmetricTrainerSuite(
         TextPredictionTrainer,
         data=str(training_path),
@@ -1110,15 +1412,21 @@ def build_pronoun_suite(config: ExperimentConfig, *, retain_models_in_memory: bo
             add_identity_for_other_classes=False,
         ),
     )
-    _assert_suite_has_expected_trainers(
-        suite,
-        expected_count=len(pronoun_pairs),
-        suite_label="English pronoun binary suite",
-    )
+    if cached_run_ids is None:
+        _assert_suite_has_expected_trainers(
+            suite,
+            expected_count=len(pronoun_pairs),
+            suite_label="English pronoun binary suite",
+        )
     return suite
 
 
-def build_pronoun_merged_suite(config: ExperimentConfig, *, retain_models_in_memory: bool) -> SymmetricTrainerSuite:
+def build_pronoun_merged_suite(
+    config: ExperimentConfig,
+    *,
+    retain_models_in_memory: bool,
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Optional[SymmetricTrainerSuite]:
     training_path, neutral_path = _pronoun_data_paths()
     pair_definitions = []
     for run_id_prefix, class_merge_map, _label, transition_group in pronoun_merged_configs:
@@ -1132,6 +1440,9 @@ def build_pronoun_merged_suite(config: ExperimentConfig, *, retain_models_in_mem
                 class_merge_transition_groups=transition_group,
             )
         )
+    pair_definitions = _filter_pair_definitions_by_cache(pair_definitions, cached_run_ids)
+    if not pair_definitions:
+        return None
     suite = SymmetricTrainerSuite(
         TextPredictionTrainer,
         data=str(training_path),
@@ -1145,11 +1456,12 @@ def build_pronoun_merged_suite(config: ExperimentConfig, *, retain_models_in_mem
             retain_models_in_memory=retain_models_in_memory,
         ),
     )
-    _assert_suite_has_expected_trainers(
-        suite,
-        expected_count=len(pronoun_merged_configs),
-        suite_label="English pronoun merged suite",
-    )
+    if cached_run_ids is None:
+        _assert_suite_has_expected_trainers(
+            suite,
+            expected_count=len(pronoun_merged_configs),
+            suite_label="English pronoun merged suite",
+        )
     return suite
 
 
@@ -1157,17 +1469,27 @@ def build_sentiment_suite(
     config: ExperimentConfig,
     *,
     retain_models_in_memory: bool,
-) -> TrainerCollection:
-    full_suite = _build_sentiment_full_lexicon_suite(
-        config,
-        retain_models_in_memory=retain_models_in_memory,
-    )
-    good_bad_trainer = _build_sentiment_good_bad_trainer(config)
-    return TrainerCollection.merge(
-        full_suite,
-        good_bad_trainer,
-        retain_models_in_memory=retain_models_in_memory,
-    )
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Optional[SuiteLike]:
+    parts: List[Any] = []
+    full_child_id = "sentiment_positive_negative"
+    good_bad_child_id = _sentiment_single_pair_child_id(*SENTIMENT_GOOD_BAD_PAIR)
+    include_good_bad = bool(getattr(config, "include_sentiment_good_bad", False))
+    if cached_run_ids is None or full_child_id in cached_run_ids:
+        full_suite = _build_sentiment_full_lexicon_suite(
+            config,
+            retain_models_in_memory=retain_models_in_memory,
+            cached_run_ids=cached_run_ids,
+        )
+        if full_suite is not None:
+            parts.append(full_suite)
+    if include_good_bad and (cached_run_ids is None or good_bad_child_id in cached_run_ids):
+        parts.append(_build_sentiment_good_bad_trainer(config))
+    if not parts:
+        return None
+    if len(parts) == 1 and isinstance(parts[0], TextPredictionTrainer):
+        return parts[0]
+    return TrainerCollection.merge(*parts, retain_models_in_memory=retain_models_in_memory)
 
 
 def _build_sentiment_good_bad_trainer(config: ExperimentConfig) -> TextPredictionTrainer:
@@ -1180,6 +1502,7 @@ def _build_sentiment_good_bad_trainer(config: ExperimentConfig) -> TextPredictio
         config,
         fail_on_non_convergence=False,
         learning_rate=learning_rate_for_problem(config, "sentiment"),
+        torch_dtype=SENTIMENT_TORCH_DTYPE,
         pre_prune_config=PrePruneConfig(
             n_samples=16,
             topk=SENTIMENT_PRE_PRUNE_TOPK,
@@ -1209,26 +1532,31 @@ def _build_sentiment_full_lexicon_suite(
     config: ExperimentConfig,
     *,
     retain_models_in_memory: bool,
-) -> SymmetricTrainerSuite:
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Optional[SymmetricTrainerSuite]:
     from gradiend.examples.train_sentiment import (
         load_and_split_sentiment_training_data,
         sentiment_training_arguments,
     )
 
+    if cached_run_ids is not None and "sentiment_positive_negative" not in cached_run_ids:
+        return None
     training_path, neutral_path = _sentiment_data_paths()
     sentiment_args = sentiment_training_arguments(
         experiment_dir=config.args.experiment_dir,
         use_cache=False,
         max_steps=15000,
         num_train_epochs=10,
-        max_seeds=10,
-        min_convergent_seeds=1,
+        max_seeds=50,
+        min_convergent_seeds=config.args.min_convergent_seeds,
         fail_on_non_convergence=False,
-        torch_dtype=config.args.torch_dtype,
+        torch_dtype=SENTIMENT_TORCH_DTYPE,
         learning_rate=learning_rate_for_problem(config, "sentiment"),
     )
     sentiment_args = replace(
         sentiment_args,
+        analyze_seed_stability=config.args.analyze_seed_stability,
+        saved_seed_runs=config.args.saved_seed_runs,
         pre_prune_config=PrePruneConfig(
             n_samples=16,
             topk=SENTIMENT_PRE_PRUNE_TOPK,
@@ -1266,7 +1594,24 @@ def _build_sentiment_full_lexicon_suite(
     )
 
 
-def build_formality_suite(config: ExperimentConfig, *, retain_models_in_memory: bool) -> SymmetricTrainerSuite:
+def build_formality_suite(
+    config: ExperimentConfig,
+    *,
+    retain_models_in_memory: bool,
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Optional[SymmetricTrainerSuite]:
+    pair_definitions = _filter_pair_definitions_by_cache(
+        [
+            SuitePairDefinition(
+                target_classes=("informal", "formal"),
+                child_id="formality_informal_formal",
+                label="informal <-> formal",
+            )
+        ],
+        cached_run_ids,
+    )
+    if not pair_definitions:
+        return None
     training_path, neutral_path = _require_local_prediction_data(
         FORMALITY_DATA_DIR,
         label="Formality",
@@ -1279,18 +1624,18 @@ def build_formality_suite(config: ExperimentConfig, *, retain_models_in_memory: 
         masked_col="masked",
         split_col="split",
         eval_neutral_data=str(neutral_path),
-        pair_definitions=[
-            SuitePairDefinition(
-                target_classes=("informal", "formal"),
-                child_id="formality_informal_formal",
-                label="informal <-> formal",
-            )
-        ],
+        pair_definitions=pair_definitions,
         **_suite_common_kwargs(config, "formality", retain_models_in_memory=retain_models_in_memory),
     )
 
 
-def build_gender_en_trainer(config: ExperimentConfig) -> TextPredictionTrainer:
+def build_gender_en_trainer(
+    config: ExperimentConfig,
+    *,
+    cached_run_ids: Optional[FrozenSet[str]] = None,
+) -> Optional[TextPredictionTrainer]:
+    if cached_run_ids is not None and "gender_en" not in cached_run_ids:
+        return None
     from gradiend.examples.train_gender_en import build_gender_trainer
 
     trainer = build_gender_trainer(
@@ -1298,7 +1643,7 @@ def build_gender_en_trainer(config: ExperimentConfig) -> TextPredictionTrainer:
         names_per_template=4,
         args=problem_args(
             config,
-            train_batch_size=32,
+            train_batch_size=8,
             encoder_eval_max_size=10,
             eval_steps=25,
             max_steps=100,
@@ -1327,9 +1672,8 @@ def train_gender_en(
     ts = stats.get("training_stats", {}) if stats else {}
     print(f"  correlation={ts.get('correlation')}, mean_by_class={ts.get('mean_by_class')}")
     trainer.cpu()
-    analysis_trainer = enter_analysis_mode(trainer)
-    models_for_heatmap[trainer.run_id] = analysis_trainer.get_model(gradiend_only=True)
-    return analysis_trainer
+    models_for_heatmap[trainer.run_id] = _gradiend_model_for_topk_heatmap(trainer)
+    return enter_analysis_mode(trainer)
 
 
 def train_all(
@@ -1446,24 +1790,44 @@ def train_all(
 def load_models_for_heatmap_from_cache(
     config: ExperimentConfig,
     trainers_by_id: Dict[str, TextPredictionTrainer],
-) -> Dict[str, Any]:
+    *,
+    plot_only: bool = False,
+) -> Tuple[Dict[str, Any], Dict[str, TextPredictionTrainer]]:
     """Resolve trained models for top-k plots without re-running training loops."""
     os.makedirs(config.args.experiment_dir, exist_ok=True)
-    prepare_global_mlm_head(config, list(trainers_by_id.values()))
+    if plot_only:
+        trainers_by_id = filter_trainers_with_checkpoints(
+            trainers_by_id,
+            experiment_dir=config.args.experiment_dir,
+        )
+
+    prepare_global_mlm_head(
+        config,
+        list(trainers_by_id.values()),
+        plot_only=plot_only,
+    )
 
     trainers_by_problem: Dict[str, List[TextPredictionTrainer]] = defaultdict(list)
     for trainer in trainers_by_id.values():
         trainers_by_problem[_problem_for_trainer(trainer)].append(trainer)
     for problem, trainers in trainers_by_problem.items():
-        prepare_decoder_resources(config, problem=problem, trainers=trainers)
+        prepare_decoder_resources(
+            config,
+            problem=problem,
+            trainers=trainers,
+            plot_only=plot_only,
+        )
 
+    cache_policy = USE_CACHE_ALWAYS if plot_only else config.args.use_cache
     models_for_heatmap: Dict[str, Any] = {}
-    for child_id, trainer in trainers_by_id.items():
-        trainer.train(use_cache=config.args.use_cache)
-        trainer.cpu()
-        analysis_trainer = enter_analysis_mode(trainer)
-        models_for_heatmap[child_id] = analysis_trainer.get_model(gradiend_only=True)
-    return models_for_heatmap
+    total = len(trainers_by_id)
+    for index, (child_id, trainer) in enumerate(trainers_by_id.items(), start=1):
+        if plot_only:
+            print(f"  loading GRADIEND weights {index}/{total}: {child_id}")
+        # Point model_path at the checkpoint dir without loading the HF base model.
+        trainer.train(use_cache=cache_policy)
+        models_for_heatmap[child_id] = _gradiend_model_for_topk_heatmap(trainer)
+    return models_for_heatmap, trainers_by_id
 
 
 def _pretty_label(mid: str) -> str:
@@ -1491,6 +1855,31 @@ def _cross_task_probe_trainers(config: ExperimentConfig) -> Dict[str, TextPredic
         eval_neutral_data=str(neutral_path),
         args=probe_args,
     )
+    sentiment_training_path, sentiment_neutral_path = _sentiment_data_paths()
+    try:
+        from gradiend.examples.train_sentiment import load_and_split_sentiment_training_data
+
+        sentiment_df = load_and_split_sentiment_training_data(
+            sentiment_training_path,
+            seed=int(config.args.seed or 0),
+        )
+        sentiment_args = problem_args(config, experiment_dir=None, use_cache=False)
+        sentiment_objective = prediction_objective_for_problem(config, "sentiment")
+        if sentiment_objective is not None:
+            sentiment_args = replace(sentiment_args, prediction_objective=sentiment_objective)
+        probes["sentiment_probe_pool"] = TextPredictionTrainer(
+            model=config.model_name,
+            run_id="sentiment_probe_pool",
+            data=sentiment_df,
+            all_classes=SENTIMENT_CLASSES,
+            target_classes=("positive", "negative"),
+            masked_col="masked",
+            split_col="split",
+            eval_neutral_data=str(sentiment_neutral_path),
+            args=sentiment_args,
+        )
+    except Exception as exc:
+        logger.warning("Could not build sentiment cross-task probe pool: %s", exc)
     return probes
 
 
@@ -1544,6 +1933,10 @@ def plot_cross_encoding(
     trainer_pretty_groups: Dict[str, List[str]],
     feature_order: Sequence[str],
     feature_pretty_groups: Dict[str, List[str]],
+    plot_only: bool = False,
+    repair_encoder_cache: bool = False,
+    recompute_encoder_cache: bool = False,
+    plot_incomplete_encoder_cache: bool = False,
 ) -> None:
     """Plot pre-anchor and anchor-aligned cross-encoding from one cross-task encoder pass."""
     from gradiend.comparison import (
@@ -1560,25 +1953,131 @@ def plot_cross_encoding(
         demo_encoding_heatmap_style_kwargs,
     )
 
-    eval_rows = collect_unified_test_rows(
-        trainers_by_id,
-        split="test",
-        probe_trainers=_cross_task_probe_trainers(config),
-        required_factual_classes=feature_order,
-    )
+    eval_rows = None
+    cache_only = bool(plot_only and not (repair_encoder_cache or recompute_encoder_cache))
+    allow_incomplete_encoder_cache = bool(cache_only and plot_incomplete_encoder_cache)
+    if allow_incomplete_encoder_cache:
+        print(
+            "WARNING: --plot-incomplete-encoder-cache is enabled. "
+            "Cross-encoding plots will use directed partial encoder CSVs; "
+            "missing probes/cells are omitted. Do not use these figures as final complete results."
+        )
+    if cache_only:
+        try:
+            eval_rows = collect_unified_test_rows(
+                trainers_by_id,
+                split="test",
+                probe_trainers=_cross_task_probe_trainers(config),
+                required_factual_classes=feature_order,
+            )
+            print(
+                f"--plot-only: validating encoder CSV coverage against "
+                f"{len(eval_rows)} local cross-task probe rows."
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not materialize local cross-task probe rows in plot-only mode; "
+                "falling back to cache metadata only: %s",
+                exc,
+            )
+            eval_rows = None
+    else:
+        if recompute_encoder_cache:
+            action = "forced encoder recompute (--recompute-encoder-cache)"
+        elif repair_encoder_cache:
+            action = "encoder cache repair (--repair-encoder-cache)"
+        else:
+            action = "encoder evaluation"
+        if recompute_encoder_cache or repair_encoder_cache:
+            print(f"Collecting unified cross-task probe rows before {action}.")
+        eval_rows = collect_unified_test_rows(
+            trainers_by_id,
+            split="test",
+            probe_trainers=_cross_task_probe_trainers(config),
+            required_factual_classes=feature_order,
+        )
+        if recompute_encoder_cache:
+            print(f"Collected {len(eval_rows)} unified cross-task probe rows; re-encoding checkpoints now.")
+        elif repair_encoder_cache:
+            print(
+                f"Collected {len(eval_rows)} unified cross-task probe rows; "
+                "encoding only missing probes and merging them into existing encoder CSVs now."
+            )
     encoder_summary = build_cross_task_encoder_summary(
         trainers_by_id,
         feature_order,
         eval_rows=eval_rows,
         split="test",
         max_size=config.args.encoder_eval_max_size,
+        cache_only=cache_only,
+        force_recompute=recompute_encoder_cache,
+        allow_incomplete_cache=allow_incomplete_encoder_cache,
     )
+    has_any_encoder_cache = any(
+        isinstance(payload.get("encoder_df"), pd.DataFrame) and not payload["encoder_df"].empty
+        for payload in encoder_summary.values()
+        if isinstance(payload, dict)
+    )
+    if cache_only and isinstance(eval_rows, pd.DataFrame) and not eval_rows.empty:
+        missing_cache_ids = [
+            str(trainer_id)
+            for trainer_id, payload in encoder_summary.items()
+            if not (
+                isinstance(payload, dict)
+                and isinstance(payload.get("encoder_df"), pd.DataFrame)
+                and not payload["encoder_df"].empty
+            )
+        ]
+        if missing_cache_ids:
+            shown = ", ".join(missing_cache_ids[:10])
+            more = "" if len(missing_cache_ids) <= 10 else f", ... ({len(missing_cache_ids)} total)"
+            print(
+                "WARNING: cached encoder CSVs are missing "
+                f"required local probe rows for {shown}{more}. "
+                "Those trainer rows/cells will be omitted rather than plotted with "
+                "incomplete cell aggregations. Run with --plot-only "
+                "--recompute-encoder-cache to overwrite/repair them."
+            )
+    if cache_only and not has_any_encoder_cache:
+        print(
+            "Skipping cross-encoding plots: no usable cached encoder CSVs found under run directories. "
+            "Run once with --plot-only --recompute-encoder-cache to generate complete "
+            "encoded_values_*_split_test.csv caches, or pass --plot-incomplete-encoder-cache "
+            "to draw from directed partial caches when they exist."
+        )
+        return
+    supplemental_eval_rows = None
+    if cache_only and load_cross_task_transition_order(config.args.experiment_dir) is None:
+        local_trainers = filter_trainers_without_hf_dataset(trainers_by_id)
+        if local_trainers:
+            supplemental_eval_rows = collect_unified_test_rows(
+                local_trainers,
+                split="test",
+                probe_trainers=_cross_task_probe_trainers(config),
+                required_factual_classes=feature_order,
+            )
     transition_order = collect_unified_test_transitions(
         trainers_by_id,
         split="test",
         eval_rows=eval_rows,
+        encoder_summary=encoder_summary,
+        supplemental_eval_rows=supplemental_eval_rows,
+        experiment_dir=config.args.experiment_dir,
     )
-    style = demo_encoding_heatmap_style_kwargs()
+    if not plot_only and transition_order:
+        write_cross_task_transition_order(config.args.experiment_dir, transition_order)
+    source_by_id = source_by_id_from_trainers(trainers_by_id)
+    style = demo_encoding_heatmap_style_kwargs(
+        group_label_fontsize=25,
+        tick_label_fontsize=15,
+        axis_label_fontsize=28,
+        annot=True,
+        annot_fontsize=8,
+        cbar_pad=-0.04,
+        cbar_y_pad=-0.62,
+        cbar_fontsize=15,
+        cbar_shrink=0.17,
+    )
     trainer_labels = build_demo_trainer_label_mapping(trainer_order)
     transition_labels = build_demo_transition_label_mapping(transition_order)
     gradiend_transition_path = os.path.join(
@@ -1628,8 +2127,20 @@ def plot_cross_encoding(
         )
 
     feature_labels = build_demo_feature_label_mapping(feature_order)
-    normalized_style = demo_encoding_heatmap_normalized_style_kwargs()
-    for s in ['factual', 'counterfactual']:
+
+
+    normalized_style = demo_encoding_heatmap_normalized_style_kwargs(
+        group_label_fontsize=25,
+        tick_label_fontsize=15,
+        axis_label_fontsize=28,
+        annot=True,
+        annot_fontsize=8,
+        cbar_pad=-0.04,
+        cbar_y_pad=-0.62,
+        cbar_fontsize=15,
+        cbar_shrink=0.17,
+    )
+    for s in ["factual", "counterfactual"]:
         cross_encoding_output = os.path.join(
             config.args.experiment_dir,
             f"cross_encoding_oriented_{s}_heatmap.pdf",
@@ -1654,39 +2165,44 @@ def plot_cross_encoding(
             **style,
         )
         print(f"Oriented cross-encoding heatmap saved to {cross_encoding_output}")
-
         if config.args.analyze_seed_stability:
-            oriented_std = compute_anchor_aligned_encoding_std_matrix(
-                pair_by_id=pair_by_id_from_trainers(trainers_by_id),
-                encoder_summary=encoder_summary,
-                feature_classes=feature_order,
-                alignment=s,
-                column_ids=feature_order,
-                source_by_id=source_by_id_from_trainers(trainers_by_id),
-            )
-            from gradiend.visualizer.heatmaps import plot_comparison_heatmap
-            from gradiend.visualizer.heatmaps.base import filter_comparison_heatmap_plot_kwargs
+            try:
+                oriented_std = compute_anchor_aligned_encoding_std_matrix(
+                    pair_by_id=pair_by_id_from_trainers(trainers_by_id),
+                    encoder_summary=encoder_summary,
+                    feature_classes=feature_order,
+                    alignment=s,
+                    column_ids=feature_order,
+                    source_by_id=source_by_id,
+                )
+            except ValueError as exc:
+                print(
+                    "WARNING: skipping oriented cross-encoding std heatmap for "
+                    f"alignment={s!r}: {exc}"
+                )
+            else:
+                from gradiend.visualizer.heatmaps import plot_comparison_heatmap
+                from gradiend.visualizer.heatmaps.base import filter_comparison_heatmap_plot_kwargs
 
-            std_output = os.path.join(
-                config.args.experiment_dir,
-                f"cross_encoding_oriented_{s}_std_heatmap.pdf",
-            )
-            std_style = dict(style)
-            std_style["cbar_label"] = "Encoding std"
-            plot_comparison_heatmap(
-                oriented_std,
-                order=feature_order,
-                pretty_groups=feature_pretty_groups,
-                row_label_mapping=feature_labels,
-                column_label_mapping=feature_labels,
-                output_path=std_output,
-                title=False,
-                show=True,
-                models=trainers_by_id,
-                **filter_comparison_heatmap_plot_kwargs(std_style),
-            )
-            print(f"Oriented cross-encoding std heatmap saved to {std_output}")
-
+                std_output = os.path.join(
+                    config.args.experiment_dir,
+                    f"cross_encoding_oriented_{s}_std_heatmap.pdf",
+                )
+                std_style = dict(style)
+                std_style["cbar_label"] = "Encoding std"
+                plot_comparison_heatmap(
+                    oriented_std,
+                    order=feature_order,
+                    pretty_groups=feature_pretty_groups,
+                    row_label_mapping=feature_labels,
+                    column_label_mapping=feature_labels,
+                    output_path=std_output,
+                    title=False,
+                    show=True,
+                    models=trainers_by_id,
+                    **filter_comparison_heatmap_plot_kwargs(std_style),
+                )
+                print(f"Oriented cross-encoding std heatmap saved to {std_output}")
         normalized_output = os.path.join(
             config.args.experiment_dir,
             f"cross_encoding_oriented_{s}_row_normalized_heatmap.pdf",
@@ -1712,38 +2228,178 @@ def plot_cross_encoding(
             **normalized_style,
         )
         print(f"Row-normalized oriented cross-encoding heatmap saved to {normalized_output}")
+    default_output = os.path.join(
+        config.args.experiment_dir,
+        "cross_encoding_oriented_default_heatmap.pdf",
+    )
+    plot_cross_encoding_heatmap(
+        trainers_by_id,
+        feature_order,
+        alignment="auto",
+        column_ids=feature_order,
+        encoder_summary=encoder_summary,
+        split="test",
+        max_size=config.args.encoder_eval_max_size,
+        cross_task_eval=False,
+        aggregate="mean",
+        order=feature_order,
+        pretty_groups=feature_pretty_groups,
+        row_label_mapping=feature_labels,
+        column_label_mapping=feature_labels,
+        output_path=default_output,
+        title=False,
+        show=True,
+        xlabel="Probe feature",
+        ylabel="Orienting feature",
+        **style,
+    )
+    print(f"Default oriented cross-encoding heatmap saved to {default_output}")
+
+    default_normalized_output = os.path.join(
+        config.args.experiment_dir,
+        "cross_encoding_oriented_default_row_normalized_heatmap.pdf",
+    )
+    plot_cross_encoding_heatmap(
+        trainers_by_id,
+        feature_order,
+        alignment="auto",
+        column_ids=feature_order,
+        encoder_summary=encoder_summary,
+        split="test",
+        max_size=config.args.encoder_eval_max_size,
+        cross_task_eval=False,
+        aggregate="mean",
+        normalize=True,
+        order=feature_order,
+        pretty_groups=feature_pretty_groups,
+        row_label_mapping=feature_labels,
+        column_label_mapping=feature_labels,
+        output_path=default_normalized_output,
+        title=False,
+        show=True,
+        xlabel="Probe feature",
+        ylabel="Orienting feature",
+        **normalized_style,
+    )
+    print(
+        "Default row-normalized oriented cross-encoding heatmap saved to "
+        f"{default_normalized_output}"
+    )
+
+
+def _validate_multiseed_plot_cache(
+    config: ExperimentConfig,
+    trainers_by_id: Dict[str, TextPredictionTrainer],
+) -> None:
+    """Fail early when a multi-seed plot run includes stale single-seed caches."""
+    if not bool(getattr(config.args, "analyze_seed_stability", False)):
+        return
+    required = int(getattr(config.args, "min_convergent_seeds", 1) or 1)
+    if required <= 1:
+        return
+
+    invalid: List[str] = []
+    for trainer_id, trainer in sorted(trainers_by_id.items()):
+        get_seed_report = getattr(trainer, "get_seed_report", None)
+        report = get_seed_report() if get_seed_report is not None else None
+        if not isinstance(report, dict):
+            invalid.append(f"{trainer_id}: missing seed_report.json")
+            continue
+        cached_required = report.get("min_convergent_seeds")
+        convergent_count = int(report.get("convergent_count") or 0)
+        if (
+            isinstance(cached_required, int)
+            and cached_required < required
+            or convergent_count < required
+        ):
+            invalid.append(
+                f"{trainer_id}: convergent_count={convergent_count}, "
+                f"cached_min_convergent_seeds={cached_required}, required={required}"
+            )
+
+    if invalid:
+        details = "\n  - ".join(invalid[:20])
+        more = "" if len(invalid) <= 20 else f"\n  ... and {len(invalid) - 20} more"
+        raise ValueError(
+            "Multi-seed plot cache is inconsistent with the requested three-seed run. "
+            "Regenerate or resync the stale run directories before plotting:\n"
+            f"  - {details}{more}"
+        )
 
 
 def plot_results(
     config: ExperimentConfig,
     models_for_heatmap: Dict[str, Any],
     trainers_by_id: Dict[str, TextPredictionTrainer],
+    *,
+    plot_only: bool = False,
+    repair_encoder_cache: bool = False,
+    recompute_encoder_cache: bool = False,
+    plot_incomplete_encoder_cache: bool = False,
 ) -> None:
     from gradiend.visualizer.multilingual_demo_labels import demo_topk_overlap_style_kwargs
+
+    _validate_multiseed_plot_cache(config, trainers_by_id)
 
     all_ids = list(models_for_heatmap.keys())
     ordered, pretty_groups = _build_plot_order_and_groups(all_ids)
     order = [mid for gids in pretty_groups.values() for mid in gids if mid in models_for_heatmap]
     pretty_labels = {mid: _pretty_label(mid) for mid in order}
-    models_display = {pretty_labels[mid]: models_for_heatmap[mid] for mid in order}
-    order_display = [pretty_labels[mid] for mid in order]
-    pretty_groups_display = {
-        group: [pretty_labels[mid] for mid in gids if mid in pretty_labels]
-        for group, gids in pretty_groups.items()
-        if any(mid in pretty_labels for mid in gids)
+    topk_converged_by_id = {
+        mid: converged_for_trainer(trainers_by_id.get(mid))
+        for mid in order
+        if mid in trainers_by_id
     }
+
+    def _plot_cross_encoding_results() -> None:
+        feature_groups = _build_feature_plot_groups()
+        grouped_features = [feature for features in feature_groups.values() for feature in features]
+        feature_order = grouped_features + [
+            feature for feature in MULTILINGUAL_FEATURE_CLASSES if feature not in grouped_features
+        ]
+        encoder_trainers_by_id = _filter_encoder_analysis_trainers(trainers_by_id)
+        encoder_trainer_order = [mid for mid in ordered if mid in encoder_trainers_by_id]
+        encoder_trainer_groups = {
+            group: [mid for mid in ids if mid in encoder_trainers_by_id]
+            for group, ids in pretty_groups.items()
+        }
+        encoder_trainer_groups = {
+            group: ids for group, ids in encoder_trainer_groups.items() if ids
+        }
+        plot_cross_encoding(
+            config,
+            encoder_trainers_by_id,
+            trainer_order=encoder_trainer_order,
+            trainer_pretty_groups=encoder_trainer_groups,
+            feature_order=feature_order,
+            feature_pretty_groups=feature_groups,
+            plot_only=plot_only,
+            repair_encoder_cache=repair_encoder_cache,
+            recompute_encoder_cache=recompute_encoder_cache,
+            plot_incomplete_encoder_cache=plot_incomplete_encoder_cache,
+        )
+
+    if recompute_encoder_cache or repair_encoder_cache:
+        if recompute_encoder_cache:
+            print("Recomputing encoder cache before top-k plots (--recompute-encoder-cache).")
+        else:
+            print("Repairing encoder cache before top-k plots (--repair-encoder-cache).")
+        _plot_cross_encoding_results()
 
     topk = 1000
     output_path = os.path.join(config.args.experiment_dir, f"topk_overlap_heatmap_all_{topk}.pdf")
     plot_topk_overlap_heatmap(
-        models_display,
+        models_for_heatmap,
         topk=topk,
         part="decoder-weight",
         value="intersection_frac",
-        order=order_display,
+        order=order,
         output_path=output_path,
         show=True,
-        pretty_groups=pretty_groups_display,
+        pretty_groups=pretty_groups,
+        row_label_mapping=pretty_labels,
+        column_label_mapping=pretty_labels,
+        converged_by_id=topk_converged_by_id,
         **demo_topk_overlap_style_kwargs(),
     )
     print(f"Heatmap saved to {output_path}")
@@ -1752,7 +2408,7 @@ def plot_results(
         from gradiend.comparison import compute_similarity_matrix
 
         topk_comparison = compute_similarity_matrix(
-            models_display,
+            models_for_heatmap,
             measure="topk_overlap",
             part="decoder-weight",
             topk=topk,
@@ -1768,33 +2424,23 @@ def plot_results(
         _plot_std_heatmap_from_cell_stats(
             topk_comparison,
             output_path=std_output_path,
-            order=order_display,
-            pretty_groups=pretty_groups_display,
-            percentages=True,
+            order=order,
+            pretty_groups=pretty_groups,
+            row_label_mapping=pretty_labels,
+            column_label_mapping=pretty_labels,
+            converged_by_id=topk_converged_by_id,
             **std_style,
         )
 
-    feature_groups = _build_feature_plot_groups()
-    grouped_features = [feature for features in feature_groups.values() for feature in features]
-    feature_order = grouped_features + [
-        feature for feature in MULTILINGUAL_FEATURE_CLASSES if feature not in grouped_features
-    ]
-    trainer_order = [mid for mid in ordered if mid in trainers_by_id]
-    plot_cross_encoding(
-        config,
-        trainers_by_id,
-        trainer_order=trainer_order,
-        trainer_pretty_groups=pretty_groups,
-        feature_order=feature_order,
-        feature_pretty_groups=feature_groups,
-    )
+    if not (recompute_encoder_cache or repair_encoder_cache):
+        _plot_cross_encoding_results()
 
     pronoun_ids = [mid for mid in order if mid.startswith("pronoun_") and not mid.startswith("pronoun_number_") and not mid.startswith("pronoun_person_")]
     venn_pronoun_ids = [mid for mid in pronoun_ids if mid in ("pronoun_1SG_3PL", "pronoun_1SG_3SG", "pronoun_3SG_3PL")]
     if len(venn_pronoun_ids) < 3:
         venn_pronoun_ids = pronoun_ids[:3]
     if len(venn_pronoun_ids) >= 3:
-        venn_models = {pretty_labels[mid]: models_for_heatmap[mid] for mid in venn_pronoun_ids}
+        venn_models = {mid: models_for_heatmap[mid] for mid in venn_pronoun_ids}
         venn_output = os.path.join(config.args.experiment_dir, "topk_overlap_venn_three_train_english_pronouns.pdf")
         plot_topk_overlap_venn(
             venn_models,
@@ -1802,6 +2448,8 @@ def plot_results(
             part="decoder-weight",
             output_path=venn_output,
             show=True,
+            label_mapping=pretty_labels,
+            converged_by_id=topk_converged_by_id,
         )
         print(f"Venn plot (3 English pronouns) saved to {venn_output}")
     else:
@@ -1830,16 +2478,42 @@ def main() -> None:
 
     retain_models = cli_args.retain_models_in_memory
     selected_problems = _parse_problems(cli_args.problems)
-    if selected_problems is not None:
+    cached_run_ids: Optional[FrozenSet[str]] = None
+    configure_plot_style(DEMO_PLOT_STYLE, force=True)
+    if cli_args.plot_only:
+        cached_run_ids = discover_cached_run_ids(config.args.experiment_dir)
+        if not cached_run_ids:
+            raise FileNotFoundError(
+                f"Plot-only mode found no cached GRADIEND checkpoints under "
+                f"{config.args.experiment_dir!r}. Train first or pass --experiment-dir."
+            )
+        print(f"--plot-only: found {len(cached_run_ids)} cached checkpoint(s)")
+        if selected_problems is None:
+            selected_problems = frozenset(
+                _demo_problem_for_run_id(run_id) for run_id in cached_run_ids
+            )
+            print(f"--plot-only: auto-selected problems: {', '.join(sorted(selected_problems))}")
+        print("--plot-only: skipping training; loading cached checkpoints and replotting")
+    if selected_problems is not None and not cli_args.plot_only:
         print(f"Problems (--problems): {', '.join(sorted(selected_problems))}")
 
+    suite_cache_filter = cached_run_ids if cli_args.plot_only else None
+
     pronoun_suite = (
-        build_pronoun_suite(config, retain_models_in_memory=retain_models)
+        build_pronoun_suite(
+            config,
+            retain_models_in_memory=retain_models,
+            cached_run_ids=suite_cache_filter,
+        )
         if _problem_selected(selected_problems, "pronoun")
         else None
     )
     pronoun_merged_suite = (
-        build_pronoun_merged_suite(config, retain_models_in_memory=retain_models)
+        build_pronoun_merged_suite(
+            config,
+            retain_models_in_memory=retain_models,
+            cached_run_ids=suite_cache_filter,
+        )
         if _problem_selected(selected_problems, "pronoun_merged")
         else None
     )
@@ -1848,22 +2522,31 @@ def main() -> None:
         built_race, built_religion = build_train_race_religion_suite(
             config,
             retain_models_in_memory=retain_models,
+            cached_run_ids=suite_cache_filter,
         )
         race_suite = built_race if _problem_selected(selected_problems, "race") else None
         religion_suite = built_religion if _problem_selected(selected_problems, "religion") else None
     gender_de_suite = (
-        build_gender_de_suite(config, retain_models_in_memory=retain_models)
+        build_gender_de_suite(
+            config,
+            retain_models_in_memory=retain_models,
+            cached_run_ids=suite_cache_filter,
+        )
         if _problem_selected(selected_problems, "gender_de")
         else None
     )
     gender_en_trainer = (
-        build_gender_en_trainer(config)
+        build_gender_en_trainer(config, cached_run_ids=suite_cache_filter)
         if _problem_selected(selected_problems, "gender_en")
         else None
     )
     formality_suite = None
     if _problem_selected(selected_problems, "formality") and ENABLE_FORMALITY:
-        formality_suite = build_formality_suite(config, retain_models_in_memory=retain_models)
+        formality_suite = build_formality_suite(
+            config,
+            retain_models_in_memory=retain_models,
+            cached_run_ids=suite_cache_filter,
+        )
 
     _assert_selected_problems_runnable(
         selected_problems,
@@ -1892,16 +2575,24 @@ def main() -> None:
     if cli_args.plot_only:
         sentiment_suite = None
         if _problem_selected(selected_problems, "sentiment"):
-            sentiment_suite = build_sentiment_suite(config, retain_models_in_memory=retain_models)
-            trainer_suites.append(sentiment_suite)
+            sentiment_suite = build_sentiment_suite(
+                config,
+                retain_models_in_memory=retain_models,
+                cached_run_ids=suite_cache_filter,
+            )
+            if sentiment_suite is not None:
+                trainer_suites.append(sentiment_suite)
         merge_parts: List[Any] = list(trainer_suites)
         if gender_en_trainer is not None:
             merge_parts.append(gender_en_trainer)
         trainers_by_id = (
             TrainerCollection.merge(*merge_parts).trainers if merge_parts else {}
         )
-        print("--plot-only: skipping training (using cached checkpoints where available)")
-        models_for_heatmap = load_models_for_heatmap_from_cache(config, trainers_by_id)
+        models_for_heatmap, trainers_by_id = load_models_for_heatmap_from_cache(
+            config,
+            trainers_by_id,
+            plot_only=True,
+        )
     else:
         models_for_heatmap, sentiment_suite = train_all(
             config,
@@ -1918,13 +2609,22 @@ def main() -> None:
         if sentiment_suite is not None:
             trainer_suites.append(sentiment_suite)
 
-    merge_parts = list(trainer_suites)
-    if gender_en_trainer is not None:
-        merge_parts.append(gender_en_trainer)
-    trainers_by_id = TrainerCollection.merge(*merge_parts).trainers if merge_parts else {}
+    if not cli_args.plot_only:
+        merge_parts = list(trainer_suites)
+        if gender_en_trainer is not None:
+            merge_parts.append(gender_en_trainer)
+        trainers_by_id = TrainerCollection.merge(*merge_parts).trainers if merge_parts else {}
     trainers_by_id = enter_analysis_mode_for_trainers(trainers_by_id)
 
-    plot_results(config, models_for_heatmap, trainers_by_id)
+    plot_results(
+        config,
+        models_for_heatmap,
+        trainers_by_id,
+        plot_only=cli_args.plot_only,
+        repair_encoder_cache=cli_args.repair_encoder_cache,
+        recompute_encoder_cache=cli_args.recompute_encoder_cache,
+        plot_incomplete_encoder_cache=cli_args.plot_incomplete_encoder_cache,
+    )
 
 
 if __name__ == "__main__":

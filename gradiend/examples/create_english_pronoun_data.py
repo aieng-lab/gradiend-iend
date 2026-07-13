@@ -134,10 +134,17 @@ def pronoun_training_data_is_complete(output_dir: str = DEFAULT_OUTPUT_DIR) -> b
     return _pronoun_training_has_all_classes(training_path)
 
 
-def _has_current_english_pronoun_data(output_dir: str) -> bool:
-    training_path, neutral_path = _data_paths(output_dir)
-    if not training_path.is_file() or not neutral_path.is_file():
+def _neutral_data_is_valid(neutral_path: Path) -> bool:
+    if not neutral_path.is_file():
         return False
+    try:
+        df = pd.read_csv(neutral_path, usecols=["text"])
+    except (OSError, ValueError, pd.errors.EmptyDataError):
+        return False
+    return bool(df["text"].dropna().astype(str).str.strip().ne("").any())
+
+
+def _generation_config_is_current(output_dir: str) -> bool:
     config_path = _generation_config_path(output_dir)
     if not config_path.is_file():
         return False
@@ -147,6 +154,15 @@ def _has_current_english_pronoun_data(output_dir: str) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     return existing == english_pronoun_generation_config()
+
+
+def _has_current_english_pronoun_data(output_dir: str) -> bool:
+    training_path, neutral_path = _data_paths(output_dir)
+    return (
+        training_path.is_file()
+        and _neutral_data_is_valid(neutral_path)
+        and _generation_config_is_current(output_dir)
+    )
 
 
 def ensure_english_pronoun_data(
@@ -173,29 +189,37 @@ def ensure_english_pronoun_data(
     ):
         return training_path, neutral_path
 
+    config_is_current = _generation_config_is_current(output_dir)
+    training_is_complete = pronoun_training_data_is_complete(output_dir)
     creator = build_english_pronoun_data_creator(output_dir=output_dir, use_cache=False)
     incomplete_sidecar = _incomplete_classes_sidecar_path(training_path)
-    if incomplete_sidecar.is_file():
-        incomplete_sidecar.unlink()
+    if force or not config_is_current or not training_is_complete:
+        if incomplete_sidecar.is_file():
+            incomplete_sidecar.unlink()
 
-    creator.generate_training_data(
-        max_size_per_class=MAX_SIZE_PER_CLASS,
-        format="per_class",
-        balance="try",
-        min_rows_per_class_for_split=MIN_ROWS_PER_CLASS_FOR_SPLIT,
-        raise_on_incomplete_classes=True,
-    )
-    if incomplete_sidecar.is_file():
-        incomplete_sidecar.unlink()
-    if not _pronoun_training_has_all_classes(training_path):
-        raise ValueError(
-            f"English pronoun training data at {training_path} is still missing classes "
-            f"after regeneration. Expected all of {PRONOUN_CLASSES}."
+        creator.generate_training_data(
+            max_size_per_class=MAX_SIZE_PER_CLASS,
+            format="per_class",
+            balance="try",
+            min_rows_per_class_for_split=MIN_ROWS_PER_CLASS_FOR_SPLIT,
+            raise_on_incomplete_classes=True,
         )
-    creator.generate_neutral_data(
+        if incomplete_sidecar.is_file():
+            incomplete_sidecar.unlink()
+        if not _pronoun_training_has_all_classes(training_path):
+            raise ValueError(
+                f"English pronoun training data at {training_path} is still missing classes "
+                f"after regeneration. Expected all of {PRONOUN_CLASSES}."
+            )
+    neutral_df = creator.generate_neutral_data(
         additional_excluded_words=NEUTRAL_EXCLUDE_ENGLISH_PRONOUNS,
         max_size=NEUTRAL_MAX_SIZE,
     )
+    if neutral_df.empty or "text" not in neutral_df.columns:
+        raise ValueError(
+            "English pronoun neutral-data generation produced no rows. "
+            "The generation state was not marked complete; rerun with an intact Wikipedia source."
+        )
 
     config_path = _generation_config_path(output_dir)
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,30 +231,20 @@ def ensure_english_pronoun_data(
 
 
 def main():
-    creator = build_english_pronoun_data_creator(output_dir=DEFAULT_OUTPUT_DIR, use_cache=False)
+    # Reuse generated CSVs when current; otherwise generate them here from the
+    # raw Wikipedia dataset (which the asset prefetcher can cache in full).
+    training_path, neutral_path = ensure_english_pronoun_data(output_dir=DEFAULT_OUTPUT_DIR)
+    training = pd.read_csv(training_path)
+    neutral = pd.read_csv(neutral_path)
 
     print("=== Training data (per_class, balance='try') ===")
-    training = creator.generate_training_data(
-        max_size_per_class=MAX_SIZE_PER_CLASS, # limit for demo; set higher or None for full data
-        format="per_class",
-        balance="try",
-    )
-    for class_id, df in training.items():
+    for class_id, df in training.groupby("label_class", sort=False):
         print(f"  {class_id}: {len(df)} rows")
         for _, row in df.head(2).iterrows():
             print(f"    masked: {row['masked']}")
             print(f"    label:  {row['label']}")
 
     print("\n=== Neutral data (pronouns excluded) ===")
-    neutral = creator.generate_neutral_data(
-        additional_excluded_words=NEUTRAL_EXCLUDE_ENGLISH_PRONOUNS,
-        max_size=NEUTRAL_MAX_SIZE,
-    )
-    config_path = _generation_config_path(DEFAULT_OUTPUT_DIR)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_path, "w", encoding="utf-8") as handle:
-        json.dump(english_pronoun_generation_config(), handle, indent=2, sort_keys=True)
-        handle.write("\n")
     print(neutral.head(10).to_string())
     print(f"\n  Total neutral sentences: {len(neutral)}")
 

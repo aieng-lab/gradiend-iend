@@ -41,6 +41,7 @@ def compute_topk_sets(
     models: Dict[str, object],
     topk: int = 100,
     part: str = "decoder-weight",
+    seed_group_policy: str = "primary",
 ) -> Tuple[Dict[str, List[int]], List[int], List[int]]:
     """
     Compute top-k weight index sets for multiple models and their intersection/union.
@@ -50,9 +51,14 @@ def compute_topk_sets(
 
     Args:
         models: Mapping from model identifier to a model with ``get_topk_weights(part, topk)``
-            (e.g. ``ModelWithGradiend``).
+            (e.g. ``ModelWithGradiend``). Values may also be ``SeedModelGroup``
+            instances or non-empty seed-model lists/tuples.
         topk: Number of top weights to select per model.
         part: ``'encoder-weight'`` or ``'decoder-weight'``.
+        seed_group_policy: How to collapse multi-seed groups into one Venn set.
+            ``"primary"`` uses the group's primary/best seed model, ``"union"``
+            uses the union across selected seeds, and ``"intersection"`` uses
+            the intersection across selected seeds.
 
     Returns:
         per_model: dict mapping model_id -> list of weight indices (flattened base-model weights)
@@ -62,7 +68,12 @@ def compute_topk_sets(
     per_model: Dict[str, List[int]] = {}
 
     for model_id, model in models.items():
-        per_model[model_id] = model.get_topk_weights(part=part, topk=topk)
+        per_model[model_id] = _topk_weights_for_venn_set(
+            model,
+            part=part,
+            topk=topk,
+            seed_group_policy=seed_group_policy,
+        )
 
     sets = {k: set(v) for k, v in per_model.items()}
     all_sets = list(sets.values())
@@ -72,6 +83,47 @@ def compute_topk_sets(
     intersection = list(set.intersection(*all_sets))
     union = list(set.union(*all_sets))
     return per_model, sorted(intersection), sorted(union)
+
+
+def _seed_models_for_venn(model: object) -> Optional[List[object]]:
+    """Return seed models when *model* is a multi-seed container."""
+    try:
+        from gradiend.trainer.core.seed_models import SeedModelGroup
+
+        if isinstance(model, SeedModelGroup):
+            return list(model.models)
+    except Exception:
+        pass
+    if isinstance(model, (list, tuple)):
+        return list(model)
+    return None
+
+
+def _topk_weights_for_venn_set(
+    model: object,
+    *,
+    part: str,
+    topk: int,
+    seed_group_policy: str = "primary",
+) -> List[int]:
+    """Resolve one top-k set for a Venn circle, including multi-seed groups."""
+    seed_group_policy = str(seed_group_policy or "primary").lower()
+    if seed_group_policy not in {"primary", "union", "intersection"}:
+        raise ValueError("seed_group_policy must be one of 'primary', 'union', or 'intersection'")
+
+    seed_models = _seed_models_for_venn(model)
+    if seed_models is None:
+        return list(model.get_topk_weights(part=part, topk=topk))
+    if not seed_models:
+        raise ValueError("Seed model group for Venn plot must contain at least one model")
+
+    if seed_group_policy == "primary":
+        return list(seed_models[0].get_topk_weights(part=part, topk=topk))
+
+    seed_sets = [set(seed_model.get_topk_weights(part=part, topk=topk)) for seed_model in seed_models]
+    if seed_group_policy == "union":
+        return sorted(set.union(*seed_sets)) if seed_sets else []
+    return sorted(set.intersection(*seed_sets)) if seed_sets else []
 
 
 def plot_topk_venn(
@@ -87,6 +139,9 @@ def plot_topk_venn(
     alpha: float = 0.5,
     title: Optional[str] = None,
     highlight_non_convergence: bool = True,
+    converged_by_id: Optional[Dict[str, Optional[bool]]] = None,
+    label_mapping: Optional[Dict[str, str]] = None,
+    seed_group_policy: str = "primary",
 ) -> None:
     """
     Plot a Venn diagram for top-k weight index sets (2–6 models).
@@ -112,6 +167,9 @@ def plot_topk_venn(
         title: Optional figure title.
         highlight_non_convergence: When True, append a non-convergence marker to circle labels
             for non-converged models.
+        converged_by_id: Optional explicit convergence status keyed by model id.
+        label_mapping: Optional display label keyed by model id.
+        seed_group_policy: How to collapse multi-seed groups into one Venn set.
     """
     model_ids = list(models.keys())
     n_models = len(model_ids)
@@ -122,13 +180,41 @@ def plot_topk_venn(
         raise ValueError("Venn diagrams support at most 6 models.")
 
     plt = _require_matplotlib()
-    per_model, _, _ = compute_topk_sets(models, topk=topk, part=part)
+    per_model, _, _ = compute_topk_sets(
+        models,
+        topk=topk,
+        part=part,
+        seed_group_policy=seed_group_policy,
+    )
     sets_dict = {mid: set(per_model[mid]) for mid in model_ids}
     label_map = format_model_labels_with_convergence(
         model_ids,
         models=models,
+        converged_by_id=converged_by_id,
         highlight_non_convergence=highlight_non_convergence,
     )
+    if label_mapping:
+        base_map = {str(key): str(value) for key, value in label_mapping.items()}
+        label_map = format_model_labels_with_convergence(
+            model_ids,
+            converged_by_id=converged_by_id,
+            highlight_non_convergence=highlight_non_convergence,
+        )
+        for mid in model_ids:
+            key = str(mid)
+            if key in base_map:
+                from gradiend.visualizer.labels import format_label_with_convergence
+
+                converged = None
+                if converged_by_id is not None:
+                    converged = converged_by_id.get(mid)
+                    if converged is None:
+                        converged = converged_by_id.get(key)
+                label_map[key] = format_label_with_convergence(
+                    base_map[key],
+                    converged=converged,
+                    highlight_non_convergence=highlight_non_convergence,
+                )
     display_labels = [label_map[mid] for mid in model_ids]
 
     if figsize is None:
@@ -255,6 +341,9 @@ def plot_topk_overlap_venn(
     alpha: float = 0.5,
     title: Optional[str] = None,
     highlight_non_convergence: bool = True,
+    converged_by_id: Optional[Dict[str, Optional[bool]]] = None,
+    label_mapping: Optional[Dict[str, str]] = None,
+    seed_group_policy: str = "primary",
 ) -> Dict[str, object]:
     """
     Plot top-k weight index set intersection across multiple GRADIEND models and return overlap stats.
@@ -278,6 +367,9 @@ def plot_topk_overlap_venn(
         title: Optional figure title.
         highlight_non_convergence: When True, append a non-convergence marker to circle labels
             for non-converged models.
+        converged_by_id: Optional explicit convergence status keyed by model id.
+        label_mapping: Optional display label keyed by model id.
+        seed_group_policy: How to collapse multi-seed groups into one Venn set.
 
     Returns:
         Dict with keys: ``per_model`` (model_id -> list of weight indices), ``intersection``,
@@ -288,7 +380,12 @@ def plot_topk_overlap_venn(
     if not isinstance(models, dict):
         models = {"model": models}
 
-    per_model, intersection, union = compute_topk_sets(models, topk=topk, part=part)
+    per_model, intersection, union = compute_topk_sets(
+        models,
+        topk=topk,
+        part=part,
+        seed_group_policy=seed_group_policy,
+    )
     plot_topk_venn(
         models,
         topk=topk,
@@ -302,6 +399,9 @@ def plot_topk_overlap_venn(
         alpha=alpha,
         title=title,
         highlight_non_convergence=highlight_non_convergence,
+        converged_by_id=converged_by_id,
+        label_mapping=label_mapping,
+        seed_group_policy=seed_group_policy,
     )
 
     return {
@@ -310,4 +410,5 @@ def plot_topk_overlap_venn(
         "union": union,
         "topk": topk,
         "part": part,
+        "seed_group_policy": seed_group_policy,
     }

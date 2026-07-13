@@ -1,6 +1,5 @@
 """Tests for seq2seq GRADIEND backbone selection."""
 
-import pytest
 import torch.nn as nn
 
 from gradiend.model.core.backbone import split_backbone_vs_head_params

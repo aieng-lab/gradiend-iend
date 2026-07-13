@@ -33,7 +33,7 @@ $$
 where $\mathrm{enc}_G(x)$ is the scalar encoded feature value of probe $x$ under
 $G$. In code, these are rows of `encoder_df` grouped by directed transition
 `factual→counterfactual`; see
-[`compute_gradiend_transition_cross_encoding_matrix`][gradiend.comparison.feature_cross_encoding.compute_gradiend_transition_cross_encoding_matrix]
+[`compute_gradiend_transition_cross_encoding_matrix`][gradiend.comparison.cross_encoding.compute_gradiend_transition_cross_encoding_matrix]
 for the rectangular **pre-anchor** matrix (GRADIEND × transition).
 
 ---
@@ -115,8 +115,8 @@ within-family structure, mixed-sign diagonals, and binary-class inversion.
 
 | Step | Function |
 |------|----------|
-| Shared test pool encoding | [`build_cross_task_encoder_summary`][gradiend.comparison.feature_cross_encoding.build_cross_task_encoder_summary] |
-| Pre-anchor GRADIEND × transition | [`compute_gradiend_transition_cross_encoding_matrix`][gradiend.comparison.feature_cross_encoding.compute_gradiend_transition_cross_encoding_matrix] |
+| Shared test pool encoding | [`build_cross_task_encoder_summary`][gradiend.comparison.cross_encoding.build_cross_task_encoder_summary] |
+| Pre-anchor GRADIEND × transition | [`compute_gradiend_transition_cross_encoding_matrix`][gradiend.comparison.cross_encoding.compute_gradiend_transition_cross_encoding_matrix] |
 | Oriented rows + pivot | [`compute_anchor_aligned_encoding_matrix`][gradiend.comparison.anchor_aligned.compute_anchor_aligned_encoding_matrix] |
 | Plot | [`plot_cross_encoding_heatmap`][gradiend.visualizer.heatmaps.encoding.plot_cross_encoding_heatmap] |
 | Inspect contributions | `payload["aligned_rows"]` on oriented payload |

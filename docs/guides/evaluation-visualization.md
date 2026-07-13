@@ -7,12 +7,12 @@ This guide documents all plot functions available for visualizing GRADIEND train
 
 ### Non-convergence markers
 
-When a run did not meet the convergence threshold, plot titles and multi-model tick/circle labels can show a **`✝`** suffix (e.g. `gender_en ✝`). Control this with:
+When a run did not meet the convergence threshold, plot titles and multi-model tick/circle labels can show a **`†`** suffix (e.g. `gender_en †`). Control this with:
 
 - **[`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].highlight_non_convergence** (default `True`) — global default for trainer plots.
 - **`highlight_non_convergence`** on each plot function — override per call (`None` on single-model plots inherits from training args).
 
-Set `highlight_non_convergence=False` to hide markers. Format: `NAME ✝` (space before the marker).
+Set `highlight_non_convergence=False` to hide markers. Format: `NAME †` (space before the marker).
 
 ---
 
@@ -32,6 +32,8 @@ Set `highlight_non_convergence=False` to hide markers. Format: `NAME ✝` (space
 | **[Seed comparison](#seed-comparison)** | Layer-wise / top-k overlap across seeds | [`plot_comparison_heatmap()`][gradiend.visualizer.heatmaps.base.plot_comparison_heatmap] with [`compute_similarity_matrix()`][gradiend.comparison.similarity.compute_similarity_matrix] |
 
 See [Oriented cross-encoding matrix](cross-encoding-matrix.md) for the multilingual demo pipeline and a synthetic aggregation walkthrough.
+
+For LaTeX fonts, transition arrows (`M -> F`), and environment variables, see **[Plot styling & LaTeX](plot-styling-latex.md)**.
 
 ---
 
@@ -72,7 +74,7 @@ Regenerate: gradiend/examples/start_workflow.py
 | `class_spread` | `"minmax"` \| `"iqr"` \| `"ci95"` \| `None` | `None` | Shade spread behind each class mean line. `"minmax"` shades min-max encoded values; `"iqr"` shades the interquartile range (Q1-Q3); `"ci95"` shades a 95% confidence interval around the mean (`mean ± 1.96 * std / sqrt(n)`). Requires spread stats from newer training runs. |
 | `best_step` | `bool` | `True` | Draw vertical line and mark best checkpoint step. |
 | `title` | `str` or `bool` | `True` | `True` = use `run_id`, `False` = no title, string = custom title. |
-| `highlight_non_convergence` | `bool` or `None` | `None` | When `True`, append `✝` to the title if the run did not converge. `None` uses [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].highlight_non_convergence (default `True`). |
+| `highlight_non_convergence` | `bool` or `None` | `None` | When `True`, append `†` to the title if the run did not converge. `None` uses [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].highlight_non_convergence (default `True`). |
 | `figsize` | `Tuple[float, float]` | `None` | Figure size in inches. Default: `(8, 3 * n_subplots)`. |
 | `output` | `str` | `None` | Explicit output file path. |
 | `experiment_dir` | `str` | `None` | Used to resolve default artifact path when `output` is not set. |
@@ -128,7 +130,7 @@ Regenerate: gradiend/examples/start_workflow.py
 | `legend_ncol` | `int` | `2` | Number of columns in the legend. |
 | `legend_bbox_to_anchor` | `Tuple[float, float]` or `None` | `None` | (x, y) for legend. When >6 entries and `None`, legend is placed below (0.5, -0.06). |
 | `title` | `str` or `bool` | `True` | `True` = use `run_id`, `False` = no title, string = custom title. |
-| `highlight_non_convergence` | `bool` or `None` | `None` | Append `✝` to title when the run did not converge. `None` uses [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].highlight_non_convergence. |
+| `highlight_non_convergence` | `bool` or `None` | `None` | Append `†` to title when the run did not converge. `None` uses [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].highlight_non_convergence. |
 | `return_fig_ax` | `bool` | `False` | Return the live Matplotlib `(fig, axes)` and leave it open for final custom edits. |
 | `title_fontsize` | `float` | `None` | Title font size. |
 | `label_fontsize` | `float` | `None` | Axis tick label font size. |
@@ -179,7 +181,7 @@ trainer.plot_encoder_scatter(encoder_df=enc_df)
 | `cmap` | `str` | `"tab20"` | Matplotlib colormap for colors (matches encoder violins). |
 | `height` | `int` | `500` | Figure height in pixels. |
 | `title` | `str` | `None` | Plot title. |
-| `highlight_non_convergence` | `bool` or `None` | `None` | Append `✝` to title when the run did not converge. |
+| `highlight_non_convergence` | `bool` or `None` | `None` | Append `†` to title when the run did not converge. |
 | `output_path` | `str` | `None` | Path to save HTML. |
 | `output_dir` | `str` | `None` | Directory for HTML when `output_path` and `experiment_dir` are not set. |
 | `show` | `bool` | `True` | Whether to display the figure. |
@@ -221,7 +223,7 @@ Regenerate: gradiend/examples/train_gender_de_detailed.py
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `models` | `Dict[str, ModelWithGradiend]` | required | Mapping from label to model. **Keys are used as axis labels**; use display labels (e.g. run_id or ``"3SG ↔ 3PL"``) as keys. |
-| `highlight_non_convergence` | `bool` | `True` | Append `✝` to axis labels for models that did not converge. |
+| `highlight_non_convergence` | `bool` | `True` | Append `†` to axis labels for models that did not converge. |
 | `topk` | `int \| float` | `1000` | Number of top weights per model, or a fraction in `(0, 1]` such as `0.01` for the top 1% per model. |
 | `part` | `str` | `"decoder-weight"` | Weight part for importance ranking: `encoder-weight`, `decoder-weight`, `decoder-bias`, or `decoder-sum`. |
 | `value` | `str` | `"intersection"` | Cell value: `"intersection"` (raw \|A ∩ B\|) or `"intersection_frac"` (normalized overlap). When selected set sizes differ, `"intersection_frac"` is \|A ∩ B\| / min(\|A\|, \|B\|), i.e. the fraction of the smaller selected set contained in the intersection. |
@@ -283,7 +285,7 @@ Regenerate: gradiend/examples/train_gender_de_detailed.py
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `models` | `Dict[str, ModelWithGradiend]` | required | Mapping from label to model (2–6 entries). **Keys are used as set labels**; use display labels as keys for consistency with the heatmap. |
-| `highlight_non_convergence` | `bool` | `True` | Append `✝` to circle labels for models that did not converge. |
+| `highlight_non_convergence` | `bool` | `True` | Append `†` to circle labels for models that did not converge. |
 | `topk` | `int` | `1000` | Number of top weights per model. |
 | `part` | `str` | `"decoder-weight"` | Weight part: `encoder-weight`, `decoder-weight`, `decoder-bias`, or `decoder-sum`. |
 | `output_path` | `str` | `None` | Path to save the figure. |

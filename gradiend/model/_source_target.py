@@ -9,8 +9,9 @@ Training vs decoder evaluation
 
 * **Decoder rewrite** uses ``model.source`` (persisted in ``gradiend_context.json``) to
 
-  pick the default ``feature_factor`` sign per class. ``model.source`` must match
-  ``TrainingArguments.source``; see :func:`sync_model_source_target_from_training_args`.
+  pick the default ``feature_factor`` sign per class. It is set once before training
+  via :func:`sync_model_source_target_from_training_args` and must not be overwritten
+  when loading a finished checkpoint for analysis.
 
 Feature-factor sign (strengthen class ``C``)
 --------------------------------------------
@@ -43,7 +44,7 @@ the reverse), encoded values are multiplied by ``-1`` — same XOR rule as decod
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 SOURCE_TARGET_KEYWORDS: frozenset[str] = frozenset({"factual", "alternative", "diff"})
 
@@ -107,13 +108,75 @@ def resolve_model_source(model: Any, trainer: Any = None, *, default: str = "fac
     return default
 
 
+def resolve_source_from_checkpoint_dir(
+    checkpoint_dir: str,
+    *,
+    default: str = "factual",
+) -> str:
+    """Return the source a finished GRADIEND was trained with.
+
+    Reads ``gradiend_context.json`` and the checkpoint's own ``training.json``.
+    When they disagree, the persisted training source wins because older
+    checkpoints sometimes saved the ``ModelWithGradiend`` constructor default
+    ``factual`` instead of the source used to create their gradients.
+
+    This deliberately does not inspect a caller's current TrainingArguments:
+    evaluation settings must never reinterpret an already-trained checkpoint.
+    """
+    from gradiend.model.utils import read_gradiend_context
+    from gradiend.trainer.core.stats import load_training_stats
+    from gradiend.util.logging import get_logger
+
+    log = get_logger(__name__)
+    try:
+        context_source, _, _ = read_gradiend_context(checkpoint_dir)
+        context_source = validate_source_target("source", context_source)
+    except (FileNotFoundError, KeyError, TypeError, ValueError):
+        return default
+
+    stats = load_training_stats(checkpoint_dir) or {}
+    training_args = stats.get("training_args") or {}
+    trained_source = (
+        training_args.get("source")
+        if isinstance(training_args, dict)
+        else None
+    )
+    if trained_source is None:
+        return context_source
+    try:
+        trained_source = validate_source_target("source", trained_source)
+    except (TypeError, ValueError):
+        log.warning(
+            "Checkpoint %s: training.json has invalid source=%r; using "
+            "gradiend_context.json source=%r.",
+            checkpoint_dir,
+            trained_source,
+            context_source,
+        )
+        return context_source
+    if trained_source != context_source:
+        log.warning(
+            "Checkpoint %s: gradiend_context.json has source=%r but training.json has %r; "
+            "using training.json (the next save will repair gradiend_context.json).",
+            checkpoint_dir,
+            context_source,
+            trained_source,
+        )
+    return trained_source
+
+
 def sync_model_source_target_from_training_args(
     model: Any,
     training_args: Any,
     *,
     log_mismatch: bool = True,
+    allow_overwrite: bool = True,
 ) -> None:
-    """Set ``model._source`` / ``model._target`` from TrainingArguments when they differ."""
+    """Align in-memory ``model._source`` / ``model._target`` before a new training run.
+
+    Only call this when constructing a model for training from a base checkpoint,
+    not when loading a finished GRADIEND for evaluation (``allow_overwrite=False``).
+    """
     if model is None or training_args is None:
         return
     from gradiend.util.logging import get_logger
@@ -127,11 +190,20 @@ def sync_model_source_target_from_training_args(
         current = getattr(model, key, None)
         if current == expected:
             continue
+        if not allow_overwrite:
+            if log_mismatch:
+                log.warning(
+                    "Checkpoint model.%s is %r but TrainingArguments has %r; "
+                    "keeping checkpoint value (source/target are fixed at training time).",
+                    key,
+                    current,
+                    expected,
+                )
+            continue
         if log_mismatch:
-            log.info(
-                "Updating model.%s from %r to %r (TrainingArguments)",
+            log.debug(
+                "Setting model.%s to %r for training (TrainingArguments)",
                 key,
-                current,
                 expected,
             )
         setattr(model, private_attr, expected)

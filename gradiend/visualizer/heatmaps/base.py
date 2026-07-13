@@ -12,13 +12,17 @@ from gradiend.visualizer.heatmaps.ordering import _reorder_comparison_data
 from gradiend.visualizer.plot_optional import _require_matplotlib, _require_seaborn
 from gradiend.visualizer.plot_style import disable_usetex_for_axis_text
 from gradiend.visualizer.labels import (
+    NON_CONVERGENCE_MARKER,
+    NON_CONVERGENCE_MARKER_TEX,
     converged_for_trainer,
     format_label_with_convergence,
+    format_transition_label,
+    label_contains_matplotlib_latex,
     resolve_axis_convergence_for_comparison_heatmap,
 )
 
 # Matrix-computation options that must not be forwarded to plot_comparison_heatmap.
-_MATRIX_COMPUTE_KWARGS = frozenset({"seed_aggregate", "dispersion", "seed_selection"})
+_MATRIX_COMPUTE_KWARGS = frozenset({"seed_aggregate", "dispersion", "seed_selection", "seed_pairing_mode"})
 
 
 def filter_comparison_heatmap_plot_kwargs(kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -100,6 +104,7 @@ def plot_comparison_heatmap(
     group_label_rotation_top: Union[int, float] = 0,
     group_label_rotation_right: Union[int, float] = 0,
     cbar_pad: Optional[float] = None,
+    cbar_y_pad: Optional[float] = None,
     cbar_fontsize: Optional[Union[int, float]] = None,
     cbar_shrink: Optional[float] = None,
     cbar_label: Optional[str] = None,
@@ -116,6 +121,7 @@ def plot_comparison_heatmap(
     dispersion_display: str = "none",
     seed_annotation: Union[bool, Dict[str, Any]] = False,
     models: Optional[Dict[str, object]] = None,
+    converged_by_id: Optional[Dict[str, Optional[bool]]] = None,
     highlight_non_convergence: bool = True,
 ) -> Any:
     """Plot a precomputed comparison matrix as a heatmap.
@@ -149,6 +155,8 @@ def plot_comparison_heatmap(
         group_label_rotation_top: Rotation for top group labels.
         group_label_rotation_right: Rotation for right group labels.
         cbar_pad: Optional colorbar padding.
+        cbar_y_pad: Optional vertical colorbar offset, as a fraction of the
+            heatmap-axis height. Negative values move the colorbar down.
         cbar_fontsize: Optional colorbar tick and label font size.
         cbar_shrink: Optional colorbar shrink factor (width relative to heatmap).
         cbar_label: Optional colorbar axis label.
@@ -165,6 +173,7 @@ def plot_comparison_heatmap(
         dispersion_display: How to show dispersion values.
         seed_annotation: Whether/how to annotate seed counts.
         models: Optional model mapping for non-convergence label lookup.
+        converged_by_id: Optional explicit convergence status by stable model id.
         highlight_non_convergence: Whether labels mark non-converged runs.
     """
     warn_deprecated_annot_fmt(fmt=fmt, annot_fmt=annot_fmt, stacklevel=1)
@@ -191,6 +200,7 @@ def plot_comparison_heatmap(
     _validate_numeric_optional("group_label_rotation_right", group_label_rotation_right)
     _validate_fontsize_optional("cbar_fontsize", cbar_fontsize)
     _validate_numeric_optional("cbar_pad", cbar_pad)
+    _validate_numeric_optional("cbar_y_pad", cbar_y_pad)
     _validate_numeric_optional("cbar_shrink", cbar_shrink)
     _validate_numeric_optional("row_metric_vmin", row_metric_vmin)
     _validate_numeric_optional("row_metric_vmax", row_metric_vmax)
@@ -222,6 +232,8 @@ def plot_comparison_heatmap(
     column_labels_map = comparison_data.get("column_labels") or {}
     row_ticklabels = [row_labels_map.get(mid, mid) for mid in row_ids]
     column_ticklabels = [column_labels_map.get(mid, mid) for mid in col_ids]
+    row_ticklabels = [format_transition_label(lbl) for lbl in row_ticklabels]
+    column_ticklabels = [format_transition_label(lbl) for lbl in column_ticklabels]
     if highlight_non_convergence:
         row_convergence, col_convergence = resolve_axis_convergence_for_comparison_heatmap(
             comparison_data,
@@ -238,14 +250,23 @@ def plot_comparison_heatmap(
         ) -> str:
             converged = None
             key = str(mid)
-            if models is not None and mid in models:
+            if converged_by_id is not None:
+                converged = converged_by_id.get(mid)
+                if converged is None:
+                    converged = converged_by_id.get(key)
+            if converged is None and models is not None and mid in models:
                 converged = converged_for_trainer(models[mid])
-            elif key in axis_convergence:
+            if converged is None and key in axis_convergence:
                 converged = axis_convergence[key]
             return format_label_with_convergence(
                 str(label),
                 converged=converged,
                 highlight_non_convergence=highlight_non_convergence,
+                marker=(
+                    NON_CONVERGENCE_MARKER_TEX
+                    if label_contains_matplotlib_latex(label)
+                    else NON_CONVERGENCE_MARKER
+                ),
             )
 
         row_ticklabels = [
@@ -400,29 +421,43 @@ def plot_comparison_heatmap(
     cbar_kws = {"shrink": 0.75 if cbar_shrink is None else float(cbar_shrink)}
     if cbar_pad is not None:
         cbar_kws["pad"] = cbar_pad
-    if cbar_label:
-        cbar_kws["label"] = cbar_label
+    # Do not pass cbar_label through cbar_kws: "%" is a TeX comment when usetex is on.
 
-    if ax is None:
-        _, ax = plt.subplots(figsize=figsize)
-    ax = sns.heatmap(
-        mat_arr,
-        ax=ax,
-        xticklabels=column_ticklabels,
-        yticklabels=row_ticklabels,
-        cmap=cmap,
-        norm=norm,
-        vmin=None if norm else vmin,
-        vmax=None if norm else vmax,
-        annot=False if custom_cell_annotation else _annot,
-        fmt=fmt,
-        annot_kws=annot_kws,
-        square=not rectangular,
-        cbar=True,
-        cbar_kws=cbar_kws,
-        linewidths=0.5,
-        linecolor="white",
-    )
+    def _draw_heatmap_with_plain_seaborn_text():
+        nonlocal ax
+        if ax is None:
+            _, ax = plt.subplots(figsize=figsize)
+        return sns.heatmap(
+            mat_arr,
+            ax=ax,
+            xticklabels=column_ticklabels,
+            yticklabels=row_ticklabels,
+            cmap=cmap,
+            norm=norm,
+            vmin=None if norm else vmin,
+            vmax=None if norm else vmax,
+            annot=False if custom_cell_annotation else _annot,
+            fmt=fmt,
+            annot_kws=annot_kws,
+            square=not rectangular,
+            cbar=True,
+            cbar_kws=cbar_kws,
+            linewidths=0.5,
+            linecolor="white",
+        )
+
+    import matplotlib as mpl
+
+    if mpl.rcParams.get("text.usetex"):
+        # Seaborn creates plain tick/colorbar labels and forces an early draw
+        # while building the heatmap. Create that scaffolding without usetex so
+        # incomplete TeX font maps (for example missing tcss1440) do not break
+        # before GRADIEND can mark plain labels as non-TeX text. Intentional
+        # math labels added below still use the restored global usetex setting.
+        with mpl.rc_context({"text.usetex": False}):
+            ax = _draw_heatmap_with_plain_seaborn_text()
+    else:
+        ax = _draw_heatmap_with_plain_seaborn_text()
     fig = ax.get_figure()
     cbar_ax = fig.axes[1] if len(fig.axes) >= 2 else None
 
@@ -437,19 +472,27 @@ def plot_comparison_heatmap(
             m_vmax = row_metric_vmax if row_metric_vmax is not None else float(np.nanmax(arr))
             divider_metric = make_axes_locatable(ax)
             ax_metric = divider_metric.append_axes("left", size="5%", pad=0.2)
-            sns.heatmap(
-                arr,
-                ax=ax_metric,
-                cmap=row_metric_cmap,
-                vmin=m_vmin,
-                vmax=m_vmax,
-                cbar=False,
-                xticklabels=[row_metric_label] if row_metric_label else [],
-                yticklabels=[],
-                square=True,
-                linewidths=0.5,
-                linecolor="white",
-            )
+
+            def _draw_row_metric_with_plain_seaborn_text():
+                return sns.heatmap(
+                    arr,
+                    ax=ax_metric,
+                    cmap=row_metric_cmap,
+                    vmin=m_vmin,
+                    vmax=m_vmax,
+                    cbar=False,
+                    xticklabels=[row_metric_label] if row_metric_label else [],
+                    yticklabels=[],
+                    square=True,
+                    linewidths=0.5,
+                    linecolor="white",
+                )
+
+            if mpl.rcParams.get("text.usetex"):
+                with mpl.rc_context({"text.usetex": False}):
+                    _draw_row_metric_with_plain_seaborn_text()
+            else:
+                _draw_row_metric_with_plain_seaborn_text()
             ax_metric.yaxis.set_ticks_position("left")
             ax_metric.tick_params(axis="x", rotation=90)
 
@@ -523,7 +566,7 @@ def plot_comparison_heatmap(
                 x_center = (x1 + x2 - 1) / 2 + 0.5
                 ax_top.hlines(0.12, x1 + line_margin, x2 - line_margin, colors="gray", linewidth=3)
                 ax_top.text(
-                    x_center, 0.28, gname,
+                    x_center, 0.28, format_transition_label(gname),
                     rotation=90 + float(group_label_rotation_top), ha="center", va="bottom",
                     fontsize=group_fontsize, transform=ax_top.transData,
                 )
@@ -541,7 +584,7 @@ def plot_comparison_heatmap(
             y_center = (y1 + y2 - 1) / 2 + 0.5
             ax_right.vlines(0.12, y1 + line_margin, y2 - line_margin, colors="gray", linewidth=3)
             ax_right.text(
-                0.28, y_center, gname,
+                0.28, y_center, format_transition_label(gname),
                 rotation=0 + float(group_label_rotation_right), ha="left", va="center",
                 fontsize=group_fontsize, transform=ax_right.transData,
             )
@@ -550,8 +593,13 @@ def plot_comparison_heatmap(
     if cbar_ax is not None:
         if cbar_fontsize is not None:
             cbar_ax.tick_params(labelsize=cbar_fontsize)
-            if cbar_label:
-                cbar_ax.set_ylabel(cbar_label, fontsize=cbar_fontsize)
+        if cbar_label:
+            cbar_ax.set_ylabel(
+                cbar_label,
+                fontsize=cbar_fontsize or plt.rcParams.get("axes.labelsize"),
+                usetex=False,
+            )
+        disable_usetex_for_axis_text(cbar_ax)
 
     if custom_cell_annotation:
         def _format_secondary(stat: Dict[str, Any]) -> str:
@@ -621,6 +669,21 @@ def plot_comparison_heatmap(
     plt.xticks(rotation=45, ha="right")
     plt.yticks(rotation=0)
     plt.tight_layout()
+
+    # Apply this after tight_layout so layout engines do not undo the requested
+    # overlap with tick/group labels. The offset is relative to the heatmap
+    # height, which keeps it stable across figure sizes and cbar shrink values.
+    if cbar_ax is not None and cbar_y_pad is not None:
+        cbar_position = cbar_ax.get_position()
+        heatmap_height = ax.get_position().height
+        cbar_ax.set_position(
+            [
+                cbar_position.x0,
+                cbar_position.y0 + float(cbar_y_pad) * heatmap_height,
+                cbar_position.width,
+                cbar_position.height,
+            ]
+        )
 
     if output_path:
         plt.savefig(output_path, bbox_inches="tight")

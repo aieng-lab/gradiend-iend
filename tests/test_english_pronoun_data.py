@@ -8,7 +8,10 @@ import pytest
 
 from gradiend.examples.create_english_pronoun_data import (
     PRONOUN_CLASSES,
+    _has_current_english_pronoun_data,
     _incomplete_classes_sidecar_path,
+    english_pronoun_generation_config,
+    ensure_english_pronoun_data,
     pronoun_training_data_is_complete,
 )
 
@@ -50,6 +53,49 @@ def test_pronoun_training_data_is_complete_when_all_classes_present():
         assert pronoun_training_data_is_complete(tmp)
 
 
+@pytest.mark.parametrize("neutral_contents", ["", "text\n"])
+def test_current_pronoun_data_rejects_empty_neutral_csv(neutral_contents):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_training_csv(root / "training.csv", PRONOUN_CLASSES)
+        (root / "neutral.csv").write_text(neutral_contents, encoding="utf-8")
+        (root / "generation_config.json").write_text(
+            __import__("json").dumps(english_pronoun_generation_config()),
+            encoding="utf-8",
+        )
+
+        assert not _has_current_english_pronoun_data(tmp)
+
+
+def test_invalid_neutral_regenerates_only_neutral_when_training_is_current(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        _write_training_csv(root / "training.csv", PRONOUN_CLASSES)
+        (root / "neutral.csv").write_text("", encoding="utf-8")
+        (root / "generation_config.json").write_text(
+            __import__("json").dumps(english_pronoun_generation_config()),
+            encoding="utf-8",
+        )
+
+        class _Creator:
+            def generate_training_data(self, **_kwargs):
+                raise AssertionError("valid training data must not be regenerated")
+
+            def generate_neutral_data(self, **_kwargs):
+                frame = pd.DataFrame({"text": ["A neutral sentence."]})
+                frame.to_csv(root / "neutral.csv", index=False)
+                return frame
+
+        monkeypatch.setattr(
+            "gradiend.examples.create_english_pronoun_data.build_english_pronoun_data_creator",
+            lambda **_kwargs: _Creator(),
+        )
+
+        ensure_english_pronoun_data(output_dir=tmp)
+        assert pd.read_csv(root / "neutral.csv")["text"].tolist() == ["A neutral sentence."]
+
+
+@pytest.mark.integration
 def test_build_pronoun_suite_requires_ten_trainers(monkeypatch):
     import argparse
     import sys

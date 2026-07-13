@@ -81,6 +81,7 @@ Repository = "https://github.com/aieng-lab/gradiend"
 "Bug Tracker" = "https://github.com/aieng-lab/gradiend/issues"
 
 [tool.pytest.ini_options]
+pythonpath = "."
 basetemp = ".pytest_tmp_local"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -105,3 +106,8 @@ exclude = ["gradiend.examples*"]
 
 [tool.setuptools.package-data]
 gradiend = ["py.typed"]
+
+[tool.ruff.lint.per-file-ignores]
+# Star-import / re-export modules: imports look unused locally but are part of the public namespace.
+"gradiend/trainer/suite/definitions.py" = ["F401"]
+"gradiend/util/__init__.py" = ["F401"]

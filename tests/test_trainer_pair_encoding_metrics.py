@@ -1,11 +1,11 @@
 import pandas as pd
 import pytest
 
-import gradiend.comparison.cross_encoding as cross_encoding_module
-from gradiend.comparison.cross_encoding import (
+import gradiend.comparison.trainer_pair_encoding as trainer_pair_encoding_module
+from gradiend.comparison.trainer_pair_encoding import (
     _resolve_full_eval,
     can_normalize_cross_encoding_by_diagonal,
-    compute_cross_encoding_matrix,
+    compute_trainer_pair_encoding_matrix,
     normalize_cross_encoding_rows_by_diagonal,
 )
 from gradiend.trainer.suite import PositiveTrainerSuite, SuitePairDefinition
@@ -57,7 +57,7 @@ def test_resolve_full_eval_defaults_to_test_split_only():
 
 def test_cross_encoding_metrics_cover_positive_negative_and_difference(monkeypatch):
     monkeypatch.setattr(
-        cross_encoding_module,
+        trainer_pair_encoding_module,
         "_load_cached_encoder_df",
         lambda trainer, split, max_size: _make_encoder_df(),
     )
@@ -67,9 +67,9 @@ def test_cross_encoding_metrics_cover_positive_negative_and_difference(monkeypat
         "times": _DummyTrainer(["commutative_plus", "non_commutative_plus"]),
     }
 
-    positive = compute_cross_encoding_matrix(trainers, metric="positive_mean", use_cache=True, run_evaluation=False)
-    negative = compute_cross_encoding_matrix(trainers, metric="negative_mean", use_cache=True, run_evaluation=False)
-    difference = compute_cross_encoding_matrix(trainers, metric="positive_minus_negative", use_cache=True, run_evaluation=False)
+    positive = compute_trainer_pair_encoding_matrix(trainers, metric="positive_mean", use_cache=True, run_evaluation=False)
+    negative = compute_trainer_pair_encoding_matrix(trainers, metric="negative_mean", use_cache=True, run_evaluation=False)
+    difference = compute_trainer_pair_encoding_matrix(trainers, metric="positive_minus_negative", use_cache=True, run_evaluation=False)
 
     assert positive["measure"] == "cross_encoding_positive_mean"
     assert negative["measure"] == "cross_encoding_negative_mean"
@@ -82,7 +82,7 @@ def test_cross_encoding_metrics_cover_positive_negative_and_difference(monkeypat
 
 def test_positive_suite_cross_encoding_uses_positive_feature_definition(monkeypatch):
     monkeypatch.setattr(
-        cross_encoding_module,
+        trainer_pair_encoding_module,
         "_load_cached_encoder_df",
         lambda trainer, split, max_size: _make_sentiment_encoder_df(),
     )
@@ -100,7 +100,7 @@ def test_positive_suite_cross_encoding_uses_positive_feature_definition(monkeypa
     suite._resolve_suite_dispersion = lambda dispersion=None: "none"
     suite.evaluate_encoder = lambda **kwargs: None
 
-    result = suite.compute_cross_encoding_matrix(use_cache=True, run_evaluation=False)
+    result = suite.compute_trainer_pair_encoding_matrix(use_cache=True, run_evaluation=False)
 
     assert result["positive_class_by_column"] == {
         "good__bad": "good",
@@ -122,8 +122,8 @@ def test_positive_suite_cross_encoding_does_not_recompute_bad_cache(monkeypatch)
         ]
     )
 
-    monkeypatch.setattr(cross_encoding_module, "_load_cached_encoder_df", lambda trainer, split, max_size: bad_cache)
-    monkeypatch.setattr(cross_encoding_module, "_load_eval_model_for_trainer", lambda trainer, load_directory=None: object())
+    monkeypatch.setattr(trainer_pair_encoding_module, "_load_cached_encoder_df", lambda trainer, split, max_size: bad_cache)
+    monkeypatch.setattr(trainer_pair_encoding_module, "_load_eval_model_for_trainer", lambda trainer, load_directory=None: object())
 
     suite = object.__new__(PositiveTrainerSuite)
     suite.trainers = {
@@ -144,10 +144,10 @@ def test_positive_suite_cross_encoding_does_not_recompute_bad_cache(monkeypatch)
     suite.evaluate_encoder = evaluate_encoder
 
     with pytest.raises(ValueError, match="Cross-encoding found no rows"):
-        suite.compute_cross_encoding_matrix(use_cache=True, run_evaluation=True)
+        suite.compute_trainer_pair_encoding_matrix(use_cache=True, run_evaluation=True)
 
 
-def test_compute_cross_encoding_matrix_passes_full_eval_to_encoder(monkeypatch):
+def test_compute_trainer_pair_encoding_matrix_passes_full_eval_to_encoder(monkeypatch):
     calls = []
 
     class _EvalTrainer(_DummyTrainer):
@@ -158,12 +158,12 @@ def test_compute_cross_encoding_matrix_passes_full_eval_to_encoder(monkeypatch):
         model_path = "/tmp/model"
 
     monkeypatch.setattr(
-        cross_encoding_module,
+        trainer_pair_encoding_module,
         "_load_cached_encoder_df",
         lambda trainer, split, max_size: None,
     )
     monkeypatch.setattr(
-        cross_encoding_module,
+        trainer_pair_encoding_module,
         "_load_eval_model_for_trainer",
         lambda trainer, load_directory=None: object(),
     )
@@ -172,7 +172,7 @@ def test_compute_cross_encoding_matrix_passes_full_eval_to_encoder(monkeypatch):
         "plus": _EvalTrainer(["commutative_plus", "non_commutative_plus"]),
         "times": _EvalTrainer(["commutative_plus", "non_commutative_plus"]),
     }
-    compute_cross_encoding_matrix(
+    compute_trainer_pair_encoding_matrix(
         trainers,
         metric="positive_mean",
         use_cache=False,
@@ -229,7 +229,7 @@ def test_resolve_trainer_load_directory_prefers_experiment_checkpoint():
     import os
     import tempfile
 
-    from gradiend.comparison.cross_encoding import _resolve_trainer_load_directory
+    from gradiend.comparison.trainer_pair_encoding import _resolve_trainer_load_directory
 
     with tempfile.TemporaryDirectory(prefix="resolve_ckpt_") as temp:
         exp_dir = os.path.join(temp, "gender_de_der__dem")

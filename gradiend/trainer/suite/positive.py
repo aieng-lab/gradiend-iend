@@ -196,7 +196,7 @@ class PositiveTrainerSuite(TrainerSuite):
         with _quiet_expected_suite_reload(self.trainers):
             return super().evaluate_encoder(*args, **kwargs)
 
-    def compute_cross_encoding_matrix(
+    def compute_trainer_pair_encoding_matrix(
         self,
         *,
         label_mapping: Optional[Dict[str, str]] = None,
@@ -205,7 +205,7 @@ class PositiveTrainerSuite(TrainerSuite):
         allow_incomplete: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Compute positive-pair cross-encoding matrix.
+        """Compute positive-pair trainer×trainer encoding matrix.
 
         Args:
             label_mapping: Optional child-id to display-label mapping.
@@ -213,7 +213,7 @@ class PositiveTrainerSuite(TrainerSuite):
                 available transitions.
             run_evaluation: Whether to run missing encoder evaluation first.
             allow_incomplete: If True, tolerate missing child encoder results.
-            **kwargs: Forwarded to cross-encoding computation.
+            **kwargs: Forwarded to trainer-pair encoding computation.
         """
         split = kwargs.get("split", "test")
         eval_use_cache = kwargs.get("use_cache", True)
@@ -241,7 +241,7 @@ class PositiveTrainerSuite(TrainerSuite):
         )
         if kwargs.get("dispersion") is None:
             kwargs["dispersion"] = self._resolve_suite_dispersion(None)
-        return compute_cross_encoding_matrix(
+        return compute_trainer_pair_encoding_matrix(
             self.trainers,
             run_evaluation=resolved_run_evaluation,
             allow_incomplete=allow_incomplete,
@@ -296,7 +296,7 @@ class PositiveTrainerSuite(TrainerSuite):
         effective_labels = self._effective_label_mapping(label_mapping, include_defaults=True)
         resolved_seed_selection = self._resolve_suite_seed_selection(seed_selection)
         resolved_dispersion = self._resolve_suite_dispersion(dispersion)
-        comparison_data = self.compute_cross_encoding_matrix(
+        comparison_data = self.compute_trainer_pair_encoding_matrix(
             label_mapping=effective_labels,
             split=split,
             max_size=max_size,

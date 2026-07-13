@@ -6,7 +6,6 @@ Also tests encoder distribution plot violin count.
 """
 
 import os
-import importlib.util
 import ast
 import subprocess
 import sys
@@ -18,6 +17,7 @@ import numpy as np
 from unittest.mock import MagicMock, patch
 
 from gradiend.visualizer.encoder_distributions import plot_encoder_distributions
+from gradiend.visualizer.labels import format_transition_label
 
 
 EXAMPLE_FILES = sorted(
@@ -217,8 +217,8 @@ class TestEncoderDistributionViolinCount:
                     labels = [txt.get_text() for txt in legend.get_texts()]
 
         assert output_path != ""
-        assert "Masc. Nom. -> Fem. Nom." in labels
-        assert "Fem. Nom. -> Masc. Nom." in labels
+        assert format_transition_label("Masc. Nom. -> Fem. Nom.") in labels
+        assert format_transition_label("Fem. Nom. -> Masc. Nom.") in labels
 
 
 class TestEncoderDistributionViolinVariants:

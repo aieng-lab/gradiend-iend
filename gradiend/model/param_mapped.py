@@ -107,10 +107,24 @@ class _CompiledParamSelector:
         if self.repr == "empty":
             return flat.new_empty(0)
         selector = self.selector_for(flat.device)
-        if self.repr == "mask":
-            return flat[selector]
         if self.repr == "indices":
-            return flat[selector]
+            return torch.index_select(flat, 0, selector)
+        if self.repr == "mask":
+            return torch.masked_select(flat, selector)
+        raise ValueError(f"Unknown compiled repr {self.repr!r}")
+
+    def select_from_param_grad(self, grad: torch.Tensor) -> torch.Tensor:
+        """Select mapped entries from a parameter gradient without cloning the full tensor."""
+        if self.repr == "empty":
+            return grad.new_empty(0)
+        flat = grad.detach().reshape(-1)
+        if self.repr == "all":
+            return flat
+        selector = self.selector_for(flat.device)
+        if self.repr == "indices":
+            return torch.index_select(flat, 0, selector)
+        if self.repr == "mask":
+            return torch.masked_select(flat, selector)
         raise ValueError(f"Unknown compiled repr {self.repr!r}")
 
 
@@ -525,13 +539,7 @@ class ParamMappedGradiendModel(GradiendModel):
         parts: List[torch.Tensor] = []
         for selector in active_selectors:
             p = _get_param_for_map_name(selector.name)
-            grad = p.grad
-            if stream_to_cpu and grad.device.type != "cpu":
-                g = grad.detach().flatten()
-            else:
-                g = grad.detach().clone().flatten()
-
-            chunk = selector.select_flat(g)
+            chunk = selector.select_from_param_grad(p.grad)
             if target_device is not None and chunk.device != target_device:
                 chunk = chunk.to(target_device, non_blocking=False)
             parts.append(chunk)
@@ -592,12 +600,12 @@ class ParamMappedGradiendModel(GradiendModel):
         active_selectors = [selector for selector in selectors if selector.num_selected > 0]
 
         def _select_chunk(grad: torch.Tensor, selector: _CompiledParamSelector) -> torch.Tensor:
-            flat = grad.detach().flatten()
-            chunk = selector.select_flat(flat)
-
+            chunk = selector.select_from_param_grad(grad)
             if target_device is not None and chunk.device != target_device:
                 return chunk.to(target_device, non_blocking=False)
-            return chunk.clone()
+            if selector.repr == "all":
+                return chunk.clone()
+            return chunk
 
         for selector in active_selectors:
             p = _get_param_for_map_name(selector.name)

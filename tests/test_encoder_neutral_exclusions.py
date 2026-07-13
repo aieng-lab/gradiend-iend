@@ -5,13 +5,12 @@ from __future__ import annotations
 from unittest.mock import Mock, patch
 
 import pandas as pd
-import pytest
 import torch
 
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.text.prediction.dataset import create_masked_pair_from_text
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
-from tests.conftest import MockTokenizer
+from tests.testing_mocks import MockTokenizer
 
 
 def _make_trainer(**config_overrides) -> TextPredictionTrainer:

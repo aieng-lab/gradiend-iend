@@ -127,7 +127,11 @@ def main() -> None:
     print(f"Experiment dir: {config.args.experiment_dir}")
     print(f"Pronoun runs: {', '.join(cli_args.pronoun_ids)}")
 
-    models_for_venn = load_models_for_heatmap_from_cache(config, selected_trainers)
+    models_for_venn, _ = load_models_for_heatmap_from_cache(
+        config,
+        selected_trainers,
+        plot_only=True,
+    )
     labelled_models = {
         _pretty_label(run_id): models_for_venn[run_id]
         for run_id in cli_args.pronoun_ids

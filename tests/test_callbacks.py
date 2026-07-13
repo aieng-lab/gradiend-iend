@@ -5,14 +5,9 @@ Tests EarlyStoppingCallback, EvaluationCallback, CheckpointCallback,
 LoggingCallback, and NormalizationCallback.
 """
 
-import os
-import tempfile
-import shutil
 from unittest.mock import MagicMock, patch
-from typing import Dict, Any
 
 import pytest
-import torch
 
 from gradiend.trainer.core.callbacks import (
     TrainingCallback,

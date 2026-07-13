@@ -35,11 +35,19 @@ def _normalise_alignment(alignment: str) -> str:
 
 
 def source_by_id_from_trainers(trainers: Dict[str, object]) -> Dict[str, str]:
-    """Map trainer id → ``model.source`` (falls back to TrainingArguments)."""
-    from gradiend.model._source_target import resolve_model_source
+    """Map trainer id → trained ``model.source`` (from checkpoint metadata)."""
+    from gradiend.model._source_target import (
+        resolve_model_source,
+        resolve_source_from_checkpoint_dir,
+    )
+    from gradiend.util.paths import has_saved_model
 
     out: Dict[str, str] = {}
     for trainer_id, trainer in trainers.items():
+        model_path = getattr(trainer, "model_path", None)
+        if model_path and has_saved_model(str(model_path)):
+            out[str(trainer_id)] = resolve_source_from_checkpoint_dir(str(model_path))
+            continue
         model = trainer.get_model() if hasattr(trainer, "get_model") else None
         out[str(trainer_id)] = resolve_model_source(model, trainer)
     return out
@@ -398,7 +406,7 @@ def compute_dense_anchor_aligned_encoding_matrix(
     ``evaluate_encoder`` summaries, this evaluates **every** trainer on a shared
     per-class test pool so off-diagonal cross-domain cells are filled.
     """
-    from gradiend.comparison.feature_cross_encoding import build_cross_task_encoder_summary
+    from gradiend.comparison.cross_encoding import build_cross_task_encoder_summary
 
     encoder_summary = build_cross_task_encoder_summary(
         trainers,

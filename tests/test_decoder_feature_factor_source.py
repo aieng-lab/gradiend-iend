@@ -10,7 +10,7 @@ from gradiend.evaluator.decoder import (
     LMSThresholdPolicy,
 )
 from gradiend.model._source_target import feature_factor_from_encoding_direction
-from tests.conftest import MockTokenizer
+from tests.testing_mocks import MockTokenizer
 
 
 class _MockModel:

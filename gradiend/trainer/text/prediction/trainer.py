@@ -8,11 +8,9 @@ It supports per-class datasets and automatically creates training pairs.
 import os
 import json
 import random
-import numpy as np
 import pandas as pd
 import torch
 from dataclasses import dataclass
-from dataclasses import fields as dc_fields
 from typing import Dict, List, Optional, Union, Any, Tuple, Type, Sequence, Literal
 
 from gradiend.visualizer.plot_delegation import see_implementation
@@ -20,6 +18,15 @@ from gradiend.visualizer.plot_delegation import see_implementation
 from gradiend.util.tqdm_utils import gradiend_tqdm
 
 from gradiend.data.core import SplitGroupKey, SplitRatiosInput, normalize_split_ratios, resplit_unified_dataframe
+from gradiend.data.core.dataframe_splitting import split_dataframe
+from gradiend.trainer.core.split_col_modes import (
+    HELDOUT_SPLIT_COL,
+    data_split_column,
+    is_heldout_split_mode,
+    is_random_resplit_mode,
+    loading_split_col,
+    uses_data_split_column,
+)
 from gradiend.trainer.trainer import Trainer, _apply_seed
 from gradiend.trainer.config import TrainerConfig
 from gradiend.trainer.core.arguments import TrainingArguments
@@ -30,8 +37,10 @@ from gradiend.trainer.core.unified_data import (
     all_subsets_to_mlm_df,
     apply_class_merge_to_merged_df,
     merged_to_unified,
+    has_explicit_alternative_columns,
     merge_per_class_dfs,
     per_class_dict_to_unified,
+    unified_from_per_class_merge_map,
     resolve_dataframe,
     resolve_training_data_path,
     load_hf_per_class,
@@ -211,10 +220,10 @@ class TextPredictionConfig(TrainerConfig):
     label_class_col: str = "label_class"
     split_col: Optional[str] = "split"
     """Dataset split column. ``\"split\"`` (default) uses row-level splits from the data.
-    ``None`` assigns vocabulary-held-out splits by factual token (per target class).
-    When omitted at trainer construction, vocabulary-held-out is auto-selected only if each
-    target class has >=10 rows and enough distinct factual tokens for the configured ratios;
-    otherwise existing random row splits are kept."""
+    ``None`` assigns random row-level train/validation/test splits (reshuffled when
+    ``split_resplit_per_seed=True``). ``\"heldout\"`` assigns vocabulary-held-out splits
+    by factual token (per target class). Vocabulary-held-out splitting is never selected
+    automatically; the user must explicitly set ``split_col=\"heldout\"``."""
     split_group_col: Optional[str] = None
     """Unified column for vocabulary-held-out resplit (default: factual token column)."""
     split_group_key: SplitGroupKey = None
@@ -584,8 +593,8 @@ class TextPredictionTrainer(Trainer):
         key_kwargs: Dict[str, Any] = {}
         if split is not None:
             available = None
-            if self.combined_data is not None and UNIFIED_SPLIT in self.combined_data.columns:
-                available = self.combined_data[UNIFIED_SPLIT].dropna().astype(str).tolist()
+            if self._data_loaded and self._combined_data is not None and UNIFIED_SPLIT in self._combined_data.columns:
+                available = self._combined_data[UNIFIED_SPLIT].dropna().astype(str).tolist()
             key_kwargs["split"] = encoder_split_cache_key(split, available=available)
         if max_size is not None:
             key_kwargs["max_size"] = max_size
@@ -943,7 +952,7 @@ class TextPredictionTrainer(Trainer):
         available = combined_data[UNIFIED_SPLIT].dropna().astype(str).tolist()
         policy = SplitPolicy.from_available(available)
         do_eval = bool(getattr(getattr(self, "training_args", None), "do_eval", True))
-        vocabulary_held_out = getattr(self.config, "split_col", "split") is None
+        vocabulary_held_out = is_heldout_split_mode(getattr(self.config, "split_col", "split"))
 
         if required_splits is not None:
             required = [normalize_split_name(split) for split in required_splits]
@@ -1001,26 +1010,17 @@ class TextPredictionTrainer(Trainer):
         min_keys = sum(1 for ratio in (train_ratio, val_ratio, test_ratio) if ratio > 0)
         target_classes = self._target_classes or self.config.target_classes
         raise ValueError(
-            "split_col=None requires vocabulary-held-out splits with at least 10 rows and "
+            f"split_col={HELDOUT_SPLIT_COL!r} requires vocabulary-held-out splits with at least 10 rows and "
             f"at least {min_keys} distinct factual token(s) per target class "
             f"{list(target_classes) if target_classes else []}. "
-            "Add more target tokens, lower split ratios, or use split_col='split' for random row splits."
+            "Add more target tokens, lower split ratios, use split_col='split' for fixed row splits, "
+            "or split_col=None for random row resplitting."
         )
 
     def _resolve_split_col_strategy(self) -> None:
-        """Pick random row splits vs vocabulary-held-out when split_col was not set explicitly."""
-        if self._split_col_explicit:
-            if self.config.split_col is None:
-                self._validate_explicit_vocabulary_split_or_raise()
-            return
-        if self._vocabulary_split_viable_for_targets():
-            logger.info(
-                "Auto-selected vocabulary-held-out splits (>=10 rows and sufficient distinct "
-                "factual tokens per target class)."
-            )
-            self.config.split_col = None
-        else:
-            self.config.split_col = "split"
+        """Validate an explicitly requested vocabulary-held-out split strategy."""
+        if is_heldout_split_mode(self.config.split_col):
+            self._validate_explicit_vocabulary_split_or_raise()
 
     def _target_pair_transition_mask(self, df: pd.DataFrame) -> pd.Series:
         target_classes = self._target_classes or self.config.target_classes
@@ -1075,7 +1075,7 @@ class TextPredictionTrainer(Trainer):
         split_cycle_index: Optional[int] = None,
         split_cycle_length: Optional[int] = None,
     ) -> None:
-        if self.config.split_col is not None:
+        if not is_heldout_split_mode(self.config.split_col):
             return
         if self._combined_data_template is None:
             return
@@ -1129,6 +1129,40 @@ class TextPredictionTrainer(Trainer):
             )
         self._splits_resplit_seed = int(seed)
 
+    def _apply_random_row_splits(self, seed: int) -> None:
+        if not is_random_resplit_mode(self.config.split_col):
+            return
+        if self._combined_data_template is None:
+            return
+        train_ratio, val_ratio, test_ratio = self._configured_split_ratios()
+        template = self._combined_data_template
+
+        def _resplit_df(df: pd.DataFrame) -> pd.DataFrame:
+            if df.empty:
+                return df
+            parts = []
+            for _, group in df.groupby(UNIFIED_FACTUAL_CLASS, sort=False):
+                parts.append(
+                    split_dataframe(
+                        group,
+                        train_ratio,
+                        val_ratio,
+                        test_ratio,
+                        int(seed),
+                        split_col=UNIFIED_SPLIT,
+                    )
+                )
+            return pd.concat(parts, ignore_index=True)
+
+        pair_mask = self._target_pair_transition_mask(template)
+        if pair_mask.any() and not pair_mask.all():
+            pair_df = _resplit_df(template[pair_mask])
+            other_df = template[~pair_mask].copy()
+            self._combined_data = pd.concat([pair_df, other_df], ignore_index=True)
+        else:
+            self._combined_data = _resplit_df(template)
+        self._splits_resplit_seed = int(seed)
+
     def _refresh_data_splits_for_seed(
         self,
         seed_value: int,
@@ -1137,11 +1171,15 @@ class TextPredictionTrainer(Trainer):
         split_cycle_index: Optional[int] = None,
         split_cycle_length: Optional[int] = None,
     ) -> None:
-        if self.config.split_col is not None:
+        heldout = is_heldout_split_mode(self.config.split_col)
+        random_resplit = is_random_resplit_mode(self.config.split_col)
+        if not heldout and not random_resplit:
             return
         per_seed = bool(getattr(args, "split_resplit_per_seed", False))
         balanced_cycle = bool(
-            per_seed and getattr(args, "split_resplit_strategy", "random") == "balanced_cycle"
+            heldout
+            and per_seed
+            and getattr(args, "split_resplit_strategy", "random") == "balanced_cycle"
         )
         target_seed = (
             self._resplit_seed_for_training(None)
@@ -1150,12 +1188,15 @@ class TextPredictionTrainer(Trainer):
         )
         if not per_seed and self._splits_resplit_seed == target_seed:
             return
-        self._apply_vocabulary_splits(
-            target_seed,
-            seed_value=seed_value if per_seed else None,
-            split_cycle_index=split_cycle_index,
-            split_cycle_length=split_cycle_length,
-        )
+        if heldout:
+            self._apply_vocabulary_splits(
+                target_seed,
+                seed_value=seed_value if per_seed else None,
+                split_cycle_index=split_cycle_index,
+                split_cycle_length=split_cycle_length,
+            )
+        else:
+            self._apply_random_row_splits(target_seed)
 
     def _ensure_data_for_training(self) -> None:
         """Ensure data is loaded before creating the model for training (so pair is set and from_pretrained can set feature_class_encoding_direction)."""
@@ -1235,7 +1276,7 @@ class TextPredictionTrainer(Trainer):
             self._combined_data = merged_to_unified(
                 data_df,
                 masked_col=config.masked_col,
-                split_col=config.split_col,
+                split_col=loading_split_col(config.split_col),
                 label_class_col=config.label_class_col,
                 label_col=config.label_col,
                 target_col=config.alternative_col,
@@ -1255,7 +1296,7 @@ class TextPredictionTrainer(Trainer):
                 classes=classes_to_load,
                 splits=config.hf_splits,
                 masked_col=config.masked_col,
-                split_col=config.split_col,
+                split_col=loading_split_col(config.split_col),
                 dataset_trust_remote_code=config.dataset_trust_remote_code,
             )
             self.data = class_dfs
@@ -1278,7 +1319,7 @@ class TextPredictionTrainer(Trainer):
                 class_dfs,
                 classes=inferred_classes,
                 masked_col=config.masked_col,
-                split_col=config.split_col,
+                split_col=loading_split_col(config.split_col),
                 use_class_names_as_columns=getattr(config, "use_class_names_as_columns", True),
                 pair=_pair_for_unified(inferred_classes, pair),
                 include_identity_rows=False,
@@ -1314,7 +1355,7 @@ class TextPredictionTrainer(Trainer):
                     class_dfs,
                     classes=classes_for_transitions,
                     masked_col=config.masked_col,
-                    split_col=config.split_col,
+                    split_col=loading_split_col(config.split_col),
                     use_class_names_as_columns=getattr(config, "use_class_names_as_columns", True),
                     pair=_pair_for_unified(classes_for_transitions, pair),
                     include_identity_rows=False,
@@ -1325,33 +1366,51 @@ class TextPredictionTrainer(Trainer):
             elif isinstance(config.data, pd.DataFrame):
                 data_df = config.data
                 merge_map = getattr(config, "class_merge_map", None)
-                if (
-                    merge_map
-                    and config.alternative_col
-                    and config.alternative_class_col
-                    and config.alternative_col in data_df.columns
-                    and config.alternative_class_col in data_df.columns
-                ):
-                    data_df = apply_class_merge_to_merged_df(
-                        data_df,
-                        merge_map,
-                        label_class_col=config.label_class_col,
-                        target_class_col=config.alternative_class_col,
-                        target_classes=config.target_classes,
-                        keep_raw=True,
-                        transition_groups=getattr(config, "class_merge_transition_groups", None),
-                    )
                 self.data = config.data
-                self._combined_data = merged_to_unified(
+                if merge_map and not has_explicit_alternative_columns(
                     data_df,
-                    masked_col=config.masked_col,
-                    split_col=config.split_col,
-                    label_class_col=config.label_class_col,
-                    label_col=config.label_col,
-                    target_col=config.alternative_col,
-                    target_class_col=config.alternative_class_col,
-                    pair=self.pair,
-                )
+                    alternative_col=config.alternative_col,
+                    alternative_class_col=config.alternative_class_col,
+                ):
+                    self._combined_data = unified_from_per_class_merge_map(
+                        data_df,
+                        merge_map=merge_map,
+                        target_classes=config.target_classes,
+                        masked_col=config.masked_col,
+                        split_col=loading_split_col(config.split_col),
+                        label_class_col=config.label_class_col,
+                        use_class_names_as_columns=getattr(config, "use_class_names_as_columns", True),
+                        pair=self.pair,
+                        max_counterfactuals_per_sentence=getattr(
+                            config, "max_counterfactuals_per_sentence", 1
+                        ),
+                        random_state=getattr(config, "random_state", getattr(config, "seed", None)),
+                    )
+                else:
+                    if merge_map and has_explicit_alternative_columns(
+                        data_df,
+                        alternative_col=config.alternative_col,
+                        alternative_class_col=config.alternative_class_col,
+                    ):
+                        data_df = apply_class_merge_to_merged_df(
+                            data_df,
+                            merge_map,
+                            label_class_col=config.label_class_col,
+                            target_class_col=config.alternative_class_col,
+                            target_classes=config.target_classes,
+                            keep_raw=True,
+                            transition_groups=getattr(config, "class_merge_transition_groups", None),
+                        )
+                    self._combined_data = merged_to_unified(
+                        data_df,
+                        masked_col=config.masked_col,
+                        split_col=loading_split_col(config.split_col),
+                        label_class_col=config.label_class_col,
+                        label_col=config.label_col,
+                        target_col=config.alternative_col,
+                        target_class_col=config.alternative_class_col,
+                        pair=self.pair,
+                    )
                 if self._combined_data is not None:
                     src = self._combined_data[UNIFIED_FACTUAL_CLASS].unique().tolist()
                     tgt = self._combined_data[UNIFIED_ALTERNATIVE_CLASS].unique().tolist()
@@ -1361,32 +1420,50 @@ class TextPredictionTrainer(Trainer):
                 self._exclude_generated_incomplete_target_classes(config.data)
                 self.data = data_df
                 merge_map = getattr(config, "class_merge_map", None)
-                if (
-                    merge_map
-                    and config.alternative_col
-                    and config.alternative_class_col
-                    and config.alternative_col in data_df.columns
-                    and config.alternative_class_col in data_df.columns
-                ):
-                    data_df = apply_class_merge_to_merged_df(
-                        data_df,
-                        merge_map,
-                        label_class_col=config.label_class_col,
-                        target_class_col=config.alternative_class_col,
-                        target_classes=config.target_classes,
-                        keep_raw=True,
-                        transition_groups=getattr(config, "class_merge_transition_groups", None),
-                    )
-                self._combined_data = merged_to_unified(
+                if merge_map and not has_explicit_alternative_columns(
                     data_df,
-                    masked_col=config.masked_col,
-                    split_col=config.split_col,
-                    label_class_col=config.label_class_col,
-                    label_col=config.label_col,
-                    target_col=config.alternative_col,
-                    target_class_col=config.alternative_class_col,
-                    pair=self.pair,
-                )
+                    alternative_col=config.alternative_col,
+                    alternative_class_col=config.alternative_class_col,
+                ):
+                    self._combined_data = unified_from_per_class_merge_map(
+                        data_df,
+                        merge_map=merge_map,
+                        target_classes=config.target_classes,
+                        masked_col=config.masked_col,
+                        split_col=loading_split_col(config.split_col),
+                        label_class_col=config.label_class_col,
+                        use_class_names_as_columns=getattr(config, "use_class_names_as_columns", True),
+                        pair=self.pair,
+                        max_counterfactuals_per_sentence=getattr(
+                            config, "max_counterfactuals_per_sentence", 1
+                        ),
+                        random_state=getattr(config, "random_state", getattr(config, "seed", None)),
+                    )
+                else:
+                    if merge_map and has_explicit_alternative_columns(
+                        data_df,
+                        alternative_col=config.alternative_col,
+                        alternative_class_col=config.alternative_class_col,
+                    ):
+                        data_df = apply_class_merge_to_merged_df(
+                            data_df,
+                            merge_map,
+                            label_class_col=config.label_class_col,
+                            target_class_col=config.alternative_class_col,
+                            target_classes=config.target_classes,
+                            keep_raw=True,
+                            transition_groups=getattr(config, "class_merge_transition_groups", None),
+                        )
+                    self._combined_data = merged_to_unified(
+                        data_df,
+                        masked_col=config.masked_col,
+                        split_col=loading_split_col(config.split_col),
+                        label_class_col=config.label_class_col,
+                        label_col=config.label_col,
+                        target_col=config.alternative_col,
+                        target_class_col=config.alternative_class_col,
+                        pair=self.pair,
+                    )
                 if self._combined_data is not None:
                     src = self._combined_data[UNIFIED_FACTUAL_CLASS].unique().tolist()
                     tgt = self._combined_data[UNIFIED_ALTERNATIVE_CLASS].unique().tolist()
@@ -1398,9 +1475,12 @@ class TextPredictionTrainer(Trainer):
                 )
         self._check_data_non_empty()
         self._resolve_split_col_strategy()
-        if config.split_col is None:
+        if is_heldout_split_mode(config.split_col):
             self._combined_data_template = self._combined_data.copy()
             self._apply_vocabulary_splits(self._resplit_seed_for_training())
+        elif is_random_resplit_mode(config.split_col):
+            self._combined_data_template = self._combined_data.copy()
+            self._apply_random_row_splits(self._resplit_seed_for_training())
         else:
             self._combined_data_template = None
         self._data_loaded = True
@@ -1682,7 +1762,9 @@ class TextPredictionTrainer(Trainer):
             ValueError: If required columns are missing
         """
         cfg = self.config
-        required = {cfg.masked_col, cfg.label_col, cfg.label_class_col, cfg.split_col}
+        required = {cfg.masked_col, cfg.label_col, cfg.label_class_col}
+        if uses_data_split_column(cfg.split_col):
+            required.add(cfg.split_col)
         missing = [c for c in required if c not in df.columns]
         if missing:
             raise ValueError(f"Missing required columns in text prediction data: {missing}")
@@ -1963,13 +2045,13 @@ class TextPredictionTrainer(Trainer):
                     training_pairs.append(identity_entry)
                 # Always add identity rows from per-class datasets for neutral classes missing in unified data.
                 if getattr(self, "class_datasets", None):
-                    split_col_cfg = self.config.split_col
+                    split_col_cfg = data_split_column(self.config.split_col)
                     masked_col_cfg = self.config.masked_col
                     for c in neutral_classes:
                         if c not in self.class_datasets:
                             continue
                         df_c = self.class_datasets[c]
-                        if split_col_cfg not in df_c.columns:
+                        if not uses_data_split_column(self.config.split_col) or split_col_cfg not in df_c.columns:
                             subset = df_c
                         else:
                             subset = df_c[
@@ -2077,17 +2159,25 @@ class TextPredictionTrainer(Trainer):
             **kwargs: Optional gradient dataset settings such as ``source``,
                 ``target``, ``dtype``, and ``device``.
         """
-        source = kwargs.pop("source", None)
-        target = kwargs.pop("target", None)
+        from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
+
+        source = kwargs.pop("source", GRADIENT_DATASET_KWARG_UNSET)
+        target = kwargs.pop("target", GRADIENT_DATASET_KWARG_UNSET)
         args = getattr(self, "training_args", None)
-        if source is None and args is not None:
-            source = None if getattr(args, "supervised_decoder", False) else getattr(args, "source", "factual")
+        if source is GRADIENT_DATASET_KWARG_UNSET:
+            if args is not None:
+                source = None if getattr(args, "supervised_decoder", False) else getattr(args, "source", "factual")
+            else:
+                source = "factual"
         if source is None:
             source = "factual"
-        if target is None and args is not None:
-            target = getattr(args, "target", "diff")
-        if target is None:
-            target = "diff"
+        if target is GRADIENT_DATASET_KWARG_UNSET:
+            if args is not None:
+                target = getattr(args, "target", "diff")
+            else:
+                target = "diff"
+            if target is None:
+                target = "diff"
         tokenizer = model_with_gradiend.tokenizer
         dtype = kwargs.pop("dtype", model_with_gradiend.gradiend.torch_dtype)
         device = kwargs.pop("device", model_with_gradiend.gradiend.device_encoder)
@@ -2972,7 +3062,7 @@ class TextPredictionTrainer(Trainer):
         if getattr(self, "class_datasets", None):
             frames: List[pd.DataFrame] = []
             masked_col = self.config.masked_col
-            split_col = self.config.split_col or "split"
+            split_col = data_split_column(self.config.split_col)
             use_class_cols = getattr(self.config, "use_class_names_as_columns", True)
             for split_name in order_split_names(["train", "validation", "test", "all"]):
                 try:
@@ -3019,7 +3109,7 @@ class TextPredictionTrainer(Trainer):
                 self.class_datasets,
                 split=split,
                 masked_col=self.config.masked_col,
-                split_col=self.config.split_col,
+                split_col=data_split_column(self.config.split_col),
                 use_class_names_as_columns=getattr(
                     self.config, "use_class_names_as_columns", True
                 ),

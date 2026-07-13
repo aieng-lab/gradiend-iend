@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pandas as pd
 
 from gradiend.examples import train_sentiment
@@ -44,7 +46,7 @@ def test_apply_vocabulary_held_out_split_assigns_all_splits():
     assert {"train", "validation", "test"}.issubset(splits)
 
 
-def test_train_sentiment_seed_controls_manual_split_seed(monkeypatch, tmp_path):
+def test_train_sentiment_seed_controls_manual_split_seed(monkeypatch):
     captured = {}
 
     class DummyTrainer:
@@ -82,13 +84,13 @@ def test_train_sentiment_seed_controls_manual_split_seed(monkeypatch, tmp_path):
     monkeypatch.setattr(train_sentiment, "_evaluate_split_stability", lambda trainer, experiment_dir: None)
 
     train_sentiment.train(
-        training_path=tmp_path / "training.csv",
-        neutral_path=tmp_path / "neutral.csv",
-        experiment_dir=tmp_path / "runs",
+        training_path=Path("unused-test-path/training.csv"),
+        neutral_path=Path("unused-test-path/neutral.csv"),
+        experiment_dir=Path("unused-test-path/runs"),
         seed=123,
     )
 
     assert captured["args"].seed == 123
     assert captured["split_seed"] == 123
-    assert captured["config"].split_col is None
+    assert captured["config"].split_col == "split"
     assert captured["trained"] is True

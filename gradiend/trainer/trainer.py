@@ -11,7 +11,6 @@ import os
 import tempfile
 import shutil
 import random
-import time
 import numpy as np
 import json
 from typing import Any, Dict, List, Literal, Optional, Sequence, Type, Union, Tuple
@@ -23,6 +22,7 @@ from torch.utils.data import DataLoader
 
 from gradiend import ModelWithGradiend
 from gradiend.model._source_target import sync_model_source_target_from_training_args
+from gradiend.model.model_with_gradiend import _is_gradiend_checkpoint
 from gradiend.util.paths import resolve_encoder_plot_path
 from gradiend.trainer.core.feature_definition import FeatureLearningDefinition, _resolve_encoder_df
 from gradiend.util.paths import (
@@ -46,6 +46,7 @@ from gradiend.trainer.factory import create_model_with_gradiend
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.core.config import validate_source_target
 from gradiend.trainer.core.cache_policy import (
+    is_unconditional_training_cache,
     should_reuse_seed_training_cache,
     should_reuse_training_cache,
 )
@@ -491,7 +492,6 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         load_directory = load_directory if load_directory is not None else kwargs.pop("load_directory", None)
         # Return in-memory model when set (e.g. during training), unless loading from a specific path
         if load_directory is None and self._model_instance is not None:
-            sync_model_source_target_from_training_args(self._model_instance, self._training_args)
             return self._model_instance
         # Pass definition so models get pair/classes when loading
         kwargs.setdefault("definition", self)
@@ -501,7 +501,6 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 kwargs.setdefault("trust_remote_code", getattr(self._training_args, "trust_remote_code", False))
         load_directory = load_directory if load_directory is not None else self.model_path
         model = super().create_model_with_gradiend(load_directory, **kwargs)
-        sync_model_source_target_from_training_args(model, self._training_args)
         # Always cache in memory; use_cache elsewhere is for disk/output only
         self._model_instance = model
         self._model_manually_unloaded = False
@@ -1043,6 +1042,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         if has_saved_model(output_dir):
             invalidate_experiment_caches(self.experiment_dir)
 
+        from_gradiend_checkpoint = False
         if not isinstance(model, ModelWithGradiend):
             if runtime_monitor is not None:
                 runtime_monitor.mark("trainer:create_model_with_gradiend:start")
@@ -1056,6 +1056,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             getattr(self, "_ensure_data_for_training", lambda: None)()
             # Resolve to custom prediction head (e.g. decoder MLM head) when it exists
             load_path = self.resolve_model_path(model) if isinstance(model, str) else model
+            load_path_str = load_path if isinstance(load_path, str) else None
+            from_gradiend_checkpoint = bool(
+                load_path_str and _is_gradiend_checkpoint(load_path_str)
+            )
             model_with_gradiend = create_model_with_gradiend(
                 load_path,
                 feature_definition=self,
@@ -1071,8 +1075,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 )
         else:
             model_with_gradiend = model
+            ckpt_path = getattr(getattr(model_with_gradiend, "gradiend", None), "name_or_path", None)
+            from_gradiend_checkpoint = isinstance(ckpt_path, str) and _is_gradiend_checkpoint(ckpt_path)
 
-        sync_model_source_target_from_training_args(model_with_gradiend, config)
+        sync_model_source_target_from_training_args(
+            model_with_gradiend,
+            config,
+            allow_overwrite=not from_gradiend_checkpoint,
+        )
 
         # Store model instance so get_model() returns the training model during training
         self._model_instance = model_with_gradiend
@@ -1509,6 +1519,28 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 else:
                     seeds = [int(args.seed) + i for i in range(args.max_seeds)]
 
+                # ``use_cache="always"`` is an unconditional reuse policy.  Once a
+                # seed pool exists, treat that pool as complete instead of using a
+                # changed convergence policy as a reason to train additional seeds.
+                # This also lets interrupted legacy runs finalize their missing
+                # aggregate model from the checkpoints they already produced.
+                cached_seed_pool_only = False
+                if is_unconditional_training_cache(args.use_cache):
+                    cached_seeds = [
+                        seed_value
+                        for seed_value in seeds
+                        if has_saved_model(os.path.join(seed_runs_dir, f"seed_{seed_value}"))
+                    ]
+                    if cached_seeds:
+                        cached_seed_pool_only = True
+                        seeds = cached_seeds
+                        logger.info(
+                            "use_cache='always': finalizing from %s existing cached seed(s) %s; "
+                            "no additional seeds will be trained.",
+                            len(cached_seeds),
+                            cached_seeds,
+                        )
+
                 convergent_metric = (args.convergent_metric or ("loss" if args.supervised_decoder else "correlation")).lower()
                 threshold = args.convergent_score_threshold
                 min_convergent = args.min_convergent_seeds
@@ -1573,7 +1605,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     model_instance = None
                     if should_reuse_seed_training_cache(args.use_cache, seed_output_dir, training_args=args):
                         logger.info(
-                            "Seed %s: convergent cached model found at %s; skipping training.",
+                            "Seed %s: cached model found at %s; skipping training.",
                             seed_value,
                             seed_output_dir,
                         )
@@ -1871,6 +1903,12 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
 
                 if best_seed is None:
                     raise RuntimeError("Multi-seed training finished, but no valid training stats were found.")
+
+                if cached_seed_pool_only and early_stop_reason is None:
+                    early_stop_reason = (
+                        "use_cache='always': existing seed cache pool exhausted; "
+                        "no additional seeds were trained"
+                    )
 
                 convergent_seeds = [
                     int(run["seed"])

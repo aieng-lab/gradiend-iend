@@ -28,7 +28,7 @@ args = TrainingArguments(
     eval_steps=20,
     learning_rate=1e-5,
     experiment_dir=f'runs/demonstration-{model}',
-    use_cache=True,
+    use_cache=False,
     pre_prune_config=PrePruneConfig(n_samples=8, topk=0.1),
     post_prune_config=PostPruneConfig(topk=0.01),
 )

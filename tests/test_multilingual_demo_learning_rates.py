@@ -1,11 +1,12 @@
 """Per-problem learning rates for multilingual_gradiend_demo."""
 
 import argparse
-import sys
 
 import pytest
 
 from gradiend import TrainerCollection
+
+pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")

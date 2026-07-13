@@ -19,7 +19,7 @@ from gradiend.evaluator.decoder import DecoderEvaluator
 from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 from gradiend.model.model_with_gradiend import effective_rewrite_learning_rate
 from gradiend import TrainingArguments
-from tests.conftest import MockTokenizer, bind_trainer_cache_resolver
+from tests.testing_mocks import MockTokenizer, bind_trainer_cache_resolver
 
 
 class _TinyParamModel(torch.nn.Module):

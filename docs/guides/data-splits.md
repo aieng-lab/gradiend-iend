@@ -39,7 +39,7 @@ too few target surface forms for vocabulary holdout.
 trainer = TextPredictionTrainer(
     model="bert-base-uncased",
     data=training_data,
-    split_col=None,                              # let GRADIEND assign splits
+    split_col="heldout",                         # explicitly request vocabulary holdout
     split_group_key=[str.strip, str.casefold],   # what counts as one "word"
 )
 ```
@@ -85,4 +85,4 @@ Copy: runs/examples/sentiment/bert-base-uncased/split_stability/encoder_by_targe
 -->
 
 Runnable example: [train_sentiment.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment.py)
-(vocabulary-held-out splits via `split_col=None`; by-target plots under `split_stability/`).
+(vocabulary-held-out splits via `split_col="heldout"`; by-target plots under `split_stability/`).

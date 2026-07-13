@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
-from typing import Any, Set, Tuple
+import math
+from typing import Any, List, Set, Tuple
 
 import torch
 
 TOPK_EVAL = 1000
 TOPK_PART = "decoder-weight"
+DEFAULT_MIN_PRE_TOPK = 1e-6
+
+
+def dense_pre_topk_grid(*, min_topk: float = DEFAULT_MIN_PRE_TOPK) -> List[float]:
+    """Dense pre_topk grid: 1.0 plus 3×10^n and 10^n down to ``min_topk``."""
+    if not (0.0 < min_topk <= 1.0):
+        raise ValueError(f"min_topk must be in (0, 1], got {min_topk!r}")
+    values = [1.0]
+    min_exp = int(math.floor(math.log10(min_topk)))
+    for exponent in range(-1, min_exp - 1, -1):
+        decade = 10.0**exponent
+        values.append(3.0 * decade)
+        values.append(decade)
+    return sorted(
+        {float(v) for v in values if v + 1e-15 >= min_topk},
+        reverse=True,
+    )
 
 
 def ref_recall_metrics(heuristic: Set[int], ref: Set[int]) -> Tuple[float, float]:

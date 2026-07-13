@@ -14,6 +14,11 @@ This is the lightweight first pass before the large pre_topk x post_topk grid in
 ``gender_de_pruning_analysis.py``. Multi-pair recall screening with all der<->die pairs
 lives in ``gender_de_pre_prune_topk_ablation.py``.
 
+Fresh recall-only run (default output dir ``german_de_v3``)::
+
+  python experiments/gender_de_pruning_parameter_ablation.py --mode pre
+  python experiments/gender_de_pruning_parameter_ablation.py --mode plot
+
 Results are saved incrementally so interrupted runs can resume.
 """
 
@@ -21,13 +26,20 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 import math
 import os
 import sys
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 from matplotlib import pyplot as plt
@@ -36,14 +48,15 @@ from gradiend import TextPredictionTrainer, TrainingArguments
 from gradiend.trainer import PostPruneConfig, PrePruneConfig
 from gradiend.trainer.core.pruning import post_prune
 from gradiend.trainer.core.stats import load_training_stats
+from experiments.plot_output import save_figure
 from gradiend.util.logging import get_logger
 from gradiend.util.paths import ARTIFACT_MODEL, resolve_output_path
 from gradiend.util.runtime_monitor import CudaMemorySpan
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pre_prune_mask_recall import (  # noqa: E402
     TOPK_EVAL,
     TOPK_PART,
+    dense_pre_topk_grid,
     all_kept_base_global as _all_kept_base_global,
     ref_recall_metrics as _ref_recall_metrics,
     topk_base_global as _topk_base_global,
@@ -248,10 +261,11 @@ def _build_trainer(
     )
 
 
-PRE_SOURCES = ["alternative", "factual", "diff"]
+PRE_SOURCES = ["factual", "alternative", "diff"]
 PRE_N_SAMPLES = [1, 2, 4, 8, 16, 32, 64]
-PRE_TOPK_VALUES = [1.0, 0.1, 0.01, 0.001]
+PRE_TOPK_VALUES = dense_pre_topk_grid()
 PRE_PRUNE_SEED = 42
+DEFAULT_OUTPUT_DIR = os.path.join("runs", "pruning_parameter_ablation", "german_de_v3")
 POST_PARTS = ["decoder-weight", "decoder-bias", "decoder-sum", "encoder-weight"]
 POST_TOPK_VALUES = [1.0, 0.1, 0.01, 0.001, 0.0001]
 
@@ -288,6 +302,70 @@ class AblationResult:
     ref_precision: Optional[float] = None
     mask_recall: bool = False
     error: Optional[str] = None
+
+
+def _pair_slug(pair: Tuple[str, str]) -> str:
+    return f"{pair[0]}_{pair[1]}"
+
+
+def _topk_pair_results_path(output_dir: str, pair: Tuple[str, str]) -> str:
+    return os.path.join(output_dir, "pair_results", f"{_pair_slug(pair)}.json")
+
+
+def _has_topk_pair_results(output_dir: str, pair: Tuple[str, str]) -> bool:
+    if os.path.isfile(_topk_pair_results_path(output_dir, pair)):
+        return True
+    if os.path.isfile(os.path.join(output_dir, "pre_topk_grid_results.json")):
+        return True
+    index_dir = os.path.join(output_dir, "topk_indices", f"gender_de_{_pair_slug(pair)}")
+    if not os.path.isdir(index_dir):
+        return False
+    return any(
+        name.endswith(".json") and not name.endswith(".filepart")
+        for name in os.listdir(index_dir)
+    )
+
+
+def _plot_topk_pair_results(
+    *,
+    output_dir: str,
+    pair: Tuple[str, str],
+    sources: Iterable[str],
+    n_samples_values: Iterable[int],
+    pre_topk_values: Iterable[float],
+    show: bool,
+) -> bool:
+    """Plot recall results written by ``gender_de_pre_prune_topk_ablation.py``."""
+    pair_path = _topk_pair_results_path(output_dir, pair)
+    combined_path = os.path.join(output_dir, "pre_topk_grid_results.json")
+    topk_path = Path(__file__).resolve().with_name("gender_de_pre_prune_topk_ablation.py")
+    spec = importlib.util.spec_from_file_location("gender_de_pre_prune_topk_ablation", topk_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot load top-k ablation module from {topk_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    if not _has_topk_pair_results(output_dir, pair):
+        return False
+
+    mod.backfill_results_from_topk_indices(output_dir, pair, results_path=pair_path)
+
+    results = mod.resolve_plot_grid_results(
+        output_dir,
+        [pair],
+        require_converged=True,
+    )
+    mod.plot_all(
+        results,
+        output_dir=output_dir,
+        sources=list(sources),
+        n_samples_values=list(n_samples_values),
+        pre_topk_values=list(pre_topk_values),
+        require_converged=True,
+        show=show,
+    )
+    return True
 
 
 def _record_cuda_memory_span(result: AblationResult, phase: str, span: CudaMemorySpan) -> None:
@@ -543,7 +621,7 @@ def run_pre_ablation(
                         pre_prune_start = time.perf_counter()
                         with CudaMemorySpan() as memory_span:
                             base_input_dim = int(trainer.get_model().gradiend.input_dim)
-                            trainer.pre_prune(inplace=False)
+                            trainer.pre_prune(pre_cfg, inplace=False)
                         result.pre_pruning_time_s = time.perf_counter() - pre_prune_start
                         _record_cuda_memory_span(result, "pre_pruning", memory_span)
                         model = trainer.get_model()
@@ -840,14 +918,26 @@ def plot_pre_metric(
     metric: str,
     output_path: str,
     mask_recall_only: bool = False,
+    show: bool = False,
 ) -> None:
     rows = [r for r in results if r.ablation == "pre" and r.error is None]
     if mask_recall_only:
         rows = [r for r in rows if r.mask_recall or (r.pre_topk is not None and math.isclose(r.pre_topk, 1.0))]
     n_samples_values = sorted({r.pre_n_samples for r in rows if r.pre_n_samples is not None})
-    sources = sorted({r.pre_source for r in rows if r.pre_source is not None})
+    present_sources = {r.pre_source for r in rows if r.pre_source is not None}
+    sources = [source for source in PRE_SOURCES if source in present_sources]
     topks = sorted({r.pre_topk for r in rows if r.pre_topk is not None}, reverse=True)
     if not rows or not n_samples_values or not sources or not topks:
+        logger.warning(
+            "Skipping %s plot: no plottable pre-prune rows in %s "
+            "(have rows=%s, n_samples=%s, sources=%s, pre_topk=%s).",
+            metric,
+            output_path,
+            len(rows),
+            n_samples_values,
+            sources,
+            [f"{v:g}" for v in topks],
+        )
         return
 
     fig, axes = plt.subplots(1, len(topks), figsize=(6 * len(topks), 4), squeeze=False)
@@ -901,9 +991,7 @@ def plot_pre_metric(
         ax.grid(True, alpha=0.3)
         ax.legend()
     fig.tight_layout()
-    _ensure_dir(os.path.dirname(output_path))
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, output_path, show=show)
 
 
 def plot_post_part_metric(
@@ -911,11 +999,13 @@ def plot_post_part_metric(
     *,
     metric: str,
     output_path: str,
+    show: bool = False,
 ) -> None:
     rows = [r for r in results if r.ablation == "post_part" and r.error is None]
     parts = sorted({r.post_part for r in rows if r.post_part != "baseline"})
     topks = sorted({r.post_topk for r in rows if r.post_topk is not None})
     if not rows or not topks:
+        logger.warning("Skipping %s post-part plot: no plottable rows.", metric)
         return
     display_parts = ["baseline"] + parts
     grid = []
@@ -946,15 +1036,13 @@ def plot_post_part_metric(
     ax.set_title(metric.replace("_", " "))
     fig.colorbar(im, ax=ax, label=metric.replace("_", " "))
     fig.tight_layout()
-    _ensure_dir(os.path.dirname(output_path))
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
+    save_figure(fig, output_path, show=show)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["pre", "post-part", "both", "plot"], default="pre")
-    parser.add_argument("--output-dir", default=os.path.join("runs", "pruning_parameter_ablation", "german_de_v1"))
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--results-path", default=None)
     parser.add_argument("--pair", default="masc_nom:fem_nom")
     mode_group = parser.add_mutually_exclusive_group()
@@ -987,8 +1075,28 @@ def main() -> None:
     if len(pair) != 2 or not pair[0] or not pair[1]:
         raise ValueError("--pair must have form source_class:target_class")
     results_path = args.results_path or os.path.join(args.output_dir, "pruning_parameter_ablation_results.json")
+    show_plots = args.mode == "plot"
 
-    results: List[AblationResult] = _load_results(results_path)
+    if args.mode == "plot":
+        native_results = _load_results(results_path) if os.path.isfile(results_path) else []
+        if not native_results:
+            if _plot_topk_pair_results(
+                output_dir=args.output_dir,
+                pair=(pair[0], pair[1]),
+                sources=args.pre_sources,
+                n_samples_values=args.pre_n_samples,
+                pre_topk_values=args.pre_topk_values,
+                show=show_plots,
+            ):
+                return
+            raise FileNotFoundError(
+                f"No results at {results_path!r} and no top-k pair results at "
+                f"{_topk_pair_results_path(args.output_dir, (pair[0], pair[1]))!r}. "
+                "Run the ablation first, or point --output-dir at an existing run."
+            )
+        results = native_results
+    else:
+        results = _load_results(results_path)
     if args.mode in ("pre", "both"):
         results = run_pre_ablation(
             output_dir=args.output_dir,
@@ -1017,17 +1125,20 @@ def main() -> None:
                 metric="ref_recall",
                 output_path=os.path.join(args.output_dir, "pre_ref_recall.pdf"),
                 mask_recall_only=True,
+                show=show_plots,
             )
             plot_pre_metric(
                 results,
                 metric="ref_precision",
                 output_path=os.path.join(args.output_dir, "pre_ref_precision.pdf"),
                 mask_recall_only=True,
+                show=show_plots,
             )
             plot_pre_metric(
                 results,
                 metric="pre_pruning_time_s",
                 output_path=os.path.join(args.output_dir, "pre_pruning_time.pdf"),
+                show=show_plots,
             )
         else:
             plot_pre_metric(

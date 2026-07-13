@@ -6,6 +6,7 @@ from gradiend import TrainingArguments
 from gradiend.visualizer.labels import (
     NON_CONVERGENCE_MARKER,
     NON_CONVERGENCE_MARKER_TEX,
+    converged_for_trainer,
     converged_from_run_info,
     format_plotly_label,
     format_label_with_convergence,
@@ -18,10 +19,24 @@ from gradiend.visualizer.labels import (
 
 
 class _TrainerStub:
-    def __init__(self, *, run_id="demo_run", highlight=True, converged=False):
+    def __init__(
+        self,
+        *,
+        run_id="demo_run",
+        highlight=True,
+        converged=False,
+        seed_report=None,
+        min_convergent_seeds=None,
+    ):
         self.run_id = run_id
-        self.training_args = TrainingArguments(highlight_non_convergence=highlight)
+        self.training_args = TrainingArguments(
+            highlight_non_convergence=highlight,
+            min_convergent_seeds=(
+                min_convergent_seeds if min_convergent_seeds is not None else 1
+            ),
+        )
         self._converged = converged
+        self._seed_report = seed_report
 
     def get_training_stats(self):
         return {
@@ -29,9 +44,12 @@ class _TrainerStub:
             "training_stats": {},
         }
 
+    def get_seed_report(self):
+        return self._seed_report
 
-def test_non_convergence_marker_is_latin_cross():
-    assert NON_CONVERGENCE_MARKER == "✝"
+
+def test_non_convergence_marker_is_visible_dagger():
+    assert NON_CONVERGENCE_MARKER == "†"
     assert NON_CONVERGENCE_MARKER != "✗"
 
 
@@ -86,7 +104,21 @@ def test_resolve_plot_title_with_convergence():
     assert resolve_plot_title_with_convergence(True, trainer=trainer_ok) == "ok"
 
 
-def test_resolve_axis_convergence_from_aligned_rows():
+def test_converged_for_trainer_uses_current_seed_requirement_over_stale_report():
+    trainer = _TrainerStub(
+        converged=True,
+        seed_report={
+            "convergent_count": 1,
+            "min_convergent_seeds": 1,
+            "runs": [{"seed": 17, "converged": True}],
+        },
+        min_convergent_seeds=3,
+    )
+
+    assert converged_for_trainer(trainer) is False
+
+
+def test_resolve_axis_convergence_does_not_mark_feature_axes_from_aligned_rows():
     import pandas as pd
 
     trainers = {
@@ -105,15 +137,35 @@ def test_resolve_axis_convergence_from_aligned_rows():
         {"aligned_rows": aligned_rows},
         models=trainers,
     )
-    assert row_status["A"] is False
-    assert row_status["B"] is True
-    assert row_status["C"] is False
-    assert col_status["A"] is True
-    assert col_status["B"] is True
-    assert col_status["C"] is False
+    assert row_status == {}
+    assert col_status == {}
 
 
-def test_resolve_axis_convergence_from_gradiend_feature_n_matrix():
+def test_resolve_axis_convergence_marks_unique_transition_pair_axes_only():
+    trainers = {
+        "gender_de_masc_nom_neut_nom": _TrainerStub(converged=False),
+        "gender_de_neut_nom_neut_dat": _TrainerStub(converged=True),
+    }
+    payload = {
+        "measure": "anchor_aligned_encoding_transition_mean",
+        "pair_by_trainer": {
+            "gender_de_masc_nom_neut_nom": ["masc_nom", "neut_nom"],
+            "gender_de_neut_nom_neut_dat": ["neut_nom", "neut_dat"],
+        },
+    }
+
+    row_status, col_status = resolve_axis_convergence_for_comparison_heatmap(
+        payload,
+        models=trainers,
+        row_ids=["masc_nom->neut_nom", "neut_nom"],
+        column_ids=["neut_nom->neut_dat", "neut_nom"],
+    )
+
+    assert row_status == {"masc_nom->neut_nom": False}
+    assert col_status == {"neut_nom->neut_dat": True}
+
+
+def test_resolve_axis_convergence_from_gradiend_feature_n_matrix_marks_only_trainer_rows():
     trainers = {
         "good": _TrainerStub(converged=True),
         "bad": _TrainerStub(converged=False),
@@ -131,8 +183,7 @@ def test_resolve_axis_convergence_from_gradiend_feature_n_matrix():
     )
     assert row_status["good"] is True
     assert row_status["bad"] is False
-    assert col_status["A"] is False
-    assert col_status["B"] is False
+    assert col_status == {}
 
 
 def test_format_model_labels_with_convergence():

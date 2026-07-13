@@ -16,7 +16,7 @@ Public API (from gradiend):
       load_training_stats, GradientTrainingDataset, TextGradientTrainingDataset,
       create_model_with_gradiend
 
-    - Comparison: compute_similarity_matrix, compute_cross_encoding_matrix,
+    - Comparison: compute_similarity_matrix, compute_trainer_pair_encoding_matrix,
 
       compute_anchor_aligned_encoding_matrix, compute_gradiend_feature_cross_encoding_matrix,
       compute_gradiend_transition_cross_encoding_matrix
@@ -76,7 +76,7 @@ __all__ = [
     "get_logger",
     "compute_similarity_matrix",
     "compute_grouped_similarity_matrices",
-    "compute_cross_encoding_matrix",
+    "compute_trainer_pair_encoding_matrix",
     "compute_anchor_aligned_encoding_matrix",
     "compute_gradiend_feature_cross_encoding_matrix",
     "compute_gradiend_transition_cross_encoding_matrix",
@@ -105,81 +105,106 @@ __all__ = [
     "plot_topk_overlap_heatmap",
     "plot_topk_overlap_venn",
     "check_plot_environment",
+    "configure_plot_style",
+    "PlotStyleConfig",
+    "PlotStyleStatus",
+    "format_transition_label",
+    "transition_bidi_arrow",
+    "transition_directed_arrow",
 ]
 
-_IMPORT_ERROR = None
-
-try:
+_LAZY_IMPORTS = {
     # Core model classes
-    from gradiend.model import GradiendModel, ParamMappedGradiendModel, ModelWithGradiend
-
-    # High-level data API (filter config, data creators, preprocess)
-    from gradiend.data import (
-        TextFilterConfig,
-        TextPredictionDataCreator,
-        DataCreator,
-        TextPreprocessConfig,
-        SpacyTagSpec,
-        preprocess_texts,
-        resolve_base_data,
-    )
-
-    # Text prediction trainer (high-level)
-    from gradiend.trainer.text.prediction.trainer import TextPredictionTrainer, TextPredictionConfig
-
+    "GradiendModel": ("gradiend.model", "GradiendModel"),
+    "ParamMappedGradiendModel": ("gradiend.model", "ParamMappedGradiendModel"),
+    "ModelWithGradiend": ("gradiend.model", "ModelWithGradiend"),
+    # High-level data API
+    "TextFilterConfig": ("gradiend.data", "TextFilterConfig"),
+    "TextPredictionDataCreator": ("gradiend.data", "TextPredictionDataCreator"),
+    "DataCreator": ("gradiend.data", "DataCreator"),
+    "TextPreprocessConfig": ("gradiend.data", "TextPreprocessConfig"),
+    "SpacyTagSpec": ("gradiend.data", "SpacyTagSpec"),
+    "preprocess_texts": ("gradiend.data", "preprocess_texts"),
+    "resolve_base_data": ("gradiend.data", "resolve_base_data"),
+    # Text prediction trainer
+    "TextPredictionTrainer": ("gradiend.trainer.text.prediction.trainer", "TextPredictionTrainer"),
+    "TextPredictionConfig": ("gradiend.trainer.text.prediction.trainer", "TextPredictionConfig"),
     # Logging
-    from gradiend.util.logging import setup_logging, get_logger
-    from gradiend.comparison import (
-        compute_similarity_matrix,
-        compute_grouped_similarity_matrices,
-        compute_cross_encoding_matrix,
-        compute_anchor_aligned_encoding_matrix,
-        compute_gradiend_feature_cross_encoding_matrix,
-        compute_gradiend_transition_cross_encoding_matrix,
-    )
-
-    # Visualization functions
-    from gradiend.visualizer import (
-        plot_gradiend_feature_cross_encoding_heatmap,
-        plot_gradiend_transition_cross_encoding_heatmap,
-        plot_comparison_heatmap,
-        plot_cross_encoding_heatmap,
-        plot_similarity_heatmap,
-        plot_topk_overlap_heatmap,
-        plot_topk_overlap_venn,
-        check_plot_environment,
-    )
-
+    "setup_logging": ("gradiend.util.logging", "setup_logging"),
+    "get_logger": ("gradiend.util.logging", "get_logger"),
+    # Comparison
+    "compute_similarity_matrix": ("gradiend.comparison", "compute_similarity_matrix"),
+    "compute_grouped_similarity_matrices": ("gradiend.comparison", "compute_grouped_similarity_matrices"),
+    "compute_trainer_pair_encoding_matrix": ("gradiend.comparison", "compute_trainer_pair_encoding_matrix"),
+    "compute_anchor_aligned_encoding_matrix": ("gradiend.comparison", "compute_anchor_aligned_encoding_matrix"),
+    "compute_gradiend_feature_cross_encoding_matrix": (
+        "gradiend.comparison",
+        "compute_gradiend_feature_cross_encoding_matrix",
+    ),
+    "compute_gradiend_transition_cross_encoding_matrix": (
+        "gradiend.comparison",
+        "compute_gradiend_transition_cross_encoding_matrix",
+    ),
+    # Visualization
+    "plot_gradiend_feature_cross_encoding_heatmap": (
+        "gradiend.visualizer",
+        "plot_gradiend_feature_cross_encoding_heatmap",
+    ),
+    "plot_gradiend_transition_cross_encoding_heatmap": (
+        "gradiend.visualizer",
+        "plot_gradiend_transition_cross_encoding_heatmap",
+    ),
+    "plot_comparison_heatmap": ("gradiend.visualizer", "plot_comparison_heatmap"),
+    "plot_cross_encoding_heatmap": ("gradiend.visualizer", "plot_cross_encoding_heatmap"),
+    "plot_similarity_heatmap": ("gradiend.visualizer", "plot_similarity_heatmap"),
+    "plot_topk_overlap_heatmap": ("gradiend.visualizer", "plot_topk_overlap_heatmap"),
+    "plot_topk_overlap_venn": ("gradiend.visualizer", "plot_topk_overlap_venn"),
+    "check_plot_environment": ("gradiend.visualizer", "check_plot_environment"),
+    "configure_plot_style": ("gradiend.visualizer", "configure_plot_style"),
+    "PlotStyleConfig": ("gradiend.visualizer", "PlotStyleConfig"),
+    "PlotStyleStatus": ("gradiend.visualizer", "PlotStyleStatus"),
+    "format_transition_label": ("gradiend.visualizer", "format_transition_label"),
+    "transition_bidi_arrow": ("gradiend.visualizer", "transition_bidi_arrow"),
+    "transition_directed_arrow": ("gradiend.visualizer", "transition_directed_arrow"),
     # Training
-    from gradiend.trainer import (
-        load_training_stats,
-        set_seed,
-        TrainerSuite,
-        TrainerCollection,
-        PositiveTrainerSuite,
-        SymmetricTrainerSuite,
-        SuitePairDefinition,
-        PositiveFeatureDefinition,
-        TrainingArguments,
-        TransitionSpec,
-        pair,
-        identity,
-        TrainerConfig,
-        GradientTrainingDataset,
-        TextGradientTrainingDataset,
-        create_model_with_gradiend,
-        PrePruneConfig,
-        PostPruneConfig,
-    )
-except Exception as exc:
-    _IMPORT_ERROR = exc
+    "load_training_stats": ("gradiend.trainer", "load_training_stats"),
+    "set_seed": ("gradiend.trainer", "set_seed"),
+    "TrainerSuite": ("gradiend.trainer", "TrainerSuite"),
+    "TrainerCollection": ("gradiend.trainer", "TrainerCollection"),
+    "PositiveTrainerSuite": ("gradiend.trainer", "PositiveTrainerSuite"),
+    "SymmetricTrainerSuite": ("gradiend.trainer", "SymmetricTrainerSuite"),
+    "SuitePairDefinition": ("gradiend.trainer", "SuitePairDefinition"),
+    "PositiveFeatureDefinition": ("gradiend.trainer", "PositiveFeatureDefinition"),
+    "TrainingArguments": ("gradiend.trainer", "TrainingArguments"),
+    "TransitionSpec": ("gradiend.trainer", "TransitionSpec"),
+    "pair": ("gradiend.trainer", "pair"),
+    "identity": ("gradiend.trainer", "identity"),
+    "TrainerConfig": ("gradiend.trainer", "TrainerConfig"),
+    "GradientTrainingDataset": ("gradiend.trainer", "GradientTrainingDataset"),
+    "TextGradientTrainingDataset": ("gradiend.trainer", "TextGradientTrainingDataset"),
+    "create_model_with_gradiend": ("gradiend.trainer", "create_model_with_gradiend"),
+    "PrePruneConfig": ("gradiend.trainer", "PrePruneConfig"),
+    "PostPruneConfig": ("gradiend.trainer", "PostPruneConfig"),
+}
 
 
 def __getattr__(name):
-    if name in __all__ and _IMPORT_ERROR is not None:
-        raise ImportError(
-            "Importing gradiend's full public API failed. "
-            "This usually means optional runtime dependencies such as torch are unavailable. "
-            "Import the needed submodule directly or fix the environment."
-        ) from _IMPORT_ERROR
+    if name in _LAZY_IMPORTS:
+        import importlib
+
+        module_name, attr_name = _LAZY_IMPORTS[name]
+        try:
+            value = getattr(importlib.import_module(module_name), attr_name)
+        except Exception as exc:
+            raise ImportError(
+                f"Importing gradiend.{name} failed. "
+                "This usually means an optional runtime dependency is unavailable. "
+                "Import a narrower submodule directly or fix the environment."
+            ) from exc
+        globals()[name] = value
+        return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

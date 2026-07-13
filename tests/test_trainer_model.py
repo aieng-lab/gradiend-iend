@@ -16,7 +16,7 @@ from gradiend.trainer import Trainer
 from gradiend.util.paths import resolve_decoder_stats_path
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel, GradiendModel
-from tests.conftest import SimpleMockModel
+from tests.testing_mocks import SimpleMockModel
 
 
 def _make_param_map_spec():
@@ -374,6 +374,76 @@ class TestMultiSeedTopkStability:
 
 
 class TestMultiSeedSelectionFallback:
+    def test_always_cache_finalizes_existing_seed_pool_without_training_more(self):
+        temp_dir = tempfile.mkdtemp(prefix="always_cache_seed_pool_")
+        try:
+            args = TrainingArguments(
+                experiment_dir=temp_dir,
+                use_cache="always",
+                max_seeds=4,
+                min_convergent_seeds=1,
+                convergent_score_threshold=0.5,
+                convergent_mean_by_class_threshold=0.5,
+                saved_seed_runs="all_tried",
+            )
+            trainer = MockTrainerForTest(model="mock-base", args=args)
+            output_dir = os.path.join(temp_dir, "selected_model")
+
+            stats_by_seed = {
+                0: (0.82, {-1.0: -0.2662, 1.0: 0.9}),
+                1: (0.61, {-1.0: 0.2, 1.0: 0.8}),
+            }
+            for seed_value, (correlation, means) in stats_by_seed.items():
+                seed_dir = os.path.join(temp_dir, "seeds", f"seed_{seed_value}")
+                os.makedirs(seed_dir, exist_ok=True)
+                with open(os.path.join(seed_dir, "config.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"architecture": {"input_dim": 4}}, handle)
+                with open(os.path.join(seed_dir, "model.safetensors"), "wb") as handle:
+                    handle.write(b"")
+                with open(os.path.join(seed_dir, "training.json"), "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "training_stats": {
+                                "correlation": correlation,
+                                "mean_by_class": {500: means},
+                            },
+                            "best_score_checkpoint": {
+                                "correlation": correlation,
+                                "global_step": 500,
+                            },
+                            "convergence_info": {
+                                "converged": False,
+                                "convergent_count": 0,
+                                "min_convergent_seeds": 1,
+                            },
+                        },
+                        handle,
+                    )
+
+            with patch.object(
+                MockTrainerForTest,
+                "_train",
+                side_effect=AssertionError("use_cache='always' must not extend an existing seed pool"),
+            ) as mock_train:
+                with patch.object(trainer, "evaluate_encoder", return_value={"correlation": 0.8}):
+                    with patch.object(MockTrainerForTest, "plot_training_convergence", return_value=None):
+                        result = trainer.train(output_dir=output_dir)
+
+            assert result is trainer
+            mock_train.assert_not_called()
+            assert os.path.exists(os.path.join(output_dir, "model.safetensors"))
+
+            seed_report_path = os.path.join(temp_dir, "seeds", "seed_report.json")
+            with open(seed_report_path, "r", encoding="utf-8") as handle:
+                seed_report = json.load(handle)
+
+            assert seed_report["seeds_tried"] == [0, 1]
+            assert all(run["used_cache"] for run in seed_report["runs"])
+            assert all(run["trained"] is False for run in seed_report["runs"])
+            assert "no additional seeds were trained" in seed_report["early_stop_reason"]
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     def test_train_does_not_count_step_zero_best_checkpoint_as_convergent(self):
         temp_dir = tempfile.mkdtemp(prefix="step_zero_best_checkpoint_case_")
         try:

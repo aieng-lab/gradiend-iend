@@ -16,7 +16,7 @@ from gradiend.visualizer.encoder_neutral import (
     build_multi_split_encoder_plot_frame,
     encoder_plot_xlabel,
 )
-from gradiend.visualizer.labels import resolve_highlight_non_convergence, resolve_plot_title_with_convergence
+from gradiend.visualizer.labels import resolve_highlight_non_convergence, resolve_plot_title_with_convergence, format_transition_label
 from gradiend.visualizer.plot_optional import _require_matplotlib, _require_seaborn
 from gradiend.util.logging import get_logger
 
@@ -632,8 +632,8 @@ def plot_encoder_distributions(
     def _display_label(raw: str) -> str:
         mapped = (legend_name_mapping or {}).get(raw)
         if mapped is not None:
-            return mapped
-        return raw
+            return format_transition_label(mapped)
+        return format_transition_label(raw)
 
     for (g, side) in half_pairs:
         legend_group = _legend_group_for_half(g, side)

@@ -6,9 +6,6 @@ Tests GradiendModel, ParamMappedGradiendModel, and ModelWithGradiend with toy ne
 
 import os
 import sys
-import tempfile
-import shutil
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,7 +13,6 @@ import torch
 import torch.nn as nn
 
 from gradiend.model import GradiendModel, ParamMappedGradiendModel
-from tests.conftest import SimpleMockModel, MockTokenizer
 
 
 class TestGradiendModel:
@@ -272,6 +268,38 @@ class TestParamMappedGradiendModel:
         assert base_stream.weight.grad is None
         assert base_stream.bias.grad is None
 
+    def test_param_mapped_select_from_param_grad_matches_select_flat(self, set_seed):
+        """Sparse selection should match flat indexing without cloning the full gradient."""
+        set_seed(0)
+        weight_mask = torch.tensor(
+            [[True, False, True, False], [False, True, False, True], [True, True, False, False]]
+        )
+        bias_indices = torch.tensor([0, 2])
+        param_map = {
+            "weight": {"shape": tuple(weight_mask.shape), "repr": "mask", "mask": weight_mask},
+            "bias": {"shape": (3,), "repr": "indices", "indices": bias_indices},
+        }
+        input_dim = int(weight_mask.sum().item() + bias_indices.numel())
+        gradiend = ParamMappedGradiendModel(input_dim=input_dim, latent_dim=1, param_map=param_map)
+
+        weight_grad = torch.randn(weight_mask.shape)
+        bias_grad = torch.randn(3)
+        for selector, grad in (
+            (gradiend._get_compiled_param_selectors()[0], weight_grad),
+            (gradiend._get_compiled_param_selectors()[1], bias_grad),
+        ):
+            expected = selector.select_flat(grad.detach().flatten())
+            actual = selector.select_from_param_grad(grad)
+            torch.testing.assert_close(actual, expected)
+
+        base = nn.Linear(4, 3)
+        base.weight.grad = weight_grad.clone()
+        base.bias.grad = bias_grad.clone()
+        weight_ptr = base.weight.grad.untyped_storage().data_ptr()
+        extracted = gradiend.extract_gradients(base, target_device=torch.device("cpu"))
+        assert base.weight.grad.untyped_storage().data_ptr() == weight_ptr
+        assert extracted.numel() == input_dim
+
     def test_param_mapped_model_pruning_updates_map(self):
         """Test that pruning updates param_map correctly."""
         param_map = {
@@ -387,7 +415,7 @@ class TestModelWithGradiend:
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
             # Return mock model and tokenizer directly
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -410,7 +438,7 @@ class TestModelWithGradiend:
 
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
             captured.update(kwargs)
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
 
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -453,7 +481,7 @@ class TestModelWithGradiend:
         from gradiend.trainer.text.common.model_base import TextModelWithGradiend
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -598,7 +626,7 @@ class TestModelWithGradiend:
         from gradiend.trainer.text.common.model_base import TextModelWithGradiend
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -631,7 +659,7 @@ class TestModelWithGradiend:
         from gradiend.trainer.text.common.model_base import TextModelWithGradiend
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -655,7 +683,7 @@ class TestModelWithGradiend:
         from gradiend.trainer.text.common.model_base import TextModelWithGradiend
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -679,7 +707,7 @@ class TestModelWithGradiend:
         from gradiend.trainer.text.common.model_base import TextModelWithGradiend
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -794,7 +822,7 @@ class TestModelWithGradiend:
         from gradiend.trainer.core.pruning import post_prune, PostPruneConfig
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -941,7 +969,7 @@ class TestModelWithGradiend:
         from gradiend.trainer.text.common.model_base import TextModelWithGradiend
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):

@@ -11,14 +11,14 @@ from gradiend.comparison.anchor_aligned import (
     source_by_id_from_trainers,
 )
 from gradiend.comparison.cross_encoding import (
-    can_normalize_cross_encoding_by_diagonal,
-    compute_cross_encoding_matrix,
-    normalize_cross_encoding_rows_by_diagonal,
-)
-from gradiend.comparison.encoder_aggregation import aggregate_encoder_dataframes
-from gradiend.comparison.feature_cross_encoding import (
     compute_gradiend_feature_cross_encoding_matrix,
     compute_gradiend_transition_cross_encoding_matrix,
+)
+from gradiend.comparison.encoder_aggregation import aggregate_encoder_dataframes
+from gradiend.comparison.trainer_pair_encoding import (
+    can_normalize_cross_encoding_by_diagonal,
+    compute_trainer_pair_encoding_matrix,
+    normalize_cross_encoding_rows_by_diagonal,
 )
 from gradiend.comparison.seed_policy import (
     enter_analysis_mode,
@@ -40,7 +40,7 @@ __all__ = [
     "compute_dense_anchor_aligned_encoding_matrix",
     "compute_similarity_matrix",
     "compute_grouped_similarity_matrices",
-    "compute_cross_encoding_matrix",
+    "compute_trainer_pair_encoding_matrix",
     "can_normalize_cross_encoding_by_diagonal",
     "compute_gradiend_feature_cross_encoding_matrix",
     "compute_gradiend_transition_cross_encoding_matrix",

@@ -13,7 +13,6 @@ import numpy as np
 from gradiend.util.paths import resolve_output_path, ARTIFACT_CONVERGENCE_PLOT
 from gradiend.visualizer.labels import resolve_highlight_non_convergence, resolve_plot_title_with_convergence
 from gradiend.visualizer.plot_optional import _require_matplotlib
-from gradiend.trainer.core.stats import load_training_stats
 from gradiend.util.logging import get_logger
 
 logger = get_logger(__name__)
@@ -556,6 +555,8 @@ def plot_training_convergence(
         else:
             run_info = {"training_stats": training_stats, "best_score_checkpoint": {}}
     elif model_path:
+        from gradiend.trainer.core.stats import load_training_stats
+
         run_info = load_training_stats(model_path)
         if run_info is None:
             logger.warning("No training.json at %s", model_path)

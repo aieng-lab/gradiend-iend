@@ -650,7 +650,7 @@ class TrainerSuite(ABC):
         )
         return compute_grouped_similarity_matrices(models, **kwargs)
 
-    def compute_cross_encoding_matrix(
+    def compute_trainer_pair_encoding_matrix(
         self,
         *,
         label_mapping: Optional[Dict[str, str]] = None,
@@ -659,7 +659,7 @@ class TrainerSuite(ABC):
         allow_incomplete: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Compute cross-encoding matrix for positive-pair suites.
+        """Compute trainer-pair encoding matrix for positive-pair suites.
 
         Args:
             label_mapping: Optional child-id to display-label mapping.
@@ -667,10 +667,10 @@ class TrainerSuite(ABC):
                 available transitions.
             run_evaluation: Whether to run missing encoder evaluation first.
             allow_incomplete: If True, tolerate missing child encoder results.
-            **kwargs: Forwarded by subclasses to cross-encoding computation.
+            **kwargs: Forwarded by subclasses to trainer-pair encoding computation.
         """
         raise NotImplementedError(
-            "compute_cross_encoding_matrix is only available for positive-pair suites. "
+            "compute_trainer_pair_encoding_matrix is only available for positive-pair suites. "
             "Use PositiveTrainerSuite for true/false-style pair semantics."
         )
 

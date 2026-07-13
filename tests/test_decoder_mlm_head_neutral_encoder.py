@@ -11,7 +11,7 @@ import torch
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
 from gradiend.trainer.text.prediction.dataset import create_masked_pair_from_text
-from tests.conftest import MockTokenizer
+from tests.testing_mocks import MockTokenizer
 
 
 class _Gpt2StyleTokenizer(MockTokenizer):

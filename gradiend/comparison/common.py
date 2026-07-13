@@ -216,7 +216,6 @@ def _encoder_label_correlation(encoder_df: Any) -> Optional[float]:
 
 def orient_encoder_df_by_label_correlation(encoder_df: Any, *, threshold: float = 0.0) -> Any:
     """Flip encoded signs when label correlation is negative (anchor-aligned frame)."""
-    import pandas as pd
 
     if not hasattr(encoder_df, "columns") or encoder_df.empty:
         return encoder_df

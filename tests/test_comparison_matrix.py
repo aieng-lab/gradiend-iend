@@ -90,6 +90,7 @@ def test_compute_similarity_matrix_multi_seed_reports_cell_counts_and_stats():
         measure="topk_overlap",
         topk=2,
         dispersion="std",
+        seed_pairing_mode="all_pairs",
     )
 
     assert result["multi_seed"] is True
@@ -97,6 +98,35 @@ def test_compute_similarity_matrix_multi_seed_reports_cell_counts_and_stats():
     assert result["matrix"][0][1] == pytest.approx(0.375)
     assert result["cell_stats"][0][1]["scores"] == pytest.approx([0.5, 0.0, 0.5, 0.5])
     assert "std" in result["cell_stats"][0][1]
+
+
+def test_compute_similarity_matrix_defaults_to_matched_seeds_with_identity_diagonal():
+    from gradiend.trainer.core.seed_models import SeedModelGroup
+
+    models = {
+        "a": SeedModelGroup(
+            [_TopKModel([1, 2]), _TopKModel([1, 3]), _TopKModel([1, 4])],
+            seed_values=[10, 11, 12],
+        ),
+        "b": SeedModelGroup(
+            [_TopKModel([2, 3]), _TopKModel([3, 4]), _TopKModel([1, 4])],
+            seed_values=[20, 21, 22],
+        ),
+    }
+
+    result = compute_similarity_matrix(
+        models,
+        measure="topk_overlap",
+        topk=2,
+        dispersion="std",
+    )
+
+    assert result["seed_pairing_mode"] == "matched"
+    assert result["n_matrix"] == [[3, 3], [3, 3]]
+    assert result["matrix"][0][0] == pytest.approx(1.0)
+    assert result["matrix"][1][1] == pytest.approx(1.0)
+    assert result["cell_stats"][0][0]["scores"] == pytest.approx([1.0, 1.0, 1.0])
+    assert result["matrix"][0][1] == pytest.approx(2.0 / 3.0)
 
 
 def test_compute_similarity_matrix_cosine_uses_aligned_vector_path(monkeypatch):
@@ -174,3 +204,47 @@ def test_spearman_metadata_distinguishes_dense_fallback_from_sparse_exact():
     assert result["full_zero_filled"] is False
     assert result["sparse_exact"] is False
     assert result["matrix"][0][1] == pytest.approx(-1.0)
+
+
+class _MappedGradiend:
+    """Minimal GRADIEND stub with distinct local vs base-global index spaces."""
+
+    def __init__(self, base_global_indices):
+        self._base_map = torch.tensor(base_global_indices, dtype=torch.long)
+
+    def get_topk_weights(self, part="decoder-weight", topk=None):
+        n = int(self._base_map.numel())
+        if topk is None:
+            return list(range(n))
+        k = min(int(topk), n)
+        return list(range(k))
+
+    def _get_base_global_index_map(self):
+        return self._base_map
+
+
+def test_gradiend_only_model_topk_maps_to_base_global_indices():
+    from gradiend.trainer.suite.definitions import _GradiendOnlyModel
+
+    model = _GradiendOnlyModel(_MappedGradiend([10, 20, 30]))
+    assert model.get_topk_weights(topk=2) == [10, 20]
+
+
+def test_gradiend_only_topk_overlap_uses_base_global_indices():
+    from gradiend.trainer.suite.definitions import _GradiendOnlyModel
+
+    models = {
+        "a": _GradiendOnlyModel(_MappedGradiend([10, 20])),
+        "b": _GradiendOnlyModel(_MappedGradiend([20, 30])),
+    }
+
+    result = compute_similarity_matrix(models, measure="topk_overlap", topk=2)
+
+    assert result["matrix"][0][1] == pytest.approx(0.5)
+
+    local_only = {
+        "a": _TinyModel([[1.0, 0.0], [0.0, 1.0]]),
+        "b": _TinyModel([[0.0, 2.0], [2.0, 0.0]]),
+    }
+    local_result = compute_similarity_matrix(local_only, measure="topk_overlap", topk=2)
+    assert local_result["matrix"][0][1] == pytest.approx(1.0)

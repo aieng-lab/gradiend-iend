@@ -8,7 +8,7 @@ mean_by_class, mean_by_type, etc.). Single source of truth for encoder metrics.
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 

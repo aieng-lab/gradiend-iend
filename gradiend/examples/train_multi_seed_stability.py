@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any
 
 from gradiend import (
+    PostPruneConfig,
+    PrePruneConfig,
     TextPredictionTrainer,
     TrainingArguments,
     compute_grouped_similarity_matrices,
@@ -91,14 +93,18 @@ def build_trainer() -> TextPredictionTrainer:
     args = TrainingArguments(
         experiment_dir=EXPERIMENT_DIR,
         train_batch_size=8,
-        encoder_eval_max_size=10,
+        encoder_eval_max_size=200,
         decoder_eval_max_size_training_like=50,
         decoder_eval_max_size_neutral=50,
-        eval_steps=25,
-        max_steps=100,
+        eval_steps=250,
+        num_train_epochs=1,
+        max_steps=1000,
         source="alternative",
         target="diff",
-        learning_rate=1e-4,
+        eval_batch_size=8,
+        learning_rate=1e-5,
+        pre_prune_config=PrePruneConfig(n_samples=16, topk=0.01, source="diff"),
+        post_prune_config=PostPruneConfig(topk=0.05, part="decoder-weight"),
         use_cache=True,
         max_seeds=3,
         min_convergent_seeds=2,
@@ -112,6 +118,10 @@ def build_trainer() -> TextPredictionTrainer:
         data=DATASET,
         target_classes=TARGET_CLASSES,
         masked_col="masked",
+        # Match the original race/religion experiment: preserve the dataset's
+        # existing row-level train/validation/test assignments. This is also
+        # the trainer default; it is explicit here to document the experiment.
+        split_col="split",
         eval_neutral_data=NEUTRAL,
         img_format="png",
         args=args,

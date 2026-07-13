@@ -1,0 +1,3 @@
+# compute_trainer_pair_encoding_matrix
+
+::: gradiend.comparison.trainer_pair_encoding.compute_trainer_pair_encoding_matrix

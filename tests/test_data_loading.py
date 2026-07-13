@@ -6,7 +6,7 @@ All HF calls are mocked so tests do not hit the network.
 """
 
 import importlib.util
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pandas as pd
 import pytest

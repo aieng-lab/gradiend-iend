@@ -17,8 +17,6 @@ default SelectionPolicy in compute_metric_summaries then selects the best candid
 per metric. Use target_class='bpi' (etc.) with rewrite_base_model(output_dir=...).
 """
 
-import json
-import os
 from typing import Optional, Any
 
 import numpy as np

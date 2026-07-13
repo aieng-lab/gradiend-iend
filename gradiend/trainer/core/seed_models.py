@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, List, Sequence
+from typing import Any, Iterator, Sequence
 
 
 @dataclass(frozen=True)
@@ -11,8 +11,8 @@ class SeedModelGroup:
     """A set of GRADIEND checkpoints selected for one trainer analysis run.
 
     ``compute_similarity_matrix`` and top-k overlap helpers accept a
-    ``SeedModelGroup`` wherever a single model is allowed: pairwise scores are
-    aggregated across all seed pairs automatically.
+    ``SeedModelGroup`` wherever a single model is allowed: scores from matching
+    positions in selected-seed groups are aggregated automatically by default.
     """
 
     models: Tuple[Any, ...]

@@ -287,7 +287,7 @@ Balancing and caps rely on a feature-class identifier. After conversion, the tra
 
 Datasets should provide `train`, `validation` (or `val`), and `test` splits. The trainer normalizes split names (e.g. `"val"` → `"validation"`). Support for fewer splits may be added later.
 
-For vocabulary-held-out target splits, set `split_col=None` and optionally provide `split_group_key`. See [Data splits](data-splits.md) for when this is  appropriate and how many distinct target words are required.
+For vocabulary-held-out target splits, explicitly set `split_col="heldout"` and optionally provide `split_group_key`. See [Data splits](data-splits.md) for when this is appropriate and how many distinct target words are required.
 
 ---
 

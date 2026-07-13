@@ -424,7 +424,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
             if UNIFIED_SPLIT in combined.columns:
                 splits = combined[UNIFIED_SPLIT].dropna().astype(str).tolist()
             else:
-                split_col = getattr(getattr(self, "config", None), "split_col", None) or "split"
+                split_col = data_split_column(getattr(getattr(self, "config", None), "split_col", None))
                 if split_col in combined.columns:
                     splits = combined[split_col].dropna().astype(str).tolist()
         if splits:
@@ -514,12 +514,12 @@ class FeatureLearningDefinition(DataProvider, ABC):
                 ``create_gradient_training_dataset``.
 
         Returns:
-            Evaluation dataset compatible with encoder analysis.
+            Evaluation dataset compatible with encoder analysis. The returned
+            gradient dataset always uses ``target=None`` because encoder
+            evaluation only encodes ``source`` gradients.
         """
         source = self._default_from_training_args(source, "source", fallback="factual")
-        target = self._default_from_training_args(None, "target", fallback="diff")
         validate_source_target("source", source)
-        validate_source_target("target", target)
         max_size = self._default_from_training_args(max_size, "encoder_eval_max_size")
         pre_load_gradients = self._default_from_training_args(pre_load_gradients, "use_cached_gradients", fallback=False)
         encoder_eval_balance = self._default_from_training_args(
@@ -560,13 +560,13 @@ class FeatureLearningDefinition(DataProvider, ABC):
         grad_kwargs = {
             k: v
             for k, v in kwargs.items()
-            if k not in ("include_other_classes", "use_all_transitions", "transition_selection", "encoder_eval_balance")
+            if k not in ("include_other_classes", "use_all_transitions", "transition_selection", "encoder_eval_balance", "target")
         }
         return self.create_gradient_training_dataset(
             raw,
             model_with_gradiend,
             source=source,
-            target=target,
+            target=None,
             cache_dir=cache_dir,
             use_cached_gradients=pre_load_gradients,
             **grad_kwargs,

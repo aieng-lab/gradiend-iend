@@ -10,18 +10,12 @@ requested does the code raise ImportError with comprehensive install instruction
 import sys
 import os
 import builtins
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 import torch
 
-# Force CPU for all tests to avoid CUDA issues
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-if torch.cuda.is_available():
-    torch.cuda.set_device(torch.device("cpu"))
-
 from gradiend.model.utils import _save_tensor_dict, _load_tensor_dict, _tensor_file_name
-from tests.conftest import MockTokenizer
 
 
 class TestSafetensorsOptional:
@@ -103,7 +97,6 @@ class TestMatplotlibOptional:
     
     def test_matplotlib_missing_error_message(self):
         """Test that missing matplotlib raises ImportError with helpful message."""
-        from gradiend.visualizer.plot_optional import _require_matplotlib
         
         # Mock matplotlib import to fail
         with patch.dict('sys.modules', {'matplotlib': None, 'matplotlib.pyplot': None}):
@@ -123,7 +116,6 @@ class TestMatplotlibOptional:
         # Test that _require_matplotlib raises ImportError when matplotlib.pyplot can't be imported
         # We need to patch the import before plot_optional tries to import matplotlib.pyplot
         import sys
-        import importlib
         
         # Save and remove modules that might have already imported matplotlib
         # Also remove encoder_distributions if it exists, since it imports matplotlib.patches
@@ -178,7 +170,6 @@ class TestSeabornOptional:
     def test_seaborn_missing_error_message(self):
         """Test that missing seaborn raises ImportError with helpful message."""
         import sys
-        import importlib
         
         # Save and remove modules that might have already imported seaborn
         modules_to_restore = {}
@@ -218,7 +209,6 @@ class TestSeabornOptional:
     def test_seaborn_used_in_visualizer(self):
         """Test that visualizer functions use _require_seaborn when seaborn is missing."""
         import sys
-        import importlib
         
         # Save and remove modules that might have already imported seaborn
         modules_to_restore = {}
@@ -268,7 +258,6 @@ class TestDatasetsOptional:
 
     def test_datasets_missing_error_message(self):
         """Test that missing datasets raises ImportError with helpful message when loading HF data."""
-        from gradiend.trainer.text.prediction.trainer import TextPredictionTrainer
 
         # Remove datasets from sys.modules so the trainer's import fails
         modules_to_restore = {}
@@ -384,7 +373,7 @@ class TestOptionalDependencyIntegration:
         from unittest.mock import patch
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         with patch.object(TextModelWithGradiend, '_load_model', classmethod(mock_load_model)):
@@ -427,7 +416,7 @@ class TestOptionalDependencyIntegration:
         import sys
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         # Save original safetensors module if it exists
@@ -480,7 +469,7 @@ class TestOptionalDependencyIntegration:
         import sys
         
         def mock_load_model(cls, load_directory, base_model_id=None, tokenizer=None, **kwargs):
-            from tests.conftest import MockTokenizer
+            from tests.testing_mocks import MockTokenizer
             return mock_model, MockTokenizer()
         
         # Remove safetensors from sys.modules to simulate it not being installed

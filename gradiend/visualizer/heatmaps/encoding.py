@@ -8,7 +8,7 @@ import torch
 
 from gradiend.comparison import (
     compute_anchor_aligned_encoding_matrix,
-    compute_cross_encoding_matrix,
+    compute_trainer_pair_encoding_matrix,
     compute_dense_anchor_aligned_encoding_matrix,
     compute_gradiend_feature_cross_encoding_matrix,
     compute_gradiend_transition_cross_encoding_matrix,
@@ -16,7 +16,7 @@ from gradiend.comparison import (
     pair_by_id_from_trainers,
     source_by_id_from_trainers,
 )
-from gradiend.comparison.feature_cross_encoding import build_cross_task_encoder_summary
+from gradiend.comparison.cross_encoding import build_cross_task_encoder_summary
 from gradiend.trainer.core.multi_seed import (
     resolve_dispersion_for_trainers,
     resolve_seed_selection_for_trainers,
@@ -25,7 +25,7 @@ from gradiend.visualizer.heatmaps.base import filter_comparison_heatmap_plot_kwa
 
 ORIENTED_CROSS_ENCODING_YLABEL = "Orienting feature"
 ORIENTED_CROSS_ENCODING_XLABEL_FACTUAL = "Probe feature"
-ORIENTED_CROSS_ENCODING_XLABEL_COUNTERFACTUAL = "Probe feature (counterfactual)"
+ORIENTED_CROSS_ENCODING_XLABEL_COUNTERFACTUAL = "Probe feature"
 ORIENTED_CROSS_ENCODING_XLABEL_TRANSITION = "Probe transition"
 CROSS_ENCODING_CBAR_LABEL = "Encoding"
 CROSS_ENCODING_ROW_NORMALIZED_CBAR_LABEL = "Relative encoding"
@@ -40,6 +40,29 @@ def _oriented_cross_encoding_axis_labels(alignment: str) -> tuple[str, str]:
     else:
         xlabel = ORIENTED_CROSS_ENCODING_XLABEL_FACTUAL
     return ORIENTED_CROSS_ENCODING_YLABEL, xlabel
+
+
+def resolve_oriented_cross_encoding_alignment(
+    trainers: Dict[str, object],
+    alignment: Optional[str] = None,
+) -> tuple[str, bool]:
+    """Resolve oriented alignment; ``auto`` follows trained GRADIEND source.
+
+    Returns ``(resolved_alignment, was_auto)``. Auto mode uses counterfactual
+    alignment only when all trainers resolve to ``source="alternative"``;
+    mixed or unknown sources fall back to factual alignment.
+    """
+    key = str(alignment or "auto").strip().lower()
+    if key not in {"auto", "default"}:
+        return key, False
+    sources = {
+        str(source).strip().lower()
+        for source in source_by_id_from_trainers(trainers).values()
+        if source
+    }
+    if sources == {"alternative"}:
+        return "counterfactual", True
+    return "factual", True
 
 
 def _evaluate_encoder_one_trainer_on_gpu(trainer: object, **kwargs: Any) -> Any:
@@ -61,7 +84,7 @@ def plot_cross_encoding_heatmap(
     trainers: Dict[str, object],
     feature_classes: Optional[Sequence[str]] = None,
     *,
-    alignment: str = "factual",
+    alignment: str = "auto",
     column_ids: Optional[Sequence[str]] = None,
     encoder_summary: Optional[Dict[str, Any]] = None,
     split: str = "test",
@@ -120,15 +143,18 @@ def plot_cross_encoding_heatmap(
 
     Pass ``feature_classes`` for oriented symmetric cross-encoding (anchor sign
     alignment and aggregation; see ``compute_anchor_aligned_encoding_matrix``).
-    Omit ``feature_classes`` for directed positive-pair cross-encoding via
-    ``compute_cross_encoding_matrix`` (default metric ``positive_mean``).
+    Omit ``feature_classes`` for directed positive-pair trainer×trainer encoding via
+    ``compute_trainer_pair_encoding_matrix`` (default metric ``positive_mean``).
 
     Args:
         trainers: Mapping of ids to trainers.
         feature_classes: Feature classes used as oriented row anchors. When
             omitted, the directed positive-pair matrix is plotted instead.
-        alignment: Column alignment for oriented mode (``factual``,
-            ``counterfactual``, or ``transition``).
+        alignment: Column alignment for oriented mode. ``"auto"`` (default)
+            follows trained GRADIEND source: factual/diff-source trainers use
+            factual alignment; alternative-source trainers use counterfactual
+            alignment. Explicit values ``"factual"``, ``"counterfactual"``,
+            and ``"transition"`` are diagnostic overrides.
         column_ids: Optional explicit oriented-matrix columns.
         encoder_summary: Optional precomputed encoder summary for oriented mode.
         split: Encoder split used when evaluation is needed.
@@ -164,11 +190,15 @@ def plot_cross_encoding_heatmap(
         dispersion = resolve_dispersion_for_trainers(trainers, None)
     if feature_classes is not None:
         oriented_full_eval = True if full_eval is None else bool(full_eval)
+        resolved_alignment, alignment_was_auto = resolve_oriented_cross_encoding_alignment(
+            trainers,
+            alignment,
+        )
         if encoder_summary is None and cross_task_eval:
             comparison_data = compute_dense_anchor_aligned_encoding_matrix(
                 trainers,
                 feature_classes,
-                alignment=alignment,
+                alignment=resolved_alignment,
                 column_ids=column_ids,
                 split=split,
                 max_size=max_size,
@@ -210,14 +240,18 @@ def plot_cross_encoding_heatmap(
                 encoder_summary=encoder_summary,
                 feature_classes=feature_classes,
                 aggregate=aggregate,
-                alignment=alignment,
+                alignment=resolved_alignment,
                 column_ids=column_ids,
                 source_by_id=source_by_id_from_trainers(trainers),
             )
         if normalize:
             comparison_data = normalize_cross_encoding_rows_by_diagonal(comparison_data)
         resolved_order = list(feature_classes) if order == "input" else order
-        default_ylabel, default_xlabel = _oriented_cross_encoding_axis_labels(alignment)
+        default_ylabel, default_xlabel = _oriented_cross_encoding_axis_labels(
+            resolved_alignment,
+        )
+        if alignment_was_auto and resolved_alignment == "counterfactual":
+            default_xlabel = ORIENTED_CROSS_ENCODING_XLABEL_FACTUAL
         return plot_comparison_heatmap(
             comparison_data,
             order=resolved_order,
@@ -260,7 +294,7 @@ def plot_cross_encoding_heatmap(
             **filter_comparison_heatmap_plot_kwargs(plot_kwargs),
         )
 
-    comparison_data = compute_cross_encoding_matrix(
+    comparison_data = compute_trainer_pair_encoding_matrix(
         trainers,
         split=split,
         max_size=max_size,

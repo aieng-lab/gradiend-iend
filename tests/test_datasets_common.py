@@ -5,10 +5,7 @@ Tests the core dataset functionality that works across all modalities.
 """
 
 import os
-import tempfile
-import shutil
 from unittest.mock import MagicMock
-from typing import Dict, Any
 
 import pytest
 import torch
@@ -560,21 +557,40 @@ class TestGradientTrainingDataset:
         assert batch["source"] is not None
     
     def test_dataset_target_none(self):
-        """Test that dataset handles target=None (e.g., supervised_encoder)."""
+        """Encoder-style datasets may omit target gradients entirely."""
         training_data = MockTrainingData([
             {"factual": torch.tensor([1.0]), "alternative": torch.tensor([2.0])}
         ])
-        
+
         gradient_creator = MagicMock(return_value=torch.randn(100))
-        
-        # Note: target=None might not be allowed by the assertion, but let's test the behavior
-        # if it's allowed
+
         dataset = GradientTrainingDataset(
             training_data=training_data,
             gradient_creator=gradient_creator,
             source="factual",
-            target="diff"  # Use valid target for now
+            target=None,
         )
-        
+
         batch = dataset[0]
-        assert batch["target"] is not None
+        assert batch["target"] is None
+        assert batch["source"] is not None
+        assert gradient_creator.call_count == 1
+
+    def test_dataset_target_none_alternative_source_skips_factual_backward(self):
+        """Encoder eval with source=alternative should not compute factual gradients."""
+        training_data = MockTrainingData([
+            {"factual": torch.tensor([1.0]), "alternative": torch.tensor([2.0])}
+        ])
+
+        gradient_creator = MagicMock(return_value=torch.randn(100))
+
+        dataset = GradientTrainingDataset(
+            training_data=training_data,
+            gradient_creator=gradient_creator,
+            source="alternative",
+            target=None,
+        )
+
+        batch = dataset[0]
+        assert batch["target"] is None
+        assert gradient_creator.call_count == 1

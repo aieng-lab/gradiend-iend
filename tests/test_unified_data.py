@@ -1,7 +1,6 @@
 """Tests for unified_data: resolve_dataframe, _load_dataframe_from_path, per_class_dict_to_unified, merged_to_unified."""
 
 import importlib.util
-from pathlib import Path
 
 import pandas as pd
 import pytest

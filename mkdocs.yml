@@ -76,6 +76,7 @@ nav:
     - Data splits: guides/data-splits.md
     - Pruning: guides/pruning-guide.md
     - Evaluation & visualization: guides/evaluation-visualization.md
+    - Plot styling & LaTeX: guides/plot-styling-latex.md
     - Cross-model comparison: guides/cross-model-comparison.md
     - Oriented cross-encoding matrix: guides/cross-encoding-matrix.md
     - "Oriented cross-encoding: computation": guides/cross-encoding-matrix-computation.md
@@ -139,11 +140,12 @@ nav:
             - plot_gradiend_feature_cross_encoding_heatmap: api/visualization/plot_gradiend_feature_cross_encoding_heatmap.md
             - plot_comparison_heatmap: api/visualization/plot_comparison_heatmap.md
             - check_plot_environment: api/visualization/check_plot_environment.md
+            - PlotStyleConfig: api/visualization/PlotStyleConfig.md
         - Comparison:
             - Overview: api/comparison/index.md
             - compute_similarity_matrix: api/comparison/compute_similarity_matrix.md
             - compute_grouped_similarity_matrices: api/comparison/compute_grouped_similarity_matrices.md
-            - compute_cross_encoding_matrix: api/comparison/compute_cross_encoding_matrix.md
+            - compute_trainer_pair_encoding_matrix: api/comparison/compute_trainer_pair_encoding_matrix.md
             - compute_anchor_aligned_encoding_matrix: api/comparison/compute_anchor_aligned_encoding_matrix.md
             - compute_gradiend_feature_cross_encoding_matrix: api/comparison/compute_gradiend_feature_cross_encoding_matrix.md
             - compute_gradiend_transition_cross_encoding_matrix: api/comparison/compute_gradiend_transition_cross_encoding_matrix.md

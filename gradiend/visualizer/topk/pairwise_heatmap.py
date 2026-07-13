@@ -38,6 +38,7 @@ def plot_topk_overlap_heatmap(
     group_label_rotation_top: Union[int, float] = 0,
     group_label_rotation_right: Union[int, float] = 0,
     cbar_pad: Optional[float] = None,
+    cbar_y_pad: Optional[float] = None,
     cbar_fontsize: Optional[Union[int, float]] = None,
     cbar_shrink: Optional[float] = None,
     percentages: bool = True,
@@ -51,7 +52,9 @@ def plot_topk_overlap_heatmap(
     highlight_non_convergence: bool = True,
     seed_aggregate: str = "mean",
     dispersion: str = "none",
+    seed_pairing_mode: str = "matched",
     dispersion_display: str = "none",
+    converged_by_id: Optional[Dict[str, Optional[bool]]] = None,
 ):
     """
     Plot pairwise top-k overlap between GRADIEND models.
@@ -85,6 +88,8 @@ def plot_topk_overlap_heatmap(
         group_label_rotation_top: Rotation for top group labels.
         group_label_rotation_right: Rotation for right group labels.
         cbar_pad: Optional colorbar padding.
+        cbar_y_pad: Optional vertical colorbar offset as a fraction of the
+            heatmap height; negative values move it down.
         cbar_fontsize: Optional colorbar font size.
         cbar_shrink: Optional colorbar shrink factor (width relative to heatmap).
         percentages: Whether overlap values are shown as percentages.
@@ -96,6 +101,8 @@ def plot_topk_overlap_heatmap(
         row_label_mapping: Optional mapping for row display labels.
         column_label_mapping: Optional mapping for column display labels.
         highlight_non_convergence: Whether labels mark non-converged runs.
+        seed_pairing_mode: ``"all_pairs"`` or positionally aligned ``"matched"``.
+        converged_by_id: Optional explicit convergence status by stable model id.
     """
     return plot_similarity_heatmap(
         models,
@@ -128,6 +135,7 @@ def plot_topk_overlap_heatmap(
         group_label_rotation_top=group_label_rotation_top,
         group_label_rotation_right=group_label_rotation_right,
         cbar_pad=cbar_pad,
+        cbar_y_pad=cbar_y_pad,
         cbar_fontsize=cbar_fontsize,
         cbar_shrink=cbar_shrink,
         percentages=percentages,
@@ -141,7 +149,9 @@ def plot_topk_overlap_heatmap(
         highlight_non_convergence=highlight_non_convergence,
         seed_aggregate=seed_aggregate,
         dispersion=dispersion,
+        seed_pairing_mode=seed_pairing_mode,
         dispersion_display=dispersion_display,
+        converged_by_id=converged_by_id,
     )
 
 
@@ -175,6 +185,7 @@ def plot_topk_overlap_heatmap_with_correlation(
     group_label_rotation_top: Union[int, float] = 0,
     group_label_rotation_right: Union[int, float] = 0,
     cbar_pad: Optional[float] = None,
+    cbar_y_pad: Optional[float] = None,
     cbar_fontsize: Optional[Union[int, float]] = None,
     cbar_shrink: Optional[float] = None,
     percentages: bool = False,
@@ -213,6 +224,8 @@ def plot_topk_overlap_heatmap_with_correlation(
         group_label_rotation_top: Rotation for top group labels.
         group_label_rotation_right: Rotation for right group labels.
         cbar_pad: Optional colorbar padding.
+        cbar_y_pad: Optional vertical colorbar offset as a fraction of the
+            heatmap height; negative values move it down.
         cbar_fontsize: Optional colorbar font size.
         percentages: Whether overlap values are shown as percentages.
         row_label_mapping: Optional mapping for row display labels.
@@ -250,6 +263,7 @@ def plot_topk_overlap_heatmap_with_correlation(
         group_label_rotation_top=group_label_rotation_top,
         group_label_rotation_right=group_label_rotation_right,
         cbar_pad=cbar_pad,
+        cbar_y_pad=cbar_y_pad,
         cbar_fontsize=cbar_fontsize,
         cbar_shrink=cbar_shrink,
         percentages=percentages,

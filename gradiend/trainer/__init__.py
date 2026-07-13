@@ -1,66 +1,10 @@
 """
 GRADIEND Training Module
 
-This module provides classes and utilities for training GRADIEND models.
-
-Main API:
-
-    - Trainer: HF-like trainer with model at creation time and lazy Evaluator
-    - TrainingArguments: Configuration for training
-    - load_training_stats: Load correlation, config, best checkpoint from a saved model dir
-
-Core components:
-
-    - train (train_core): Core training loop
-    - TextGradientTrainingDataset: Dataset for training
-    - create_model_with_gradiend: Factory for model creation
+This package exposes trainer APIs lazily so lightweight submodules such as
+``gradiend.trainer.core.unified_schema`` can be imported without pulling in the
+full text trainer, evaluator, and visualization stack.
 """
-
-# Trainer and reproducibility
-from .trainer import Trainer, set_seed
-from .core.multi_seed import MultiSeedTrainerView, is_multi_seed_view
-from .core.seed_models import SeedModelGroup
-
-# Load training stats from saved model directory
-from .core.stats import load_training_stats
-
-# Core training components
-from .core.training import train as train_core
-from .core.callbacks import (
-    TrainingCallback,
-    EvaluationCallback,
-    CheckpointCallback,
-    NormalizationCallback,
-    LoggingCallback,
-    get_default_callbacks,
-)
-
-# Training Arguments (HF-like)
-from .core.arguments import TrainingArguments
-from .core.transition_selection import TransitionSpec, pair, identity, expand_transition_selection
-
-# Base config (modality-agnostic)
-from .config import TrainerConfig
-
-# Pre-prune and post-prune configs and helpers
-from .core.pruning import PostPruneConfig, PrePruneConfig, post_prune, pre_prune
-
-# Dataset: modality-agnostic in core; text wrapper in trainer.text.common
-from .core.dataset import GradientTrainingDataset, PreComputedTrainingDataset
-from .text.common.dataset import TextGradientTrainingDataset
-
-# Factory
-from .factory import create_model_with_gradiend
-
-# Suite (after datasets — text stack imports GradientTrainingDataset from gradiend.trainer)
-from .suite import (
-    TrainerSuite,
-    TrainerCollection,
-    PositiveTrainerSuite,
-    SymmetricTrainerSuite,
-    SuitePairDefinition,
-    PositiveFeatureDefinition,
-)
 
 __all__ = [
     "Trainer",
@@ -97,3 +41,54 @@ __all__ = [
     "LoggingCallback",
     "get_default_callbacks",
 ]
+
+_LAZY_IMPORTS = {
+    "Trainer": ("gradiend.trainer.trainer", "Trainer"),
+    "set_seed": ("gradiend.trainer.trainer", "set_seed"),
+    "MultiSeedTrainerView": ("gradiend.trainer.core.multi_seed", "MultiSeedTrainerView"),
+    "is_multi_seed_view": ("gradiend.trainer.core.multi_seed", "is_multi_seed_view"),
+    "SeedModelGroup": ("gradiend.trainer.core.seed_models", "SeedModelGroup"),
+    "load_training_stats": ("gradiend.trainer.core.stats", "load_training_stats"),
+    "train_core": ("gradiend.trainer.core.training", "train"),
+    "TrainingCallback": ("gradiend.trainer.core.callbacks", "TrainingCallback"),
+    "EvaluationCallback": ("gradiend.trainer.core.callbacks", "EvaluationCallback"),
+    "CheckpointCallback": ("gradiend.trainer.core.callbacks", "CheckpointCallback"),
+    "NormalizationCallback": ("gradiend.trainer.core.callbacks", "NormalizationCallback"),
+    "LoggingCallback": ("gradiend.trainer.core.callbacks", "LoggingCallback"),
+    "get_default_callbacks": ("gradiend.trainer.core.callbacks", "get_default_callbacks"),
+    "TrainingArguments": ("gradiend.trainer.core.arguments", "TrainingArguments"),
+    "TransitionSpec": ("gradiend.trainer.core.transition_selection", "TransitionSpec"),
+    "pair": ("gradiend.trainer.core.transition_selection", "pair"),
+    "identity": ("gradiend.trainer.core.transition_selection", "identity"),
+    "expand_transition_selection": ("gradiend.trainer.core.transition_selection", "expand_transition_selection"),
+    "TrainerConfig": ("gradiend.trainer.config", "TrainerConfig"),
+    "PostPruneConfig": ("gradiend.trainer.core.pruning", "PostPruneConfig"),
+    "PrePruneConfig": ("gradiend.trainer.core.pruning", "PrePruneConfig"),
+    "post_prune": ("gradiend.trainer.core.pruning", "post_prune"),
+    "pre_prune": ("gradiend.trainer.core.pruning", "pre_prune"),
+    "GradientTrainingDataset": ("gradiend.trainer.core.dataset", "GradientTrainingDataset"),
+    "PreComputedTrainingDataset": ("gradiend.trainer.core.dataset", "PreComputedTrainingDataset"),
+    "TextGradientTrainingDataset": ("gradiend.trainer.text.common.dataset", "TextGradientTrainingDataset"),
+    "create_model_with_gradiend": ("gradiend.trainer.factory", "create_model_with_gradiend"),
+    "TrainerSuite": ("gradiend.trainer.suite", "TrainerSuite"),
+    "TrainerCollection": ("gradiend.trainer.suite", "TrainerCollection"),
+    "PositiveTrainerSuite": ("gradiend.trainer.suite", "PositiveTrainerSuite"),
+    "SymmetricTrainerSuite": ("gradiend.trainer.suite", "SymmetricTrainerSuite"),
+    "SuitePairDefinition": ("gradiend.trainer.suite", "SuitePairDefinition"),
+    "PositiveFeatureDefinition": ("gradiend.trainer.suite", "PositiveFeatureDefinition"),
+}
+
+
+def __getattr__(name):
+    if name in _LAZY_IMPORTS:
+        import importlib
+
+        module_name, attr_name = _LAZY_IMPORTS[name]
+        value = getattr(importlib.import_module(module_name), attr_name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

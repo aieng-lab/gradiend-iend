@@ -14,7 +14,6 @@ from gradiend.trainer.text.prediction.seq2seq import (
     SEQ2SEQ_DECODER_SEQUENCE_CLOZE,
     create_seq2seq_decoder_item,
     create_seq2seq_decoder_sequence_item,
-    create_seq2seq_mlm_item,
     score_seq2seq_continuation_logprob,
 )
 

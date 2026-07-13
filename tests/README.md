@@ -80,6 +80,18 @@ Shared fixtures are in `conftest.py`:
   network/cache-dependent assets, or intentionally heavier wrapper/integration paths.
 - **Integration tests**: Marked with `@pytest.mark.integration` (real HF weights or full training). Excluded by default like slow tests.
 
+The slow/integration selection also includes the configured example smoke runs. `tests/test_examples_smoke_integration.py` delegates to `test_bench/examples/test_examples_smoke.py`, where each example is launched in a subprocess and non-zero exits—including non-convergence failures—fail the test.
+
+```bash
+pytest tests/ -v -s -m "slow or integration"
+```
+
+To run only the example smoke tests directly:
+
+```bash
+pytest test_bench/examples/ -v -s -m integration
+```
+
 ### Memory-safe testing for agents and local dev
 
 Prefer running only the test file you changed:
@@ -94,7 +106,7 @@ Full CI-equivalent unit suite (~1000 tests; can use substantial RAM):
 pytest tests/ -m "not slow and not integration" -q
 ```
 
-Do **not** run slow/integration tests or `python -m gradiend.examples.train_*` unless you explicitly need them. See `AGENTS.md`.
+Do **not** run slow/integration tests (which include the example smoke runner) or `python -m gradiend.examples.train_*` unless you explicitly need them. See `AGENTS.md`.
 
 ### Memory profiling
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Iterator, Tuple
 
-import torch
 import torch.nn as nn
 
 from gradiend.model.utils import is_seq2seq_model

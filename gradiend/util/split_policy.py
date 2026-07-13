@@ -98,7 +98,7 @@ def validate_data_split_policy(
         )
     if vocabulary_held_out and "test" not in available:
         raise ValueError(
-            "split_col=None uses vocabulary-held-out splits and requires a held-out 'test' split. "
+            "split_col='heldout' uses vocabulary-held-out splits and requires a held-out 'test' split. "
             f"Available: {order_split_names(policy.available)}. "
             "Add more target tokens or adjust split ratios so test is non-empty."
         )

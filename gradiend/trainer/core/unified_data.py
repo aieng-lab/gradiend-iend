@@ -94,6 +94,72 @@ def resolve_training_data_path(
     raise FileNotFoundError(f"Training data path does not exist: {path}")
 
 
+def per_class_dict_from_label_class_table(
+    df: pd.DataFrame,
+    *,
+    label_class_col: str = "label_class",
+) -> Dict[str, pd.DataFrame]:
+    """Split a factual-only table (one row per masked example) into per-class DataFrames."""
+    if label_class_col not in df.columns:
+        raise ValueError(
+            f"Expected column {label_class_col!r} for per-class grouping; got {list(df.columns)}"
+        )
+    out: Dict[str, pd.DataFrame] = {}
+    for class_id, group in df.groupby(label_class_col, sort=False):
+        key = str(class_id)
+        g = group.copy()
+        if "label" in g.columns:
+            g[key] = g["label"]
+        out[key] = g
+    return out
+
+
+def has_explicit_alternative_columns(
+    df: pd.DataFrame,
+    *,
+    alternative_col: Optional[str],
+    alternative_class_col: Optional[str],
+) -> bool:
+    if not alternative_col or not alternative_class_col:
+        return False
+    return alternative_col in df.columns and alternative_class_col in df.columns
+
+
+def unified_from_per_class_merge_map(
+    df: pd.DataFrame,
+    *,
+    merge_map: Dict[str, List[str]],
+    target_classes: Optional[List[str]] = None,
+    masked_col: str = "masked",
+    split_col: Optional[str] = "split",
+    label_class_col: str = "label_class",
+    use_class_names_as_columns: bool = True,
+    pair: Optional[Tuple[str, str]] = None,
+    max_counterfactuals_per_sentence: int = 1,
+    random_state: Optional[int] = None,
+) -> pd.DataFrame:
+    """Build unified rows when data is factual-only but class_merge_map merges raw classes."""
+    class_dfs = per_class_dict_from_label_class_table(df, label_class_col=label_class_col)
+    class_dfs = merge_per_class_dfs(class_dfs, merge_map, target_classes)
+    inferred_classes = list(class_dfs.keys())
+    resolved_pair = pair
+    if resolved_pair is not None and not set(resolved_pair).issubset(set(inferred_classes)):
+        resolved_pair = None
+    if resolved_pair is None and len(inferred_classes) == 2:
+        resolved_pair = tuple(inferred_classes)
+    return per_class_dict_to_unified(
+        class_dfs,
+        classes=inferred_classes,
+        masked_col=masked_col,
+        split_col=split_col,
+        use_class_names_as_columns=use_class_names_as_columns,
+        pair=resolved_pair,
+        include_identity_rows=False,
+        max_counterfactuals_per_sentence=max_counterfactuals_per_sentence,
+        random_state=random_state,
+    )
+
+
 def merge_per_class_dfs(
     class_dfs: Dict[str, pd.DataFrame],
     merge_map: Dict[str, List[str]],

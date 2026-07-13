@@ -5,12 +5,10 @@ Tests parameter validation, serialization, and override behavior.
 """
 
 import json
-import tempfile
 import os
 
 import pytest
 import torch
-import torch.nn as nn
 
 from gradiend.trainer.core.arguments import TrainingArguments
 

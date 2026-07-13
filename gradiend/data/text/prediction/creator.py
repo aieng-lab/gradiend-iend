@@ -4,7 +4,6 @@ TextPredictionDataCreator: build training and neutral datasets for text predicti
 
 from __future__ import annotations
 
-import random
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Union
 
@@ -653,7 +652,9 @@ class TextPredictionDataCreator:
         if neutral is None:
             neutral = []
         rows = [{"text": s} for s in neutral]
-        df = pd.DataFrame(rows)
+        # Keep a valid CSV/Parquet schema even when filtering is interrupted
+        # before the first row or legitimately produces no neutral sentences.
+        df = pd.DataFrame(rows, columns=["text"])
 
         out_path = output or self._resolve_output_path("neutral", None)
         if out_path is not None:

@@ -9,7 +9,6 @@ import os
 import tempfile
 from unittest.mock import patch
 
-import pandas as pd
 import pytest
 import torch
 
@@ -20,7 +19,7 @@ from gradiend import (
     TextPredictionTrainer,
     PrePruneConfig,
 )
-from tests.conftest import SimpleMockModel, MockTokenizer
+from tests.testing_mocks import SimpleMockModel, MockTokenizer
 
 MINI_TEXTS = [
     "The chef tasted the soup, then he added a pinch of pepper.",
@@ -86,6 +85,10 @@ def test_standard_workflow_mlm_train_encoder_decoder(use_pre_prune):
             experiment_dir=os.path.join(tmpdir, "workflow_test"),
             use_cache=False,
             do_eval=False,
+            decoder_eval_lrs=[1e-3],
+            decoder_eval_feature_factors=[-1.0],
+            decoder_eval_max_size_training_like=2,
+            decoder_eval_max_size_neutral=2,
             pre_prune_config=PrePruneConfig(n_samples=4, topk=0.5) if use_pre_prune else None,
         )
         with patch(

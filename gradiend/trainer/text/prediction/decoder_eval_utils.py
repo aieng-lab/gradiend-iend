@@ -18,13 +18,12 @@ import torch
 
 from gradiend.model.utils import is_decoder_only_model, prediction_eval_kind
 from gradiend.trainer.text.prediction.seq2seq import (
-    mask_placeholder_for_tokenizer,
     score_seq2seq_continuation_logprob,
     seq2seq_mlm_probs_at_mask,
 )
 from gradiend.util.logging import get_logger
 
-from gradiend.trainer.text.common.lm_eval import evaluate_mlm, evaluate_clm_perplexity, evaluate_seq2seq_perplexity, compute_lms
+from gradiend.trainer.text.common.lm_eval import compute_lms
 
 
 logger = get_logger(__name__)

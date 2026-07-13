@@ -373,7 +373,7 @@ class TestTrainerUseCacheIntegration:
         assert trainer._last_train_used_cache is False
         mock_train.assert_called_once()
 
-    def test_multi_seed_always_reuses_cached_seed_only(self, temp_dir):
+    def test_multi_seed_always_reuses_existing_seed_pool_without_extending_it(self, temp_dir):
         from tests.test_trainer_model import MockTrainerForTest
 
         exp_dir = temp_dir
@@ -396,15 +396,18 @@ class TestTrainerUseCacheIntegration:
         )
         trainer = MockTrainerForTest(model="mock-base", args=args)
 
-        def _fake_train(output_dir, **kwargs):
-            return output_dir
-
-        with patch.object(MockTrainerForTest, "_train", side_effect=_fake_train) as mock_train:
+        with patch.object(MockTrainerForTest, "_train") as mock_train:
             trainer.train()
 
-        assert mock_train.call_count == 1
-        trained_seed_dir = mock_train.call_args.kwargs.get("output_dir") or mock_train.call_args[0][0]
-        assert os.path.basename(trained_seed_dir) == "seed_1"
+        mock_train.assert_not_called()
+        assert not os.path.exists(os.path.join(exp_dir, "seeds", "seed_1"))
+        seed_report_path = os.path.join(exp_dir, "seeds", "seed_report.json")
+        with open(seed_report_path, encoding="utf-8") as handle:
+            seed_report = json.load(handle)
+        assert seed_report["seeds_tried"] == [0]
+        assert seed_report["runs"][0]["used_cache"] is True
+        assert seed_report["runs"][0]["trained"] is False
+        assert "no additional seeds were trained" in seed_report["early_stop_reason"]
 
     def test_multi_seed_true_retrains_all_seeds_on_fingerprint_mismatch(self, temp_dir):
         from tests.test_trainer_model import MockTrainerForTest

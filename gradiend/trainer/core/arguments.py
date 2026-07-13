@@ -262,8 +262,10 @@ class TrainingArguments:
     at the best checkpoint step (their product must be negative)."""
 
     split_resplit_per_seed: bool = False
-    """When split_col is None, re-draw vocabulary-held-out splits per training seed.
-    False keeps the same split assignment across multi-seed runs (using TrainingArguments.seed)."""
+    """When ``split_col`` is ``\"heldout\"`` or ``None``, re-draw splits per training seed.
+    For ``\"heldout\"``, vocabulary groups rotate (see ``split_resplit_strategy``).
+    For ``None``, rows are reshuffled randomly. False keeps the same assignment across
+    multi-seed runs (using TrainingArguments.seed)."""
 
     split_resplit_strategy: Literal["random", "balanced_cycle"] = "random"
     """Strategy used when split_resplit_per_seed=True.
@@ -313,7 +315,7 @@ class TrainingArguments:
     """If True, raise when training finishes and convergent_count < min_convergent_seeds (requires min_convergent_seeds > 0)."""
 
     highlight_non_convergence: bool = True
-    """If True, append a non-convergence marker (✝) to plot/tick labels for non-converged runs."""
+    """If True, append a non-convergence marker (†) to plot/tick labels for non-converged runs."""
 
     # ----- Post-prune -----
     post_prune_config: Optional["PostPruneConfig"] = None

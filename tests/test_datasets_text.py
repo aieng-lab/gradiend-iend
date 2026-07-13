@@ -6,24 +6,17 @@ and data loading variations (add_identity_for_other_classes, max_size).
 """
 
 import os
-import tempfile
 import pandas as pd
 from unittest.mock import MagicMock
-from typing import Dict, Any
 
 import pytest
 import torch
 
 from gradiend.trainer.text.common.dataset import TextGradientTrainingDataset
 from gradiend.trainer.text.prediction.dataset import TextTrainingDataset
-from gradiend.trainer.core.unified_schema import (
-    UNIFIED_MASKED,
-    UNIFIED_FACTUAL,
-    UNIFIED_ALTERNATIVE,
-    UNIFIED_FACTUAL_CLASS,
-    UNIFIED_ALTERNATIVE_CLASS,
-)
-from tests.conftest import MockTokenizer
+from gradiend.trainer.text.prediction.trainer import TextPredictionTrainer
+from gradiend.trainer.core.arguments import TrainingArguments
+from tests.testing_mocks import MockTokenizer
 
 
 class TestTextGradientTrainingDataset:
@@ -86,6 +79,27 @@ class TestTextGradientTrainingDataset:
         # Other keys should use 0
         padding_value_other = dataset._get_padding_value("attention_mask")
         assert padding_value_other == 0
+
+    def test_create_gradient_training_dataset_respects_explicit_target_none(self):
+        """Explicit target=None must not be replaced by TrainingArguments.target."""
+        trainer = TextPredictionTrainer.__new__(TextPredictionTrainer)
+        trainer._training_args = TrainingArguments(source="alternative", target="diff")
+
+        tokenizer = MockTokenizer()
+        model = MagicMock()
+        model.tokenizer = tokenizer
+        model.gradiend.torch_dtype = torch.float32
+        model.gradiend.device_encoder = torch.device("cpu")
+        model.gradient_creator = MagicMock(return_value=torch.randn(4))
+
+        raw = MagicMock()
+        raw.__len__ = MagicMock(return_value=1)
+
+        default_dataset = trainer.create_gradient_training_dataset(raw, model)
+        assert default_dataset.target == "diff"
+
+        eval_dataset = trainer.create_gradient_training_dataset(raw, model, target=None)
+        assert eval_dataset.target is None
     
     def test_text_dataset_caching_uses_cache_key_fields(self, temp_dir):
         """Test that text dataset uses correct cache_key_fields for caching."""

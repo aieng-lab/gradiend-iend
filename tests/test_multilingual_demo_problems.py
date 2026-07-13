@@ -2,6 +2,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 
 @pytest.fixture(scope="module")
 def demo():

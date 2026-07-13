@@ -190,8 +190,6 @@ def build_training_cache_fingerprint(training_args: Any) -> dict:
     post_cfg = _normalize_post_prune_config(args_dict.get("post_prune_config"))
     if post_cfg is not None:
         fingerprint["post_prune_config"] = post_cfg
-    if args_dict.get("reuse_pre_prune") is not None:
-        fingerprint["reuse_pre_prune"] = bool(args_dict.get("reuse_pre_prune"))
     for key in ("source", "target"):
         if args_dict.get(key) is not None:
             fingerprint[key] = args_dict[key]
@@ -277,7 +275,7 @@ def checkpoint_matches_training_fingerprint(
             return False
         return True
 
-    for key in ("pre_prune_config", "post_prune_config", "reuse_pre_prune", "source", "target"):
+    for key in ("pre_prune_config", "post_prune_config", "source", "target"):
         if expected.get(key) != saved.get(key):
             if log_reason:
                 logger.warning(

@@ -1,5 +1,3 @@
-import json
-import os
 from types import SimpleNamespace
 
 import pandas as pd
@@ -296,3 +294,29 @@ def test_classification_evaluate_decoder_lazy_loads_data_when_needed(monkeypatch
     assert result["training_rows"] >= 1
     assert result["neutral_rows"] >= 1
     assert trainer._combined_data is not None
+
+
+def test_encoder_cache_path_does_not_trigger_hf_data_load(monkeypatch, tmp_path):
+    ensure_calls = {"n": 0}
+    real_ensure = TextPredictionTrainer._ensure_data
+
+    def _tracking_ensure(self, **kwargs):
+        ensure_calls["n"] += 1
+        return real_ensure(self, **kwargs)
+
+    monkeypatch.setattr(TextPredictionTrainer, "_ensure_data", _tracking_ensure)
+
+    trainer = TextPredictionTrainer(
+        model="bert-base-uncased",
+        run_id="gender_de_masc_nom_masc_dat",
+        data="aieng-lab/de-gender-case-articles",
+        target_classes=["masc_nom", "masc_dat"],
+        args=TrainingArguments(experiment_dir=str(tmp_path), use_cache=True),
+    )
+
+    cache_path = trainer._encoder_cache_path("", split="test", max_size=50)
+
+    assert ensure_calls["n"] == 0
+    assert trainer._combined_data is None
+    assert cache_path is not None
+    assert "encoded_values_max_size_50_split_test.csv" in cache_path.replace("\\", "/")

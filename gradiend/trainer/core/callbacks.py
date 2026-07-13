@@ -14,12 +14,9 @@ Provided callbacks:
 - TensorBoardCallback: log metrics to TensorBoard (optional).
 """
 
-import os
-import time
 from typing import Optional, Callable, Dict, Any, Union, List
 from abc import ABC
 
-from gradiend.visualizer.plot_optional import _require_matplotlib
 from gradiend.util.logging import get_logger
 
 logger = get_logger(__name__)

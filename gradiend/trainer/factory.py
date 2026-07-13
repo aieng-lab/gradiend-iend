@@ -2,7 +2,7 @@
 Factory functions for creating ModelWithGradiend instances for training.
 """
 
-from typing import Any, Optional, List, Union, Type
+from typing import Any, Optional, List, Type
 
 import torch
 

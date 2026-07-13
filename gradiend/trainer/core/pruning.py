@@ -653,7 +653,7 @@ def _pre_prune_streaming_topk(
 
     def _make_hook(name: str, selector: Any):
         def _hook(grad: torch.Tensor):
-            selected = selector.select_flat(grad.detach().flatten())
+            selected = selector.select_from_param_grad(grad)
             if current_sign[0] < 0:
                 selected = selected.neg()
             if name in accumulators:

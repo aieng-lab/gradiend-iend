@@ -9,8 +9,6 @@ import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-import pandas as pd
-
 from gradiend import (
     TextFilterConfig,
     TextPredictionDataCreator,

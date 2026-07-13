@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from gradiend.comparison import compute_similarity_matrix
-from gradiend.trainer.core.stats import load_training_stats
 from gradiend.util.logging import get_logger
 from gradiend.visualizer.heatmaps.base import plot_comparison_heatmap
 
@@ -19,6 +18,8 @@ def _extract_best_correlation_for_models(models: Dict[str, object]) -> Dict[str,
         if not model_path:
             continue
         try:
+            from gradiend.trainer.core.stats import load_training_stats
+
             run_info = load_training_stats(model_path)
         except Exception as e:
             logger.debug("Could not load training stats for %s from %s: %s", mid, model_path, e)
@@ -64,6 +65,7 @@ def plot_similarity_heatmap(
     group_label_rotation_top: Union[int, float] = 0,
     group_label_rotation_right: Union[int, float] = 0,
     cbar_pad: Optional[float] = None,
+    cbar_y_pad: Optional[float] = None,
     cbar_fontsize: Optional[Union[int, float]] = None,
     cbar_shrink: Optional[float] = None,
     percentages: bool = False,
@@ -76,8 +78,10 @@ def plot_similarity_heatmap(
     column_label_mapping: Optional[Dict[str, str]] = None,
     seed_aggregate: str = "mean",
     dispersion: str = "none",
+    seed_pairing_mode: str = "matched",
     dispersion_display: str = "none",
     seed_annotation: Union[bool, Dict[str, Any]] = False,
+    converged_by_id: Optional[Dict[str, Optional[bool]]] = None,
     highlight_non_convergence: bool = True,
 ) -> Any:
     """Compute model similarity and plot it as a heatmap.
@@ -112,6 +116,8 @@ def plot_similarity_heatmap(
         group_label_rotation_top: Rotation for top group labels.
         group_label_rotation_right: Rotation for right group labels.
         cbar_pad: Optional colorbar padding.
+        cbar_y_pad: Optional vertical colorbar offset as a fraction of the
+            heatmap height; negative values move it down.
         cbar_fontsize: Optional colorbar font size.
         cbar_shrink: Optional colorbar shrink factor (width relative to heatmap).
         percentages: Whether to show values as percentages.
@@ -124,8 +130,10 @@ def plot_similarity_heatmap(
         column_label_mapping: Optional mapping for column labels.
         seed_aggregate: Seed aggregation mode.
         dispersion: Dispersion mode.
+        seed_pairing_mode: ``"all_pairs"`` or positionally aligned ``"matched"``.
         dispersion_display: How to show dispersion values.
         seed_annotation: Whether/how to annotate seed counts.
+        converged_by_id: Optional explicit convergence status by stable model id.
         highlight_non_convergence: Whether labels mark non-converged runs.
     """
     comparison_data = compute_similarity_matrix(
@@ -136,6 +144,7 @@ def plot_similarity_heatmap(
         value=value,
         seed_aggregate=seed_aggregate,
         dispersion=dispersion,
+        seed_pairing_mode=seed_pairing_mode,
     )
     return plot_comparison_heatmap(
         comparison_data,
@@ -164,6 +173,7 @@ def plot_similarity_heatmap(
         group_label_rotation_top=group_label_rotation_top,
         group_label_rotation_right=group_label_rotation_right,
         cbar_pad=cbar_pad,
+        cbar_y_pad=cbar_y_pad,
         cbar_fontsize=cbar_fontsize,
         cbar_shrink=cbar_shrink,
         percentages=percentages,
@@ -177,6 +187,7 @@ def plot_similarity_heatmap(
         dispersion_display=dispersion_display,
         seed_annotation=seed_annotation,
         models=models,
+        converged_by_id=converged_by_id,
         highlight_non_convergence=highlight_non_convergence,
     )
 

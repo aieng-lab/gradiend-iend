@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
-LATEX_BIDI_ARROW = r"$\longleftrightarrow$"
-LATEX_ARROW = r"$\rightarrow$"
+from gradiend.visualizer.labels import transition_bidi_arrow, transition_directed_arrow
 
 CASE_PRETTY: Dict[str, str] = {
     "masc_nom": "Masc.Nom",
@@ -83,24 +82,33 @@ GERMAN_ARTICLE_FEATURE_GROUP_ORDER: Tuple[str, ...] = (
 )
 
 
+def _demo_bidi_arrow() -> str:
+    """Follow the active GRADIEND plot transition-arrow style."""
+    return transition_bidi_arrow()
+
+
+def _demo_directed_arrow() -> str:
+    return transition_directed_arrow()
+
+
 def pretty_demo_trainer_id(trainer_id: str) -> str:
     """Row/column tick label for a trained GRADIEND (same as demo top-k overlap heatmap)."""
     mid = str(trainer_id)
     if mid == "gender_en":
-        return f"he{LATEX_BIDI_ARROW}she"
+        return f"he{_demo_bidi_arrow()}she"
     if mid == "sentiment_positive_negative":
-        return f"Pos{LATEX_BIDI_ARROW}Neg"
+        return f"Pos{_demo_bidi_arrow()}Neg"
     if mid.startswith("sentiment_"):
         rest = mid.removeprefix("sentiment_")
         if "_" in rest:
             positive, negative = rest.split("_", 1)
             return (
                 f"{positive.capitalize()}"
-                f"{LATEX_BIDI_ARROW}"
+                f"{_demo_bidi_arrow()}"
                 f"{negative.capitalize()}"
             )
     if mid == "formality_informal_formal":
-        return f"Inf{LATEX_BIDI_ARROW}Form"
+        return f"Inf{_demo_bidi_arrow()}Form"
     if mid.startswith("gender_de_"):
         rest = mid.removeprefix("gender_de_")
         parts = rest.split("_")
@@ -109,28 +117,28 @@ def pretty_demo_trainer_id(trainer_id: str) -> str:
             right = "_".join(parts[2:])
             return (
                 f"{CASE_PRETTY.get(left, left)}"
-                f"{LATEX_BIDI_ARROW}"
+                f"{_demo_bidi_arrow()}"
                 f"{CASE_PRETTY.get(right, right)}"
             )
     if mid.startswith("pronoun_number_"):
-        return f"SG{LATEX_BIDI_ARROW}PL"
+        return f"SG{_demo_bidi_arrow()}PL"
     if mid.startswith("pronoun_person_"):
         rest = mid.removeprefix("pronoun_person_")
         person_pretty = {
-            "1vs2": f"1st{LATEX_BIDI_ARROW}2nd",
-            "1vs3": f"1st{LATEX_BIDI_ARROW}3rd",
-            "2vs3": f"2nd{LATEX_BIDI_ARROW}3rd",
+            "1vs2": f"1st{_demo_bidi_arrow()}2nd",
+            "1vs3": f"1st{_demo_bidi_arrow()}3rd",
+            "2vs3": f"2nd{_demo_bidi_arrow()}3rd",
         }
-        return person_pretty.get(rest, rest.replace("vs", LATEX_BIDI_ARROW))
+        return person_pretty.get(rest, rest.replace("vs", _demo_bidi_arrow()))
     if mid.startswith("pronoun_"):
         c1, c2 = mid.removeprefix("pronoun_").split("_", 1)
-        return f"{c1}{LATEX_BIDI_ARROW}{c2}"
+        return f"{c1}{_demo_bidi_arrow()}{c2}"
     if mid.startswith("race_"):
         w1, w2 = mid.removeprefix("race_").split("_", 1)
-        return f"{w1.capitalize()}{LATEX_BIDI_ARROW}{w2.capitalize()}"
+        return f"{w1.capitalize()}{_demo_bidi_arrow()}{w2.capitalize()}"
     if mid.startswith("religion_"):
         w1, w2 = mid.removeprefix("religion_").split("_", 1)
-        return f"{w1.capitalize()}{LATEX_BIDI_ARROW}{w2.capitalize()}"
+        return f"{w1.capitalize()}{_demo_bidi_arrow()}{w2.capitalize()}"
     return mid
 
 
@@ -143,7 +151,7 @@ def _gender_de_article_group_key(trainer_id: str) -> str:
         ARTICLE_MAPPING["_".join(pair)]
         for pair in zip(*[iter(parts)] * 2)
     )
-    return LATEX_BIDI_ARROW.join(articles)
+    return _demo_bidi_arrow().join(articles)
 
 
 def build_demo_trainer_order_and_groups(
@@ -218,7 +226,7 @@ def pretty_demo_transition_id(transition_id: str) -> str:
     if "->" not in tid:
         return pretty_demo_feature_id(tid)
     src, tgt = tid.split("->", 1)
-    return f"{pretty_demo_feature_id(src)}{LATEX_ARROW}{pretty_demo_feature_id(tgt)}"
+    return f"{pretty_demo_feature_id(src)}{_demo_directed_arrow()}{pretty_demo_feature_id(tgt)}"
 
 
 def build_german_article_feature_subgroups(
@@ -282,14 +290,15 @@ def demo_topk_overlap_style_kwargs(**overrides: object) -> Dict[str, object]:
     style: Dict[str, object] = {
         "scale": "linear",
         "scale_gamma": 0.5,
-        "group_label_fontsize": 16,
-        "tick_label_fontsize": 14,
+        "group_label_fontsize": 20,
+        "tick_label_fontsize": 15,
         "axis_label_fontsize": 16,
         "annot": True,
         "annot_fontsize": 9,
-        "cbar_pad": 0.15,
-        "cbar_fontsize": 18,
-        "cbar_shrink": 0.75,
+        "cbar_pad": -0.03,
+        "cbar_y_pad": -0.48,
+        "cbar_fontsize": 15,
+        "cbar_shrink": 0.12,
         "percentages": True,
     }
     style.update(overrides)
@@ -301,28 +310,43 @@ def demo_topk_overlap_style_kwargs(**overrides: object) -> Dict[str, object]:
 
 
 def demo_encoding_heatmap_style_kwargs(**overrides: object) -> Dict[str, object]:
-    """Cross-encoding heatmaps: same typography as overlap; diverging signed scale."""
-    style = demo_topk_overlap_style_kwargs(
-        cmap="coolwarm",
-        vmin=-1.0,
-        vmax=1.0,
-        annot=False,
-        percentages=False,
-        scale_gamma=None,
-        cbar_label="Encoding",
-    )
+    """Cross-encoding heatmaps: same knobs as overlap, encoding-specific defaults.
+
+    Unlike top-k overlap, cross-encoding keeps the seaborn default colorbar on the
+    right (no ``cbar_y_pad``). Pass ``cbar_y_pad`` in ``overrides`` to opt in.
+    """
+    style: Dict[str, object] = {
+        "scale": "linear",
+        "group_label_fontsize": 20,
+        "tick_label_fontsize": 15,
+        "axis_label_fontsize": 16,
+        "annot": True,
+        "annot_fontsize": 9,
+        "cbar_pad": 0.15,
+        "cbar_fontsize": 18,
+        "cbar_shrink": 0.75,
+        "percentages": True,
+        "cmap": "coolwarm",
+        # Raw encoding units; ``percentages=True`` scales display to -100..100.
+        "vmin": -1.0,
+        "vmax": 1.0,
+        "scale_gamma": None,
+        "cbar_label": "Encoding (%)",
+    }
     style.update(overrides)
+    tick = style.get("tick_label_fontsize")
+    axis = style.get("axis_label_fontsize")
+    if isinstance(tick, (int, float)) and isinstance(axis, (int, float)):
+        style["axis_label_fontsize"] = max(float(axis), float(tick) + 2)
     return style
 
 
 def demo_encoding_heatmap_normalized_style_kwargs(**overrides: object) -> Dict[str, object]:
-    """Row-normalized cross-encoding heatmaps: auto color scale (diagonal fixed at 1)."""
+    """Row-normalized cross-encoding heatmaps: auto color scale (diagonal fixed at 100)."""
     style = demo_encoding_heatmap_style_kwargs(
-        annot=True,
-        annot_fmt=".2f",
         vmin=None,
         vmax=None,
-        cbar_label="Relative encoding",
+        cbar_label="Relative encoding (%)",
     )
     style.update(overrides)
     return style

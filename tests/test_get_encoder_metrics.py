@@ -4,9 +4,7 @@ Tests for get_encoder_metrics and evaluate_encoder.
 Verifies that both cached results and explicit encoder_df work correctly.
 """
 
-import os
 from typing import Any, Dict, List
-from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -116,7 +114,6 @@ class TestGetEncoderMetricsFromDataframe:
 
     def test_mean_by_class_includes_identity_label_0(self):
         """mean_by_class must include identity classes (label 0) for convergence plot."""
-        import numpy as np
 
         encoder_df = pd.DataFrame({
             "encoded": [0.5, -0.5, 0.02],
@@ -674,8 +671,7 @@ class TestUseCacheWithoutExperimentDir:
     def test_evaluate_encoder_use_cache_no_experiment_dir_raises(self):
         """evaluate_encoder(use_cache=True) with experiment_dir=None raises."""
         from gradiend.evaluator.encoder import EncoderEvaluator
-        from gradiend.trainer.core.dataset import GradientTrainingDataset
-        from tests.test_evaluator import MockTrainer, MockTrainingData
+        from tests.test_evaluator import MockTrainer
 
         evaluator = EncoderEvaluator()
         args = type("Args", (), {"use_cache": True, "experiment_dir": None, "encoder_eval_max_size": 100})()

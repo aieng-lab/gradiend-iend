@@ -4,7 +4,7 @@ TextPredictionModelWithGradiend: MLM/CLM implementation of TextModelWithGradiend
 
 import torch
 
-from gradiend.util.logging import get_logger, suppress_tokenizer_length_warning
+from gradiend.util.logging import get_logger
 from gradiend.trainer.text.common.model_base import TextModelWithGradiend
 from gradiend.trainer.text.prediction.seq2seq import (
     SEQ2SEQ_DECODER_SEQUENCE_CLOZE,

@@ -5,7 +5,7 @@ This module defines protocols for the key components of a FeatureLearningDefinit
 evaluator, feature analyzer), allowing for better type hints and extensibility.
 """
 
-from typing import Protocol, Optional, Dict, Any, Union
+from typing import Protocol, Dict, Any
 from torch.utils.data import Dataset
 
 

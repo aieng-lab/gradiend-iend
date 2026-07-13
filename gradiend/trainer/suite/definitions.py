@@ -35,10 +35,11 @@ from gradiend.comparison import (
     compute_anchor_aligned_encoding_matrix,
     compute_similarity_matrix,
     compute_grouped_similarity_matrices,
-    compute_cross_encoding_matrix,
+    compute_trainer_pair_encoding_matrix,
     normalize_cross_encoding_rows_by_diagonal,
     source_by_id_from_trainers,
 )
+from gradiend.trainer.core.split_col_modes import HELDOUT_SPLIT_COL, data_split_column
 from gradiend.trainer.core.unified_data import (
     _load_dataframe_from_path,
     load_hf_per_class,
@@ -74,7 +75,15 @@ class _GradiendOnlyModel:
         self.name_or_path = getattr(gradiend, "name_or_path", None)
 
     def get_topk_weights(self, *args: Any, **kwargs: Any) -> Any:
-        return self.gradiend.get_topk_weights(*args, **kwargs)
+        local_idx = self.gradiend.get_topk_weights(*args, **kwargs)
+        if not local_idx:
+            return []
+        getter = getattr(self.gradiend, "_get_base_global_index_map", None)
+        if not callable(getter):
+            return local_idx
+        base_map = getter()
+        idx_t = torch.as_tensor(local_idx, dtype=torch.long)
+        return base_map[idx_t].tolist()
 
     def get_weight_importance(self, *args: Any, **kwargs: Any) -> Any:
         return self.gradiend.get_weight_importance(*args, **kwargs)
@@ -485,12 +494,15 @@ def _resolve_suite_training_view(
             hf_splits = getattr(config, "hf_splits", None)
         import gradiend.trainer.suite as suite_api
 
+        raw_split_col = split_col
+        if raw_split_col is None and config is not None:
+            raw_split_col = getattr(config, "split_col", None)
         return suite_api.load_hf_per_class(
             data,
             classes=classes_to_load if classes_to_load is not None else "all",
             splits=hf_splits,
             masked_col=masked_col or "masked",
-            split_col=split_col or "split",
+            split_col=data_split_column(raw_split_col),
             dataset_trust_remote_code=dataset_trust_remote_code,
         )
 
@@ -651,7 +663,7 @@ def _infer_transition_columns(config: Optional[Any], data: Any) -> Tuple[Optiona
                 target_col = right
                 break
         split_value = getattr(config, "split_col", None)
-        if isinstance(split_value, str):
+        if isinstance(split_value, str) and split_value != HELDOUT_SPLIT_COL:
             split_col = split_value
     if hasattr(data, "columns"):
         fallback_pairs = (

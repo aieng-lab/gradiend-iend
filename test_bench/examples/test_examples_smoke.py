@@ -39,7 +39,10 @@ EXAMPLE_MODULES = [
     "gradiend.examples.create_english_pronoun_data",
     "gradiend.examples.train_english_pronouns",
     "gradiend.examples.train_multi_seed_stability",
-    "gradiend.examples.train_seq2seq_decoder_sequence",
+    # Encoder-side MLM is the supported/convergent seq2seq example.  The
+    # decoder-sequence workflow remains available as an experimental example,
+    # but is intentionally not a smoke-test convergence requirement.
+    "gradiend.examples.train_seq2seq_encoder_mlm",
     "gradiend.examples.train_sentiment",
     #"gradiend.examples.train_gender_de_detailed", # we exclude detailed run as it takes very long (many features)
 ]

@@ -676,6 +676,7 @@ def compute_similarity_matrix(
     value: str = "intersection_frac",
     seed_aggregate: str = "mean",
     dispersion: str = "none",
+    seed_pairing_mode: str = "matched",
 ) -> Dict[str, Any]:
     """Compute a pairwise similarity matrix for trained GRADIEND models.
 
@@ -710,14 +711,18 @@ def compute_similarity_matrix(
             Supported values are ``"none"``, ``"std"``, ``"range"``, and
             ``"minmax"``. ``"range"`` is incompatible with ``seed_aggregate`` of
             ``"min"`` or ``"max"``.
+        seed_pairing_mode: How seed groups are paired. ``"all_pairs"`` compares
+            every seed in the left group with every seed in the right group.
+            ``"matched"`` pairs models by position in each selected-seed group
+            and requires equal group sizes. Original seed ids need not match.
 
     Returns:
         For one model per id, a payload with ``measure``, ``model_ids``,
         ``matrix``, ``part``, ``topk``, and measure-specific metadata such as
         ``value``, ``resolved_topk``, ``per_model``, ``block_dim``,
         ``full_zero_filled``, ``sparse_exact``, or ``fallback_dense``. For
-        list/tuple seed groups, every cell aggregates all seed-pair scores,
-        diagonal cells include self-pairs, and the payload also contains
+        list/tuple seed groups, every cell aggregates the selected seed-pair
+        scores, and the payload also contains
         ``seed_aggregate``, ``dispersion``, ``n_matrix``, ``cell_stats``,
         ``multi_seed=True``, plus ``global_n`` or ``global_n_range`` when
         available.
@@ -731,6 +736,8 @@ def compute_similarity_matrix(
             and dispersion settings are incompatible.
     """
     model_groups = _normalize_model_groups(models)
+    if seed_pairing_mode not in {"all_pairs", "matched"}:
+        raise ValueError("seed_pairing_mode must be 'all_pairs' or 'matched'")
     _validate_topk_optional(topk)
     measure = (measure or "cosine").lower()
     resolved_part = (part or ("decoder-weight" if measure == "topk_overlap" else "encoder-weight")).lower()
@@ -766,10 +773,24 @@ def compute_similarity_matrix(
     for i, mi in enumerate(model_ids):
         stats_row: List[Dict[str, Any]] = []
         for j, mj in enumerate(model_ids):
+            if seed_pairing_mode == "matched":
+                left_group = model_groups[mi]
+                right_group = model_groups[mj]
+                if len(left_group) != len(right_group):
+                    raise ValueError(
+                        "seed_pairing_mode='matched' requires equal selected-seed group sizes; "
+                        f"{mi!r} has {len(left_group)} and {mj!r} has {len(right_group)}"
+                    )
+                model_pairs = list(zip(left_group, right_group))
+            else:
+                model_pairs = [
+                    (left_model, right_model)
+                    for left_model in model_groups[mi]
+                    for right_model in model_groups[mj]
+                ]
             scores = [
                 _score_similarity_pair(left_model, right_model, measure=measure, part=resolved_part, topk=topk, value=value)
-                for left_model in model_groups[mi]
-                for right_model in model_groups[mj]
+                for left_model, right_model in model_pairs
             ]
             stats = _aggregate_seed_scores(scores, seed_aggregate=seed_aggregate, dispersion=dispersion)
             matrix[i][j] = float(stats["aggregate"])
@@ -786,6 +807,7 @@ def compute_similarity_matrix(
         "value": value,
         "seed_aggregate": seed_aggregate,
         "dispersion": dispersion,
+        "seed_pairing_mode": seed_pairing_mode,
         "n_matrix": n_matrix,
         "cell_stats": cell_stats,
         "multi_seed": True,

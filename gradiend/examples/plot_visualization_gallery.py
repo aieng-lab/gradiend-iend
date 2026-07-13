@@ -399,6 +399,12 @@ def generate_gallery(output_dir: Path) -> list[Path]:
 
 
 if __name__ == "__main__":
+    import torch
+
+    assert torch.cuda.is_available(), (
+        "The example smoke run requires CUDA, but torch.cuda.is_available() is False. "
+        "Ensure the scheduler allocated a GPU and CUDA_VISIBLE_DEVICES is not empty."
+    )
     written = generate_gallery(Path("runs") / "examples" / "plot_visualization_gallery")
     print("Generated visualization approval artifacts:")
     for path in written:

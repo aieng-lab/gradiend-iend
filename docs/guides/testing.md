@@ -16,6 +16,30 @@ pytest test_bench/examples/ -v -s
 
 These tests are marked `slow` and `integration`; they run each example as a subprocess and assert exit code 0. On failure, full logs are written to `test_bench/results/last_failure_<module>.log`. See [test_bench/README.md](../../test_bench/README.md) for smoke-only options (e.g. `-m integration`) and details.
 
+For an offline GPU job, first prepare every dataset, model, spaCy package, and
+the complete raw Wikipedia dataset snapshot using the same shared cache as the job:
+
+```bash
+python scripts/prefetch_example_assets.py --cache-dir /shared/drechsel/hf-cache
+python scripts/prefetch_example_assets.py --cache-dir /shared/drechsel/hf-cache --verify-only
+```
+
+Set `HF_HOME=/shared/drechsel/hf-cache` in the offline test job as well. The
+explicit path prevents models from being prefetched into a login node's default
+`~/.cache/huggingface` while the job reads the shared cache.
+
+`scripts/prefetch_hf_datasets.py` is only the legacy dataset/export helper; it
+does not fetch models such as `dbmdz/german-gpt2` and is not sufficient for the
+offline example suite.
+
+The main test suite exposes the same smoke runner through `tests/test_examples_smoke_integration.py`. Therefore the complete heavyweight selection includes both the slow/integration tests and all configured example runs:
+
+```bash
+pytest tests/ -v -s -m "slow or integration"
+```
+
+Do not run this command as a routine unit-test check: it loads real models and executes training examples. The bridge delegates to the test-bench implementation, so the example list and failure logging remain defined in one place.
+
 Exclude slow/integration tests explicitly:
 
 ```bash

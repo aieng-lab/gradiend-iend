@@ -166,7 +166,7 @@ excluded by the model-loading logic.
 | **convergent_metric** | `None` | `"correlation"` or `"loss"`. `None` defaults to `"correlation"` unless `supervised_decoder=True`. |
 | **convergent_score_threshold** | `None` | Score threshold for convergence. `None` becomes `0.5` for correlation; required for loss. |
 | **convergent_mean_by_class_threshold** | `None` | Additional convergence threshold: every non-zero target class must have \|mean encoded\| ≥ this value at the best step. For correlation mode, `None` becomes `0.5`. |
-| **split_resplit_per_seed** | `False` | When `split_col=None`, redraw vocabulary-held-out splits per training seed. |
+| **split_resplit_per_seed** | `False` | For trainer-assigned splits (`split_col="heldout"` or `None`), redraw them per training seed. |
 | **split_resplit_strategy** | `"random"` | Strategy for per-seed resplitting: `"random"` or `"balanced_cycle"`. |
 | **seed** | `0` | Base seed. Multi-seed runs use `seed+i`; `None` requests non-deterministic runs. |
 | **seed_runs_dir** | `None` | Directory for per-seed runs. Defaults to `experiment_dir/seeds`. |

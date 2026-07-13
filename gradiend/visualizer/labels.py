@@ -4,14 +4,16 @@ Shared plot label helpers (e.g. non-convergence markers).
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
+import re
+from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
-from gradiend.trainer.core.stats import load_training_stats
-
-# Latin cross — marks non-converged runs (distinct from ✗ which can look like a checkbox).
-NON_CONVERGENCE_MARKER = "✝"
+# Dagger — marks non-converged runs. Prefer U+2020 over the Latin cross (✝):
+# the latter is missing from common Matplotlib fonts and can disappear in PDFs.
+NON_CONVERGENCE_MARKER = "†"
 NON_CONVERGENCE_MARKER_TEX = r"\textdagger{}"
+
+_TRANSITION_DIRECTED_RE = re.compile(r"\s*(?:->|→)\s*")
+_TRANSITION_BIDI_RE = re.compile(r"\s*(?:<->|↔)\s*")
 
 PLOTLY_LABEL_OVERRIDES = {
     "color": "Label",
@@ -33,6 +35,78 @@ PLOTLY_LABEL_OVERRIDES = {
     "text_hover": "Text",
     "type": "Type",
 }
+
+
+def matplotlib_usetex_enabled() -> bool:
+    """Whether matplotlib is currently rendering text through LaTeX."""
+    try:
+        import matplotlib as mpl
+
+        return bool(mpl.rcParams.get("text.usetex", False))
+    except Exception:
+        return False
+
+
+def label_contains_matplotlib_latex(text: Any) -> bool:
+    """True when *text* includes an inline math segment for matplotlib usetex."""
+    return "$" in str(text)
+
+
+def transition_bidi_arrow(*, use_latex: Optional[bool] = None) -> str:
+    """Bidirectional transition arrow for matplotlib labels (GRADIEND pair notation)."""
+    from gradiend.visualizer.plot_style_config import resolve_transition_arrow_mode
+
+    mode = resolve_transition_arrow_mode(use_latex=use_latex)
+    if mode == "latex":
+        return "$\\rightleftarrows$"
+    if mode == "ascii":
+        return " <-> "
+    return " ↔ "
+
+
+def transition_directed_arrow(*, use_latex: Optional[bool] = None) -> str:
+    """Directed transition arrow for matplotlib labels (source to target)."""
+    from gradiend.visualizer.plot_style_config import resolve_transition_arrow_mode
+
+    mode = resolve_transition_arrow_mode(use_latex=use_latex)
+    if mode == "latex":
+        return "$\\rightarrow$"
+    if mode == "ascii":
+        return " -> "
+    return " → "
+
+
+def format_transition_label(label: Any, *, use_latex: Optional[bool] = None) -> str:
+    """Replace transition delimiters with matplotlib-appropriate arrows.
+
+    When ``use_latex`` is omitted, follows :func:`resolve_transition_arrow_mode`.
+    Idempotent for labels that already contain ``$...$`` math segments.
+    """
+    from gradiend.visualizer.plot_style_config import resolve_transition_arrow_mode
+
+    text = str(label)
+    if label_contains_matplotlib_latex(text):
+        return text
+    mode = resolve_transition_arrow_mode(use_latex=use_latex)
+    if mode == "latex":
+        if _TRANSITION_BIDI_RE.search(text):
+            return _TRANSITION_BIDI_RE.sub(
+                lambda _match: transition_bidi_arrow(use_latex=True),
+                text,
+            )
+        if _TRANSITION_DIRECTED_RE.search(text):
+            return _TRANSITION_DIRECTED_RE.sub(
+                lambda _match: transition_directed_arrow(use_latex=True),
+                text,
+            )
+        return text
+    if mode == "ascii":
+        if _TRANSITION_BIDI_RE.search(text):
+            return _TRANSITION_BIDI_RE.sub(" <-> ", text)
+        return _TRANSITION_DIRECTED_RE.sub(" -> ", text)
+    if _TRANSITION_BIDI_RE.search(text):
+        return _TRANSITION_BIDI_RE.sub(" ↔ ", text)
+    return _TRANSITION_DIRECTED_RE.sub(" → ", text)
 
 
 def format_plotly_label(column: Any) -> str:
@@ -72,6 +146,39 @@ def converged_from_run_info(run_info: Optional[Dict[str, Any]]) -> Optional[bool
     return None
 
 
+def converged_from_seed_report(
+    report: Optional[Dict[str, Any]],
+    *,
+    min_convergent_seeds: Optional[int] = None,
+) -> Optional[bool]:
+    """Resolve convergence from a multi-seed ``seed_report.json`` payload.
+
+    The current requested seed requirement takes precedence over the cached
+    report's requirement. That makes stale one-seed caches visibly invalid in a
+    three-seed plotting run instead of silently inheriting ``min=1`` from disk.
+    """
+    if not isinstance(report, dict):
+        return None
+    required = min_convergent_seeds
+    if required is None:
+        cached_required = report.get("min_convergent_seeds")
+        if isinstance(cached_required, int):
+            required = cached_required
+    if required is None:
+        required = 1
+    if required <= 0:
+        return True
+    count = report.get("convergent_count")
+    if isinstance(count, int):
+        return count >= required
+    runs = report.get("runs")
+    if isinstance(runs, list):
+        observed = [bool(run.get("converged")) for run in runs if isinstance(run, dict)]
+        if observed:
+            return sum(observed) >= required
+    return None
+
+
 def converged_for_model_path(model_path: Optional[str]) -> Optional[bool]:
     """Read convergence status for a saved model path.
 
@@ -81,9 +188,19 @@ def converged_for_model_path(model_path: Optional[str]) -> Optional[bool]:
     if not model_path:
         return None
     try:
+        from gradiend.trainer.core.stats import load_training_stats
+
         return converged_from_run_info(load_training_stats(model_path))
     except Exception:
         return None
+
+
+def _min_convergent_seeds_for_trainer(trainer: Any) -> Optional[int]:
+    args = getattr(trainer, "training_args", None) or getattr(trainer, "_training_args", None)
+    if args is None:
+        return None
+    value = getattr(args, "min_convergent_seeds", None)
+    return value if isinstance(value, int) else None
 
 
 def converged_for_trainer(trainer: Any) -> Optional[bool]:
@@ -94,6 +211,18 @@ def converged_for_trainer(trainer: Any) -> Optional[bool]:
     """
     if trainer is None:
         return None
+    required = _min_convergent_seeds_for_trainer(trainer)
+    get_seed_report = getattr(trainer, "get_seed_report", None)
+    if get_seed_report is not None:
+        try:
+            converged = converged_from_seed_report(
+                get_seed_report(),
+                min_convergent_seeds=required,
+            )
+            if converged is not None:
+                return converged
+        except Exception:
+            pass
     get_stats = getattr(trainer, "get_training_stats", None)
     if get_stats is not None:
         try:
@@ -144,6 +273,7 @@ def format_label_with_convergence(
     *,
     converged: Optional[bool] = None,
     highlight_non_convergence: bool = True,
+    marker: Optional[str] = None,
 ) -> str:
     """Append the non-convergence marker when highlight is enabled and the run did not converge.
 
@@ -155,7 +285,7 @@ def format_label_with_convergence(
     text = str(label)
     if not highlight_non_convergence or converged is not False:
         return text
-    marker = non_convergence_marker_for_matplotlib()
+    marker = marker if marker is not None else non_convergence_marker_for_matplotlib()
     if text.endswith(marker) or text.endswith(NON_CONVERGENCE_MARKER):
         return text
     return f"{text} {marker}"
@@ -211,23 +341,48 @@ def resolve_plot_title_with_convergence(
     )
 
 
-def _aggregate_contributor_convergence(values: Iterable[Optional[bool]]) -> Optional[bool]:
-    """Return False if any contributor did not converge; True if all did."""
-    observed = list(values)
-    if not observed:
-        return None
-    if any(value is False for value in observed):
-        return False
-    if all(value is True for value in observed):
-        return True
-    return None
-
-
 def converged_by_trainer_id(trainers: Optional[Dict[str, Any]]) -> Dict[str, Optional[bool]]:
     """Map trainer id to convergence status."""
     if not trainers:
         return {}
     return {str(trainer_id): converged_for_trainer(trainer) for trainer_id, trainer in trainers.items()}
+
+
+def _transition_axis_ids_for_pair(left: str, right: str) -> set[str]:
+    return {
+        f"{left}_{right}",
+        f"{left}->{right}",
+        f"{right}->{left}",
+        f"{left}<->{right}",
+        f"{right}<->{left}",
+        f"{left}→{right}",
+        f"{right}→{left}",
+        f"{left}↔{right}",
+        f"{right}↔{left}",
+    }
+
+
+def _unique_pair_axis_convergence(
+    comparison_data: Dict[str, Any],
+    converged_map: Dict[str, Optional[bool]],
+) -> Dict[str, Optional[bool]]:
+    """Map axis ids to convergence only when they identify exactly one trainer."""
+    pair_by_trainer = comparison_data.get("pair_by_trainer")
+    if not isinstance(pair_by_trainer, dict):
+        return {}
+    candidates: Dict[str, list[Optional[bool]]] = {}
+    for trainer_id, pair in pair_by_trainer.items():
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        left, right = str(pair[0]), str(pair[1])
+        converged = converged_map.get(str(trainer_id))
+        for axis_id in _transition_axis_ids_for_pair(left, right):
+            candidates.setdefault(axis_id, []).append(converged)
+    return {
+        axis_id: statuses[0]
+        for axis_id, statuses in candidates.items()
+        if len(statuses) == 1
+    }
 
 
 def resolve_axis_convergence_for_comparison_heatmap(
@@ -239,10 +394,10 @@ def resolve_axis_convergence_for_comparison_heatmap(
 ) -> Tuple[Dict[str, Optional[bool]], Dict[str, Optional[bool]]]:
     """Resolve row/column convergence when axis ids are not trainer ids.
 
-    For oriented cross-encoding matrices, a feature label is marked non-converged
-    when any GRADIEND that contributed to that axis value did not converge.
-    For GRADIEND × feature-class matrices, column labels use the same rule while
-    row labels remain per-trainer.
+    Convergence is a property of trained GRADIEND runs, not of broad derived
+    feature classes. Therefore axes are marked only when their ids directly name
+    a trainer/model, or when a transition/pair axis id uniquely resolves to one
+    trainer. Ambiguous shared feature axes intentionally remain unmarked.
 
     Args:
         comparison_data: Heatmap payload from comparison matrix helpers.
@@ -256,36 +411,6 @@ def resolve_axis_convergence_for_comparison_heatmap(
         return row_status, col_status
 
     converged_map = converged_by_trainer_id(models)
-    aligned_rows = comparison_data.get("aligned_rows")
-    if aligned_rows is not None:
-        try:
-            import pandas as pd
-        except ImportError:
-            pd = None
-        if pd is not None and isinstance(aligned_rows, pd.DataFrame) and not aligned_rows.empty:
-            row_contributors: Dict[str, list[Optional[bool]]] = defaultdict(list)
-            col_contributors: Dict[str, list[Optional[bool]]] = defaultdict(list)
-            for _, row in aligned_rows.iterrows():
-                trainer_id = str(row.get("trainer_id", ""))
-                converged = converged_map.get(trainer_id)
-                anchor = row.get("anchor_class")
-                if anchor is not None and str(anchor):
-                    row_contributors[str(anchor)].append(converged)
-                eval_class = row.get("eval_class")
-                if eval_class is None:
-                    eval_class = row.get("aligned_column")
-                if eval_class is not None and str(eval_class):
-                    col_contributors[str(eval_class)].append(converged)
-            row_status = {
-                axis_id: _aggregate_contributor_convergence(values)
-                for axis_id, values in row_contributors.items()
-            }
-            col_status = {
-                axis_id: _aggregate_contributor_convergence(values)
-                for axis_id, values in col_contributors.items()
-            }
-            return row_status, col_status
-
     measure = str(comparison_data.get("measure", ""))
     n_matrix = comparison_data.get("n_matrix")
     trainer_ids = [str(value) for value in comparison_data.get("model_ids", [])]
@@ -297,30 +422,23 @@ def resolve_axis_convergence_for_comparison_heatmap(
         and measure.startswith(("gradiend_feature_cross_encoding_", "gradiend_transition_cross_encoding_"))
     ):
         row_status = {trainer_id: converged_map.get(trainer_id) for trainer_id in trainer_ids}
-        col_contributors: Dict[str, list[Optional[bool]]] = defaultdict(list)
-        for row_index, trainer_id in enumerate(trainer_ids):
-            converged = converged_map.get(trainer_id)
-            row_counts = n_matrix[row_index] if row_index < len(n_matrix) else []
-            for col_index, column_id in enumerate(columns):
-                count = row_counts[col_index] if col_index < len(row_counts) else 0
-                if count and int(count) > 0:
-                    col_contributors[column_id].append(converged)
-        col_status = {
-            axis_id: _aggregate_contributor_convergence(values)
-            for axis_id, values in col_contributors.items()
-        }
         return row_status, col_status
 
+    pair_axis_status = _unique_pair_axis_convergence(comparison_data, converged_map)
     if row_ids is not None:
         for axis_id in row_ids:
             key = str(axis_id)
             if key in converged_map:
                 row_status[key] = converged_map[key]
+            elif key in pair_axis_status:
+                row_status[key] = pair_axis_status[key]
     if column_ids is not None:
         for axis_id in column_ids:
             key = str(axis_id)
             if key in converged_map:
                 col_status[key] = converged_map[key]
+            elif key in pair_axis_status:
+                col_status[key] = pair_axis_status[key]
     return row_status, col_status
 
 
@@ -352,7 +470,7 @@ def format_model_labels_with_convergence(
             model_path = getattr(model, "name_or_path", None)
             converged = converged_for_model_path(model_path)
         out[key] = format_label_with_convergence(
-            key,
+            format_transition_label(key),
             converged=converged,
             highlight_non_convergence=highlight_non_convergence,
         )

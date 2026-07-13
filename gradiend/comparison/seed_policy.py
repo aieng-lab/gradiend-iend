@@ -7,7 +7,7 @@ duplicating seed loops or reading ``analyze_seed_stability`` directly.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from gradiend.trainer.core.multi_seed import (
     MultiSeedTrainerView,

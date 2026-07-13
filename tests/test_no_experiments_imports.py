@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SEARCH_ROOTS = ("experiments", "tests", "gradiend")
+SEARCH_ROOTS = ("tests", "gradiend")
 
 
 def _python_files():

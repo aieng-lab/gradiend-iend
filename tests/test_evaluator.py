@@ -8,9 +8,7 @@ import os
 import tempfile
 import json
 from unittest.mock import MagicMock, patch, Mock
-from typing import Dict, Any, List
 
-import pytest
 import torch
 import numpy as np
 import pandas as pd
@@ -19,7 +17,7 @@ from gradiend.evaluator.decoder import DecoderEvaluator
 from gradiend.evaluator.encoder import EncoderEvaluator
 from gradiend.trainer.core.dataset import GradientTrainingDataset
 from gradiend.trainer.core.feature_definition import FeatureLearningDefinition
-from tests.conftest import MockTokenizer
+from tests.testing_mocks import MockTokenizer
 
 
 class MockTrainer:

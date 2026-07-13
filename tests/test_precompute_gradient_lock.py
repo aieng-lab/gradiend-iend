@@ -10,7 +10,6 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import pandas as pd
-import pytest
 import torch
 
 from gradiend import TextPredictionTrainer, TrainingArguments
@@ -21,7 +20,7 @@ from gradiend.trainer.core.dataset import (
     PreComputedTrainingDataset,
 )
 from gradiend.model import ParamMappedGradiendModel
-from tests.conftest import SimpleMockModel, MockTokenizer
+from tests.testing_mocks import SimpleMockModel, MockTokenizer
 from tests.test_trainer_model import MockModelWithGradiendForTest, _make_param_map_spec
 from tests.test_workflow_encoder_decoder import _make_mock_load_model
 

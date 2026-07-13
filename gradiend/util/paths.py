@@ -3,7 +3,7 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 
 def is_under_temp_dir(path: Optional[str]) -> bool:

@@ -6,8 +6,10 @@ from typing import Dict
 
 import pandas as pd
 
-from gradiend.trainer.core.unified_data import per_class_dict_to_unified
-from gradiend.trainer.core.unified_schema import UNIFIED_FACTUAL, UNIFIED_FACTUAL_CLASS
+UNIFIED_FACTUAL = "factual"
+UNIFIED_FACTUAL_CLASS = "factual_class"
+UNIFIED_MASKED = "masked"
+UNIFIED_SPLIT = "split"
 
 
 def _to_minimal(class_dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -30,14 +32,23 @@ def _to_merged(class_dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     feature_class_id is the string id from TextFilterConfig (same as label_class per row).
     Splits are applied per feature class in _apply_auto_split.
     """
-    df = per_class_dict_to_unified(
-        class_dfs,
-        classes=list(class_dfs.keys()),
-        masked_col="masked",
-        split_col="split",
-        use_class_names_as_columns=True,
+    rows = []
+    for class_id, class_df in class_dfs.items():
+        if class_df is None or class_df.empty:
+            continue
+        for _, row in class_df.iterrows():
+            rows.append(
+                {
+                    UNIFIED_MASKED: row[UNIFIED_MASKED],
+                    UNIFIED_SPLIT: row[UNIFIED_SPLIT],
+                    UNIFIED_FACTUAL_CLASS: class_id,
+                    UNIFIED_FACTUAL: row["label"],
+                }
+            )
+    df = pd.DataFrame(
+        rows,
+        columns=[UNIFIED_MASKED, UNIFIED_SPLIT, UNIFIED_FACTUAL_CLASS, UNIFIED_FACTUAL],
     )
-    # Map unified schema to merged column names expected by callers
     df = df.rename(columns={UNIFIED_FACTUAL_CLASS: "label_class", UNIFIED_FACTUAL: "label"})
     df["feature_class_id"] = df["label_class"]
     return df

@@ -1,12 +1,15 @@
 """Tests for multilingual demo heatmap label helpers (overlap + encoding parity)."""
 
+from gradiend.visualizer.labels import transition_bidi_arrow, transition_directed_arrow
 from gradiend.visualizer.multilingual_demo_labels import (
     build_demo_feature_label_mapping,
     build_demo_feature_plot_groups,
     build_demo_trainer_label_mapping,
     build_demo_trainer_order_and_groups,
-    build_demo_transition_label_mapping,
     build_german_article_feature_subgroups,
+    demo_encoding_heatmap_normalized_style_kwargs,
+    demo_encoding_heatmap_style_kwargs,
+    demo_topk_overlap_style_kwargs,
     pretty_demo_feature_id,
     pretty_demo_trainer_id,
     pretty_demo_transition_id,
@@ -25,7 +28,8 @@ def test_pretty_demo_transition_id_uses_arrows():
     label = pretty_demo_transition_id("M->F")
     assert "he" in label
     assert "she" in label
-    assert "rightarrow" in label or r"\rightarrow" in label
+    arrow = transition_directed_arrow()
+    assert arrow.strip() in label.replace(" ", "")
 
 
 def test_pretty_demo_trainer_id_uses_case_pretty_not_articles():
@@ -34,7 +38,8 @@ def test_pretty_demo_trainer_id_uses_case_pretty_not_articles():
     assert "Masc.Dat" in label
     assert "der" not in label
     assert "dem" not in label
-    assert pretty_demo_trainer_id("gender_en") == r"he$\longleftrightarrow$she"
+    arrow = transition_bidi_arrow()
+    assert pretty_demo_trainer_id("gender_en") == f"he{arrow}she"
 
 
 def test_build_demo_feature_plot_groups_uses_article_subgroups():
@@ -59,7 +64,8 @@ def test_pretty_demo_trainer_id_sentiment_word_pairs():
     label = pretty_demo_trainer_id("sentiment_good_bad")
     assert "Good" in label
     assert "Bad" in label
-    assert pretty_demo_trainer_id("sentiment_positive_negative") == r"Pos$\longleftrightarrow$Neg"
+    arrow = transition_bidi_arrow()
+    assert pretty_demo_trainer_id("sentiment_positive_negative") == f"Pos{arrow}Neg"
 
 
 def test_build_demo_trainer_order_and_groups():
@@ -77,7 +83,8 @@ def test_build_demo_trainer_order_and_groups():
     assert ordered[3] == "race_white_black"
     assert list(groups.keys())[-1] == "Race"
     assert groups["Race"] == ["race_white_black"]
-    assert groups[r"dem$\longleftrightarrow$der"] == ["gender_de_masc_nom_masc_dat"]
+    arrow = transition_bidi_arrow()
+    assert groups[f"dem{arrow}der"] == ["gender_de_masc_nom_masc_dat"]
 
 
 def test_build_demo_feature_plot_groups_follows_domain_order():
@@ -101,3 +108,20 @@ def test_label_mappings_cover_all_ids():
     assert feature_labels["masc_nom"] == "Masc.Nom"
     assert feature_labels["M"] == "he"
     assert set(build_demo_trainer_label_mapping(trainers)) == set(trainers)
+
+
+def test_demo_heatmap_styles_use_separate_cbar_defaults():
+    topk_style = demo_topk_overlap_style_kwargs()
+    encoding_style = demo_encoding_heatmap_style_kwargs()
+    normalized_style = demo_encoding_heatmap_normalized_style_kwargs()
+
+    assert topk_style["cbar_y_pad"] < 0
+    assert topk_style["cbar_shrink"] < encoding_style["cbar_shrink"]
+    assert "cbar_y_pad" not in encoding_style
+    assert encoding_style["cbar_pad"] == 0.15
+    assert encoding_style["cbar_shrink"] == 0.75
+    assert encoding_style["vmin"] == -1.0
+    assert encoding_style["vmax"] == 1.0
+    assert encoding_style["percentages"] is True
+    assert encoding_style["cbar_label"] == "Encoding (%)"
+    assert normalized_style["cbar_label"] == "Relative encoding (%)"

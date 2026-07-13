@@ -29,7 +29,10 @@ from gradiend.util import unwrap_model
 from gradiend.util.logging import get_logger
 from gradiend.model import ParamMappedGradiendModel
 from gradiend.model.core import build_gradiend_from_base_model
-from gradiend.model._source_target import validate_source_target
+from gradiend.model._source_target import (
+    resolve_source_from_checkpoint_dir,
+    validate_source_target,
+)
 from gradiend.model.utils import (
     get_hf_device_map,
     resolve_device_config_for_model,
@@ -1104,9 +1107,13 @@ class ModelWithGradiend(nn.Module, ABC):
                 **gradiend_device_config,
             )
 
-        # Source/target: from adapter_config when loading checkpoint, else kwargs
+        # Source/target: checkpoint provenance is authoritative for a trained model.
+        # Legacy checkpoints may contain the constructor default in
+        # gradiend_context.json; their persisted training.json records the source
+        # actually used to create gradients and repairs that historical bug.
         if gradiend is not None and getattr(gradiend, "name_or_path", None) == load_directory_str:
-            source, target, feature_class_encoding_direction_from_context = read_gradiend_context(load_directory_str)
+            _, target, feature_class_encoding_direction_from_context = read_gradiend_context(load_directory_str)
+            source = resolve_source_from_checkpoint_dir(load_directory_str)
         else:
             source = kwargs.get("source", _training_arg_value("source", "factual"))
             target = kwargs.get("target", _training_arg_value("target", "diff"))

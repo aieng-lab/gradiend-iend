@@ -13,6 +13,7 @@ from gradiend.visualizer.heatmaps.encoding import (
     ORIENTED_CROSS_ENCODING_YLABEL,
     _oriented_cross_encoding_axis_labels,
     plot_cross_encoding_heatmap,
+    resolve_oriented_cross_encoding_alignment,
 )
 
 
@@ -184,6 +185,52 @@ def test_plot_cross_encoding_heatmap_oriented_sets_default_axis_labels(monkeypat
         plt.close("all")
 
 
+def test_oriented_cross_encoding_auto_alignment_follows_alternative_source(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_compute(**kwargs):
+        captured["alignment"] = kwargs.get("alignment")
+        return _oriented_comparison_payload()
+
+    def fake_plot(comparison_data, **kwargs):
+        captured["xlabel"] = kwargs.get("xlabel")
+        return {"path": None}
+
+    monkeypatch.setattr(
+        "gradiend.visualizer.heatmaps.encoding.source_by_id_from_trainers",
+        lambda trainers: {key: "alternative" for key in trainers},
+    )
+    monkeypatch.setattr(
+        "gradiend.visualizer.heatmaps.encoding.compute_anchor_aligned_encoding_matrix",
+        fake_compute,
+    )
+    monkeypatch.setattr(
+        "gradiend.visualizer.heatmaps.encoding.plot_comparison_heatmap",
+        fake_plot,
+    )
+
+    plot_cross_encoding_heatmap(
+        _dummy_trainers(),
+        ["A", "B"],
+        encoder_summary={"ab": {"encoder_df": []}},
+        show=False,
+    )
+
+    assert captured["alignment"] == "counterfactual"
+    assert captured["xlabel"] == ORIENTED_CROSS_ENCODING_XLABEL_FACTUAL
+
+
+def test_resolve_oriented_cross_encoding_alignment_falls_back_for_mixed_sources(monkeypatch):
+    monkeypatch.setattr(
+        "gradiend.visualizer.heatmaps.encoding.source_by_id_from_trainers",
+        lambda trainers: {"a": "alternative", "b": "factual"},
+    )
+    assert resolve_oriented_cross_encoding_alignment({"a": object(), "b": object()}) == (
+        "factual",
+        True,
+    )
+
+
 def test_plot_cross_encoding_heatmap_oriented_respects_alignment_axis_labels(monkeypatch):
     pytest.importorskip("matplotlib")
     pytest.importorskip("seaborn")
@@ -244,7 +291,7 @@ def test_plot_cross_encoding_heatmap_directed_mode_has_no_default_axis_labels(mo
     import matplotlib.pyplot as plt
 
     monkeypatch.setattr(
-        "gradiend.visualizer.heatmaps.encoding.compute_cross_encoding_matrix",
+        "gradiend.visualizer.heatmaps.encoding.compute_trainer_pair_encoding_matrix",
         lambda *args, **kwargs: {
             "measure": "cross_encoding_positive_mean",
             "model_ids": ["a", "b"],
@@ -266,7 +313,7 @@ def test_plot_cross_encoding_heatmap_directed_mode_has_no_default_axis_labels(mo
         plt.close("all")
 
 
-def test_plot_cross_encoding_heatmap_oriented_marks_non_converged_feature_labels(monkeypatch):
+def test_plot_cross_encoding_heatmap_oriented_does_not_mark_feature_labels(monkeypatch):
     pytest.importorskip("matplotlib")
     pytest.importorskip("seaborn")
     import matplotlib.pyplot as plt
@@ -316,12 +363,12 @@ def test_plot_cross_encoding_heatmap_oriented_marks_non_converged_feature_labels
         )
         ylabels = [label.get_text() for label in ax.get_yticklabels()]
         xlabels = [label.get_text() for label in ax.get_xticklabels()]
-        assert marker in ylabels[0]
+        assert marker not in ylabels[0]
         assert marker not in ylabels[1]
-        assert marker in ylabels[2]
+        assert marker not in ylabels[2]
         assert marker not in xlabels[0]
         assert marker not in xlabels[1]
-        assert marker in xlabels[2]
+        assert marker not in xlabels[2]
     finally:
         plt.close("all")
 
@@ -370,7 +417,7 @@ def test_plot_cross_encoding_heatmap_directed_forwards_only_valid_plot_kwargs(mo
         return comparison_data
 
     monkeypatch.setattr(
-        "gradiend.visualizer.heatmaps.encoding.compute_cross_encoding_matrix",
+        "gradiend.visualizer.heatmaps.encoding.compute_trainer_pair_encoding_matrix",
         lambda *args, **kwargs: {
             "measure": "cross_encoding_positive_mean",
             "model_ids": ["a", "b"],

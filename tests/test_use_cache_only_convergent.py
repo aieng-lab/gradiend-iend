@@ -12,7 +12,6 @@ from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.core.cache_policy import (
     USE_CACHE_ALWAYS,
     USE_CACHE_ONLY_CONVERGENT,
-    STALE_PRUNED_INPUT_DIM_THRESHOLD,
     build_training_cache_fingerprint,
     checkpoint_matches_training_fingerprint,
     coerce_artifact_use_cache,
@@ -365,6 +364,37 @@ def test_pruned_checkpoint_with_matching_fingerprint_is_reused():
         model_dir,
         min_convergent_seeds=2,
         training_args=args,
+    )
+
+
+def test_reuse_pre_prune_toggle_does_not_invalidate_training_checkpoint():
+    from gradiend.trainer import PrePruneConfig
+
+    temp = _temp_dir("reuse_pre_prune_fp")
+    model_dir = os.path.join(temp, "model")
+    pre_cfg = PrePruneConfig(topk=0.1, n_samples=8, source="alternative")
+    current_args = TrainingArguments(
+        use_cache="only_convergent",
+        pre_prune_config=pre_cfg,
+        reuse_pre_prune=True,
+    )
+    legacy_fingerprint = build_training_cache_fingerprint(current_args)
+    legacy_fingerprint["reuse_pre_prune"] = False
+
+    _write_min_model(model_dir, converged=True, convergent_count=1)
+    training_path = os.path.join(model_dir, "training.json")
+    with open(training_path, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    payload["cache_fingerprint"] = legacy_fingerprint
+    with open(training_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle)
+
+    assert checkpoint_matches_training_fingerprint(model_dir, current_args)
+    assert should_reuse_training_cache(
+        "only_convergent",
+        model_dir,
+        min_convergent_seeds=1,
+        training_args=current_args,
     )
 
 

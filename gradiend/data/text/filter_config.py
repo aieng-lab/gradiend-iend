@@ -6,7 +6,7 @@ Not prediction-specific; used by text filtering in general.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 # Type alias for spacy morph/tag constraints (e.g. {"pos": "DET", "Case": "Nom"})

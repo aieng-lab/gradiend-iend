@@ -349,7 +349,7 @@ def test_dense_anchor_aligned_cross_task_fills_cross_domain_columns(monkeypatch)
         }
 
     monkeypatch.setattr(
-        "gradiend.comparison.feature_cross_encoding.build_cross_task_encoder_summary",
+        "gradiend.comparison.cross_encoding.build_cross_task_encoder_summary",
         _fake_cross_task_summary,
     )
     monkeypatch.setattr(
@@ -515,7 +515,7 @@ def test_anchor_aligned_includes_cross_domain_label_zero_rows():
 
 
 def test_sample_cross_task_eval_rows_keeps_each_factual_class():
-    from gradiend.comparison.feature_cross_encoding import _sample_cross_task_eval_rows
+    from gradiend.comparison.cross_encoding import _sample_cross_task_eval_rows
 
     df = pd.DataFrame(
         {

@@ -5,15 +5,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
-import gradiend.comparison.feature_cross_encoding as feature_cross_encoding_module
+import gradiend.comparison.cross_encoding as cross_encoding_module
 from gradiend.comparison.anchor_aligned import compute_anchor_aligned_encoding_matrix
-from gradiend.comparison.feature_cross_encoding import (
+from gradiend.comparison.cross_encoding import (
     build_cross_task_encoder_summary,
     compute_gradiend_transition_cross_encoding_matrix,
 )
@@ -29,9 +28,17 @@ from gradiend.comparison.similarity import compute_similarity_matrix
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.core.multi_seed import MultiSeedTrainerView, is_multi_seed_view
 from gradiend.trainer.core.seed_models import SeedModelGroup
-from tests.test_gradiend_feature_cross_encoding import _Trainer, _unified_row
+from tests.test_cross_encoding import _Trainer, _unified_row
 from tests.test_multi_seed_view import _local_temp, _write_seed_report
 from tests.test_trainer_model import MockTrainerForTest
+
+
+def test_multi_seed_example_preserves_original_race_dataset_splits():
+    from gradiend.examples.train_multi_seed_stability import build_trainer
+
+    trainer = build_trainer()
+
+    assert trainer.config.split_col == "split"
 
 
 class _TopKModel:
@@ -110,7 +117,8 @@ def test_seed_model_group_works_with_similarity_matrix():
         dispersion="std",
     )
     assert result["multi_seed"] is True
-    assert result["matrix"][0][1] == pytest.approx(0.375)
+    assert result["seed_pairing_mode"] == "matched"
+    assert result["matrix"][0][1] == pytest.approx(0.5)
     assert len(group_a) == 2
     assert group_a.primary.get_topk_weights(topk=2) == [1, 2]
 
@@ -342,8 +350,12 @@ def test_build_cross_task_encoder_summary_multi_seed_aggregates(monkeypatch):
             max_size,
             use_cache_effective,
             expected_transitions,
+            expected_probe_keys=None,
             load_directory=None,
             allow_disk_cache=True,
+            cache_only=False,
+            force_recompute=False,
+            allow_incomplete_cache=False,
         ):
             loaded_paths.append(load_directory)
             encoded = 1.0 if load_directory and "seed_10" in load_directory else 0.0
@@ -360,7 +372,7 @@ def test_build_cross_task_encoder_summary_multi_seed_aggregates(monkeypatch):
             )
 
         monkeypatch.setattr(
-            feature_cross_encoding_module,
+            cross_encoding_module,
             "_build_cross_task_encoder_df_for_seed",
             _fake_build_cross_task_encoder_df_for_seed,
         )
@@ -422,7 +434,7 @@ def test_transition_cross_encoding_matrix_uses_multi_seed_summary(monkeypatch):
             )
 
         monkeypatch.setattr(
-            feature_cross_encoding_module,
+            cross_encoding_module,
             "_build_cross_task_encoder_df_for_seed",
             _fake_build_cross_task_encoder_df_for_seed,
         )

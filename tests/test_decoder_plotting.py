@@ -6,7 +6,7 @@ vertical line at selected LR, x-axis clamped to data range, and plot structure.
 """
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -316,7 +316,7 @@ class TestPlotProbabilityShifts:
                 "gradiend.trainer.text.prediction.prediction_objective.PredictionObjective.compute_lms",
                 return_value={"lms": 0.5},
             ):
-                from tests.conftest import SimpleMockModel, MockTokenizer
+                from tests.testing_mocks import SimpleMockModel, MockTokenizer
                 result = trainer.evaluate_base_model(
                     model=SimpleMockModel(),
                     tokenizer=MockTokenizer(),

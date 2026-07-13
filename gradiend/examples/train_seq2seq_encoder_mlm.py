@@ -5,6 +5,9 @@ Same English 3SG/3PL pronoun data as ``train_english_pronouns.py`` / ``start_wor
 but on ``t5-small``. With ``prediction_objective="auto"``, seq2seq models resolve to
 encoder-side MLM — BERT-like ``[MASK]`` scoring on the encoder stack.
 
+This is the supported, convergent seq2seq example and is included in the example
+smoke test suite. The decoder-sequence counterpart is experimental.
+
 Run:
     python -m gradiend.examples.train_seq2seq_encoder_mlm
 """
