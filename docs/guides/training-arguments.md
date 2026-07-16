@@ -65,7 +65,7 @@ the alternative gradient and the decoder learns the difference to apply.
 | **encoder_eval_train_max_size** | `None` | Max samples for in-training encoder evaluation. `None` uses `encoder_eval_max_size`. |
 | **encoder_eval_max_size** | `None` | Max samples for encoder evaluation outside training. |
 | **encoder_eval_balance** | `True` | Balance encoder evaluation data per feature class. |
-| **include_other_classes** | `False` | Include all class transitions in the evaluation split (not only the trained pair) when `len(all_classes) > 2`. Affects encoder evaluation, encoder plots, and cross-encoding with `full_eval=True`. See also [`TransitionSpec`][gradiend.trainer.core.transition_selection.TransitionSpec] for explicit transition lists. |
+| **include_other_classes** | `False` | Include all class transitions in the evaluation split (not only the trained pair) when `len(all_classes) > 2`. Affects encoder evaluation, encoder plots, and suite cross-encoding plots built from encoder evaluation. See also [`TransitionSpec`][gradiend.trainer.core.transition_selection.TransitionSpec] for explicit transition lists. |
 | **seed_selection_eval_max_size** | `None` | Max samples for post-hoc seed selection evaluation. `None` uses `encoder_eval_max_size`. |
 | **decoder_eval_max_size_training_like** | `None` | Max samples for decoder training-like evaluation data. |
 | **decoder_eval_max_size_neutral** | `None` | Max samples for decoder neutral evaluation and LMS text. |
@@ -74,6 +74,12 @@ the alternative gradient and the decoder learns the difference to apply.
 | **eval_batch_size** | `32` | Batch size for evaluation. |
 | **do_eval** | `True` | Whether to evaluate during training. |
 | **evaluate_fn** | `None` | Custom in-training evaluation callable. `None` uses the default encoder-correlation evaluation. |
+
+At call time, [`evaluate_decoder(max_size=N)`][gradiend.trainer.trainer.Trainer.evaluate_decoder]
+uses `N` as a shared convenience cap for both decoder datasets:
+`max_size_training_like=N` and `max_size_neutral=N`, unless either explicit
+decoder cap is passed. `split` selects the training-like decoder rows, just as
+for encoder evaluation; neutral data is still drawn from `eval_neutral_data`.
 
 ---
 

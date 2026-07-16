@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 import pandas as pd
 import torch
@@ -298,7 +298,7 @@ def compute_trainer_pair_encoding_matrix(
     use_cache: bool = True,
     metric: str = "positive_mean",
     full_eval: Optional[bool] = None,
-    run_evaluation: bool = True,
+    encoder_eval: Literal["auto", "cached", "recompute"] = "auto",
     allow_incomplete: bool = False,
     seed_selection: Optional[str] = None,
     seed_aggregate: str = "mean",
@@ -320,18 +320,18 @@ def compute_trainer_pair_encoding_matrix(
         split: Data split for encoder evaluation and cache lookup.
         max_size: Optional maximum number of examples used by encoder
             evaluation/cache keys.
-        use_cache: Whether cached encoder outputs may be loaded. With
-            ``run_evaluation=True``, this is also passed through to
-            ``trainer.evaluate_encoder`` for best-seed evaluation.
+        use_cache: Whether cached encoder outputs may be loaded in
+            ``encoder_eval="auto"`` mode.
         metric: Cell metric. Supported values are ``"positive_mean"``,
             ``"negative_mean"``, and ``"positive_minus_negative"``.
         full_eval: Controls whether encoder evaluation includes other classes.
             ``None`` defaults to ``True`` for ``split="test"`` and ``False``
             otherwise. This becomes ``include_other_classes`` in
             ``trainer.evaluate_encoder``.
-        run_evaluation: If ``True``, missing caches are computed by loading the
-            relevant model and calling ``trainer.evaluate_encoder``. If
-            ``False``, missing caches raise unless ``allow_incomplete=True``.
+        encoder_eval: Encoder evaluation policy. ``"auto"`` loads cached
+            encoder outputs when available and computes missing rows;
+            ``"cached"`` requires existing cached encoder outputs;
+            ``"recompute"`` ignores encoder caches and recomputes rows.
         allow_incomplete: If ``True``, missing row data or empty row/column
             subsets produce ``NaN`` cells instead of raising.
         seed_selection: ``"best"`` compares the selected best model/cache.
@@ -350,7 +350,7 @@ def compute_trainer_pair_encoding_matrix(
         A comparison payload with ``measure``, ``model_ids``, ``rows``,
         ``columns``, ``matrix``, ``split``, ``max_size``, ``metric``,
         ``positive_class_by_column``, ``negative_class_by_column``,
-        ``available_mask``, ``full_eval``, ``run_evaluation``,
+        ``available_mask``, ``full_eval``, ``encoder_eval``,
         ``allow_incomplete``, ``seed_selection``, ``seed_aggregate``,
         ``dispersion``, ``n_matrix``, ``cell_stats``, and ``multi_seed``.
         ``global_n`` or ``global_n_range`` is included when seed counts are
@@ -369,6 +369,9 @@ def compute_trainer_pair_encoding_matrix(
             "Currently supported cross-encoding metrics are "
             "'positive_mean', 'negative_mean', and 'positive_minus_negative'"
         )
+    encoder_eval = str(encoder_eval).strip().lower()  # type: ignore[assignment]
+    if encoder_eval not in {"auto", "cached", "recompute"}:
+        raise ValueError("encoder_eval must be one of: 'auto', 'cached', 'recompute'")
     seed_selection = resolve_seed_selection_for_trainers(trainers, seed_selection)
     if dispersion is None:
         dispersion = resolve_dispersion_for_trainers(trainers, None)
@@ -397,15 +400,19 @@ def compute_trainer_pair_encoding_matrix(
         )
         pair_by_col[trainer_id] = target_classes
         if seed_selection == "best":
-            encoder_df = _load_cached_encoder_df(trainer, split=split, max_size=max_size) if use_cache else None
-            if encoder_df is None and run_evaluation:
+            encoder_df = (
+                _load_cached_encoder_df(trainer, split=split, max_size=max_size)
+                if encoder_eval in {"auto", "cached"} and use_cache
+                else None
+            )
+            if encoder_df is None and encoder_eval in {"auto", "recompute"}:
                 eval_model = _load_eval_model_for_trainer(trainer)
                 try:
                     eval_result = trainer.evaluate_encoder(
                         model_with_gradiend=eval_model,
                         split=split,
                         max_size=max_size,
-                        use_cache=use_cache,
+                        use_cache=bool(use_cache and encoder_eval == "auto"),
                         return_df=True,
                         plot=False,
                         include_other_classes=include_other_classes,
@@ -426,11 +433,24 @@ def compute_trainer_pair_encoding_matrix(
             encoder_dfs: List[Any] = []
             best_seed_path = trainer.get_best_seed_run_path() if hasattr(trainer, "get_best_seed_run_path") else None
             reused_best_cache = False
-            if use_cache and best_seed_path is not None:
+            if encoder_eval in {"auto", "cached"} and use_cache and best_seed_path is not None:
                 cached_best_df = _load_cached_encoder_df(trainer, split=split, max_size=max_size)
                 if cached_best_df is not None:
                     encoder_dfs.append(cached_best_df)
                     reused_best_cache = True
+            if encoder_eval == "cached":
+                row_encoder_dfs[trainer_id] = encoder_dfs
+                value = row_encoder_dfs[trainer_id]
+                if value is None or (isinstance(value, list) and len(value) == 0):
+                    if allow_incomplete:
+                        row_encoder_dfs[trainer_id] = None
+                        continue
+                    raise ValueError(
+                        f"Trainer {trainer_id!r} has no cached encoder data for cross-encoding. "
+                        "Run suite.evaluate_encoder(split='test', full_eval=True, return_df=True) first, "
+                        "or use encoder_eval='auto'."
+                    )
+                continue
             for seed_path in seed_paths:
                 if not isinstance(seed_path, str) or not os.path.isdir(seed_path):
                     continue
@@ -468,7 +488,8 @@ def compute_trainer_pair_encoding_matrix(
                 continue
             raise ValueError(
                 f"Trainer {trainer_id!r} has no full encoder data for cross-encoding. "
-                "Run suite.evaluate_encoder(split='test', full_eval=True, return_df=True) first, or pass run_evaluation=True."
+                "Run suite.evaluate_encoder(split='test', full_eval=True, return_df=True) first, "
+                "or use encoder_eval='auto'."
             )
     matrix = [[float("nan")] * len(ids) for _ in range(len(ids))]
     available_mask = [[False] * len(ids) for _ in range(len(ids))]
@@ -525,7 +546,7 @@ def compute_trainer_pair_encoding_matrix(
         "negative_class_by_column": negative_by_col,
         "available_mask": available_mask,
         "full_eval": include_other_classes,
-        "run_evaluation": run_evaluation,
+        "encoder_eval": encoder_eval,
         "allow_incomplete": allow_incomplete,
         "seed_selection": seed_selection,
         "seed_aggregate": seed_aggregate,

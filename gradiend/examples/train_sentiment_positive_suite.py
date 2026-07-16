@@ -144,7 +144,6 @@ def plot_suite_outputs(
     cross_encoding_output = EXPERIMENT_DIR / CROSS_ENCODING_PLOT
     print(f"\n=== Plotting cross-encoding heatmap to {cross_encoding_output} ===")
     suite.plot_cross_encoding_heatmap(
-        run_evaluation=False,
         output_path=str(cross_encoding_output),
         show=False,
     )

@@ -19,7 +19,8 @@ Public API (from gradiend):
     - Comparison: compute_similarity_matrix, compute_trainer_pair_encoding_matrix,
 
       compute_anchor_aligned_encoding_matrix, compute_gradiend_feature_cross_encoding_matrix,
-      compute_gradiend_transition_cross_encoding_matrix
+      compute_gradiend_transition_cross_encoding_matrix,
+      build_cross_task_encoder_summary
 
     - Logging: setup_logging, get_logger
 
@@ -78,6 +79,7 @@ __all__ = [
     "compute_grouped_similarity_matrices",
     "compute_trainer_pair_encoding_matrix",
     "compute_anchor_aligned_encoding_matrix",
+    "build_cross_task_encoder_summary",
     "compute_gradiend_feature_cross_encoding_matrix",
     "compute_gradiend_transition_cross_encoding_matrix",
     # Training
@@ -137,6 +139,7 @@ _LAZY_IMPORTS = {
     "compute_grouped_similarity_matrices": ("gradiend.comparison", "compute_grouped_similarity_matrices"),
     "compute_trainer_pair_encoding_matrix": ("gradiend.comparison", "compute_trainer_pair_encoding_matrix"),
     "compute_anchor_aligned_encoding_matrix": ("gradiend.comparison", "compute_anchor_aligned_encoding_matrix"),
+    "build_cross_task_encoder_summary": ("gradiend.comparison", "build_cross_task_encoder_summary"),
     "compute_gradiend_feature_cross_encoding_matrix": (
         "gradiend.comparison",
         "compute_gradiend_feature_cross_encoding_matrix",

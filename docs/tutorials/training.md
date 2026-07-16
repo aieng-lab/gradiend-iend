@@ -82,7 +82,10 @@ Legacy checkpoints without `cache_fingerprint` are rejected when pre-pruning is 
 
 > **Incomplete coverage:** Fingerprinting is a best-effort guard, not a full equivalence check on [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments]. It currently covers pruning and source/target settings only. Many arguments that affect training are **not** compared (e.g. `learning_rate`, `max_steps`, `train_batch_size`, `params`, `target_classes`, data splits). Changing those can still reuse an old checkpoint when the fingerprint matches. Treat `use_cache=True` as convenient for iterative analysis, not as proof that two runs used identical settings. Set `use_cache=False`, use `use_cache="always"` only when you intentionally want to skip fingerprint checks, or use a new `experiment_dir` / `run_id`, when you need a guaranteed fresh train.
 
-Evaluator caches key on different arguments (e.g. `split` and `max_size` in [`evaluate_encoder()`][gradiend.trainer.trainer.Trainer.evaluate_encoder]), so evaluating on different subsets can coexist.
+Evaluator caches key on different arguments (e.g. `split` and `max_size` in
+[`evaluate_encoder()`][gradiend.trainer.trainer.Trainer.evaluate_encoder] and
+[`evaluate_decoder()`][gradiend.trainer.trainer.Trainer.evaluate_decoder]), so
+evaluating on different subsets can coexist.
 
 Use `use_cache=True` when iterating on analysis or plots with matching pruning/source settings; use `"always"` to force reuse regardless of fingerprint; use `False` when you want to force recomputation or retrain.
 

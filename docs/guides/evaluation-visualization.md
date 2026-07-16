@@ -31,7 +31,7 @@ Set `highlight_non_convergence=False` to hide markers. Format: `NAME †` (space
 | **[Suite comparison heatmaps](#suite-heatmaps)** | Similarity and cross-encoding across suite children | [`suite.plot_similarity_heatmap()`][gradiend.trainer.suite.base.TrainerSuite.plot_similarity_heatmap], [`suite.plot_cross_encoding_heatmap()`][gradiend.trainer.suite.base.TrainerSuite.plot_cross_encoding_heatmap] |
 | **[Seed comparison](#seed-comparison)** | Layer-wise / top-k overlap across seeds | [`plot_comparison_heatmap()`][gradiend.visualizer.heatmaps.base.plot_comparison_heatmap] with [`compute_similarity_matrix()`][gradiend.comparison.similarity.compute_similarity_matrix] |
 
-See [Oriented cross-encoding matrix](cross-encoding-matrix.md) for the multilingual demo pipeline and a synthetic aggregation walkthrough.
+See [Oriented cross-encoding matrix](cross-encoding-matrix.md) for the multilingual demo pipeline and a BERT race+gender aggregation walkthrough.
 
 For LaTeX fonts, transition arrows (`M -> F`), and environment variables, see **[Plot styling & LaTeX](plot-styling-latex.md)**.
 
@@ -358,10 +358,11 @@ After training a [trainer suite](trainer-suites.md):
 
 ```python
 suite.plot_similarity_heatmap(measure="cosine", output_path="suite_similarity.png")
-suite.plot_cross_encoding_heatmap(run_evaluation=False, output_path="suite_cross_encoding.png")
+suite.plot_cross_encoding_heatmap(output_path="suite_cross_encoding.png")
+suite.plot_topk_overlap_heatmap(topk=1000, output_path="suite_topk_overlap.png")
 ```
 
- todo topk overlap as well
+![Top-k decoder overlap across suite children](../img/symmetric_suite_topk_overlap.png)
 
 [`SymmetricTrainerSuite.plot_cross_encoding_heatmap(feature_classes, ...)`][gradiend.trainer.suite.symmetric.SymmetricTrainerSuite.plot_cross_encoding_heatmap].
 
@@ -385,10 +386,6 @@ plot_cross_encoding_heatmap(trainers, feature_classes, alignment="counterfactual
 ```
 
 See [Oriented cross-encoding matrix](cross-encoding-matrix.md) for semantics and a worked cell trace.
-
-<!-- DOC_PLOT: docs/img/cross_encoding_oriented_counterfactual.png
-Regenerate: experiments/multilingual_gradiend_demo_small.py (--plot-only)
--->
 
 ---
 

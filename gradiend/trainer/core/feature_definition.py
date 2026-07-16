@@ -29,7 +29,7 @@ from gradiend.util.logging import get_logger
 from gradiend.model import ModelWithGradiend
 from gradiend.util.paths import resolve_encoder_analysis_path
 from gradiend.evaluator.encoder_metrics import get_encoder_metrics_from_dataframe, get_model_metrics
-from gradiend.util.encoder_splits import encoder_split_cache_key
+from gradiend.util.encoder_splits import EncoderSplit, encoder_split_cache_key
 from gradiend.util.split_policy import SplitPolicy
 
 logger = get_logger(__name__)
@@ -604,6 +604,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
         tokenizer,
         max_size_training_like: Optional[int] = None,
         max_size_neutral: Optional[int] = None,
+        split: Optional[EncoderSplit] = "test",
         cached_training_like_df: Optional[pd.DataFrame] = None,
         cached_neutral_df: Optional[pd.DataFrame] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -614,6 +615,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
             tokenizer: Tokenizer
             max_size_training_like: Maximum number of generated training-like samples
             max_size_neutral: Maximum number of generated neutral samples
+            split: Dataset split(s) used for training-like decoder evaluation rows.
             cached_training_like_df: Optional cached training-like DataFrame to reuse
             cached_neutral_df: Optional cached neutral DataFrame to reuse
 

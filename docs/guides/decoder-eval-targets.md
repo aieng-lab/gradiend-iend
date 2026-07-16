@@ -27,6 +27,10 @@ trainer = TextPredictionTrainer(
 sample caps for decoder eval (`decoder_eval_lrs`, `decoder_eval_feature_factors`,
 `decoder_eval_max_size_training_like`, …) live on
 [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments] instead.
+You can override the evaluation subset per call with `split` and `max_size`:
+`evaluate_decoder(split="test", max_size=50)` uses the test split for training-like
+probability scoring and caps both training-like rows and neutral LMS rows at 50.
+Use `max_size_training_like` or `max_size_neutral` when those caps should differ.
 
 **Default:** `decoder_eval_targets=None`. Leave it unset (or pass `None`) and GRADIEND
 infers targets from your training data when decoder evaluation runs depending on the data:
@@ -97,10 +101,6 @@ dec = trainer.evaluate_decoder(plot=True, target_class="commutative")
 
 There is no dedicated example script for commutative overlap — inline snippet only. Overlap detection is covered in
 `tests/test_trainer_data_inputs.py` (`test_infer_decoder_eval_targets_marks_overlapping_tokens_for_row_wise_fallback`).
-
-<!-- DOC_PLOT: docs/img/decoder_eval_commutative_probability_shifts.png
-Optional: run the snippet above in a notebook or short script; copy decoder plot from experiment_dir.
--->
 
 ---
 

@@ -578,13 +578,13 @@ def _streaming_topk_from_accumulators(
         higher_count = 0 if position == 0 else int(descending_cumulative[position - 1].item())
         return int(hist.numel()) - 1 - position, rank - higher_count
 
-    logger.info("Streaming pre-prune: GPU radix-select pass 1/3 (high score bits).")
+    logger.debug("Streaming pre-prune: GPU radix-select pass 1/3 (high score bits).")
     high16, rank_within_high = _bucket_for_rank(_histogram(), k)
-    logger.info("Streaming pre-prune: GPU radix-select pass 2/3 (low score bits).")
+    logger.debug("Streaming pre-prune: GPU radix-select pass 2/3 (low score bits).")
     low16, equal_to_keep = _bucket_for_rank(_histogram(high16=high16), rank_within_high)
     threshold_bits = (high16 << 16) | low16
 
-    logger.info("Streaming pre-prune: GPU radix-select pass 3/3 (selected indices).")
+    logger.debug("Streaming pre-prune: GPU radix-select pass 3/3 (selected indices).")
     try:
         keep_idx = torch.empty(k, dtype=torch.long, device="cpu")
     except (RuntimeError, MemoryError) as exc:

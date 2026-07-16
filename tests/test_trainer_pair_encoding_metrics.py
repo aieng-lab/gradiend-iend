@@ -67,9 +67,9 @@ def test_cross_encoding_metrics_cover_positive_negative_and_difference(monkeypat
         "times": _DummyTrainer(["commutative_plus", "non_commutative_plus"]),
     }
 
-    positive = compute_trainer_pair_encoding_matrix(trainers, metric="positive_mean", use_cache=True, run_evaluation=False)
-    negative = compute_trainer_pair_encoding_matrix(trainers, metric="negative_mean", use_cache=True, run_evaluation=False)
-    difference = compute_trainer_pair_encoding_matrix(trainers, metric="positive_minus_negative", use_cache=True, run_evaluation=False)
+    positive = compute_trainer_pair_encoding_matrix(trainers, metric="positive_mean", use_cache=True, encoder_eval="cached")
+    negative = compute_trainer_pair_encoding_matrix(trainers, metric="negative_mean", use_cache=True, encoder_eval="cached")
+    difference = compute_trainer_pair_encoding_matrix(trainers, metric="positive_minus_negative", use_cache=True, encoder_eval="cached")
 
     assert positive["measure"] == "cross_encoding_positive_mean"
     assert negative["measure"] == "cross_encoding_negative_mean"
@@ -100,7 +100,7 @@ def test_positive_suite_cross_encoding_uses_positive_feature_definition(monkeypa
     suite._resolve_suite_dispersion = lambda dispersion=None: "none"
     suite.evaluate_encoder = lambda **kwargs: None
 
-    result = suite.compute_trainer_pair_encoding_matrix(use_cache=True, run_evaluation=False)
+    result = suite.compute_trainer_pair_encoding_matrix(use_cache=True, encoder_eval="cached")
 
     assert result["positive_class_by_column"] == {
         "good__bad": "good",
@@ -144,7 +144,7 @@ def test_positive_suite_cross_encoding_does_not_recompute_bad_cache(monkeypatch)
     suite.evaluate_encoder = evaluate_encoder
 
     with pytest.raises(ValueError, match="Cross-encoding found no rows"):
-        suite.compute_trainer_pair_encoding_matrix(use_cache=True, run_evaluation=True)
+        suite.compute_trainer_pair_encoding_matrix(use_cache=True)
 
 
 def test_compute_trainer_pair_encoding_matrix_passes_full_eval_to_encoder(monkeypatch):
@@ -176,7 +176,7 @@ def test_compute_trainer_pair_encoding_matrix_passes_full_eval_to_encoder(monkey
         trainers,
         metric="positive_mean",
         use_cache=False,
-        run_evaluation=True,
+        encoder_eval="recompute",
         full_eval=False,
         split="test",
     )

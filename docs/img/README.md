@@ -27,19 +27,18 @@ Plot regeneration instructions also appear as HTML comments (`<!-- DOC_PLOT: ...
 | `multi_seed_probability_shifts.png` | [multi-seed.md](../guides/multi-seed.md) | Same |
 | `seed_comparison_topk_overlap.png` | [cross-model-comparison.md](../guides/cross-model-comparison.md) | Same |
 | `seed_comparison_decoder_cosine.png` | [cross-model-comparison.md](../guides/cross-model-comparison.md) | Same |
-| `multi_seed_component_similarity.png` | [cross-model-comparison.md](../guides/cross-model-comparison.md) | Same |
+| `multi_seed_suite_dispersion_heatmap.png` | [trainer-suites.md](../guides/trainer-suites.md) | Multilingual demo multi-seed suite output, converted from the generated PDF |
 | `topk_overlap_heatmap.png` | [evaluation-visualization.md](../guides/evaluation-visualization.md) | [train_gender_de_detailed.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_gender_de_detailed.py) |
 | `topk_overlap_venn.png` | [evaluation-visualization.md](../guides/evaluation-visualization.md) | Same |
-| `cross_encoding_gradiend_by_transition.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | [multilingual_gradiend_demo_small.py](https://github.com/aieng-lab/gradiend/blob/main/experiments/multilingual_gradiend_demo_small.py) (`--plot-only`) |
-| `cross_encoding_oriented_counterfactual.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `cross_encoding_synthetic_preanchor_overview.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | `python scripts/generate_cross_encoding_matrix_doc_figures.py` |
-| `cross_encoding_synthetic_oriented_overview.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `cross_encoding_synthetic_preanchor_diagonal_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `cross_encoding_synthetic_oriented_diagonal_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `cross_encoding_synthetic_aggregation_diagonal.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `cross_encoding_synthetic_preanchor_offdiag_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `cross_encoding_synthetic_oriented_offdiag_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `cross_encoding_synthetic_aggregation_offdiag.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
-| `decoder_eval_commutative_probability_shifts.png` | [decoder-eval-targets.md](../guides/decoder-eval-targets.md) | Inline snippet in guide (no dedicated script) |
+| `pruning_analysis_metric_grid.png` | [pruning-guide.md](../guides/pruning-guide.md) | `runs/paper/pruning_analysis_metric_grid.pdf` |
+| `cross_encoding_example_race_gender_oriented_counterfactual.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Race + English gender subset from the multilingual demo BERT cross-encoding outputs |
+| `cross_encoding_example_race_gender_preanchor.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
+| `cross_encoding_example_race_gender_preanchor_black_black_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
+| `cross_encoding_example_race_gender_oriented_black_black_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
+| `cross_encoding_example_race_gender_preanchor_black_asian_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
+| `cross_encoding_example_race_gender_oriented_black_asian_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
+| `cross_encoding_example_race_gender_preanchor_asian_asian_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
+| `cross_encoding_example_race_gender_oriented_asian_asian_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
+| `cross_encoding_example_race_gender_oriented_white_asian_highlight.png` | [cross-encoding-matrix.md](../guides/cross-encoding-matrix.md) | Same |
 
 After adding or updating these files, commit them so deployed docs show the plots.

@@ -42,6 +42,17 @@ PLOT_METHODS = frozenset({
     "plot_encoder_strip_by_split",
 })
 
+ENCODER_DF_PLOT_EVAL_KEYS = frozenset({
+    "split",
+    "max_size",
+    "use_cache",
+    "include_other_classes",
+    "transition_selection",
+    "balance",
+    "return_df",
+    "plot",
+})
+
 # Keys omitted from scalar top-level aggregate (kept in seeds.per_seed when requested).
 EVAL_SKIP_TOP_LEVEL_KEYS = frozenset({
     "encoder_df",
@@ -551,6 +562,10 @@ class MultiSeedTrainerView:
             )
 
     def _run_for_seeds(self, method_name: str, fn: Callable[..., Any], /, **kwargs: Any) -> Any:
+        return_per_seed = self.return_per_seed
+        if "return_per_seed" in kwargs:
+            return_per_seed = bool(kwargs.pop("return_per_seed"))
+
         if len(self._entries) == 1:
             seed_val, seed_path = self._entries[0]
             model = self._load_seed_model(seed_path)
@@ -567,9 +582,9 @@ class MultiSeedTrainerView:
                     selection=self.selection,
                     aggregate=self.aggregate,
                     dispersion=self.dispersion,
-                    return_per_seed=self.return_per_seed,
+                    return_per_seed=return_per_seed,
                 )
-                if not self.return_per_seed:
+                if not return_per_seed:
                     plot_payload["seeds"].pop("per_seed", None)
                 return plot_payload
             if isinstance(single, dict):
@@ -583,7 +598,7 @@ class MultiSeedTrainerView:
                     "dispersion": self.dispersion,
                     "stats": _build_stats_from_single(payload, self.aggregate, self.dispersion),
                 }
-                if self.return_per_seed:
+                if return_per_seed:
                     payload["seeds"]["per_seed"] = {seed_val: per_seed_payload}
                 return payload
             return single
@@ -607,9 +622,9 @@ class MultiSeedTrainerView:
                 selection=self.selection,
                 aggregate=self.aggregate,
                 dispersion=self.dispersion,
-                return_per_seed=self.return_per_seed,
+                return_per_seed=return_per_seed,
             )
-            if not self.return_per_seed:
+            if not return_per_seed:
                 payload["seeds"].pop("per_seed", None)
             return payload
 
@@ -623,7 +638,7 @@ class MultiSeedTrainerView:
                     "selection": self.selection,
                     "aggregate": self.aggregate,
                     "dispersion": self.dispersion,
-                    "per_seed": dict(zip(seed_values, results)) if self.return_per_seed else None,
+                    "per_seed": dict(zip(seed_values, results)) if return_per_seed else None,
                 },
             }
 
@@ -638,7 +653,7 @@ class MultiSeedTrainerView:
                     selection=self.selection,
                     aggregate=self.aggregate,
                     dispersion=self.dispersion,
-                    return_per_seed=self.return_per_seed,
+                    return_per_seed=return_per_seed,
                 )
             if dec_results:
                 merged["decoder"] = aggregate_eval_results(
@@ -647,7 +662,7 @@ class MultiSeedTrainerView:
                     selection=self.selection,
                     aggregate=self.aggregate,
                     dispersion=self.dispersion,
-                    return_per_seed=self.return_per_seed,
+                    return_per_seed=return_per_seed,
                 )
             return merged
 
@@ -657,9 +672,9 @@ class MultiSeedTrainerView:
             selection=self.selection,
             aggregate=self.aggregate,
             dispersion=self.dispersion,
-            return_per_seed=self.return_per_seed,
+            return_per_seed=return_per_seed,
         )
-        if not self.return_per_seed and "per_seed" in merged_eval.get("seeds", {}):
+        if not return_per_seed and "per_seed" in merged_eval.get("seeds", {}):
             merged_eval["seeds"].pop("per_seed", None)
         return merged_eval
 
@@ -809,7 +824,7 @@ class MultiSeedTrainerView:
         Args:
             **kwargs: Forwarded to ``trainer.plot_encoder_distributions``.
         """
-        return self._bind_method("plot_encoder_distributions")(**kwargs)
+        return self._plot_with_seed_encoder_df("plot_encoder_distributions", **kwargs)
 
     def plot_encoder_scatter(self, **kwargs: Any) -> Dict[str, Any]:
         """Create interactive encoder-scatter plots for each selected seed.
@@ -817,7 +832,15 @@ class MultiSeedTrainerView:
         Args:
             **kwargs: Forwarded to ``trainer.plot_encoder_scatter``.
         """
-        return self._bind_method("plot_encoder_scatter")(**kwargs)
+        return self._plot_with_seed_encoder_df("plot_encoder_scatter", **kwargs)
+
+    def plot_encoder_strip_by_split(self, **kwargs: Any) -> Dict[str, Any]:
+        """Create encoder strip-by-split plots for each selected seed.
+
+        Args:
+            **kwargs: Forwarded to ``trainer.plot_encoder_strip_by_split``.
+        """
+        return self._plot_with_seed_encoder_df("plot_encoder_strip_by_split", **kwargs)
 
     def plot_probability_shifts(self, **kwargs: Any) -> Dict[str, Any]:
         """Create decoder probability-shift plots for each selected seed.
@@ -826,6 +849,48 @@ class MultiSeedTrainerView:
             **kwargs: Forwarded to ``trainer.plot_probability_shifts``.
         """
         return self._bind_method("plot_probability_shifts")(**kwargs)
+
+    def _plot_with_seed_encoder_df(self, method_name: str, **kwargs: Any) -> Dict[str, Any]:
+        return_per_seed = self.return_per_seed
+        if "return_per_seed" in kwargs:
+            return_per_seed = bool(kwargs.pop("return_per_seed"))
+        eval_kwargs = {
+            key: kwargs.pop(key)
+            for key in list(kwargs)
+            if key in ENCODER_DF_PLOT_EVAL_KEYS
+        }
+        eval_kwargs.setdefault("split", "test")
+        eval_kwargs.setdefault("max_size", None)
+        eval_kwargs.setdefault("use_cache", True)
+        eval_kwargs["return_df"] = True
+        eval_kwargs["plot"] = False
+
+        results: List[Any] = []
+        seed_values: List[int] = []
+        for seed_val, seed_path in self._entries:
+            model = self._load_seed_model(seed_path)
+            try:
+                self._prepare_seed_data(seed_val)
+                with _seed_execution_context(self._trainer, seed_path, model):
+                    eval_result = self._trainer.evaluate_encoder(**eval_kwargs)
+                    encoder_df = eval_result.get("encoder_df") if isinstance(eval_result, dict) else None
+                    result = getattr(self._trainer, method_name)(encoder_df=encoder_df, **kwargs)
+                results.append(result)
+                seed_values.append(int(seed_val))
+            finally:
+                self._cleanup_model(model)
+
+        payload = _aggregate_plot_results(
+            results,
+            seed_values,
+            selection=self.selection,
+            aggregate=self.aggregate,
+            dispersion=self.dispersion,
+            return_per_seed=return_per_seed,
+        )
+        if not return_per_seed:
+            payload["seeds"].pop("per_seed", None)
+        return payload
 
     def seed_models(self) -> Iterator[Any]:
         """Lazy-load seed checkpoints (shared base model when possible)."""

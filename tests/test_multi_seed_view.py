@@ -188,6 +188,43 @@ class TestMultiSeedTrainerView:
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def test_evaluate_encoder_per_call_return_per_seed_is_view_option(self):
+        temp_dir = _local_temp("multi_seed_per_call_per_seed")
+        try:
+            seed_a = os.path.join(temp_dir, "seed_10")
+            seed_b = os.path.join(temp_dir, "seed_11")
+            os.makedirs(seed_a)
+            os.makedirs(seed_b)
+            _write_seed_report(
+                temp_dir,
+                [
+                    {"seed": 10, "output_dir": seed_a, "converged": True},
+                    {"seed": 11, "output_dir": seed_b, "converged": True},
+                ],
+            )
+            trainer = MockTrainerForTest(
+                model=os.path.join(temp_dir, "model"),
+                args=TrainingArguments(experiment_dir=temp_dir),
+            )
+            correlations = iter([0.6, 0.8])
+
+            def _fake_evaluate_encoder(**kwargs):
+                assert "return_per_seed" not in kwargs
+                return {"correlation": next(correlations), "n_samples": 50}
+
+            with patch.object(trainer, "evaluate_encoder", side_effect=_fake_evaluate_encoder):
+                with patch.object(
+                    trainer,
+                    "load_model",
+                    return_value=MagicMock(base_model=MagicMock(), tokenizer=MagicMock()),
+                ):
+                    result = trainer.multi_seed().evaluate_encoder(split="test", return_per_seed=True)
+
+            assert result["correlation"] == pytest.approx(0.7)
+            assert set(result["seeds"]["per_seed"]) == {10, 11}
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     def test_evaluate_encoder_refreshes_recorded_split_cycle_slots(self):
         temp_dir = _local_temp("multi_seed_split_cycle_slots")
         try:
@@ -413,6 +450,69 @@ class TestMultiSeedTrainerView:
 
             assert result["encoder"]["correlation"] == pytest.approx(0.5)
             assert "seeds" in result["encoder"]
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    @pytest.mark.parametrize(
+        ("method_name", "paths"),
+        [
+            ("plot_encoder_distributions", ["seed_10_dist.png", "seed_11_dist.png"]),
+            ("plot_encoder_scatter", ["seed_10_scatter.html", "seed_11_scatter.html"]),
+            ("plot_encoder_strip_by_split", ["seed_10_strip.png", "seed_11_strip.png"]),
+        ],
+    )
+    def test_encoder_df_plots_build_seed_encoder_df(self, method_name, paths):
+        temp_dir = _local_temp(f"multi_seed_{method_name}")
+        try:
+            seed_a = os.path.join(temp_dir, "seed_10")
+            seed_b = os.path.join(temp_dir, "seed_11")
+            os.makedirs(seed_a)
+            os.makedirs(seed_b)
+            _write_seed_report(
+                temp_dir,
+                [
+                    {"seed": 10, "output_dir": seed_a, "converged": True},
+                    {"seed": 11, "output_dir": seed_b, "converged": True},
+                ],
+            )
+            trainer = MockTrainerForTest(
+                model=os.path.join(temp_dir, "model"),
+                args=TrainingArguments(experiment_dir=temp_dir),
+            )
+            frames = iter([
+                pd.DataFrame({"encoded": [0.1], "label": [1.0], "type": ["training"]}),
+                pd.DataFrame({"encoded": [0.2], "label": [1.0], "type": ["training"]}),
+            ])
+            plot_paths = iter(paths)
+
+            def _fake_evaluate_encoder(**kwargs):
+                assert kwargs["split"] == "test"
+                assert kwargs["max_size"] == 50
+                assert kwargs["return_df"] is True
+                assert kwargs["plot"] is False
+                return {"encoder_df": next(frames)}
+
+            def _fake_plot(*, encoder_df=None, **kwargs):
+                assert encoder_df is not None
+                assert not encoder_df.empty
+                assert kwargs["show"] is False
+                return next(plot_paths)
+
+            with patch.object(trainer, "evaluate_encoder", side_effect=_fake_evaluate_encoder):
+                with patch.object(trainer, method_name, side_effect=_fake_plot):
+                    with patch.object(
+                        trainer,
+                        "load_model",
+                        return_value=MagicMock(base_model=MagicMock(), tokenizer=MagicMock()),
+                    ):
+                        result = getattr(trainer.multi_seed(), method_name)(
+                            split="test",
+                            max_size=50,
+                            show=False,
+                        )
+
+            assert result["paths"] == paths
+            assert result["seeds"]["values"] == [10, 11]
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 

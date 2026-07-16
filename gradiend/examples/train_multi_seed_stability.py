@@ -9,7 +9,7 @@ Trains until two seeds converge, then exercises:
 - get_model() / get_model(gradiend_only=True) -> SeedModelGroup
 - encoder-by-target plots (per-seed grid, combined strip, errorbar ± std, interactive)
 - per-seed encoder distributions, scatter, probability shifts, training convergence
-- seed comparison heatmaps (top-k overlap, decoder cosine, layer-wise, component)
+- seed comparison heatmaps (top-k overlap, decoder cosine, layer-wise)
 
 Run from repo root:
 
@@ -61,7 +61,6 @@ DOCS_IMAGES: dict[str, str] = {
     "layerwise_similarity": "docs/img/multi_seed_layerwise_similarity.png",
     "seed_comparison_topk_overlap": "docs/img/seed_comparison_topk_overlap.png",
     "seed_comparison_decoder_cosine": "docs/img/seed_comparison_decoder_cosine.png",
-    "component_similarity": "docs/img/multi_seed_component_similarity.png",
 }
 
 
@@ -93,7 +92,7 @@ def build_trainer() -> TextPredictionTrainer:
     args = TrainingArguments(
         experiment_dir=EXPERIMENT_DIR,
         train_batch_size=8,
-        encoder_eval_max_size=200,
+        encoder_eval_max_size=50,
         decoder_eval_max_size_training_like=50,
         decoder_eval_max_size_neutral=50,
         eval_steps=250,
@@ -103,7 +102,7 @@ def build_trainer() -> TextPredictionTrainer:
         target="diff",
         eval_batch_size=8,
         learning_rate=1e-5,
-        pre_prune_config=PrePruneConfig(n_samples=16, topk=0.01, source="diff"),
+        pre_prune_config=PrePruneConfig(n_samples=8, topk=0.1, source="factual"),
         post_prune_config=PostPruneConfig(topk=0.05, part="decoder-weight"),
         use_cache=True,
         max_seeds=3,
@@ -175,9 +174,14 @@ def run_multi_seed_eval(trainer: TextPredictionTrainer, eval_kwargs: dict[str, A
     print("\n=== Multi-seed evaluate() / evaluate_decoder() ===")
     full_eval = view.evaluate(**eval_kwargs)
     enc_corr = full_eval.get("encoder", {}).get("correlation")
-    dec_corr = full_eval.get("decoder", {}).get("correlation")
+    decoder = full_eval.get("decoder", {})
+    decoder_summaries = {
+        key: value.get("value")
+        for key, value in decoder.items()
+        if isinstance(value, dict) and "value" in value
+    }
     print(f"  evaluate().encoder.correlation = {enc_corr!r}")  # evaluate().encoder.correlation = 0.7981
-    print(f"  evaluate().decoder.correlation = {dec_corr!r}")  # evaluate().decoder.correlation = 0.65
+    print(f"  evaluate().decoder summary values = {decoder_summaries!r}")  # e.g. {'white': 0.91, 'black': 0.88}
 
     print("\n=== return_per_seed=True ===")
     per_seed = view.evaluate_encoder(return_per_seed=True, **eval_kwargs)
@@ -214,7 +218,7 @@ def run_model_loading(view) -> None:
 
 def run_encoder_by_target_plots(view, *, write_docs_images: bool) -> dict[str, str | None]:
     print("\n=== plot_encoder_by_target (multi-seed variants) ===")
-    plot_kwargs = {"split": "test", "max_size": 50, "show": False}
+    plot_kwargs = {"split": "test", "show": False}
     paths: dict[str, str | None] = {}
 
     paths["encoder_by_target_seeds"] = view.plot_encoder_by_target(
@@ -261,7 +265,7 @@ def run_encoder_by_target_plots(view, *, write_docs_images: bool) -> dict[str, s
 
 def run_other_encoder_plots(view, *, write_docs_images: bool) -> dict[str, Any]:
     print("\n=== Per-seed plot methods (paths list) ===")
-    eval_plot_kwargs = {"split": "test", "max_size": 50, "show": False, "use_cache": True}
+    eval_plot_kwargs = {"split": "test", "show": False, "use_cache": True}
     outputs: dict[str, Any] = {}
 
     dist = view.plot_encoder_distributions(**eval_plot_kwargs)
@@ -318,7 +322,6 @@ def run_seed_comparison_heatmaps(view, *, write_docs_images: bool) -> dict[str, 
         _copy_docs_image(paths.get("layerwise_similarity"), "layerwise_similarity")
         _copy_docs_image(paths.get("topk_overlap"), "seed_comparison_topk_overlap")
         _copy_docs_image(paths.get("decoder_cosine"), "seed_comparison_decoder_cosine")
-        _copy_docs_image(paths.get("component_similarity"), "component_similarity")
 
     print(f"  comparison plots: {json.dumps(paths, indent=2)}")
     return paths
@@ -392,42 +395,6 @@ def _plot_pairwise_seed_comparisons(models_by_seed: dict[str, Any]) -> dict[str,
         )
         paths[name] = output_path
         print(f"  {name}: {output_path}")
-
-    grouped_components = compute_grouped_similarity_matrices(
-        models_by_seed,
-        measure="cosine",
-        part="decoder-weight",
-        topk=1000,
-        group_by="component",
-    )
-    component_scores = sorted(
-        (
-            (name, _mean_off_diagonal(data["matrix"]))
-            for name, data in grouped_components.items()
-            if name != "other"
-        ),
-        key=lambda item: item[0],
-    )
-    if component_scores:
-        comparison_data = {
-            "measure": "component_similarity",
-            "part": "decoder-weight",
-            "model_ids": ["mean"],
-            "column_ids": [name for name, _ in component_scores],
-            "matrix": [[value for _, value in component_scores]],
-            "row_labels": {"mean": "mean pairwise cosine"},
-        }
-        output_path = _plot_path("component_seed_similarity")
-        plot_comparison_heatmap(
-            comparison_data,
-            output_path=output_path,
-            title="Component-wise seed similarity",
-            show=False,
-            vmin=0.0,
-            vmax=1.0,
-        )
-        paths["component_similarity"] = output_path
-        print(f"  component_similarity: {output_path}")
     return paths
 
 
@@ -449,7 +416,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     cli = parse_args()
     trainer = build_trainer()
-    eval_kwargs = {"split": "test", "max_size": 50, "plot": False, "use_cache": True}
+    eval_kwargs = {"split": "test", "plot": False, "use_cache": True}
 
     if not cli.plot_only:
         run_training(trainer)
@@ -462,11 +429,6 @@ def main() -> None:
     run_encoder_by_target_plots(view, write_docs_images=cli.write_docs_images)
     run_other_encoder_plots(view, write_docs_images=cli.write_docs_images)
     run_seed_comparison_heatmaps(view, write_docs_images=cli.write_docs_images)
-
-    print("\n=== Done ===")
-    print("Single-seed API unchanged; use trainer.multi_seed() for stability analysis.")
-    # Single-seed API unchanged; use trainer.multi_seed() for stability analysis.
-
 
 if __name__ == "__main__":
     main()

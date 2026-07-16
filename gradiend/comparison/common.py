@@ -113,6 +113,7 @@ def comparison_matrix_from_cell_stat(
     payload["matrix"] = matrix
     measure = str(comparison_data.get("measure") or "comparison")
     payload["measure"] = f"{measure}_{field}"
+    payload["cell_stat_field"] = field
     payload.pop("cell_stats", None)
     payload.pop("row_normalized_by_diagonal", None)
     return payload

@@ -117,7 +117,7 @@ def test_plot_cross_encoding_oriented_normalize_scales_rows_by_diagonal(monkeypa
     assert captured["cbar_label"] == "Relative encoding"
 
 
-def test_plot_cross_encoding_heatmap_resolves_multi_seed_for_stable_trainers(monkeypatch):
+def test_plot_cross_encoding_heatmap_builds_shared_pool_by_default(monkeypatch):
     pytest.importorskip("matplotlib")
     pytest.importorskip("seaborn")
 
@@ -150,7 +150,6 @@ def test_plot_cross_encoding_heatmap_resolves_multi_seed_for_stable_trainers(mon
         plot_cross_encoding_heatmap(
             {"ab": trainer},
             ["A", "B"],
-            cross_task_eval=True,
             show=False,
         )
         assert captured["seed_selection"] == "all_convergent"
@@ -303,7 +302,7 @@ def test_plot_cross_encoding_heatmap_directed_mode_has_no_default_axis_labels(mo
         _, _, ax = plot_cross_encoding_heatmap(
             _dummy_trainers(),
             feature_classes=None,
-            run_evaluation=False,
+            encoder_eval="cached",
             show=False,
             return_fig_ax=True,
         )
@@ -433,7 +432,7 @@ def test_plot_cross_encoding_heatmap_directed_forwards_only_valid_plot_kwargs(mo
     plot_cross_encoding_heatmap(
         _dummy_trainers(),
         feature_classes=None,
-        run_evaluation=False,
+        encoder_eval="cached",
         seed_aggregate="median",
         dispersion="std",
         cmap="plasma",

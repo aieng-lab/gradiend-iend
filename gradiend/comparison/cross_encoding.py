@@ -813,7 +813,7 @@ def _load_unified_encoder_cache(
 
 def build_cross_task_encoder_summary(
     trainers: Dict[str, object],
-    feature_classes: Sequence[str],
+    feature_classes: Optional[Sequence[str]] = None,
     *,
     eval_rows: Optional[pd.DataFrame] = None,
     eval_by_class: Optional[Dict[str, pd.DataFrame]] = None,
@@ -848,6 +848,14 @@ def build_cross_task_encoder_summary(
     When ``seed_selection`` is omitted, trainers with
     ``analyze_seed_stability=True`` automatically use all convergent seed
     checkpoints and aggregate encoder responses (same rule as suite plots).
+
+    Args:
+        trainers: Mapping from trainer id to trainer object.
+        feature_classes: Deprecated compatibility argument. The shared eval pool
+            is inferred from ``trainers`` unless ``eval_rows`` or
+            ``eval_by_class`` is supplied.
+        eval_rows: Optional prebuilt unified rows for the shared pool.
+        eval_by_class: Optional prebuilt unified rows grouped by feature class.
     """
     meta = comparison_seed_metadata(
         trainers,

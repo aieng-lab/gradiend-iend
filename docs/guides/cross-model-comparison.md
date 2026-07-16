@@ -43,10 +43,10 @@ Plot with [`plot_comparison_heatmap(comparison_data, ...)`][gradiend.visualizer.
 Best **first** comparison: easy to interpret, cheap to compute.
 
 ```python
-models = {t.run_id: t.get_model() for t in trainers}
 suite.plot_similarity_heatmap(metric="topk_overlap", value="intersection_frac")
 # or standalone:
 from gradiend.visualizer.topk.pairwise_heatmap import plot_topk_overlap_heatmap
+models = {t.run_id: t.get_model() for t in trainers}
 plot_topk_overlap_heatmap(models, topk=1000, value="intersection_frac")
 ```
 
@@ -71,8 +71,6 @@ Copy from experiment_dir or pass output_path when plotting.
 See also evaluation-visualization.md section 4.
 -->
 
-> **Note:** A large pre-pruning value (e.g., `topk<0.1`) typically has a important weight recall of <50%. This means that such models are less suited for such topk comparisons.
-
 
 ---
 
@@ -88,7 +86,7 @@ Component grouping (`embedding`, `attention`, `mlp`, `layer`, `lm_head`) follows
 Hugging Face naming. Custom architectures may need explicit `group_by` or ungrouped
 inspection.
 
-todo plot
+![Cosine similarity across suite children](../img/suite_similarity_heatmap.png)
 
 ---
 
@@ -97,7 +95,7 @@ todo plot
 **Semantic** comparison: how well one GRADIEND's encoder separates another feature's data.
 
 ```python
-suite.plot_cross_encoding_heatmap(run_evaluation=False)  # reuse cached encoder eval
+suite.plot_cross_encoding_heatmap()
 ```
 
 - High parameter overlap + low cross-encoding → same location, different feature signal.
@@ -132,12 +130,14 @@ print(multi["seeds"]["stats"]["correlation"]) # std, min, max, n
 Report `multi["seeds"]["n"]` alongside means. Low encoder dispersion + high checkpoint
 overlap → stable feature.
 
-todo plot
+![Multi-seed suite dispersion heatmap](../img/multi_seed_suite_dispersion_heatmap.png)
+
+Most cells are at 0.0 or close to it, meaning the matched-seed top-k overlap percentages are effectively identical across the three BERT runs. 
+In this example plot, even a brighter value around 0.7 means a standard deviation of only 0.7 percentage points, for example overlap values near 41.3%, 42.0%, and 42.7% around a 42% mean.
 
 ### Checkpoint similarity (weight space)
 
-Load GRADIEND weights only (no base model) and run the same comparison helpers as
-for different trainers. See [Saving and loading — GRADIEND-only](saving-loading.md#gradiend-only-loading-gradiend_onlytrue).
+To compare different checkpoints of the same feature (different GRADIEND models trained on different random seeds), use the `compute_similarity_matrix` helper.
 
 ```python
 from gradiend import compute_similarity_matrix, plot_comparison_heatmap
@@ -164,7 +164,6 @@ plot_comparison_heatmap(
 | Pairwise top-k overlap | Shared high-importance parameters between seeds |
 | Pairwise decoder cosine | Full decoder-vector agreement |
 | Layer-wise similarity | Mean pairwise cosine per layer ([`compute_grouped_similarity_matrices`][gradiend.comparison.similarity.compute_grouped_similarity_matrices], `group_by="layer"`) |
-| Component similarity | Embedding / attention / MLP agreement |
 
 ![Top-k overlap across convergent seeds](../img/seed_comparison_topk_overlap.png)
 
@@ -181,12 +180,6 @@ Regenerate: python -m gradiend.examples.train_multi_seed_stability --write-docs-
 ![Layer-wise seed similarity](../img/multi_seed_layerwise_similarity.png)
 
 <!-- DOC_PLOT: docs/img/multi_seed_layerwise_similarity.png
-Regenerate: python -m gradiend.examples.train_multi_seed_stability --write-docs-images
--->
-
-![Component-wise seed similarity](../img/multi_seed_component_similarity.png)
-
-<!-- DOC_PLOT: docs/img/multi_seed_component_similarity.png
 Regenerate: python -m gradiend.examples.train_multi_seed_stability --write-docs-images
 -->
 

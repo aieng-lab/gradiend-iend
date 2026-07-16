@@ -113,6 +113,11 @@ The result is a grid of scores; the “best” configuration is the one that max
 
 **evaluate_decoder()** runs this grid (or loads it from cache when **use_cache=True**). It returns a dict with summary entries at top level (e.g. `dec['3SG']` for strengthen, `dec['3SG_weaken']` for weaken), plus `grid` and optional `plot_paths`/`plot_path`. By default only the **strengthen** direction is computed; pass **increase_target_probabilities=False** to compute only **weaken** (summary keys then use the `_weaken` suffix). Only the dataset–feature-factor combinations required for the chosen direction are evaluated.
 
+Like encoder evaluation, decoder evaluation accepts `split` and `max_size`.
+`split` selects the training-like rows used for probability scoring, and
+`max_size` is a shared cap for both training-like rows and neutral LMS rows. Use
+`max_size_training_like` and `max_size_neutral` when the two caps should differ.
+
 **Decoder eval targets** (which tokens to score per class) are inferred from your data when `decoder_eval_targets` is omitted, or set explicitly. When the same token appears in multiple classes with different meanings (e.g. commutative vs non-commutative formulas), use an instance-dependent mapping. See [Decoder eval targets](../guides/decoder-eval-targets.md) for class-based, label-based, and (label, label_class) options and the commutative example.
 
 ---
@@ -155,7 +160,7 @@ enc_eval = trainer.evaluate_encoder(max_size=100, return_df=True, plot=True)
 # enc_eval = trainer.evaluate_encoder(use_cache=True)
 
 dec_results = trainer.evaluate_decoder()
-# Optional: dec_results = trainer.evaluate_decoder(use_cache=True) when re-running
+# Optional: dec_results = trainer.evaluate_decoder(split="test", max_size=100, use_cache=True) when re-running
 
 # Next step:
 # changed_model = trainer.rewrite_base_model(decoder_results=dec_results, target_class="masc_nom")

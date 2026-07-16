@@ -201,7 +201,7 @@ class PositiveTrainerSuite(TrainerSuite):
         *,
         label_mapping: Optional[Dict[str, str]] = None,
         full_eval: bool = True,
-        run_evaluation: bool = True,
+        encoder_eval: str = "auto",
         allow_incomplete: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -211,20 +211,21 @@ class PositiveTrainerSuite(TrainerSuite):
             label_mapping: Optional child-id to display-label mapping.
             full_eval: Whether child encoder evaluation should include all
                 available transitions.
-            run_evaluation: Whether to run missing encoder evaluation first.
+            encoder_eval: Encoder evaluation policy: ``"auto"``, ``"cached"``,
+                or ``"recompute"``.
             allow_incomplete: If True, tolerate missing child encoder results.
             **kwargs: Forwarded to trainer-pair encoding computation.
         """
         split = kwargs.get("split", "test")
         eval_use_cache = kwargs.get("use_cache", True)
-        resolved_run_evaluation = bool(run_evaluation or not allow_incomplete)
+        resolved_encoder_eval = str(encoder_eval).strip().lower()
         resolved_seed_selection = self._resolve_suite_seed_selection(kwargs.get("seed_selection"))
-        if resolved_run_evaluation and resolved_seed_selection == "best":
+        if resolved_encoder_eval in {"auto", "recompute"} and resolved_seed_selection == "best":
             with _quiet_expected_suite_reload(self.trainers):
                 self.evaluate_encoder(
                     split=split,
                     max_size=kwargs.get("max_size"),
-                    use_cache=eval_use_cache,
+                    use_cache=bool(eval_use_cache and resolved_encoder_eval == "auto"),
                     plot=False,
                     return_df=False,
                     full_eval=full_eval,
@@ -243,7 +244,7 @@ class PositiveTrainerSuite(TrainerSuite):
             kwargs["dispersion"] = self._resolve_suite_dispersion(None)
         return compute_trainer_pair_encoding_matrix(
             self.trainers,
-            run_evaluation=resolved_run_evaluation,
+            encoder_eval=resolved_encoder_eval,
             allow_incomplete=allow_incomplete,
             full_eval=full_eval,
             **kwargs,
@@ -259,7 +260,7 @@ class PositiveTrainerSuite(TrainerSuite):
         use_cache: bool = True,
         metric: str = "positive_mean",
         full_eval: bool = True,
-        run_evaluation: bool = True,
+        encoder_eval: str = "auto",
         allow_incomplete: bool = False,
         seed_selection: Optional[str] = None,
         seed_aggregate: str = "mean",
@@ -281,7 +282,8 @@ class PositiveTrainerSuite(TrainerSuite):
             use_cache: Whether to use child evaluation/model caches.
             metric: Cross-encoding metric to plot.
             full_eval: Whether child encoder evaluation includes all transitions.
-            run_evaluation: Whether to run missing encoder evaluation first.
+            encoder_eval: Encoder evaluation policy: ``"auto"``, ``"cached"``,
+                or ``"recompute"``.
             allow_incomplete: If True, tolerate missing child encoder results.
             seed_selection: Optional seed selection for multi-seed children.
             seed_aggregate: Aggregate used for seed-level cross encoding.
@@ -303,7 +305,7 @@ class PositiveTrainerSuite(TrainerSuite):
             use_cache=use_cache,
             metric=metric,
             full_eval=full_eval,
-            run_evaluation=run_evaluation,
+            encoder_eval=encoder_eval,
             allow_incomplete=allow_incomplete,
             seed_selection=resolved_seed_selection,
             seed_aggregate=seed_aggregate,

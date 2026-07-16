@@ -35,6 +35,16 @@ logger = get_logger(__name__)
 PROBS_BY_DATASET_GROUPING = "label_class"
 
 
+def _decoder_split_cache_key(split: Any) -> str:
+    if split is None:
+        return "none"
+    if isinstance(split, str):
+        return split
+    if isinstance(split, Sequence) and not isinstance(split, (str, bytes)):
+        return "_".join(str(item) for item in split)
+    return str(split)
+
+
 def _refresh_probs_by_dataset_for_plotting(
     trainer: Any,
     *,
@@ -543,6 +553,8 @@ class DecoderEvaluator:
         summary_lr_from_id: Callable[[CandidateId], float] = lambda cid: cid['learning_rate'] if isinstance(cid, dict) else cid[1],
         summary_empty_default_id: str = "base",
         use_cache: Optional[bool] = None,
+        split: Optional[Any] = "test",
+        max_size: Optional[int] = None,
         max_size_training_like: Optional[int] = None,
         max_size_neutral: Optional[int] = None,
         eval_batch_size: Optional[int] = None,
@@ -581,6 +593,11 @@ class DecoderEvaluator:
                 When the selector returns None, we first try the candidate with learning_rate != 0 and smallest
                 absolute value; only if none exists do we use this default (representing the base model).
             use_cache: If True, use cached results when available; if False, recompute.
+            split: Dataset split used for training-like decoder evaluation rows.
+                Defaults to ``"test"``.
+            max_size: Shared evaluation-size alias. If set and
+                explicit decoder caps are omitted, caps both training-like decoder
+                rows and neutral/LMS rows.
             max_size_training_like: Maximum size for generated training-like eval data.
             max_size_neutral: Maximum size for generated neutral eval data (and LMS text cap).
             eval_batch_size: Common eval batch size used for LMS.
@@ -619,6 +636,30 @@ class DecoderEvaluator:
         """
         logger.info(f"Starting decoder evaluation with part={part}")
         use_cache = trainer._resolve_artifact_use_cache(use_cache, fallback=False)
+        if max_size_training_like is None:
+            max_size_training_like = max_size
+        if max_size_neutral is None:
+            max_size_neutral = max_size
+        trainer_config = getattr(trainer, "config", None)
+        training_args = getattr(trainer, "_training_args", None)
+        if max_size_training_like is None:
+            if hasattr(trainer, "_default_from_training_args"):
+                max_size_training_like = trainer._default_from_training_args(
+                    max_size_training_like, "decoder_eval_max_size_training_like"
+                )
+            elif training_args is not None:
+                max_size_training_like = getattr(training_args, "decoder_eval_max_size_training_like", None)
+        if max_size_training_like is None and trainer_config is not None:
+            max_size_training_like = getattr(trainer_config, "decoder_eval_lms_max_samples", None)
+        if max_size_neutral is None:
+            if hasattr(trainer, "_default_from_training_args"):
+                max_size_neutral = trainer._default_from_training_args(
+                    max_size_neutral, "decoder_eval_max_size_neutral"
+                )
+            elif training_args is not None:
+                max_size_neutral = getattr(training_args, "decoder_eval_max_size_neutral", None)
+        if max_size_neutral is None and trainer_config is not None:
+            max_size_neutral = getattr(trainer_config, "decoder_eval_lms_max_samples", None)
 
         if selector is None:
             selector = LMSThresholdPolicy(ratio=0.99)
@@ -718,6 +759,7 @@ class DecoderEvaluator:
             )
         if cache_file:
             os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        split_cache_key = _decoder_split_cache_key(split)
 
         pairs = [(ff, lr) for ff in feature_factors for lr in lrs]
         pairs = sorted(pairs)  # deterministic order for reproducible decoder evaluation
@@ -739,10 +781,16 @@ class DecoderEvaluator:
                 cached_part = payload.get("part")
                 cached_feature_factors = payload.get("feature_factors")
                 cached_lrs = payload.get("lrs")
+                cached_split = payload.get("split", "test")
+                cached_max_size_training_like = payload.get("max_size_training_like")
+                cached_max_size_neutral = payload.get("max_size_neutral")
                 cache_matches = (
                     cached_part == part
                     and cached_feature_factors == list(feature_factors)
                     and cached_lrs == list(lrs)
+                    and cached_split == split_cache_key
+                    and cached_max_size_training_like == max_size_training_like
+                    and cached_max_size_neutral == max_size_neutral
                 )
                 if cache_matches:
                     relevant_results = convert_results_to_dict(payload.get("results", []))
@@ -775,12 +823,11 @@ class DecoderEvaluator:
                         if not plot:
                             return {**summary, "grid": relevant_results}
                         # plot=True: get full df and run fill-in + plot
-                        _max_t = getattr(getattr(trainer, "config", None), "decoder_eval_lms_max_samples", None) or getattr(getattr(trainer, "_training_args", None), "decoder_eval_max_size_training_like", None)
-                        _max_n = getattr(getattr(trainer, "config", None), "decoder_eval_lms_max_samples", None) or getattr(getattr(trainer, "_training_args", None), "decoder_eval_max_size_neutral", None)
                         training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
                             tokenizer,
-                            max_size_training_like=_max_t,
-                            max_size_neutral=_max_n,
+                            max_size_training_like=max_size_training_like,
+                            max_size_neutral=max_size_neutral,
+                            split=split,
                             cached_training_like_df=None,
                             cached_neutral_df=None,
                         )
@@ -804,6 +851,9 @@ class DecoderEvaluator:
                             try:
                                 payload_update = {
                                     "part": part,
+                                    "split": split_cache_key,
+                                    "max_size_training_like": max_size_training_like,
+                                    "max_size_neutral": max_size_neutral,
                                     "feature_factors": list(feature_factors),
                                     "lrs": list(lrs),
                                     "results": convert_results_to_list(relevant_results),
@@ -835,28 +885,27 @@ class DecoderEvaluator:
                             out["plot_path"] = plot_paths[0] if len(plot_paths) == 1 else None
                         return out
                 else:
-                    logger.info("Decoder cache mismatch (part/feature_factors/lrs); recomputing.")
+                    logger.info("Decoder cache mismatch (part/split/size/feature_factors/lrs); recomputing.")
             except Exception as e:
                 logger.warning("Error loading cached decoder results: %s", e)
 
-        trainer_config = getattr(trainer, "config", None)
-        training_args = getattr(trainer, "_training_args", None)
         if max_size_training_like is None:
-            if trainer_config is not None and hasattr(trainer_config, "decoder_eval_lms_max_samples"):
-                max_size_training_like = trainer_config.decoder_eval_lms_max_samples
-            elif training_args is not None:
+            if training_args is not None:
                 max_size_training_like = getattr(training_args, "decoder_eval_max_size_training_like", None)
+            if max_size_training_like is None and trainer_config is not None:
+                max_size_training_like = getattr(trainer_config, "decoder_eval_lms_max_samples", None)
         if max_size_neutral is None:
-            if trainer_config is not None and hasattr(trainer_config, "decoder_eval_lms_max_samples"):
-                max_size_neutral = trainer_config.decoder_eval_lms_max_samples
-            elif training_args is not None:
+            if training_args is not None:
                 max_size_neutral = getattr(training_args, "decoder_eval_max_size_neutral", None)
+            if max_size_neutral is None and trainer_config is not None:
+                max_size_neutral = getattr(trainer_config, "decoder_eval_lms_max_samples", None)
 
         if training_like_df is None or neutral_df is None:
             training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
                 tokenizer,
                 max_size_training_like=max_size_training_like,
                 max_size_neutral=max_size_neutral,
+                split=split,
                 cached_training_like_df=training_like_df,
                 cached_neutral_df=neutral_df,
             )
@@ -899,6 +948,7 @@ class DecoderEvaluator:
                 base_model,
                 tokenizer,
                 use_cache=use_cache,
+                cache_folder=f"base_split_{split_cache_key}_max_{max_size_training_like}_neutral_{max_size_neutral}",
                 training_like_df=training_like_df,
                 neutral_df=neutral_df,
                 max_size_training_like=max_size_training_like,
@@ -929,7 +979,7 @@ class DecoderEvaluator:
                 modified_model,
                 tokenizer,
                 use_cache=use_cache,
-                cache_folder=f"{feature_factor}_{lr}",
+                cache_folder=f"split_{split_cache_key}_max_{max_size_training_like}_neutral_{max_size_neutral}_{feature_factor}_{lr}",
                 model_id=model_id,
                 training_like_df=training_like_df,
                 neutral_df=neutral_df,
@@ -989,6 +1039,9 @@ class DecoderEvaluator:
                 try:
                     payload = {
                         "part": part,
+                        "split": split_cache_key,
+                        "max_size_training_like": max_size_training_like,
+                        "max_size_neutral": max_size_neutral,
                         "feature_factors": list(feature_factors),
                         "lrs": list(lrs),
                         "results": convert_results_to_list(relevant_results),
@@ -1018,6 +1071,9 @@ class DecoderEvaluator:
             try:
                 payload = {
                     "part": part,
+                    "split": split_cache_key,
+                    "max_size_training_like": max_size_training_like,
+                    "max_size_neutral": max_size_neutral,
                     "feature_factors": list(feature_factors),
                     "lrs": list(lrs),
                     "results": convert_results_to_list(relevant_results),

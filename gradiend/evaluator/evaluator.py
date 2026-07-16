@@ -119,6 +119,8 @@ class Evaluator:
         feature_factors: Optional[list] = None,
         lrs: Optional[list] = None,
         use_cache: Optional[bool] = None,
+        split: Optional[Any] = "test",
+        max_size: Optional[int] = None,
         max_size_training_like: Optional[int] = None,
         max_size_neutral: Optional[int] = None,
         eval_batch_size: Optional[int] = None,
@@ -148,6 +150,11 @@ class Evaluator:
             use_cache: If True, cached decoder grid results are reused when
                 available under the trainer's experiment_dir. If None, defaults
                 come from trainer training args.
+            split: Dataset split used for training-like decoder evaluation rows.
+                Defaults to ``"test"``.
+            max_size: Shared evaluation-size alias. If set and
+                explicit decoder caps are omitted, caps both training-like decoder
+                rows and neutral/LMS rows.
             max_size_training_like: Maximum size for generated training-like eval data.
             max_size_neutral: Maximum size for generated neutral eval data (and LMS text cap).
             eval_batch_size: Common eval batch size used for LMS.
@@ -170,12 +177,18 @@ class Evaluator:
             Each entry has value, feature_factor, learning_rate, id, strengthen, lms, base_lms. Plus 'grid'.
             When plot=True, also 'plot_paths' and 'plot_path'.
         """
+        if max_size_training_like is None:
+            max_size_training_like = max_size
+        if max_size_neutral is None:
+            max_size_neutral = max_size
         kwargs = dict(
             trainer=self._trainer,
             model_with_gradiend=model_with_gradiend,
             feature_factors=feature_factors,
             lrs=lrs,
             use_cache=use_cache,
+            split=split,
+            max_size=max_size,
             max_size_training_like=max_size_training_like,
             max_size_neutral=max_size_neutral,
             eval_batch_size=eval_batch_size,

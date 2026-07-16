@@ -7,6 +7,7 @@ Tests parameter overwriting, caching behavior, and basic evaluation functionalit
 import os
 import tempfile
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, Mock
 
 import torch
@@ -15,6 +16,7 @@ import pandas as pd
 
 from gradiend.evaluator.decoder import DecoderEvaluator
 from gradiend.evaluator.encoder import EncoderEvaluator
+from gradiend.evaluator.evaluator import Evaluator
 from gradiend.trainer.core.dataset import GradientTrainingDataset
 from gradiend.trainer.core.feature_definition import FeatureLearningDefinition
 from tests.testing_mocks import MockTokenizer
@@ -140,6 +142,27 @@ class MockTrainingData:
     
     def __getitem__(self, idx):
         return self.items[idx]
+
+
+def test_combined_evaluate_forwards_shared_split_and_max_size_to_decoder():
+    trainer = MockTrainer()
+    evaluator = Evaluator(trainer)
+    captured_decoder_kwargs = {}
+
+    evaluator.evaluate_encoder = lambda **kwargs: {"encoder_kwargs": kwargs}
+    evaluator._decoder_evaluator = MagicMock()
+    evaluator._decoder_evaluator.evaluate_decoder.side_effect = (
+        lambda **kwargs: captured_decoder_kwargs.update(kwargs) or {"grid": {}}
+    )
+
+    result = evaluator.evaluate(split="validation", max_size=5, use_cache=False)
+
+    assert result["encoder"]["encoder_kwargs"]["split"] == "validation"
+    assert result["encoder"]["encoder_kwargs"]["max_size"] == 5
+    assert captured_decoder_kwargs["split"] == "validation"
+    assert captured_decoder_kwargs["max_size"] == 5
+    assert captured_decoder_kwargs["max_size_training_like"] == 5
+    assert captured_decoder_kwargs["max_size_neutral"] == 5
 
 
 class MockModelWithGradiend:
@@ -294,6 +317,37 @@ class TestEncoderEvaluator:
         result = evaluator.evaluate_encoder(trainer, encoder_df=encoder_df, split="test", use_cache=True)
 
         assert result["n_samples"] == 2
+
+    def test_evaluate_encoder_with_trusted_encoder_df_loads_json_cache(self, temp_dir):
+        evaluator = EncoderEvaluator()
+        training_args = MockTrainingArguments()
+        training_args.use_cache = True
+        trainer = MockTrainer(training_args=training_args)
+        trainer.experiment_dir = temp_dir
+
+        with open(os.path.join(temp_dir, "encoded_values_split_test.json"), "w", encoding="utf-8") as handle:
+            json.dump({"n_samples": 999, "correlation": 0.25}, handle)
+
+        encoder_df = pd.DataFrame(
+            {
+                "encoded": [0.8, -0.4],
+                "label": [1, -1],
+                "type": ["training", "training"],
+                "source_id": ["positive", "negative"],
+                "target_id": ["negative", "positive"],
+            }
+        )
+
+        result = evaluator.evaluate_encoder(
+            trainer,
+            encoder_df=encoder_df,
+            split="test",
+            use_cache=True,
+            trust_encoder_df_cache=True,
+        )
+
+        assert result["n_samples"] == 999
+        assert result["correlation"] == 0.25
     
     def test_evaluate_encoder_correlation_computation(self):
         """Test that correlation is computed correctly."""
@@ -452,6 +506,30 @@ class TestDecoderEvaluator:
 
         assert mock_get_df.call_args.kwargs["max_size_training_like"] == 100
         assert mock_get_df.call_args.kwargs["max_size_neutral"] == 100
+        assert "grid" in result
+
+    def test_evaluate_decoder_prefers_training_args_when_config_legacy_cap_is_none(self):
+        evaluator = DecoderEvaluator()
+        training_args = MockTrainingArguments()
+        training_args.decoder_eval_max_size_training_like = 7
+        training_args.decoder_eval_max_size_neutral = 11
+        trainer = MockTrainer(training_args=training_args)
+        trainer.config = SimpleNamespace(decoder_eval_lms_max_samples=None)
+        trainer._model = MockModelWithGradiend()
+
+        with patch.object(
+            trainer,
+            "_get_decoder_eval_dataframe",
+            wraps=trainer._get_decoder_eval_dataframe,
+        ) as mock_get_df:
+            result = evaluator.evaluate_decoder(
+                trainer,
+                feature_factors=[-1.0],
+                lrs=[1e-2],
+            )
+
+        assert mock_get_df.call_args.kwargs["max_size_training_like"] == 7
+        assert mock_get_df.call_args.kwargs["max_size_neutral"] == 11
         assert "grid" in result
     
     def test_evaluate_decoder_use_cache_overwriting(self):

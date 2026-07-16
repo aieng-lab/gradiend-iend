@@ -1,283 +1,136 @@
 # Oriented cross-encoding matrix
 
-When you train **many pairwise GRADIENDs** over the same feature domain (e.g. race:
-white↔black, white↔asian, black↔asian), a single pairwise cross-encoding heatmap
-from [`suite.plot_cross_encoding_heatmap()`][gradiend.trainer.suite.base.TrainerSuite.plot_cross_encoding_heatmap] is no longer enough. You want to know:
+The main idea of the *cross-encoding* matrix is *how* GRADIEND models trained over a diverse range of feature families encode *all* feature classes.
 
-- Does a GRADIEND trained on one pair also **encode** snippets from other pairs?
-- After **orienting** signs so “left class = +1, right class = −1”, do anchors line up
-  on the diagonal?
-
-**Dense cross-encoding** answers this by encoding every trained GRADIEND on a **shared
-test pool** (all directed transitions merged across trainers) and aggregating into
-square anchor-aligned matrices.
-
-Use this workflow when:
-
-- you have **≥3 feature classes** trained as separate pairwise GRADIENDs;
-- classes share surface tokens or transitions and you need comparable signs;
-- you want publication-style **feature × feature** leakage matrices.
-
-For two-run comparisons, [`suite.plot_cross_encoding_heatmap()`][gradiend.trainer.suite.base.TrainerSuite.plot_cross_encoding_heatmap] is simpler and faster.
+This aggregation also overcomes the problem of pairwise GRADIENDs seen in the topk overlap plots, where we use pairwise GRADIENDs corresponding to a pair of feature classes on the axis. However, this means that these plots compare two feature pairs with each other, which may become complicated.
+The cross-encoding matrix instead operates directly on feature classes by aggregating the means of all GRADIENDs trained on that feature class.
+We treat the encoding as a measure of how similar the feature classes are represented in the base model.
+The following guide explains how to compute the matrix and how to interpret it.
 
 **Computation details:** [Oriented cross-encoding: computation](cross-encoding-matrix-computation.md)  
-**Formal notation:** [Oriented cross-encoding matrix (paper)](../paper/cross_encoding_matrix.tex)
+**Formal notation:** [Oriented cross-encoding matrix (paper Appendix D)](https://arxiv.org/abs/2602.23993)
 
 ---
 
-## Two matrix views
-
-| Output | API | Rows | Columns | Read as |
-|--------|-----|------|---------|---------|
-| Pre-anchor GRADIEND × transition | [`plot_gradiend_transition_cross_encoding_heatmap`][gradiend.visualizer.heatmaps.encoding.plot_gradiend_transition_cross_encoding_heatmap] | trained GRADIEND id | directed transition `factual→alternative` | Raw mean encoding per model and input transition |
-| Oriented square heatmaps | [`plot_cross_encoding_heatmap`][gradiend.visualizer.heatmaps.encoding.plot_cross_encoding_heatmap] | feature-class **anchor** | factual class, counterfactual class, or transition (`alignment`) | Sign-aligned, aggregated across all GRADIENDs whose pair contains the anchor |
-
-**Pre-anchor** values are direct means from the cross-task encoder pass. **Oriented**
-matrices flip signs so the anchor class is always “positive”, then average within each
-GRADIEND and across GRADIENDs that share the anchor.
-
----
-
-## Real example plots (trained models)
-
-The figures below come from a **real** small multilingual demo: three race GRADIENDs
-plus German der/dem article pairs, trained and evaluated on held-out data.
-
-[:material-file-code-outline: `multilingual_gradiend_demo_small.py`](https://github.com/aieng-lab/gradiend/blob/main/experiments/multilingual_gradiend_demo_small.py)
-
-```bash
-python experiments/multilingual_gradiend_demo_small.py --plot-only
-# Copy PDFs from runs/.../ to docs/img/ (see docs/img/README.md)
-```
-
-![GRADIEND × transition (pre-anchor, trained models)](../img/cross_encoding_gradiend_by_transition.png)
-
-<!-- DOC_PLOT: docs/img/cross_encoding_gradiend_by_transition.png
-Regenerate: experiments/multilingual_gradiend_demo_small.py (--plot-only if checkpoints exist)
-Copy: runs/multilingual_gradiend_demo_small/cross_encoding_gradiend_by_transition_heatmap.pdf -> docs/img/
--->
-
-![Oriented counterfactual matrix (trained models)](../img/cross_encoding_oriented_counterfactual.png)
-
-<!-- DOC_PLOT: docs/img/cross_encoding_oriented_counterfactual.png
-Regenerate: experiments/multilingual_gradiend_demo_small.py
-Copy: runs/multilingual_gradiend_demo_small/cross_encoding_oriented_counterfactual_heatmap.pdf -> docs/img/
--->
-
-!!! note "Real vs synthetic"
-    These overview plots reflect **actual encoder evaluations** (checkpoint-dependent
-    values). The step-by-step aggregation walkthrough below uses **hand-set synthetic
-    data** so cell arithmetic is stable in the docs without retraining.
-
----
-
-## Runnable pipeline
-
-For **one symmetric suite** with a few peer classes (e.g. three race GRADIENDs),
-[`suite.plot_cross_encoding_heatmap()`][gradiend.trainer.suite.base.TrainerSuite.plot_cross_encoding_heatmap] is enough — see
-[Trainer suites](trainer-suites.md) and
-[train_race_symmetric_suite.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_race_symmetric_suite.py).
+## Computation
 
 The workflows below are for **dense** matrices when many pairwise GRADIENDs share a
 large feature domain.
 
-The **small demo**
-[multilingual_gradiend_demo_small.py](https://github.com/aieng-lab/gradiend/blob/main/experiments/multilingual_gradiend_demo_small.py)
-trains three race GRADIENDs plus German der/dem article pairs — enough for a 6×6
-oriented matrix without the full multilingual runtime. See that file for CLI flags
-(e.g. `--plot-only` to replot from cache).
+
 
 The **full demo**
 [multilingual_gradiend_demo.py](https://github.com/aieng-lab/gradiend/blob/main/experiments/multilingual_gradiend_demo.py)
-adds pronouns, religion, sentiment, and the complete German case grid.
+used for the Python package paper adds pronouns, religion, sentiment, and the
+complete German case grid.
 
-Core plotting pattern (shared by both demos):
+Note that there is also a **small demo**
+[multilingual_gradiend_demo_small.py](https://github.com/aieng-lab/gradiend/blob/main/experiments/multilingual_gradiend_demo_small.py) which includes only a few feature families.
+
+**Core plotting pattern:**
 
 ```python
+from gradiend import build_cross_task_encoder_summary, plot_cross_encoding_heatmap
+
+feature_classes = ["white", "black", "asian", "M", "F"]
+
 encoder_summary = build_cross_task_encoder_summary(
-    trainers_by_id,
-    feature_order,
+    trainers_by_id, # dict of ids mapping to its trainer
     split="test",
     max_size=config.args.encoder_eval_max_size,
 )
-transition_order = collect_unified_test_transitions(trainers_by_id, split="test")
-
-# 1) Rectangular: every GRADIEND × every input transition
-plot_gradiend_transition_cross_encoding_heatmap(
+plot_cross_encoding_heatmap(
     trainers_by_id,
-    trainer_order=trainer_order,
-    transition_order=transition_order,
+    feature_classes,
+    alignment="counterfactual",
     encoder_summary=encoder_summary,
-    output_path="cross_encoding_gradiend_by_transition_heatmap.pdf",
+    output_path="cross_encoding_oriented_counterfactual_heatmap.pdf",
 )
-
-# 2) Square: one heatmap per alignment mode
-for alignment in ("factual", "counterfactual", "transition"):
-    plot_cross_encoding_heatmap(
-        trainers_by_id,
-        feature_order,
-        alignment=alignment,
-        encoder_summary=encoder_summary,
-        cross_task_eval=False,
-        output_path=f"cross_encoding_oriented_{alignment}_heatmap.pdf",
-    )
 ```
 
-**What you can change:**
 
-| Parameter | Effect |
-|-----------|--------|
-| `feature_order` | Row/column order in oriented matrices; use sorted class ids for reproducible papers |
-| `alignment` | `"factual"` columns = `factual_class`; `"counterfactual"` = `alternative_class`; `"transition"` = directed pair |
-| `encoder_summary` | Precompute once and pass to all plots to avoid re-encoding |
-| `cross_task_eval=False` | Use the shared cross-task encoder cache (recommended for suites) |
-| `split`, `max_size` | Which held-out rows enter the matrix; cap for speed during development |
+> When you only deal with a *single* feature and train all GRADIENDs using a SymmetricTrainerSuite, you can directly use
+[`suite.plot_cross_encoding_heatmap()`][gradiend.trainer.suite.base.TrainerSuite.plot_cross_encoding_heatmap], see
+[Trainer suites](trainer-suites.md) and
+[train_race_symmetric_suite.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_race_symmetric_suite.py).
 
-Cross-task encoder rows use the **same** per-trainer cache as
-``evaluate_encoder`` — ``encoded_values_max_size_{N}_split_test.csv`` (or
-``encoded_values_split_test.csv`` when ``max_size`` is unset). A cross-task pool
-wider than a pair-local (train-only) cache replaces it automatically. Set
-``TrainingArguments.use_cache=True`` to reuse it across plotting runs.
+
+
+
+![Race + gender oriented counterfactual matrix](../img/cross_encoding_example_race_gender_oriented_counterfactual.png)
+
+Rows are *orienting features*: each row combines the GRADIENDs that contain that feature.
+Columns are *probe features*: the `Asian` column averages examples changed into `Asian`; the `M` column averages examples changed into `M`; and so on.
 
 ---
 
-## How aggregation works (synthetic walkthrough) { #synthetic-walkthrough }
+## Race + Gender Aggregation Example
 
-The rest of this section uses **synthetic encoder means** — not the trained-model
-figures above. Four GRADIENDs:
+To understand how the aggregation to feature classes works, this walkthrough uses the race + English gender subset of the multilingual demo
+outputs. This example includes three [race GRADIENDs](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_race_symmetric_suite.py)
+(`race_white_asian`, `race_black_asian`, `race_white_black`) plus the English
+gender GRADIEND ([`gender_en`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_gender_en.py), ordered `M/F`).
 
-| GRADIEND | Pair | Family |
-|----------|------|--------|
-| `race_white_asian` | white / asian | race |
-| `race_black_asian` | black / asian | race |
-| `race_white_black` | white / black | race |
-| `gender_he_she` | he / she | English gender (unrelated) |
+### GRADIEND x Transition
 
-Feature order in the oriented matrix: **White**, **Black**, **Asian** (Race bracket),
-then **he**, **she** (Gender). Alignment: **counterfactual** (column keys =
-counterfactual class).
+Cross-encoding starts by evaluating every trained GRADIEND on the same transition pool, meaning every GRADIEND model is evaluated on every transition used during the training of any considered GRADIEND in that matrix. 
+This gives a GRADIEND × transition table: each row is one trained GRADIEND, and each column is a directed input transition such as
+`white→asian`, `black→asian`, or `M→F`. Normal encoding evaluation only evaluates the model on the transition pool used during training (i.e., the diagonal of the matrix).
 
-![Synthetic pre-anchor matrix (full transition pool)](../img/cross_encoding_synthetic_preanchor_overview.png)
+![GRADIEND x transition matrix for the race and gender subset](../img/cross_encoding_example_race_gender_preanchor.png)
 
-<!-- DOC_PLOT: docs/img/cross_encoding_synthetic_preanchor_overview.png
-Regenerate: python scripts/generate_cross_encoding_matrix_doc_figures.py
--->
+### Diagonal cell `(Black, Black)`
 
-![Synthetic oriented overview (counterfactual probes)](../img/cross_encoding_synthetic_oriented_overview.png)
+We now trace the aggregation for `(Black, Black)`, which appears as `0.97` in
+the matrix above.
 
-<!-- DOC_PLOT: docs/img/cross_encoding_synthetic_oriented_overview.png
-Regenerate: python scripts/generate_cross_encoding_matrix_doc_figures.py
--->
+Because the GRADIENDs used for this example are trained with counterfactual
+inputs, this aggregation uses input transitions with `Black` as the
+counterfactual class. With factual-input GRADIENDs, it would instead use
+transitions with `Black` as the factual class.
 
-!!! tip "Mixed-sign diagonals are normal"
-    Unlike a correlation matrix, oriented entries depend on **which side of each
-    binary pair** a feature was trained on. In this synthetic matrix,
-    `white`/`white` and `black`/`black` are **negative** while `asian`/`asian`
-    is **positive** — the same pattern you often see in real dense matrices.
-    For English gender, `she` is the **second** class in the pair, so
-    `she`/`she` is negative by the anchor sign convention even when the encoder
-    is strong; `he`/`he` is positive. The two gender classes are **inverted by
-    definition** (off-diagonal `he`↔`she` have opposite signs).
+We also consider all GRADIEND models involving the `Black` feature. This gives
+two GRADIEND models and two input transitions, resulting in four selected cells.
 
-Regenerate all synthetic figures:
+![Pre-anchor contributors for Black, Black](../img/cross_encoding_example_race_gender_preanchor_black_black_highlight.png)
 
-```bash
-python scripts/generate_cross_encoding_matrix_doc_figures.py
-```
+An important detail to consider for aggregating the GRADIEND models is the sign of the encoded feature.
+During training of GRADIEND `F1<->F2`, the encoder is normalized to assign `+1` to the first class `F1` and `-1` to the second class `F2`. 
+Hence, we need to align the sign of the encoded feature to be positive for the selected orienting feature, which we do with the so-called *anchor sign*.
 
-Fixture source: [`scripts/synthetic_cross_encoding_fixture.py`](https://github.com/aieng-lab/gradiend/blob/main/scripts/synthetic_cross_encoding_fixture.py)
+The anchor sign differs across the two contributing GRADIENDs: `black` is the
+first class in `race_black_asian` (`+1`) and the second class in
+`race_white_black` (`-1`). After applying these signs, the four contributions
+are consistently positive:
 
-### Example 1 — diagonal cell `(asian, asian)`
+| GRADIEND | Transition | Raw mean | Anchor sign | Signed value |
+|----------|------------|---------:|------------:|-------------:|
+| race_black_asian | white→black | 0.948 | 1 | 0.948 |
+| race_black_asian | asian→black | 0.981 | 1 | 0.981 |
+| race_white_black | white→black | -0.971 | -1 | 0.971 |
+| race_white_black | asian→black | -0.988 | -1 | 0.988 |
 
-**Question:** Why is $M_{\texttt{asian},\texttt{asian}} \approx +0.55$ on the synthetic
-matrix?
+Mean signed value: **0.972**, shown as **0.97** in the rounded heatmap cell.
 
-#### Step 1 — Column key (counterfactual alignment)
+![Oriented Black, Black cell highlight](../img/cross_encoding_example_race_gender_oriented_black_black_highlight.png)
 
-Counterfactual column `asian` collects transitions whose **counterfactual** class is
-`asian`:
+### Non-identity cell `(Black, Asian)`
 
-- `white→asian`
-- `black→asian`
+In the second example, we consider `(Black, Asian)`, which appears as `-0.64` in the matrix above.
 
-(There is no `asian→asian` transition.)
+![Pre-anchor contributors for Black, Asian](../img/cross_encoding_example_race_gender_preanchor_black_asian_highlight.png)
 
-#### Step 2 — Row key (anchor aggregation)
+| GRADIEND | Transition | Raw mean | Anchor sign | Signed value |
+|----------|------------|---------:|------------:|-------------:|
+| race_black_asian | black→asian | -0.998 | 1 | -0.998 |
+| race_black_asian | white→asian | -0.996 | 1 | -0.996 |
+| race_white_black | black→asian | 0.369 | -1 | -0.369 |
+| race_white_black | white→asian | 0.187 | -1 | -0.187 |
 
-Anchor row `asian` aggregates GRADIENDs whose pair **contains** `asian`:
+Mean signed value: **-0.637**, shown as **-0.64**.
 
-- `race_white_asian`
-- `race_black_asian`
+![Oriented Black, Asian cell highlight](../img/cross_encoding_example_race_gender_oriented_black_asian_highlight.png)
 
-`race_white_black` and `gender_he_she` do **not** contribute.
-
-#### Step 3 — Pre-anchor contributors (highlighted)
-
-![Synthetic pre-anchor highlights for (asian, asian)](../img/cross_encoding_synthetic_preanchor_diagonal_highlight.png)
-
-Orange outlines mark the four GRADIEND × transition cells that feed this oriented entry.
-
-#### Step 4 — Anchor sign and aggregate
-
-`asian` is the **second** class in both race pairs → anchor sign **−1**. Raw
-pre-anchor means on incoming-asian snippets are negative; flipping yields positive
-signed contributions. Mean across the four signed values, then across the two
-GRADIENDs → **≈ +0.55**.
-
-![Synthetic aggregation table (asian, asian)](../img/cross_encoding_synthetic_aggregation_diagonal.png)
-
-#### Step 5 — Oriented cell
-
-![Synthetic oriented highlight (asian, asian)](../img/cross_encoding_synthetic_oriented_diagonal_highlight.png)
-
----
-
-### Example 2 — off-diagonal cell `(white, asian)`
-
-**Question:** How does cross-encoding differ when the orienting feature is **not** the
-probe class?
-
-Same column (`asian` counterfactual probes), but row `white` now aggregates
-`race_white_asian` and `race_white_black`. Signed contributions partially cancel;
-the synthetic entry is **≈ −0.24** (weak cross-encoding / mixed signs).
-
-![Synthetic pre-anchor highlights for (white, asian)](../img/cross_encoding_synthetic_preanchor_offdiag_highlight.png)
-
-![Synthetic aggregation table (white, asian)](../img/cross_encoding_synthetic_aggregation_offdiag.png)
-
-![Synthetic oriented highlight (white, asian)](../img/cross_encoding_synthetic_oriented_offdiag_highlight.png)
-
-Compare the two oriented highlights: mixed-sign **race** diagonals (`asian` positive,
-`white`/`black` negative), near-zero **race × gender** cells, and the inverted
-**he**/`she` block (positive `he`/`he`, negative `she`/`she`).
-
----
-
-### Example 3 — negative race diagonal `(white, white)`
-
-Not every diagonal is positive. `white` is the **first** class in two race GRADIENDs
-but aggregating counterfactual probes with anchor sign **+1** can still yield a
-**negative** oriented entry (≈ **−0.50** here) when pre-anchor means on
-`→white` transitions are predominantly negative under `source=alternative`.
-
-This is the same aggregation recipe as Example 1 — only the signed contributions
-and final mean differ. Do **not** read a negative diagonal as “the encoder failed”
-without checking anchor position and alignment.
-
----
-
-### What to look for in real matrices
-
-- **Diagonal magnitude** (often ≈ ±1 for selective encoders): sign depends on anchor
-  position in each binary pair — **not** every diagonal is positive.
-- **Binary pairs** (e.g. English `he`/`she`, sentiment `Pos`/`Neg`): the second class
-  picks up anchor sign **−1**, so its diagonal can be negative while the first class
-  is positive; off-diagonal entries are inverted relative to each other.
-- **Near-zero off-diagonal** within a family: little cross-feature leakage.
-- **Cross-family cells** (e.g. race × gender): often near zero when no GRADIEND pair
-  linked those features — see [computation limitation](cross-encoding-matrix-computation.md#limitation-incomplete-cross-family-identification).
-- **Factual vs counterfactual** heatmaps differ because column keys use different
-  class columns — compare both when explaining a result.
 
 ---
 

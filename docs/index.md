@@ -59,7 +59,7 @@ When you need to understand a topic or look up options:
 - **[Token prediction methods](guides/token-prediction-methods.md)** — Differences between masked-token, decoder-only, and seq2seq objectives.
 - **[Data splits](guides/data-splits.md)** — Row-level vs vocabulary-held-out splitting.
 - **[Cross-model comparison](guides/cross-model-comparison.md)** — Compare runs, features, and convergent seeds.
-- **[Oriented cross-encoding matrix](guides/cross-encoding-matrix.md)** — Dense cross-task matrices, pre-anchor vs anchor-aligned plots, multilingual demo outputs.
+- **[Oriented cross-encoding matrix](guides/cross-encoding-matrix.md)** — Compute and interpret feature-class cross-encoding matrices.
 - **[Multi-seed analysis](guides/multi-seed.md)** — Evaluate and plot across convergent seed checkpoints.
 - **[Trainer suites](guides/trainer-suites.md)** — Orchestrate many related feature-pair runs ([`TrainerSuite`][gradiend.trainer.suite.base.TrainerSuite], [`TrainerCollection`][gradiend.trainer.suite.collection.TrainerCollection]).
 - **[Decoder evaluation targets](guides/decoder-eval-targets.md)** — Row-wise vs class-based decoder scoring.

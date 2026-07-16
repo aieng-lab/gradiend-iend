@@ -127,6 +127,7 @@ class EncoderEvaluator:
         use_cache: Optional[bool] = None,
         split: Optional[str] = None,
         max_size: Optional[int] = None,
+        trust_encoder_df_cache: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -149,6 +150,9 @@ class EncoderEvaluator:
                 (requires experiment_dir).
             split: Dataset split for create_eval_data. Default: "test".
             max_size: Maximum samples per variant for create_eval_data.
+            trust_encoder_df_cache: If True, a cached metrics JSON for ``split``/``max_size``
+                may be reused even when ``encoder_df`` is provided. This is intended for
+                trainer-owned DataFrames that were loaded or created from the same cache key.
             model_with_gradiend: Optional model instance used for encoding. If
                 omitted, ``trainer.get_model()`` is used. This is useful when the
                 caller already has a loaded model and wants to avoid another
@@ -162,7 +166,16 @@ class EncoderEvaluator:
             mean_by_eval_group, eval_group_basis, label_value_to_class_name.
         """
         use_cache = trainer._resolve_artifact_use_cache(use_cache, fallback=False)
-        skip = {"eval_batch_size", "use_cache", "encoder_df", "return_df", "plot", "plot_kwargs", "model_with_gradiend"}
+        skip = {
+            "eval_batch_size",
+            "use_cache",
+            "encoder_df",
+            "return_df",
+            "plot",
+            "plot_kwargs",
+            "model_with_gradiend",
+            "trust_encoder_df_cache",
+        }
         create_kwargs = dict(kwargs)
         if split is not None:
             create_kwargs["split"] = split
@@ -204,7 +217,8 @@ class EncoderEvaluator:
                 logger.warning("Failed to load encoder eval cache %s: %s", path, e)
                 return None
 
-        if use_cache and encoder_df is None and cache_dirs:
+        allow_cached_metrics = encoder_df is None or trust_encoder_df_cache
+        if use_cache and allow_cached_metrics and cache_dirs:
             for cache_dir in cache_dirs:
                 candidate = resolve_encoder_eval_result_path(cache_dir, None, **key_kwargs)
                 if candidate and os.path.isfile(candidate):
@@ -219,12 +233,12 @@ class EncoderEvaluator:
                         logger.info("Loaded cached encoder evaluation from legacy path %s", legacy_path)
                         return raw
 
-        if use_cache and encoder_df is None and metrics_path and os.path.isfile(metrics_path):
+        if use_cache and allow_cached_metrics and metrics_path and os.path.isfile(metrics_path):
             raw = _load_metrics(metrics_path)
             if raw is not None:
                 logger.info("Loaded cached encoder evaluation from %s", metrics_path)
                 return raw
-        if use_cache and encoder_df is None and experiment_dir and str(experiment_dir).strip():
+        if use_cache and allow_cached_metrics and experiment_dir and str(experiment_dir).strip():
             legacy_path = resolve_encoder_eval_result_path_legacy(experiment_dir, **key_kwargs)
             if legacy_path and legacy_path != metrics_path and os.path.isfile(legacy_path):
                 raw = _load_metrics(legacy_path)

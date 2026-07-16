@@ -91,7 +91,6 @@ def plot_suite_outputs(
         RACE_CLASSES,
         split="test",
         alignment="counterfactual",
-        run_evaluation=False,
         output_path=str(cross_encoding_output),
         show=False,
     )

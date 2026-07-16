@@ -198,6 +198,69 @@ def test_prediction_evaluate_decoder_lazy_loads_data_when_needed(monkeypatch):
     assert trainer._data_loaded is True
 
 
+def test_prediction_evaluate_decoder_uses_requested_split(monkeypatch):
+    _patch_training_cache_hit(monkeypatch)
+    trainer = _make_prediction_trainer("prediction-cache-exp")
+    trainer.train()
+    trainer.get_model = lambda: SimpleNamespace(tokenizer=_DummyPredictionTokenizer())
+
+    def _fake_evaluate_decoder(**kwargs):
+        training_like_df, _ = trainer._get_decoder_eval_dataframe(
+            _DummyPredictionTokenizer(),
+            split=kwargs.get("split"),
+            cached_training_like_df=kwargs.get("training_like_df"),
+            cached_neutral_df=kwargs.get("neutral_df"),
+        )
+        return {"splits": sorted(training_like_df["split"].astype(str).unique())}
+
+    trainer._evaluator = SimpleNamespace(evaluate_decoder=_fake_evaluate_decoder)
+
+    result = trainer.evaluate_decoder(split="validation", use_cache=False)
+
+    assert result["splits"] == ["validation"]
+
+
+def test_prediction_decoder_plotting_analysis_uses_training_argument_caps(monkeypatch):
+    trainer = _make_prediction_trainer("prediction-cache-exp")
+    trainer._training_args.decoder_eval_max_size_training_like = 7
+    trainer._training_args.decoder_eval_max_size_neutral = 11
+    trainer._training_args.eval_batch_size = 3
+    trainer.get_model = lambda: SimpleNamespace(
+        base_model=SimpleNamespace(),
+        tokenizer=_DummyPredictionTokenizer(),
+    )
+
+    captured = {}
+
+    def _fake_get_decoder_eval_dataframe(tokenizer, **kwargs):
+        captured["data_kwargs"] = kwargs
+        return (
+            pd.DataFrame({"masked": ["[MASK] went home"], "label_class": ["3SG"]}),
+            pd.DataFrame({"text": ["neutral"]}),
+        )
+
+    def _fake_evaluate_base_model(model, tokenizer, **kwargs):
+        captured["base_kwargs"] = kwargs
+        return {"probs_by_dataset": {"3SG": {"3SG": 0.8}}}
+
+    trainer._get_decoder_eval_dataframe = _fake_get_decoder_eval_dataframe
+    trainer._resolve_decoder_eval_targets = lambda training_like_df=None: ({"3SG": ["he"]}, False)
+    trainer.evaluate_base_model = _fake_evaluate_base_model
+
+    trainer.analyze_decoder_for_plotting(
+        decoder_results={"grid": {"base": {}}},
+        class_ids=["3SG"],
+        use_cache=True,
+    )
+
+    assert captured["data_kwargs"]["split"] == "test"
+    assert captured["data_kwargs"]["max_size_training_like"] == 7
+    assert captured["data_kwargs"]["max_size_neutral"] == 11
+    assert captured["base_kwargs"]["max_size_training_like"] == 7
+    assert captured["base_kwargs"]["max_size_neutral"] == 11
+    assert captured["base_kwargs"]["eval_batch_size"] == 3
+
+
 def test_classification_cached_train_defers_data_loading(monkeypatch):
     _patch_training_cache_hit(monkeypatch)
     trainer = _make_classification_trainer("classification-cache-exp")
@@ -294,6 +357,28 @@ def test_classification_evaluate_decoder_lazy_loads_data_when_needed(monkeypatch
     assert result["training_rows"] >= 1
     assert result["neutral_rows"] >= 1
     assert trainer._combined_data is not None
+
+
+def test_classification_evaluate_decoder_uses_requested_split(monkeypatch):
+    _patch_training_cache_hit(monkeypatch)
+    trainer = _make_classification_trainer("classification-cache-exp")
+    trainer.train()
+    trainer.get_model = lambda: SimpleNamespace(tokenizer=_DummyClassificationTokenizer())
+
+    def _fake_evaluate_decoder(**kwargs):
+        training_like_df, _ = trainer._get_decoder_eval_dataframe(
+            _DummyClassificationTokenizer(),
+            split=kwargs.get("split"),
+            cached_training_like_df=kwargs.get("training_like_df"),
+            cached_neutral_df=kwargs.get("neutral_df"),
+        )
+        return {"splits": sorted(training_like_df["split"].astype(str).unique())}
+
+    trainer._evaluator = SimpleNamespace(evaluate_decoder=_fake_evaluate_decoder)
+
+    result = trainer.evaluate_decoder(split="test", use_cache=False)
+
+    assert result["splits"] == ["test"]
 
 
 def test_encoder_cache_path_does_not_trigger_hf_data_load(monkeypatch, tmp_path):

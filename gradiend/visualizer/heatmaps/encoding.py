@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import torch
-
 from gradiend.comparison import (
     compute_anchor_aligned_encoding_matrix,
     compute_trainer_pair_encoding_matrix,
@@ -16,7 +14,6 @@ from gradiend.comparison import (
     pair_by_id_from_trainers,
     source_by_id_from_trainers,
 )
-from gradiend.comparison.cross_encoding import build_cross_task_encoder_summary
 from gradiend.trainer.core.multi_seed import (
     resolve_dispersion_for_trainers,
     resolve_seed_selection_for_trainers,
@@ -65,21 +62,6 @@ def resolve_oriented_cross_encoding_alignment(
     return "factual", True
 
 
-def _evaluate_encoder_one_trainer_on_gpu(trainer: object, **kwargs: Any) -> Any:
-    """Run encoder eval on one trainer: move to CUDA, evaluate, move back to CPU."""
-    moved_to_gpu = False
-    if torch.cuda.is_available() and hasattr(trainer, "cuda"):
-        trainer.cuda()
-        moved_to_gpu = True
-    try:
-        return trainer.evaluate_encoder(**kwargs)
-    finally:
-        if moved_to_gpu and hasattr(trainer, "cpu"):
-            trainer.cpu()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-
 def plot_cross_encoding_heatmap(
     trainers: Dict[str, object],
     feature_classes: Optional[Sequence[str]] = None,
@@ -91,10 +73,9 @@ def plot_cross_encoding_heatmap(
     max_size: Optional[int] = None,
     use_cache: bool = True,
     full_eval: Optional[bool] = None,
-    cross_task_eval: bool = False,
     aggregate: str = "mean",
     metric: str = "positive_mean",
-    run_evaluation: bool = True,
+    encoder_eval: str = "auto",
     allow_incomplete: bool = False,
     seed_selection: Optional[str] = None,
     seed_aggregate: str = "mean",
@@ -160,11 +141,13 @@ def plot_cross_encoding_heatmap(
         split: Encoder split used when evaluation is needed.
         max_size: Optional evaluation row cap.
         use_cache: Whether to use cached encoder analysis.
-        full_eval: Whether encoder evaluation includes all transitions.
-        cross_task_eval: Oriented mode only; use shared per-class test pool.
+        full_eval: Directed mode only; whether encoder evaluation includes all
+            transitions. Oriented matrices use a shared cross-task test pool
+            when ``encoder_summary`` is not supplied.
         aggregate: Oriented mode aggregate across trainers per anchor.
         metric: Directed mode cross-encoding metric.
-        run_evaluation: Directed mode; run encoder eval before plotting.
+        encoder_eval: Directed mode encoder evaluation policy:
+            ``"auto"``, ``"cached"``, or ``"recompute"``.
         allow_incomplete: Directed mode; tolerate missing cells.
         seed_selection: Directed mode seed selection.
         seed_aggregate: Directed mode seed aggregate.
@@ -189,12 +172,11 @@ def plot_cross_encoding_heatmap(
     if dispersion is None:
         dispersion = resolve_dispersion_for_trainers(trainers, None)
     if feature_classes is not None:
-        oriented_full_eval = True if full_eval is None else bool(full_eval)
         resolved_alignment, alignment_was_auto = resolve_oriented_cross_encoding_alignment(
             trainers,
             alignment,
         )
-        if encoder_summary is None and cross_task_eval:
+        if encoder_summary is None:
             comparison_data = compute_dense_anchor_aligned_encoding_matrix(
                 trainers,
                 feature_classes,
@@ -208,33 +190,6 @@ def plot_cross_encoding_heatmap(
                 dispersion=dispersion,
             )
         else:
-            if encoder_summary is None:
-                if cross_task_eval:
-                    encoder_summary = build_cross_task_encoder_summary(
-                        trainers,
-                        feature_classes,
-                        split=split,
-                        max_size=max_size,
-                        use_cache=use_cache,
-                        seed_selection=seed_selection,
-                        seed_aggregate=seed_aggregate,
-                        dispersion=dispersion,
-                    )
-                else:
-                    encoder_summary = {}
-                    include_other_classes = oriented_full_eval
-                    for trainer_id, trainer in trainers.items():
-                        if not hasattr(trainer, "evaluate_encoder"):
-                            raise TypeError(f"Trainer {trainer_id!r} does not support evaluate_encoder")
-                        encoder_summary[trainer_id] = _evaluate_encoder_one_trainer_on_gpu(
-                            trainer,
-                            split=split,
-                            max_size=max_size,
-                            use_cache=use_cache,
-                            return_df=True,
-                            plot=False,
-                            include_other_classes=include_other_classes,
-                        )
             comparison_data = compute_anchor_aligned_encoding_matrix(
                 pair_by_id=pair_by_id_from_trainers(trainers),
                 encoder_summary=encoder_summary,
@@ -301,7 +256,7 @@ def plot_cross_encoding_heatmap(
         use_cache=use_cache,
         metric=metric,
         full_eval=full_eval,
-        run_evaluation=run_evaluation,
+        encoder_eval=encoder_eval,
         allow_incomplete=allow_incomplete,
         seed_selection=seed_selection,
         seed_aggregate=seed_aggregate,

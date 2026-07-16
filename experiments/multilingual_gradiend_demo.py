@@ -2153,7 +2153,6 @@ def plot_cross_encoding(
             encoder_summary=encoder_summary,
             split="test",
             max_size=config.args.encoder_eval_max_size,
-            cross_task_eval=False,
             aggregate="mean",
             order=feature_order,
             pretty_groups=feature_pretty_groups,
@@ -2215,7 +2214,6 @@ def plot_cross_encoding(
             encoder_summary=encoder_summary,
             split="test",
             max_size=config.args.encoder_eval_max_size,
-            cross_task_eval=False,
             aggregate="mean",
             normalize=True,
             order=feature_order,
@@ -2240,7 +2238,6 @@ def plot_cross_encoding(
         encoder_summary=encoder_summary,
         split="test",
         max_size=config.args.encoder_eval_max_size,
-        cross_task_eval=False,
         aggregate="mean",
         order=feature_order,
         pretty_groups=feature_pretty_groups,
@@ -2267,7 +2264,6 @@ def plot_cross_encoding(
         encoder_summary=encoder_summary,
         split="test",
         max_size=config.args.encoder_eval_max_size,
-        cross_task_eval=False,
         aggregate="mean",
         normalize=True,
         order=feature_order,
@@ -2420,7 +2416,8 @@ def plot_results(
             f"topk_overlap_heatmap_all_{topk}_std.pdf",
         )
         std_style = dict(demo_topk_overlap_style_kwargs())
-        std_style["cbar_label"] = "Overlap std"
+        std_style["cbar_label"] = "Top-k overlap std (%)"
+        std_style["annot_fmt"] = ".1f"
         _plot_std_heatmap_from_cell_stats(
             topk_comparison,
             output_path=std_output_path,

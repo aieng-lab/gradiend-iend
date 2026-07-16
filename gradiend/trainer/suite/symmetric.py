@@ -76,7 +76,6 @@ class SymmetricTrainerSuite(TrainerSuite):
         max_size: Optional[int] = None,
         use_cache: bool = True,
         full_eval: bool = True,
-        cross_task_eval: bool = False,
         aggregate: str = "mean",
         order: Any = "input",
         cluster: bool = False,
@@ -95,7 +94,6 @@ class SymmetricTrainerSuite(TrainerSuite):
             max_size: Optional encoder-evaluation cap.
             use_cache: Whether to use cached encoder results.
             full_eval: Whether encoder evaluation includes all transitions.
-            cross_task_eval: Use shared per-class test pool across trainers.
             aggregate: Aggregate used when multiple pair models cover one anchor.
             order: Heatmap ordering strategy or explicit order.
             cluster: If True, cluster heatmap rows/columns.
@@ -104,6 +102,15 @@ class SymmetricTrainerSuite(TrainerSuite):
         """
         from gradiend.visualizer.heatmaps.encoding import plot_cross_encoding_heatmap
 
+        if encoder_summary is None:
+            encoder_summary = self.evaluate_encoder(
+                split=split,
+                max_size=max_size,
+                use_cache=use_cache,
+                plot=False,
+                return_df=True,
+                full_eval=full_eval,
+            )
         return plot_cross_encoding_heatmap(
             self.trainers,
             feature_classes,
@@ -114,7 +121,6 @@ class SymmetricTrainerSuite(TrainerSuite):
             max_size=max_size,
             use_cache=use_cache,
             full_eval=full_eval,
-            cross_task_eval=cross_task_eval,
             aggregate=aggregate,
             order=order,
             cluster=cluster,

@@ -655,7 +655,7 @@ class TrainerSuite(ABC):
         *,
         label_mapping: Optional[Dict[str, str]] = None,
         full_eval: bool = True,
-        run_evaluation: bool = True,
+        encoder_eval: str = "auto",
         allow_incomplete: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
@@ -665,7 +665,8 @@ class TrainerSuite(ABC):
             label_mapping: Optional child-id to display-label mapping.
             full_eval: Whether child encoder evaluation should include all
                 available transitions.
-            run_evaluation: Whether to run missing encoder evaluation first.
+            encoder_eval: Encoder evaluation policy: ``"auto"``, ``"cached"``,
+                or ``"recompute"``.
             allow_incomplete: If True, tolerate missing child encoder results.
             **kwargs: Forwarded by subclasses to trainer-pair encoding computation.
         """
@@ -684,7 +685,7 @@ class TrainerSuite(ABC):
         use_cache: bool = True,
         metric: str = "positive_mean",
         full_eval: bool = True,
-        run_evaluation: bool = True,
+        encoder_eval: str = "auto",
         allow_incomplete: bool = False,
         seed_selection: Optional[str] = None,
         seed_aggregate: str = "mean",
@@ -706,7 +707,8 @@ class TrainerSuite(ABC):
             use_cache: Whether to use child evaluation/model caches.
             metric: Cross-encoding metric to plot.
             full_eval: Whether child encoder evaluation includes all transitions.
-            run_evaluation: Whether to run missing encoder evaluation first.
+            encoder_eval: Encoder evaluation policy: ``"auto"``, ``"cached"``,
+                or ``"recompute"``.
             allow_incomplete: If True, tolerate missing child encoder results.
             seed_selection: Optional seed selection for multi-seed children.
             seed_aggregate: Aggregate used for seed-level cross encoding.

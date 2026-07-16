@@ -57,6 +57,21 @@ class TestEvalBeforeTrain:
         mock_eval.assert_called_once()
         assert result is decoder_result
 
+    def test_evaluate_decoder_forwards_split(self, temp_dir):
+        trainer = MockTrainerForTest(model="mock-base", args=TrainingArguments(experiment_dir=temp_dir))
+        untrained = MagicMock()
+        untrained.name_or_path = "mock-base"
+        decoder_result = {"summary": {}, "grid": {}}
+
+        with patch.object(trainer, "_prepare_model_for_evaluation", return_value=untrained):
+            with patch.object(trainer.evaluator, "evaluate_decoder", return_value=decoder_result) as mock_eval:
+                trainer.evaluate_decoder(split="validation", max_size=7, use_cache=False)
+
+        assert mock_eval.call_args.kwargs["split"] == "validation"
+        assert mock_eval.call_args.kwargs["max_size"] == 7
+        assert mock_eval.call_args.kwargs["max_size_training_like"] == 7
+        assert mock_eval.call_args.kwargs["max_size_neutral"] == 7
+
     def test_rewrite_base_model_before_train_requires_decoder_results(self, temp_dir):
         trainer = MockTrainerForTest(
             model="mock-base",

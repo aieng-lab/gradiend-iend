@@ -278,7 +278,7 @@ target_classes=["masc_nom", "fem_nom"]   # Pair for training (currently: must ha
 Balancing and caps rely on a feature-class identifier. After conversion, the trainer infers this from the class labels in your data.
 
 - [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].train_max_size: Caps training samples; applied per feature class when available.
-- [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].encoder_eval_max_size, `decoder_eval_max_size_training_like`, etc.: Similar per-class caps for evaluation.
+- [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].encoder_eval_max_size, `decoder_eval_max_size_training_like`, and `decoder_eval_max_size_neutral`: Similar caps for evaluation. At call time, `evaluate_decoder(max_size=N)` caps both decoder training-like rows and neutral/LMS rows unless the decoder-specific caps are passed explicitly.
 - When class information is available, the scheduler oversamples smaller classes and `train_max_size` applies per-class downsampling.
 
 ---

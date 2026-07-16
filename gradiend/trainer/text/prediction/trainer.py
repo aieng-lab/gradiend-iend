@@ -2317,7 +2317,15 @@ class TextPredictionTrainer(Trainer):
 
         # Resolve eval datasets (probability and LMS can use different sources).
         if max_size_training_like is None:
+            max_size_training_like = self._default_from_training_args(
+                max_size_training_like, "decoder_eval_max_size_training_like"
+            )
+        if max_size_training_like is None:
             max_size_training_like = self.config.decoder_eval_lms_max_samples
+        if max_size_neutral is None:
+            max_size_neutral = self._default_from_training_args(
+                max_size_neutral, "decoder_eval_max_size_neutral"
+            )
         if max_size_neutral is None:
             max_size_neutral = self.config.decoder_eval_lms_max_samples
         if training_like_df is None or neutral_df is None:
@@ -2486,11 +2494,31 @@ class TextPredictionTrainer(Trainer):
             class_ids: Classes to evaluate probabilities for. If None, uses all_classes if available,
                 else target_classes.
             use_cache: Whether to use cached results when re-evaluating.
-            **kwargs: Reserved for future decoder plotting options.
+            **kwargs: Decoder evaluation options such as ``split``,
+                ``max_size_training_like``, ``max_size_neutral``, ``max_size``,
+                and ``eval_batch_size``. Omitted size options default to
+                ``TrainingArguments``.
 
         Returns:
             Dict with 'plotting_data' (extended grid with probs_by_dataset) and 'summary' (summary entries from decoder_results).
         """
+        split = kwargs.get("split", "test")
+        max_size = kwargs.get("max_size")
+        max_size_training_like = kwargs.get("max_size_training_like")
+        max_size_neutral = kwargs.get("max_size_neutral")
+        eval_batch_size = kwargs.get("eval_batch_size")
+        if max_size_training_like is None:
+            max_size_training_like = max_size
+        if max_size_neutral is None:
+            max_size_neutral = max_size
+        max_size_training_like = self._default_from_training_args(
+            max_size_training_like, "decoder_eval_max_size_training_like"
+        )
+        max_size_neutral = self._default_from_training_args(
+            max_size_neutral, "decoder_eval_max_size_neutral"
+        )
+        eval_batch_size = self._default_from_training_args(eval_batch_size, "eval_batch_size")
+
         if decoder_results is None:
             decoder_results = self.evaluate_decoder(use_cache=use_cache, **kwargs)
         
@@ -2518,6 +2546,9 @@ class TextPredictionTrainer(Trainer):
         # Get training_like_df for evaluation
         training_like_df, neutral_df = self._get_decoder_eval_dataframe(
             tokenizer,
+            split=split,
+            max_size_training_like=max_size_training_like,
+            max_size_neutral=max_size_neutral,
             cached_training_like_df=None,
             cached_neutral_df=None,
         )
@@ -2563,6 +2594,9 @@ class TextPredictionTrainer(Trainer):
                 tokenizer,
                 training_like_df=training_like_df,
                 neutral_df=neutral_df,
+                max_size_training_like=max_size_training_like,
+                max_size_neutral=max_size_neutral,
+                eval_batch_size=eval_batch_size,
                 use_cache=False,
             )
             if "probs_by_dataset" in eval_result:
@@ -3226,16 +3260,18 @@ class TextPredictionTrainer(Trainer):
         tokenizer: Any,
         max_size_training_like: Optional[int] = None,
         max_size_neutral: Optional[int] = None,
+        split: Optional[EncoderSplit] = "test",
         cached_training_like_df: Optional[pd.DataFrame] = None,
         cached_neutral_df: Optional[pd.DataFrame] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Get DataFrame for decoder evaluation (test split).
+        Get DataFrame for decoder evaluation.
 
         Args:
             tokenizer: Tokenizer
             max_size_training_like: Maximum number of generated training-like samples
             max_size_neutral: Maximum number of generated neutral samples
+            split: Dataset split(s) used for generated training-like samples.
             cached_training_like_df: Optional cached training-like DataFrame to reuse
             cached_neutral_df: Optional cached neutral DataFrame to reuse
 
@@ -3244,11 +3280,19 @@ class TextPredictionTrainer(Trainer):
         """
         training_like_df = cached_training_like_df
         neutral_df = cached_neutral_df
+        if max_size_training_like is None:
+            max_size_training_like = self._default_from_training_args(
+                max_size_training_like, "decoder_eval_max_size_training_like"
+            )
+        if max_size_neutral is None:
+            max_size_neutral = self._default_from_training_args(
+                max_size_neutral, "decoder_eval_max_size_neutral"
+            )
 
         if training_like_df is None:
             eval_dataset = self.create_training_data(
                 tokenizer,
-                split='test',
+                split=split,
                 batch_size=1,
                 max_size=max_size_training_like,
             )

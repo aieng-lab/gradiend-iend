@@ -1,0 +1,9 @@
+.md-content p > img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: min(100%, 56rem);
+  max-height: min(70vh, 48rem);
+  object-fit: contain;
+  margin: 1rem auto;
+}

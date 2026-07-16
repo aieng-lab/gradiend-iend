@@ -63,6 +63,33 @@ def _symmetric_value_limits(mat_arr: Any) -> Tuple[float, float]:
     return -max_abs, max_abs
 
 
+def _comparison_cell_stat_field(comparison_data: Dict[str, Any]) -> Optional[str]:
+    field = comparison_data.get("cell_stat_field")
+    if isinstance(field, str) and field:
+        return field
+    measure = str(comparison_data.get("measure") or "")
+    suffix_map = {
+        "_std": "std",
+        "_range_half_width": "range_half_width",
+    }
+    for suffix, inferred in suffix_map.items():
+        if measure.endswith(suffix):
+            return inferred
+    return None
+
+
+def _base_measure_name(measure: Optional[str], cell_stat_field: Optional[str]) -> str:
+    name = str(measure or "")
+    if cell_stat_field:
+        suffix = f"_{cell_stat_field}"
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    for suffix in ("_std", "_range_half_width"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 def _validate_numeric_optional(name: str, value: Optional[Union[int, float]]) -> None:
     if value is None:
         return
@@ -281,11 +308,16 @@ def plot_comparison_heatmap(
     n_cols = len(col_ids)
     custom_vmin = vmin is not None
     custom_vmax = vmax is not None
+    measure_name = str(comparison_data.get("measure") or "")
+    value_name = comparison_data.get("value")
+    cell_stat_field = _comparison_cell_stat_field(comparison_data)
+    is_dispersion_stat_matrix = cell_stat_field in {"std", "range_half_width"}
+    base_measure = _base_measure_name(measure_name, cell_stat_field)
 
     if percentages:
         if (
-            comparison_data.get("measure") == "topk_overlap"
-            and comparison_data.get("value") == "intersection"
+            base_measure == "topk_overlap"
+            and value_name == "intersection"
             and "resolved_topk" in comparison_data
         ):
             resolved_topk = comparison_data["resolved_topk"]
@@ -323,7 +355,7 @@ def plot_comparison_heatmap(
     if annot_fmt is not None:
         fmt = annot_fmt
     elif fmt is None:
-        fmt = ".0f" if percentages else ".2f"
+        fmt = ".1f" if percentages and is_dispersion_stat_matrix else (".0f" if percentages else ".2f")
 
     if figsize is None:
         if rectangular:
@@ -371,7 +403,6 @@ def plot_comparison_heatmap(
 
     mat_arr = np.array(mat, dtype=float)
     measure = comparison_data.get("measure")
-    value_name = comparison_data.get("value")
     row_normalized_by_diagonal = bool(comparison_data.get("row_normalized_by_diagonal"))
     normalized_cross_encoding = row_normalized_by_diagonal and str(measure).startswith("cross_encoding_")
     cross_encoding_difference = measure == "cross_encoding_positive_minus_negative"
@@ -380,14 +411,18 @@ def plot_comparison_heatmap(
     bounded_unit_measures = {"cosine", "cosine_signed", "spearman", "spearman_signed", "mass_overlap", "cross_encoding_positive_mean", "cross_encoding_negative_mean", "cross_encoding_positive_minus_negative"}
     cmap = _default_colormap_for_measure(measure, cmap)
     if vmin is None:
-        if cross_encoding_difference or signed_encoding:
+        if is_dispersion_stat_matrix:
+            vmin = float(np.nanmin(mat_arr))
+        elif cross_encoding_difference or signed_encoding:
             vmin, _ = _symmetric_value_limits(mat_arr)
         elif measure in signed_measures:
             vmin = -100.0 if percentages else -1.0
         else:
             vmin = 0.0
     if vmax is None:
-        if cross_encoding_difference or signed_encoding:
+        if is_dispersion_stat_matrix:
+            vmax = float(np.nanmax(mat_arr))
+        elif cross_encoding_difference or signed_encoding:
             _, vmax = _symmetric_value_limits(mat_arr)
         elif normalized_cross_encoding:
             vmax = max(1.0, float(np.nanmax(mat_arr)))
@@ -401,6 +436,18 @@ def plot_comparison_heatmap(
             vmax = 1.0
         else:
             vmax = float(np.nanmax(mat_arr))
+    if float(vmin) == float(vmax):
+        if float(vmax) == 0.0:
+            vmax = 1.0
+        else:
+            pad = abs(float(vmax)) * 0.05
+            vmin = float(vmin) - pad
+            vmax = float(vmax) + pad
+    if cbar_label is None and is_dispersion_stat_matrix:
+        if cell_stat_field == "std":
+            cbar_label = "Std. dev. (%)" if percentages else "Std. dev."
+        elif cell_stat_field == "range_half_width":
+            cbar_label = "Range half-width (%)" if percentages else "Range half-width"
 
     norm = None
     eps = max(1e-10, np.finfo(float).tiny)

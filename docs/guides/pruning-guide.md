@@ -111,4 +111,8 @@ args = TrainingArguments(
 - Use post-pruning to compress after training while preserving learned behavior. Post-pruning is based on the final weights and is typically more accurate for selecting important dimensions, so it can achieve higher compression with less performance loss.
 - Use manual masks for deterministic selection or when you already have a mask from an external analysis.
 
-todo regenerate based on pruning ablation results
+![Pruning ablation metric grid](../img/pruning_analysis_metric_grid.png)
+
+<!-- DOC_PLOT: docs/img/pruning_analysis_metric_grid.png
+Regenerate: pruning ablation analysis; copy runs/paper/pruning_analysis_metric_grid.pdf
+-->

@@ -106,7 +106,7 @@ encoder separates another feature's data — the semantic complement.
 
 ```python
 # After training a suite:
-suite.plot_cross_encoding_heatmap(run_evaluation=False, output_path="cross_encoding.png")
+suite.plot_cross_encoding_heatmap(output_path="cross_encoding.png")
 ```
 
 For dense anchor-aligned matrices over many pairwise GRADIENDs, see

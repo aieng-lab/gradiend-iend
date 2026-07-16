@@ -11,6 +11,7 @@ from gradiend.comparison.anchor_aligned import (
     source_by_id_from_trainers,
 )
 from gradiend.comparison.cross_encoding import (
+    build_cross_task_encoder_summary,
     compute_gradiend_feature_cross_encoding_matrix,
     compute_gradiend_transition_cross_encoding_matrix,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "compute_grouped_similarity_matrices",
     "compute_trainer_pair_encoding_matrix",
     "can_normalize_cross_encoding_by_diagonal",
+    "build_cross_task_encoder_summary",
     "compute_gradiend_feature_cross_encoding_matrix",
     "compute_gradiend_transition_cross_encoding_matrix",
     "normalize_cross_encoding_rows_by_diagonal",

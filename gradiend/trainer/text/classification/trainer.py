@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -286,6 +286,7 @@ class TextClassificationTrainer(Trainer):
         tokenizer: Any,
         max_size_training_like: Optional[int] = None,
         max_size_neutral: Optional[int] = None,
+        split: Optional[EncoderSplit] = "test",
         cached_training_like_df: Optional[pd.DataFrame] = None,
         cached_neutral_df: Optional[pd.DataFrame] = None,
     ) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -294,8 +295,15 @@ class TextClassificationTrainer(Trainer):
         self._ensure_data()
         split_col = getattr(self.config, "split_col", "split")
         if split_col in self._combined_data.columns:
+            available = self._combined_data[split_col].dropna().astype(str).tolist()
+            if split == "all":
+                split_names = set(resolve_encoder_splits(split, available_splits=available))
+            elif isinstance(split, Sequence) and not isinstance(split, (str, bytes)):
+                split_names = set(resolve_encoder_splits(split, available_splits=available))
+            else:
+                split_names = {normalize_split_name(str(split or "test"))}
             eval_data = self._combined_data[
-                self._combined_data[split_col].astype(str).str.lower().isin(("test", "validation"))
+                self._combined_data[split_col].astype(str).map(normalize_split_name).isin(split_names)
             ].copy()
         else:
             eval_data = self._combined_data.copy()

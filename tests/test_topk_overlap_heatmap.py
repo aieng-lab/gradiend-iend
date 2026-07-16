@@ -318,3 +318,35 @@ def test_overlap_heatmap_rejects_custom_count_bounds_for_nonuniform_percentage_s
             show=False,
             return_data=True,
         )
+
+
+def test_overlap_dispersion_heatmap_autoscales_and_uses_decimal_annotations():
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("seaborn")
+    import matplotlib.pyplot as plt
+
+    from gradiend.visualizer.heatmaps import plot_comparison_heatmap
+
+    try:
+        result, fig, ax = plot_comparison_heatmap(
+            {
+                "measure": "topk_overlap_std",
+                "cell_stat_field": "std",
+                "value": "intersection_frac",
+                "model_ids": ["A", "B"],
+                "matrix": [[0.0, 0.0123], [0.025, 0.0]],
+            },
+            percentages=True,
+            show=False,
+            return_data=True,
+            return_fig_ax=True,
+        )
+        mesh = ax.collections[0]
+
+        assert result["matrix"][0][1] == pytest.approx(1.23)
+        assert mesh.norm.vmin == pytest.approx(0.0)
+        assert mesh.norm.vmax == pytest.approx(2.5)
+        assert any(text.get_text() == "1.2" for text in ax.texts)
+        assert fig.axes[1].get_ylabel() == "Std. dev. (%)"
+    finally:
+        plt.close("all")

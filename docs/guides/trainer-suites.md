@@ -186,8 +186,6 @@ suite.plot_topk_overlap_heatmap(topk=1000, value="intersection_frac", output_pat
 Regenerate: gradiend/examples/train_race_symmetric_suite.py (--write-docs-images)
 -->
 
-> **TODO:** missing `docs/img/symmetric_suite_topk_overlap.png` — [:material-file-code-outline: `train_race_symmetric_suite.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_race_symmetric_suite.py) `--write-docs-images`
-
 ![Top-k decoder overlap across the three race GRADIENDs](../img/symmetric_suite_topk_overlap.png)
 
 ```python
@@ -195,7 +193,6 @@ suite.plot_cross_encoding_heatmap(
     ["white", "black", "asian"],
     split="test",
     alignment="counterfactual",
-    run_evaluation=False,
     output_path="suite_cross_encoding.png",
 )
 ```
@@ -203,8 +200,6 @@ suite.plot_cross_encoding_heatmap(
 <!-- DOC_PLOT: docs/img/symmetric_suite_cross_encoding.png
 Regenerate: gradiend/examples/train_race_symmetric_suite.py (--write-docs-images)
 -->
-
-> **TODO:** missing `docs/img/symmetric_suite_cross_encoding.png` — [:material-file-code-outline: `train_race_symmetric_suite.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_race_symmetric_suite.py) `--write-docs-images`
 
 ![Oriented cross-encoding (counterfactual alignment) for the race suite](../img/symmetric_suite_cross_encoding.png)
 
@@ -261,7 +256,6 @@ suite.train()
 suite.evaluate_encoder(split="test")
 suite.plot_similarity_heatmap(measure="cosine", output_path="suite_similarity.png")
 suite.plot_cross_encoding_heatmap(
-    run_evaluation=False,   # reuse encoder cache from evaluate_encoder
     output_path="suite_cross_encoding.png",
 )
 ```
@@ -287,7 +281,6 @@ with `positive_class` stored on the pair for cross-encoding.
 suite.plot_cross_encoding_heatmap(
     metric="positive_mean",   # or "negative_mean", "positive_minus_negative"
     normalize=False,          # True: divide each row by its diagonal
-    run_evaluation=True,      # False if evaluate_encoder already ran
 )
 ```
 
@@ -298,15 +291,11 @@ with sign aligned to A’s positive class. See [Cross-model comparison](cross-mo
 Regenerate: gradiend/examples/train_sentiment_positive_suite.py (--write-docs-images)
 -->
 
-> **TODO:** missing `docs/img/suite_similarity_heatmap.png` — [:material-file-code-outline: `train_sentiment_positive_suite.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment_positive_suite.py) `--write-docs-images`
-
 ![Cosine similarity across sentiment suite children](../img/suite_similarity_heatmap.png)
 
 <!-- DOC_PLOT: docs/img/suite_cross_encoding_heatmap.png
 Regenerate: gradiend/examples/train_sentiment_positive_suite.py (--write-docs-images)
 -->
-
-> **TODO:** missing `docs/img/suite_cross_encoding_heatmap.png` — [:material-file-code-outline: `train_sentiment_positive_suite.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment_positive_suite.py) `--write-docs-images`
 
 ![Cross-encoding across sentiment suite children](../img/suite_cross_encoding_heatmap.png)
 
@@ -457,7 +446,21 @@ suite.plot_similarity_heatmap(
 
 [:material-file-code-outline: `train_multi_seed_stability.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_multi_seed_stability.py)
 
-> **TODO:** missing multi-seed *suite* dispersion heatmap ([`plot_similarity_heatmap(dispersion="std")`][gradiend.visualizer.heatmaps.similarity.plot_similarity_heatmap] on a [`TrainerSuite`][gradiend.trainer.suite.base.TrainerSuite])
+![Multi-seed suite dispersion heatmap](../img/multi_seed_suite_dispersion_heatmap.png)
+
+<!-- DOC_PLOT: docs/img/multi_seed_suite_dispersion_heatmap.png
+Regenerate: multilingual 3-seed BERT run; copy topk_overlap_heatmap_all_1000_std.pdf
+-->
+
+This dispersion view is a stability diagnostic, not the overlap matrix itself:
+each cell is the seed-to-seed standard deviation of the corresponding top-k
+overlap comparison after converting overlap values to percent. A value of 0.0
+means the matched-seed overlap percentages are effectively identical across
+runs. A value of 0.7 means the standard deviation is 0.7 percentage points, so
+overlap values near a 42% mean would typically be only about 41.3%, 42.0%, and
+42.7% across seeds; even the brightest cells here are small seed effects.
+The color scale is local to the observed dispersion range rather than fixed to
+the 0–100 overlap scale.
 
 Heatmap cells can then show mean comparison values with seed spread. Enable only
 after single-seed children converge reliably — see [Multi-seed analysis](multi-seed.md).

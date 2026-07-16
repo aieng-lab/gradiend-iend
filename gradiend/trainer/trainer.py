@@ -2398,6 +2398,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         lrs: Optional[Sequence[float]] = None,
         feature_factors: Optional[Sequence[float]] = None,
         use_cache: Optional[bool] = None,
+        split: EncoderSplit = "test",
+        max_size: Optional[int] = None,
         max_size_training_like: Optional[int] = None,
         max_size_neutral: Optional[int] = None,
         eval_batch_size: Optional[int] = None,
@@ -2428,6 +2430,11 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 from `TrainingArguments.decoder_eval_feature_factors`.
             use_cache: If True, reuse cached decoder grid results when available under experiment_dir.
                 If None, defaults are taken from `TrainingArguments.use_cache` (default: False).
+            split: Dataset split used for training-like decoder evaluation rows. A single name
+                (default ``"test"``), ``"all"``, or a sequence of split names.
+            max_size: Shared evaluation-size alias. If set and
+                explicit decoder caps are omitted, caps both training-like decoder
+                rows and neutral/LMS rows.
             max_size_training_like: Maximum number of samples per variant for training-like decoder
                 evaluation data. If None, defaults are taken from
                 `TrainingArguments.decoder_eval_max_size_training_like`.
@@ -2483,6 +2490,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             raise TypeError(f"max_size_training_like must be int or None, got {type(max_size_training_like).__name__}")
         if max_size_training_like is not None and max_size_training_like < 0:
             raise ValueError(f"max_size_training_like must be >= 0, got {max_size_training_like}")
+        if max_size is not None and not isinstance(max_size, int):
+            raise TypeError(f"max_size must be int or None, got {type(max_size).__name__}")
+        if max_size is not None and max_size < 0:
+            raise ValueError(f"max_size must be >= 0, got {max_size}")
         if max_size_neutral is not None and not isinstance(max_size_neutral, int):
             raise TypeError(f"max_size_neutral must be int or None, got {type(max_size_neutral).__name__}")
         if max_size_neutral is not None and max_size_neutral < 0:
@@ -2491,8 +2502,19 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             raise TypeError(f"eval_batch_size must be int or None, got {type(eval_batch_size).__name__}")
         if eval_batch_size is not None and eval_batch_size < 1:
             raise ValueError(f"eval_batch_size must be >= 1, got {eval_batch_size}")
+        if isinstance(split, (str, bytes)):
+            pass
+        elif isinstance(split, Sequence):
+            if len(split) == 0:
+                raise ValueError("split sequence must not be empty")
+        else:
+            raise TypeError(f"split must be str or a sequence of str, got {type(split).__name__}")
 
         use_cache = self._resolve_artifact_use_cache(use_cache, fallback=False)
+        if max_size_training_like is None:
+            max_size_training_like = max_size
+        if max_size_neutral is None:
+            max_size_neutral = max_size
         max_size_training_like = self._default_from_training_args(
             max_size_training_like, "decoder_eval_max_size_training_like"
         )
@@ -2517,6 +2539,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         lrs=lrs,
                         feature_factors=feature_factors,
                         use_cache=use_cache,
+                        split=split,
+                        max_size=max_size,
                         max_size_training_like=max_size_training_like,
                         max_size_neutral=max_size_neutral,
                         eval_batch_size=eval_batch_size,
@@ -2693,6 +2717,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     use_cache=use_cache,
                     split=split,
                     max_size=max_size,
+                    trust_encoder_df_cache=resolved_encoder_df is None,
                     **{k: v for k, v in kwargs.items() if k not in ("return_df", "plot", "plot_kwargs")},
                 )
                 runtime_monitor.mark("trainer:evaluate_encoder:done", split=split, max_size=max_size)
