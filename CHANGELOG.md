@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-16
+
+### Changed
+
+- Multi-seed dispersion heatmaps now use dispersion-specific autoscaling and one-decimal percentage annotations, making small seed-to-seed variation readable.
+- Documentation now explains dispersion heatmap values as standard deviations of percentage overlap across seeds.
+- Decoder evaluation cache keys now include split and size caps so cached grids are reused only for matching evaluation settings.
+
+### Fixed
+
+- `evaluate_decoder()` consistently accepts `split` and shared `max_size` arguments; `max_size` caps both training-like and neutral decoder evaluation rows unless explicit caps are supplied.
+- Text-prediction and classification decoder evaluation now honor requested splits.
+- Decoder plotting analysis honors `TrainingArguments.decoder_eval_max_size_training_like`, `decoder_eval_max_size_neutral`, and `eval_batch_size`, preventing uncapped neutral/LMS evaluation during probability-shift plotting.
+- Encoder metrics caches are reused when `Trainer.evaluate_encoder()` supplies a trainer-owned cached encoder DataFrame.
+- Multi-seed per-call `return_per_seed=True` is handled by `MultiSeedTrainerView` instead of leaking into single-seed trainer calls.
+- Multi-seed encoder distribution, scatter, and strip-by-split plots now build per-seed encoder DataFrames before plotting.
+- API autoref links in docs were refreshed for CI.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added
@@ -50,6 +68,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 Initial public release of the GRADIEND Python package.
 
-[Unreleased]: https://github.com/aieng-lab/gradiend/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/aieng-lab/gradiend/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/aieng-lab/gradiend/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/aieng-lab/gradiend/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/aieng-lab/gradiend/releases/tag/v0.1.0
