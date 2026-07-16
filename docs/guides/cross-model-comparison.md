@@ -137,7 +137,7 @@ In this example plot, even a brighter value around 0.7 means a standard deviatio
 
 ### Checkpoint similarity (weight space)
 
-To compare different checkpoints of the same feature (different GRADIEND models trained on different random seeds), use the `compute_similarity_matrix` helper.
+To compare different checkpoints of the same feature (different GRADIEND models trained on different random seeds), use the [`compute_similarity_matrix`][gradiend.comparison.similarity.compute_similarity_matrix] helper.
 
 ```python
 from gradiend import compute_similarity_matrix, plot_comparison_heatmap
