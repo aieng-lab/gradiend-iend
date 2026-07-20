@@ -30,8 +30,13 @@ from gradiend.trainer.core.split_col_modes import (
 from gradiend.trainer.trainer import Trainer, _apply_seed
 from gradiend.trainer.config import TrainerConfig
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
 from gradiend.model import ModelWithGradiend
-from gradiend.trainer.text.prediction.dataset import TextTrainingDataset, create_masked_pair_from_text
+from gradiend.trainer.text.prediction.dataset import (
+    TextActivationTrainingDataset,
+    TextTrainingDataset,
+    create_masked_pair_from_text,
+)
 from pathlib import Path
 from gradiend.trainer.core.unified_data import (
     all_subsets_to_mlm_df,
@@ -78,6 +83,7 @@ from gradiend.trainer.text.prediction.prediction_objective import (
 )
 from gradiend.trainer.text.prediction.seq2seq import tokenize_prediction_label
 from gradiend.trainer.text.common.dataset import TextGradientTrainingDataset
+from gradiend.trainer.core.signals import ActivationSignalExtractor, require_single_signal
 
 logger = get_logger(__name__)
 
@@ -2159,8 +2165,6 @@ class TextPredictionTrainer(Trainer):
             **kwargs: Optional gradient dataset settings such as ``source``,
                 ``target``, ``dtype``, and ``device``.
         """
-        from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
-
         source = kwargs.pop("source", GRADIENT_DATASET_KWARG_UNSET)
         target = kwargs.pop("target", GRADIENT_DATASET_KWARG_UNSET)
         args = getattr(self, "training_args", None)
@@ -2181,6 +2185,40 @@ class TextPredictionTrainer(Trainer):
         tokenizer = model_with_gradiend.tokenizer
         dtype = kwargs.pop("dtype", model_with_gradiend.gradiend.torch_dtype)
         device = kwargs.pop("device", model_with_gradiend.gradiend.device_encoder)
+        if "signal" not in kwargs and args is not None:
+            kwargs["signal"] = getattr(args, "signal", None)
+        if "signals" not in kwargs and args is not None:
+            kwargs["signals"] = getattr(args, "signals", None)
+        signal = require_single_signal(
+            signal=kwargs.get("signal"),
+            signals=kwargs.get("signals"),
+            context="TextPredictionTrainer.create_gradient_training_dataset",
+        )
+        if signal.kind == "activation":
+            if kwargs.get("signals") is not None:
+                kwargs.pop("signals")
+            kwargs.pop("signal", None)
+            scope = kwargs.pop("signal_scope", getattr(args, "signal_scope", None) if args is not None else None)
+            signal = TextActivationTrainingDataset.default_signal(signal)
+            return TextActivationTrainingDataset(
+                raw_training_data,
+                tokenizer,
+                ActivationSignalExtractor(
+                    model_with_gradiend,
+                    signal=signal,
+                    scope=scope,
+                    tokenizer=tokenizer,
+                ),
+                source=source,
+                target=target,
+                cache_dir=cache_dir,
+                use_cached_signals=use_cached_gradients,
+                dtype=dtype,
+                device=device,
+                timing_label=kwargs.pop("timing_label", "text-activation"),
+                signal=signal,
+                **kwargs,
+            )
         return TextGradientTrainingDataset(
             raw_training_data,
             tokenizer,

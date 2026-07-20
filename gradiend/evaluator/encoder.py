@@ -1,5 +1,5 @@
 """
-Encoder evaluation: encode gradients and compute unified encoder metrics.
+Encoder evaluation: encode training signals and compute unified encoder metrics.
 
 EncoderEvaluator runs encoding on evaluation data and delegates to
 get_encoder_metrics_from_dataframe for all metrics (correlation, accuracy,
@@ -13,9 +13,8 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from gradiend.evaluator.encoder_metrics import get_encoder_metrics_from_dataframe
-from gradiend.trainer.core.dataset import GradientTrainingDataset
+from gradiend.trainer.core.dataset import SignalTrainingDatasetBase
 from gradiend.util.encoding_rows import encode_dataset_to_rows
-from gradiend.util.split_policy import SplitPolicy
 from gradiend.util.paths import resolve_encoder_eval_result_path, resolve_encoder_eval_result_path_legacy
 from gradiend.util.logging import get_logger
 from gradiend.util.util import to_jsonable
@@ -23,18 +22,12 @@ from gradiend.util.util import to_jsonable
 logger = get_logger(__name__)
 
 
-def _encoder_metrics_kwargs_from_trainer(trainer: Any, encoder_df: pd.DataFrame) -> Dict[str, Any]:
+def _encoder_metrics_kwargs_from_trainer(trainer: Any, _encoder_df: pd.DataFrame) -> Dict[str, Any]:
     """Build optional kwargs for get_encoder_metrics_from_dataframe from trainer context."""
     target_classes = getattr(trainer, "target_classes", None) or getattr(trainer, "pair", None)
     kwargs: Dict[str, Any] = {}
     if target_classes:
         kwargs["target_classes"] = list(target_classes)
-    if "data_split" in encoder_df.columns and encoder_df["data_split"].nunique(dropna=True) > 1:
-        splits = encoder_df["data_split"].dropna().astype(str).tolist()
-        policy = SplitPolicy.from_available(splits)
-        gen_pair = policy.generalization_pair()
-        if gen_pair is not None:
-            kwargs["generalization_splits"] = gen_pair
     return kwargs
 
 
@@ -113,7 +106,7 @@ def _rows_to_encoder_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 class EncoderEvaluator:
     """
-    Encoder evaluation: encode gradients on eval data and compute label correlation.
+    Encoder evaluation: encode signals on eval data and compute label correlation.
     Uses trainer for model and create_eval_data; subclasses can override to
     customize behavior (caching, metrics).
     """
@@ -131,7 +124,7 @@ class EncoderEvaluator:
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
-        Evaluate encoder on eval data: encode gradients and compute unified encoder metrics.
+        Evaluate encoder on eval data: encode signals and compute unified encoder metrics.
 
         Uses get_encoder_metrics_from_dataframe as single source of truth for all metrics.
         When encoder_df is provided, skips encoding and computes metrics directly from it.
@@ -144,7 +137,7 @@ class EncoderEvaluator:
             encoder_df: Optional DataFrame with encoded values. If provided, skips encoding
                 and computes metrics from this DataFrame. Use when you already have
                 encoder outputs (e.g. from evaluate_encoder(return_df=True)).
-            eval_data: Optional pre-computed GradientTrainingDataset. If None and encoder_df
+            eval_data: Optional pre-computed SignalTrainingDatasetBase. If None and encoder_df
                 is None, created via trainer.create_eval_data.
             use_cache: If True, use cached encoder evaluation result when available
                 (requires experiment_dir).
@@ -261,8 +254,8 @@ class EncoderEvaluator:
                     model_with_gradiend,
                     **create_kwargs,
                 )
-            if not isinstance(eval_data, GradientTrainingDataset):
-                raise TypeError("EncoderEvaluator.evaluate_encoder expected a GradientTrainingDataset.")
+            if not isinstance(eval_data, SignalTrainingDatasetBase):
+                raise TypeError("EncoderEvaluator.evaluate_encoder expected a SignalTrainingDatasetBase.")
             max_size = create_kwargs.get("max_size")
             try:
                 n_eval = len(eval_data)

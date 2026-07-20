@@ -1,10 +1,10 @@
 """
-Gradient training datasets: modality-agnostic GradientTrainingDataset and text wrapper.
+Signal training datasets: modality-agnostic signal batching and gradient wrapper.
 
-GradientTrainingDataset wraps any training dataset that yields batches with 'factual' and
-'alternative' inputs, runs a gradient_creator on them, and returns source/target tensors.
-Modality-specific: padding value when batching variable-length tensors (get_padding_value),
-and when caching is used, cache_key_fields (list of batch keys to include in the hash).
+SignalTrainingDatasetBase wraps any training dataset that yields batches with 'factual'
+and 'alternative' inputs, runs a signal_extractor on them, and returns source/target
+tensors. Modality-specific details are delegated to callers: padding value when batching
+variable-length tensors (get_padding_value), and cache_key_fields when caching is used.
 """
 
 from __future__ import annotations
@@ -26,6 +26,12 @@ from gradiend.trainer.core.config import (
     alternative_computation_required_keywords,
     source_target_keywords,
 )
+from gradiend.trainer.core.signals import (
+    GradientSignalExtractor,
+    SignalSet,
+    require_single_gradient_signal,
+    require_single_signal,
+)
 
 logger = get_logger(__name__)
 
@@ -46,27 +52,27 @@ def _invert_numeric_label(label: Any) -> Any:
     return label
 
 
-class GradientTrainingDataset:
+class SignalTrainingDatasetBase:
     """
-    Modality-agnostic dataset for GRADIEND gradient creation and batching.
+    Modality-agnostic dataset for GRADIEND signal extraction and batching.
 
     Wraps a training dataset that provides items with 'factual' and 'alternative' inputs.
     Batches items, optionally pads variable-length tensors (via get_padding_value),
-    runs gradient_creator on factual/alternative, and returns source/target tensors
-    (factual, alternative, or diff). When cache_dir and use_cached_gradients are set, cache_key_fields must be provided:
+    runs a signal extractor on factual/alternative, and returns source/target tensors
+    (factual, alternative, or diff). When cache_dir and use_cached_signals are set, cache_key_fields must be provided:
     list of batch dict keys whose values are included in the cache hash (e.g. ['input_text', 'label']).
     All listed keys must be present in every batch when caching is used.
 
     Args:
         training_data: Dataset with __len__ and __getitem__ returning dicts containing
             at least 'factual' and 'alternative' (modality-specific, e.g. tokenizer outputs).
-        gradient_creator: Callable(inputs) -> gradients tensor (e.g. model.forward_pass_create_gradients).
-        source: 'factual' | 'alternative' | 'diff' | None. When None (e.g. supervised_decoder), source gradients are not computed.
-        target: Same options or None. When None (e.g. supervised_encoder), target gradients are not computed.
-        cache_dir: Optional directory for caching gradients.
-        use_cached_gradients: If True and cache_dir set, load/save gradients.
+        signal_extractor: Callable producing a SignalBatch from factual/alternative inputs.
+        source: 'factual' | 'alternative' | 'diff' | None. When None (e.g. supervised_decoder), source signals are not computed.
+        target: Same options or None. When None (e.g. supervised_encoder), target signals are not computed.
+        cache_dir: Optional directory for caching extracted signals.
+        use_cached_signals: If True and cache_dir set, load/save signals.
         cache_key_fields: When caching is used, list of batch keys to include in cache hash.
-            Required when cache_dir is set and use_cached_gradients is True. All keys must exist in batch.
+            Required when cache_dir is set and use_cached_signals is True. All keys must exist in batch.
         dtype: Tensor dtype.
         device: Device for tensors.
         return_metadata: If True, pass through batch 'metadata'.
@@ -77,26 +83,28 @@ class GradientTrainingDataset:
     def __init__(
         self,
         training_data: Any,
-        gradient_creator: Any,
+        signal_extractor: Any,
         *,
         source: str = 'factual',
         target: str = 'diff',
         cache_dir: Optional[str] = None,
-        use_cached_gradients: bool = True,
+        use_cached_signals: bool = True,
         cache_key_fields: Optional[List[str]] = None,
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         return_metadata: bool = False,
         get_padding_value: Optional[Callable[[str], int]] = None,
         timing_steps: int = 0,
-        timing_label: str = "gradient",
+        timing_label: str = "signal",
+        signal: Any = None,
+        signals: Any = None,
     ):
         assert source in source_target_keywords, f'Invalid source {source}, must be one of {source_target_keywords}'
         assert target in source_target_keywords, f'Invalid target {target}, must be one of {source_target_keywords}'
 
-        if cache_dir is not None and use_cached_gradients and (not cache_key_fields or len(cache_key_fields) == 0):
+        if cache_dir is not None and use_cached_signals and (not cache_key_fields or len(cache_key_fields) == 0):
             raise ValueError(
-                "When cache_dir is set and use_cached_gradients is True, cache_key_fields must be provided "
+                "When cache_dir is set and use_cached_signals is True, cache_key_fields must be provided "
                 "(list of batch keys to include in cache hash, e.g. ['input_text', 'label'])."
             )
 
@@ -104,13 +112,28 @@ class GradientTrainingDataset:
 
         self.training_data = training_data
         self.batch_size = getattr(training_data, 'batch_size', None) or 1
-        self.gradient_creator = gradient_creator
+        if not callable(signal_extractor):
+            raise TypeError(f"signal_extractor must be callable, got {type(signal_extractor).__name__}")
+        self.signal_extractor = signal_extractor
+        extractor_signal = getattr(signal_extractor, "signal", None)
+        extractor_signals = getattr(signal_extractor, "signals", None)
+        if signal is None and signals is None and extractor_signal is None and extractor_signals is None:
+            raise ValueError(
+                f"{self.__class__.__name__} requires signal=..., signals=..., "
+                "or a signal_extractor with .signal/.signals metadata."
+            )
+        self.signal = require_single_signal(
+            signal=signal if signal is not None else extractor_signal,
+            signals=signals if signals is not None else extractor_signals,
+            context=self.__class__.__name__,
+        )
+        self.signals = SignalSet(self.signal)
         self.source = source
         self.target = target
         self.cache_dir = cache_dir
         if self.cache_dir is not None:
             os.makedirs(self.cache_dir, exist_ok=True)
-        self.use_cached_gradients = use_cached_gradients
+        self.use_cached_signals = use_cached_signals
         self.cache_key_fields = cache_key_fields or []
         self.dtype = dtype
         self.device = device
@@ -172,13 +195,42 @@ class GradientTrainingDataset:
                 batch[key] = {subkey: torch.stack([d[subkey] for d in batch[key]]) for subkey in first}
         return batch
 
-    def _exclusive_gradient_access(self):
-        """Serialize tokenization and base forward/backward for one gradient row."""
-        creator = self.gradient_creator
-        model = getattr(creator, "__self__", None)
+    def _exclusive_signal_access(self):
+        """Serialize tokenization and base signal extraction for one row when needed."""
+        access = getattr(self.signal_extractor, "exclusive_signal_access", None)
+        if callable(access):
+            return access()
+        model = getattr(self.signal_extractor, "__self__", None)
         if model is not None and hasattr(model, "exclusive_base_gradient_access"):
             return model.exclusive_base_gradient_access()
         return nullcontext()
+
+    def _exclusive_gradient_access(self):
+        """Backward-compatible alias for old gradient-specific subclasses."""
+        return self._exclusive_signal_access()
+
+    def _extract_one_side(self, inputs: Any, *, side: str) -> torch.Tensor:
+        if side == "factual":
+            batch = self.signal_extractor(
+                factual_inputs=inputs,
+                alternative_inputs=None,
+                requires_factual=True,
+                requires_alternative=False,
+            )
+            tensor = batch.factual
+        elif side == "alternative":
+            batch = self.signal_extractor(
+                factual_inputs=None,
+                alternative_inputs=inputs,
+                requires_factual=False,
+                requires_alternative=True,
+            )
+            tensor = batch.alternative
+        else:
+            raise ValueError(f"Unknown signal side {side!r}")
+        if tensor is None:
+            raise RuntimeError(f"Signal extractor returned no {side} tensor for signal {self.signal.id!r}")
+        return tensor
 
     def __getitem__(self, index: int) -> dict:
         timing_enabled = self.timing_steps > 0 and (index == 0 or (index + 1) % self.timing_steps == 0)
@@ -192,7 +244,7 @@ class GradientTrainingDataset:
 
         indices = list(range(index * self.batch_size, min((index + 1) * self.batch_size, len(self.training_data))))
 
-        with self._exclusive_gradient_access():
+        with self._exclusive_signal_access():
             batch = self._merge_batch(indices)
             if timing_enabled:
                 self._sync_cuda_for_timing()
@@ -200,82 +252,82 @@ class GradientTrainingDataset:
 
             cache_file_factual = ''
             cache_file_alternative = ''
-            if self.use_cached_gradients and self.cache_dir is not None and self.cache_key_fields:
+            if self.use_cached_signals and self.cache_dir is not None and self.cache_key_fields:
                 missing = [k for k in self.cache_key_fields if k not in batch]
                 if missing:
                     raise KeyError(
                         f"Cache key requires batch keys {self.cache_key_fields}; missing in batch: {missing}. "
                         "Ensure training_data yields these keys when caching is used."
                     )
-                h = hash_it([batch[k] for k in self.cache_key_fields] + [self.dtype])
+                h = hash_it([batch[k] for k in self.cache_key_fields] + [self.dtype, self.signal.to_dict()])
                 cache_file_factual = os.path.join(self.cache_dir, f'factual_{h}.pt')
                 cache_file_alternative = os.path.join(self.cache_dir, f'alternative_{h}.pt')
 
-            factual_gradients = None
-            alternative_gradients = None
+            factual_signal = None
+            alternative_signal = None
 
-            if self.use_cached_gradients and self.cache_dir is not None and cache_file_factual:
+            if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
                 if os.path.exists(cache_file_factual):
-                    factual_gradients = torch.load(cache_file_factual, weights_only=True)
+                    factual_signal = torch.load(cache_file_factual, weights_only=True)
                 if os.path.exists(cache_file_alternative):
-                    alternative_gradients = torch.load(cache_file_alternative, weights_only=True)
+                    alternative_signal = torch.load(cache_file_alternative, weights_only=True)
 
             requires_factual = self.source in factual_computation_required_keywords or self.target in factual_computation_required_keywords
-            if factual_gradients is None and requires_factual:
+            if factual_signal is None and requires_factual:
                 factual_inputs = batch["factual"]
-                factual_gradients = self.gradient_creator(factual_inputs)
+                factual_signal = self._extract_one_side(factual_inputs, side="factual")
                 del factual_inputs
-                factual_gradients = factual_gradients.to(dtype=self.dtype, device=self.device)
-                if self.use_cached_gradients and self.cache_dir is not None and cache_file_factual:
+                factual_signal = factual_signal.to(dtype=self.dtype, device=self.device)
+                if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
                     os.makedirs(self.cache_dir, exist_ok=True)
-                    torch.save(factual_gradients, cache_file_factual)
+                    torch.save(factual_signal, cache_file_factual)
             if timing_enabled:
                 self._sync_cuda_for_timing()
                 t_factual = time.perf_counter()
 
             requires_alternative = self.source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords
-            if alternative_gradients is None and requires_alternative:
+            if alternative_signal is None and requires_alternative:
                 alternative_inputs = batch['alternative']
-                alternative_gradients = self.gradient_creator(alternative_inputs)
+                alternative_signal = self._extract_one_side(alternative_inputs, side="alternative")
                 del alternative_inputs
-                alternative_gradients = alternative_gradients.to(dtype=self.dtype, device=self.device)
-                if self.use_cached_gradients and self.cache_dir is not None and cache_file_alternative:
+                alternative_signal = alternative_signal.to(dtype=self.dtype, device=self.device)
+                if self.use_cached_signals and self.cache_dir is not None and cache_file_alternative:
                     os.makedirs(self.cache_dir, exist_ok=True)
-                    torch.save(alternative_gradients, cache_file_alternative)
+                    torch.save(alternative_signal, cache_file_alternative)
             if timing_enabled:
                 self._sync_cuda_for_timing()
                 t_alternative = time.perf_counter()
 
             if self.source == 'factual':
-                source_tensor = factual_gradients
+                source_tensor = factual_signal
             elif self.source == 'alternative':
-                source_tensor = alternative_gradients
+                source_tensor = alternative_signal
             elif self.source == 'diff':
-                source_tensor = factual_gradients - alternative_gradients
+                source_tensor = factual_signal - alternative_signal
             elif self.source is None:
                 source_tensor = None  # e.g. supervised_decoder: only target needed
             else:
                 raise ValueError(f'Unknown source: {self.source}')
 
             if self.target == 'factual':
-                target_tensor = factual_gradients
+                target_tensor = factual_signal
             elif self.target == 'alternative':
-                target_tensor = alternative_gradients
+                target_tensor = alternative_signal
             elif self.target == 'diff':
-                target_tensor = source_tensor.clone() if self.source == 'diff' else (factual_gradients - alternative_gradients)
+                target_tensor = source_tensor.clone() if self.source == 'diff' else (factual_signal - alternative_signal)
             elif self.target is None:
                 target_tensor = None
             else:
                 raise ValueError(f'Unknown target: {self.target}')
 
-            del factual_gradients
-            del alternative_gradients
+            del factual_signal
+            del alternative_signal
 
             output = {'source': source_tensor, 'target': target_tensor}
             for key in batch:
                 if key not in output and key not in {'metadata', 'factual', 'alternative'}:
                     output[key] = batch[key]
-            # Label metadata must describe the gradient exposed as source.
+            # Label metadata must describe the signal exposed as source.
             # For binary pairs, the alternative side is the opposite feature class.
             if self.source == 'alternative' and 'label' in output:
                 output['label'] = _invert_numeric_label(output['label'])
@@ -297,13 +349,65 @@ class GradientTrainingDataset:
         return output
 
 
+class GradientTrainingDataset(SignalTrainingDatasetBase):
+    """
+    Backward-compatible dataset for raw-gradient GRADIEND training.
+
+    This wrapper preserves the public constructor while delegating batching,
+    caching, and source/target selection to SignalTrainingDatasetBase.
+    """
+
+    def __init__(
+        self,
+        training_data: Any,
+        gradient_creator: Any,
+        *,
+        source: str = 'factual',
+        target: str = 'diff',
+        cache_dir: Optional[str] = None,
+        use_cached_gradients: bool = True,
+        cache_key_fields: Optional[List[str]] = None,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[torch.device] = None,
+        return_metadata: bool = False,
+        get_padding_value: Optional[Callable[[str], int]] = None,
+        timing_steps: int = 0,
+        timing_label: str = "gradient",
+        signal: Any = None,
+        signals: Any = None,
+    ):
+        gradient_signal = require_single_gradient_signal(
+            signal=signal,
+            signals=signals,
+            context="GradientTrainingDataset",
+        )
+        self.gradient_creator = gradient_creator
+        super().__init__(
+            training_data,
+            GradientSignalExtractor(gradient_creator, signal=gradient_signal),
+            source=source,
+            target=target,
+            cache_dir=cache_dir,
+            use_cached_signals=use_cached_gradients,
+            cache_key_fields=cache_key_fields,
+            dtype=dtype,
+            device=device,
+            return_metadata=return_metadata,
+            get_padding_value=get_padding_value,
+            timing_steps=timing_steps,
+            timing_label=timing_label,
+            signal=gradient_signal,
+        )
+        self.use_cached_gradients = self.use_cached_signals
+
+
 class PreComputedTrainingDataset(torch.utils.data.IterableDataset):
     """
-    Asynchronously precompute rows from another gradient dataset.
+    Asynchronously precompute rows from another signal dataset.
 
     This wrapper is intentionally small: a single background thread evaluates the
     wrapped dataset sequentially and keeps a bounded queue of ready rows. It does
-    not copy or wrap the model; it only overlaps the next base-gradient extraction
+    not copy or wrap the model; it only overlaps the next base signal extraction
     with the current GRADIEND optimizer step.
 
     Safe when base forward/backward uses ModelWithGradiend.exclusive_base_gradient_access
@@ -345,7 +449,7 @@ class PreComputedTrainingDataset(torch.utils.data.IterableDataset):
 
         worker = threading.Thread(
             target=_worker,
-            name="gradiend-gradient-precompute",
+            name="gradiend-signal-precompute",
             daemon=True,
         )
         worker.start()

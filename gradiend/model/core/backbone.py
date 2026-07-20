@@ -6,6 +6,7 @@ parameters; all other parameters (prediction heads, poolers, etc.) are excluded.
 """
 
 import re
+import warnings
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -156,6 +157,8 @@ def build_gradiend_from_base_model(
     load_directory: str,
     param_map: Optional[List[str]] = None,
     params: Optional[List[str]] = None,
+    scope_params: Optional[List[str]] = None,
+    scope_mode: str = "default",
     latent_dim: int = 1,
     torch_dtype: Optional[torch.dtype] = None,
     device_encoder: Optional[torch.device] = None,
@@ -166,9 +169,9 @@ def build_gradiend_from_base_model(
     """
     Build a ParamMappedGradiendModel from a base model (non–GRADIEND checkpoint).
 
-    Backbone vs head is determined by Hugging Face backbone (base_model_prefix
-    / base_model). Only backbone parameters are included unless params or
-    param_map further restrict them.
+    ``scope_mode="default"`` uses the Hugging Face backbone/text tower and
+    excludes prediction heads and uninvolved towers. ``scope_mode="full"`` uses
+    every parameter in the model.
 
     Args:
         base_model: The HF-style model.
@@ -188,33 +191,57 @@ def build_gradiend_from_base_model(
     if torch_dtype is None:
         torch_dtype = torch.float32
 
-    core, excluded = split_backbone_vs_head_params(base_model)
-    overlap = debug_param_overlap(base_model)
-    logger.debug(
-        "Backbone vs model params: backbone=%s model=%s shared=%s",
-        overlap["backbone_param_count"],
-        overlap["model_param_count"],
-        overlap["shared_param_count"],
-    )
-    if excluded:
-        logger.info(
-            "Excluded %d non-backbone (head) parameter(s); names: %s",
-            len(excluded),
-            [e["name"] for e in excluded],
-        )
-        for e in excluded:
-            logger.debug(
-                "Excluded param: name=%r py_id=%s data_ptr=%s shape=%s requires_grad=%s device=%s dtype=%s",
-                e["name"],
-                e["py_id"],
-                e["data_ptr"],
-                e["shape"],
-                e["requires_grad"],
-                e["device"],
-                e["dtype"],
-            )
+    if scope_mode not in {"default", "full"}:
+        raise ValueError("scope_mode must be 'default' or 'full'")
 
-    param_lookup = _filter_params_by_include(core, params)
+    if params is not None:
+        warnings.warn(
+            "build_gradiend_from_base_model(params=...) is deprecated; use "
+            "SignalScope.from_values(params=...) via TrainingArguments.signal_scope instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if scope_params is not None and params is not None and list(scope_params) != list(params):
+        raise ValueError("scope_params conflicts with deprecated params")
+    if param_map is not None:
+        warnings.warn(
+            "build_gradiend_from_base_model(param_map=...) is deprecated as public scope selection; use "
+            "SignalScope.from_values(params=...) and pruning/splitting APIs instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    if scope_mode == "full":
+        core = OrderedDict((name, p) for name, p in unwrap_model(base_model).named_parameters(recurse=True))
+    else:
+        core, excluded = split_backbone_vs_head_params(base_model)
+        overlap = debug_param_overlap(base_model)
+        logger.debug(
+            "Backbone vs model params: backbone=%s model=%s shared=%s",
+            overlap["backbone_param_count"],
+            overlap["model_param_count"],
+            overlap["shared_param_count"],
+        )
+        if excluded:
+            logger.info(
+                "Excluded %d non-backbone (head) parameter(s); names: %s",
+                len(excluded),
+                [e["name"] for e in excluded],
+            )
+            for e in excluded:
+                logger.debug(
+                    "Excluded param: name=%r py_id=%s data_ptr=%s shape=%s requires_grad=%s device=%s dtype=%s",
+                    e["name"],
+                    e["py_id"],
+                    e["data_ptr"],
+                    e["shape"],
+                    e["requires_grad"],
+                    e["device"],
+                    e["dtype"],
+                )
+
+    selected_params = scope_params if scope_params is not None else params
+    param_lookup = _filter_params_by_include(core, selected_params)
     param_map = _normalize_param_map_arg(param_map)
 
     if param_map:

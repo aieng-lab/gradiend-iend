@@ -8,6 +8,8 @@ from gradiend.visualizer.labels import (
     NON_CONVERGENCE_MARKER_TEX,
     converged_for_trainer,
     converged_from_run_info,
+    escape_matplotlib_usetex_text,
+    format_transition_label,
     format_plotly_label,
     format_label_with_convergence,
     format_model_labels_with_convergence,
@@ -68,6 +70,25 @@ def test_format_label_with_convergence_uses_tex_safe_marker(monkeypatch):
 
     monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
     assert format_label_with_convergence("run_a", converged=False) == f"run_a {NON_CONVERGENCE_MARKER_TEX}"
+
+
+def test_escape_matplotlib_usetex_text_escapes_unescaped_percent_only(monkeypatch):
+    import matplotlib as mpl
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", False)
+    assert escape_matplotlib_usetex_text("95% CI") == "95% CI"
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+    assert escape_matplotlib_usetex_text("95% CI") == r"95\% CI"
+    assert escape_matplotlib_usetex_text(r"95\% CI") == r"95\% CI"
+
+
+def test_shared_matplotlib_label_formatters_escape_percent_for_usetex(monkeypatch):
+    import matplotlib as mpl
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+    assert format_label_with_convergence("95% run", converged=True) == r"95\% run"
+    assert format_transition_label("A% -> B", use_latex=True) == r"A\%$\rightarrow$B"
 
 
 def test_converged_from_run_info():

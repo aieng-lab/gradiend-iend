@@ -16,7 +16,12 @@ from gradiend.visualizer.encoder_neutral import (
     build_multi_split_encoder_plot_frame,
     encoder_plot_xlabel,
 )
-from gradiend.visualizer.labels import resolve_highlight_non_convergence, resolve_plot_title_with_convergence, format_transition_label
+from gradiend.visualizer.labels import (
+    escape_matplotlib_usetex_text,
+    format_transition_label,
+    resolve_highlight_non_convergence,
+    resolve_plot_title_with_convergence,
+)
 from gradiend.visualizer.plot_optional import _require_matplotlib, _require_seaborn
 from gradiend.util.logging import get_logger
 
@@ -117,15 +122,15 @@ def _plot_encoder_distributions_by_data_split(
                 ax=ax,
                 cut=0,
             )
-            ax.set_title(str(sp))
+            ax.set_title(escape_matplotlib_usetex_text(sp))
             ax.set_xlabel("")
             ax.tick_params(axis="x", rotation=15 if len(panel_groups) > 3 else 0)
         axes[0].set_ylabel("Encoded value")
         axes[-1].set_xlabel(x_label)
     if title is True and run_id:
-        plt.suptitle(str(run_id))
+        plt.suptitle(escape_matplotlib_usetex_text(run_id))
     elif isinstance(title, str):
-        plt.suptitle(title)
+        plt.suptitle(escape_matplotlib_usetex_text(title))
 
     out_path = output
     if not out_path:
@@ -720,9 +725,9 @@ def plot_encoder_distributions(
     if title is False:
         pass
     elif isinstance(title, str):
-        plt.title(title, fontsize=title_fontsize)
+        plt.title(escape_matplotlib_usetex_text(title), fontsize=title_fontsize)
     elif run_id:
-        plt.title(str(run_id), fontsize=title_fontsize)
+        plt.title(escape_matplotlib_usetex_text(run_id), fontsize=title_fontsize)
     ax.set_xticklabels([])
     plt.xlabel("", fontsize=axis_label_fontsize)
     plt.ylabel("Encoded value", fontsize=axis_label_fontsize)

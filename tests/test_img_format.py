@@ -10,6 +10,7 @@ from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
 from gradiend.visualizer.convergence import (
     plot_training_convergence,
+    _class_spread_title_suffix,
     _confidence_interval_series,
     _range_series,
     _steps_and_values,
@@ -205,6 +206,13 @@ class TestImgFormatVisualizerOutputPath:
             assert len(collections) >= 1
         finally:
             plt.close("all")
+
+    def test_plot_training_convergence_class_spread_ci95_escapes_percent_for_usetex(self, monkeypatch):
+        pytest.importorskip("matplotlib")
+        import matplotlib as mpl
+
+        monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+        assert _class_spread_title_suffix("ci95") == r" (shaded: 95\% CI)"
 
     def test_plot_encoder_distributions_output_path_uses_img_format(self, tmp_path):
         pytest.importorskip("matplotlib")

@@ -47,6 +47,21 @@ def matplotlib_usetex_enabled() -> bool:
         return False
 
 
+def escape_matplotlib_usetex_text(text: Any) -> str:
+    """Escape plain text that Matplotlib will pass through LaTeX.
+
+    Matplotlib's ``text.usetex`` sends ordinary labels through LaTeX, where an
+    unescaped percent sign starts a comment and hides the rest of the label.
+    Keep this helper intentionally narrow: GRADIEND currently relies on plain
+    labels plus small inline math snippets, and escaping already-escaped percent
+    signs would corrupt caller-provided TeX.
+    """
+    value = str(text)
+    if not matplotlib_usetex_enabled():
+        return value
+    return re.sub(r"(?<!\\)%", r"\\%", value)
+
+
 def label_contains_matplotlib_latex(text: Any) -> bool:
     """True when *text* includes an inline math segment for matplotlib usetex."""
     return "$" in str(text)
@@ -90,16 +105,18 @@ def format_transition_label(label: Any, *, use_latex: Optional[bool] = None) -> 
     mode = resolve_transition_arrow_mode(use_latex=use_latex)
     if mode == "latex":
         if _TRANSITION_BIDI_RE.search(text):
-            return _TRANSITION_BIDI_RE.sub(
+            formatted = _TRANSITION_BIDI_RE.sub(
                 lambda _match: transition_bidi_arrow(use_latex=True),
                 text,
             )
+            return escape_matplotlib_usetex_text(formatted)
         if _TRANSITION_DIRECTED_RE.search(text):
-            return _TRANSITION_DIRECTED_RE.sub(
+            formatted = _TRANSITION_DIRECTED_RE.sub(
                 lambda _match: transition_directed_arrow(use_latex=True),
                 text,
             )
-        return text
+            return escape_matplotlib_usetex_text(formatted)
+        return escape_matplotlib_usetex_text(text)
     if mode == "ascii":
         if _TRANSITION_BIDI_RE.search(text):
             return _TRANSITION_BIDI_RE.sub(" <-> ", text)
@@ -284,11 +301,11 @@ def format_label_with_convergence(
     """
     text = str(label)
     if not highlight_non_convergence or converged is not False:
-        return text
+        return escape_matplotlib_usetex_text(text)
     marker = marker if marker is not None else non_convergence_marker_for_matplotlib()
     if text.endswith(marker) or text.endswith(NON_CONVERGENCE_MARKER):
-        return text
-    return f"{text} {marker}"
+        return escape_matplotlib_usetex_text(text)
+    return escape_matplotlib_usetex_text(f"{text} {marker}")
 
 
 def non_convergence_marker_for_matplotlib() -> str:

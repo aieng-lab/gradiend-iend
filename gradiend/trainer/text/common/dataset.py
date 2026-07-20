@@ -31,6 +31,8 @@ class TextGradientTrainingDataset(GradientTrainingDataset):
         return_metadata: bool = False,
         timing_steps: int = 0,
         timing_label: str = "text-gradient",
+        signal: Any = None,
+        signals: Any = None,
     ):
         pad_token_id = getattr(tokenizer, 'pad_token_id', 0) if tokenizer is not None else 0
 
@@ -51,5 +53,7 @@ class TextGradientTrainingDataset(GradientTrainingDataset):
             get_padding_value=get_padding_value,
             timing_steps=timing_steps,
             timing_label=timing_label,
+            signal=signal,
+            signals=signals,
         )
         self.tokenizer = tokenizer

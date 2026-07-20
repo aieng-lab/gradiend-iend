@@ -22,6 +22,39 @@ from gradiend.util.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _config_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _eval_enabled(config: Any, *, loss_only: bool = False) -> bool:
+    if loss_only:
+        return False
+    return bool(_config_get(config, "do_eval", True))
+
+
+def _current_step_correlation(
+    *,
+    step: int,
+    training_stats: Dict[str, Any],
+    eval_result: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    if isinstance(eval_result, dict) and eval_result.get("correlation") is not None:
+        return float(eval_result["correlation"])
+    scores = training_stats.get("scores")
+    if isinstance(scores, dict) and step in scores and scores[step] is not None:
+        return float(scores[step])
+    return None
+
+
+def _format_loss_for_log(loss: float) -> str:
+    value = float(loss)
+    if value != 0.0 and abs(value) < 1e-4:
+        return f"{value:.3e}"
+    return f"{value:.4f}"
+
+
 class TrainingCallback(ABC):
     """
     Base class for training callbacks (HF Trainer–style lifecycle).
@@ -304,8 +337,12 @@ class CheckpointCallback(TrainingCallback):
             is_better = self.best_score is None or loss < self.best_score
             score_for_log = loss
         else:
-            corr = training_stats.get('correlation')
-            # No valid correlation (e.g. empty eval data); do not update best checkpoint
+            corr = _current_step_correlation(
+                step=step,
+                training_stats=training_stats,
+                eval_result=kwargs.get("eval_result"),
+            )
+            # No current-step evaluation result; do not treat stale/sentinel correlation as a checkpoint score.
             if corr is None:
                 is_better = False
                 score_for_log = None
@@ -316,7 +353,7 @@ class CheckpointCallback(TrainingCallback):
         if is_better:
             was_first = self.best_score is None
             old_score = self.best_score
-            self.best_score = loss if self.use_loss_for_best else training_stats.get('correlation')
+            self.best_score = loss if self.use_loss_for_best else corr
             self.best_step = step
             self.best_epoch = kwargs.get('epoch', 0)
 
@@ -407,7 +444,16 @@ class LoggingCallback(TrainingCallback):
         )
         # Log if we should log AND (have losses OR have eval results for step 0)
         if should_log and (last_losses or (step == 0 and eval_result is not None)):
-            corr = training_stats.get('correlation')
+            eval_is_enabled = _eval_enabled(config, loss_only=self.loss_only)
+            corr = (
+                _current_step_correlation(
+                    step=step,
+                    training_stats=training_stats,
+                    eval_result=eval_result,
+                )
+                if eval_is_enabled
+                else None
+            )
 
             # Try to get mean encoded values per class for the current step
             mean_by_class_hist = training_stats.get('mean_by_class', {})
@@ -438,19 +484,20 @@ class LoggingCallback(TrainingCallback):
                 mean_str = ", ".join(parts)
 
             suffix = ""
-            if not self.loss_only and corr is not None:
+            if eval_is_enabled and corr is not None:
                 # Compare against the best correlation seen so far (including step 0)
                 # so that "(new best)" in logs matches the global best used in plots
                 # and final training stats.
                 if self._best_corr_including_start is None or abs(corr) > abs(self._best_corr_including_start):
                     suffix = " (new best)"
                     self._best_corr_including_start = float(corr)
-            corr_str = "N/A" if (self.loss_only or corr is None) else f"{corr:.4f}"
-            logger.info(
-                f'Step {step}, Correlation: {corr_str}, '
-                + (f'mean: {mean_str}' if mean_str else '')
-                + suffix
-            )
+            parts = [f"Step {step}", f"Loss: {_format_loss_for_log(loss)}"]
+            if eval_is_enabled:
+                corr_str = "N/A" if corr is None else f"{corr:.4f}"
+                parts.append(f"Correlation: {corr_str}")
+                if mean_str:
+                    parts.append(f"mean: {mean_str}")
+            logger.info(", ".join(parts) + suffix)
     
     def on_epoch_end(self, epoch: int, model, config: Dict[str, Any], 
                     time_stats: Dict[str, float], **kwargs):

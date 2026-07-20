@@ -256,7 +256,8 @@ class TestCheckpointCallback:
         # First step with correlation 0.5
         training_stats['correlation'] = 0.5
         callback.on_step_end(
-            step=50, loss=0.5, model=model, config=config, training_stats=training_stats
+            step=50, loss=0.5, model=model, config=config, training_stats=training_stats,
+            eval_result={"correlation": 0.5},
         )
         
         # Should save as best (first one, but only if step > 1)
@@ -267,7 +268,8 @@ class TestCheckpointCallback:
         # Second step with better correlation
         training_stats['correlation'] = 0.8
         callback.on_step_end(
-            step=100, loss=0.5, model=model, config=config, training_stats=training_stats
+            step=100, loss=0.5, model=model, config=config, training_stats=training_stats,
+            eval_result={"correlation": 0.8},
         )
         
         # Should save again (better metric)
@@ -279,7 +281,8 @@ class TestCheckpointCallback:
         # Third step with worse correlation
         training_stats['correlation'] = 0.6
         callback.on_step_end(
-            step=150, loss=0.5, model=model, config=config, training_stats=training_stats
+            step=150, loss=0.5, model=model, config=config, training_stats=training_stats,
+            eval_result={"correlation": 0.6},
         )
 
         assert callback.best_score == 0.8
@@ -300,12 +303,38 @@ class TestCheckpointCallback:
         training_stats = {"correlation": 0.9}
 
         callback.on_step_end(
-            step=0, loss=0.0, model=model, config={}, training_stats=training_stats
+            step=0, loss=0.0, model=model, config={}, training_stats=training_stats,
+            eval_result={"correlation": 0.9},
         )
 
         model.save_pretrained.assert_not_called()
         assert callback.best_step == 0
         assert callback.best_score == 0.9
+
+    def test_checkpoint_callback_ignores_unevaluated_sentinel_correlation(self, temp_dir):
+        """Global sentinel/default correlation must not become a best checkpoint score."""
+        callback = CheckpointCallback(
+            output=temp_dir,
+            checkpoints=False,
+            keep_only_best=True,
+            use_loss_for_best=False
+        )
+
+        model = MagicMock()
+        model.save_pretrained = MagicMock()
+
+        callback.on_step_end(
+            step=50,
+            loss=0.5,
+            model=model,
+            config={},
+            training_stats={"correlation": -1.0, "scores": {}},
+            eval_result=None,
+        )
+
+        model.save_pretrained.assert_not_called()
+        assert callback.best_step is None
+        assert callback.best_score is None
     
     def test_checkpoint_callback_saves_periodic_checkpoints(self, temp_dir):
         """Test that checkpoint saves periodic checkpoints when checkpoints=True."""
@@ -356,29 +385,48 @@ class TestCheckpointCallback:
 
 class TestLoggingCallback:
     """Test LoggingCallback."""
-    
+
     def test_logging_callback_creation(self):
         """Test LoggingCallback can be created."""
         callback = LoggingCallback(n_loss_report=100, loss_only=False)
-        
+
         assert callback.n_loss_report == 100
         assert callback.loss_only is False
-    
+
     def test_logging_callback_logs_loss(self):
         """Test that logging callback emits a step log at report intervals."""
         callback = LoggingCallback(n_loss_report=50, loss_only=True)
         training_stats = {}
-
         with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
             callback.on_step_end(
-                step=50, loss=0.5, model=None, config={}, training_stats=training_stats,
+                step=50, loss=0.5, model=None, config={"do_eval": False}, training_stats=training_stats,
                 last_losses=[0.5, 0.4, 0.3],
             )
 
         mock_logger.info.assert_called_once()
         message = mock_logger.info.call_args[0][0]
         assert message.startswith("Step 50,")
-        assert "Correlation: N/A" in message
+        assert "Loss: 0.5000" in message
+        assert "Correlation:" not in message
+
+    def test_logging_callback_uses_scientific_notation_for_tiny_nonzero_loss(self):
+        """Tiny nonzero losses should not be hidden as 0.0000."""
+        callback = LoggingCallback(n_loss_report=50, loss_only=True)
+
+        with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
+            callback.on_step_end(
+                step=50,
+                loss=3.2e-8,
+                model=None,
+                config={"do_eval": False},
+                training_stats={},
+                last_losses=[3.2e-8],
+            )
+
+        mock_logger.info.assert_called_once()
+        message = mock_logger.info.call_args[0][0]
+        assert "Loss: 3.200e-08" in message
+        assert "Loss: 0.0000" not in message
 
     def test_logging_callback_logs_metrics(self):
         """Test that logging callback records correlation and marks new best runs."""
@@ -387,7 +435,7 @@ class TestLoggingCallback:
 
         with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
             callback.on_step_end(
-                step=50, loss=0.5, model=None, config={}, training_stats=training_stats,
+                step=50, loss=0.5, model=None, config={"do_eval": True}, training_stats=training_stats,
                 eval_result={"correlation": 0.8},
                 last_losses=[0.5, 0.4, 0.3],
             )
@@ -397,6 +445,44 @@ class TestLoggingCallback:
         assert "Step 50," in message
         assert "Correlation: 0.8000" in message
         assert "(new best)" in message
+
+    def test_logging_callback_does_not_report_sentinel_correlation_without_eval(self):
+        """Unevaluated steps must not display the initialized -1.0 as measured correlation."""
+        callback = LoggingCallback(n_loss_report=50, loss_only=False)
+        training_stats = {"correlation": -1.0, "scores": {}}
+
+        with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
+            callback.on_step_end(
+                step=50, loss=0.5, model=None, config={"do_eval": True}, training_stats=training_stats,
+                eval_result=None,
+                last_losses=[0.5, 0.4, 0.3],
+            )
+
+        mock_logger.info.assert_called_once()
+        message = mock_logger.info.call_args[0][0]
+        assert "Step 50," in message
+        assert "Correlation: N/A" in message
+        assert "-1.0000" not in message
+        assert "(new best)" not in message
+
+    def test_logging_callback_ignores_eval_result_when_eval_is_disabled(self):
+        """do_eval=False means progress logging must not expose evaluation metrics."""
+        callback = LoggingCallback(n_loss_report=50, loss_only=False)
+        training_stats = {"correlation": 0.8, "scores": {50: 0.8}}
+
+        with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
+            callback.on_step_end(
+                step=50, loss=0.5, model=None, config={"do_eval": False}, training_stats=training_stats,
+                eval_result={"correlation": 0.8},
+                last_losses=[0.5, 0.4, 0.3],
+            )
+
+        mock_logger.info.assert_called_once()
+        message = mock_logger.info.call_args[0][0]
+        assert "Step 50," in message
+        assert "Loss: 0.5000" in message
+        assert "Correlation:" not in message
+        assert "(new best)" not in message
 
 
 # Note: EarlyStoppingCallback is not yet implemented in the codebase

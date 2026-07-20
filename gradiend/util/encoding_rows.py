@@ -1,4 +1,4 @@
-"""Dependency-light helpers for encoding gradient datasets into row dicts."""
+"""Dependency-light helpers for encoding signal datasets into row dicts."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def gradient_entry_to_encoder_row(
     input_type: Optional[str] = "factual",
     overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build one encoder-analysis row from a gradient-dataset entry."""
+    """Build one encoder-analysis row from a signal-dataset entry."""
     if input_type == "alternative":
         source_id = entry.get("alternative_id")
         source_token = entry.get("alternative_token")
@@ -63,7 +63,7 @@ def encode_dataset_to_rows(
     row_extractor: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Encode a GradientTrainingDataset and return per-row dicts for building DataFrames.
+    Encode a SignalTrainingDatasetBase and return per-row dicts for building DataFrames.
 
     Each row has: encoded, label, source_id, target_id, plus optional fields
     provided by row_extractor (modality-specific, e.g. text).
@@ -83,9 +83,9 @@ def encode_dataset_to_rows(
         ncols=80,
         position=0,
     ):
-        grad = entry["source"]
+        signal_tensor = entry["source"]
         label = entry["label"]
-        encoded_val = model_with_gradiend.encode(grad, return_float=True)
+        encoded_val = model_with_gradiend.encode(signal_tensor, return_float=True)
         input_type = getattr(dataset, "source", None)
         row = gradient_entry_to_encoder_row(
             entry,

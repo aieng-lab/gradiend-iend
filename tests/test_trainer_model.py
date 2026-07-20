@@ -15,7 +15,9 @@ import torch
 from gradiend.trainer import Trainer
 from gradiend.util.paths import resolve_decoder_stats_path
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.signals import Signal, SignalScope
 from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel, GradiendModel
+from gradiend.signal_space import resolve_signal_training_plan
 from tests.testing_mocks import SimpleMockModel
 
 
@@ -44,6 +46,30 @@ class MockModelWithGradiendForTest(ModelWithGradiend):
             input_dim=64,
             latent_dim=1,
             param_map=_make_param_map_spec(),
+        )
+
+
+class SignalSpaceModelWithGradiendForTest(ModelWithGradiend):
+    """ModelWithGradiend subclass that uses the base _create_gradiend implementation."""
+
+    def _save_model(self, save_directory, **kwargs):
+        pass
+
+    def create_gradients(self, *args, **kwargs):
+        return torch.randn(64)
+
+    @classmethod
+    def _load_model(cls, load_directory, base_model_id=None, gradiend_kwargs=None, **kwargs):
+        return (SimpleMockModel(name_or_path=base_model_id or load_directory),)
+
+
+class TinyActivationBase(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.emb = torch.nn.Embedding(16, 4)
+        self.block = torch.nn.Sequential(
+            torch.nn.Linear(4, 6),
+            torch.nn.LayerNorm(6),
         )
 
 
@@ -186,6 +212,110 @@ class TestGetModelDuringTraining:
         load_dir_arg = (pos[0] if len(pos) > 0 else None) or (pos[1] if len(pos) > 1 else None) or kw.get("load_directory")
         assert load_dir_arg is not None
         assert selected_best_path in str(load_dir_arg) or os.path.normpath(selected_best_path) in str(load_dir_arg)
+
+    def test_train_signal_override_replaces_default_signal_set(self, temp_dir):
+        """trainer.train(signal=...) should not conflict with stored default signals."""
+        args = TrainingArguments(experiment_dir=None)
+        trainer = MockTrainerForTest(model="mock-base", args=args)
+        output_dir = os.path.join(temp_dir, "model_out")
+        selected_model = MagicMock()
+
+        def fake_train(**kwargs):
+            os.makedirs(kwargs["output_dir"], exist_ok=True)
+            return kwargs["output_dir"]
+
+        with patch.object(MockTrainerForTest, "_train", side_effect=fake_train) as mock_train:
+            with patch(
+                "gradiend.trainer.trainer.FeatureLearningDefinition.create_model_with_gradiend",
+                return_value=selected_model,
+            ):
+                trainer.train(output_dir=output_dir, signal=Signal.activation())
+
+        passed_args = mock_train.call_args.kwargs["args"]
+        assert passed_args.signal == Signal.activation()
+        assert passed_args.signals.ids == ("activation",)
+
+    def test_activation_signal_constructs_activation_width_gradiend(self):
+        base = TinyActivationBase()
+        signal_plan = resolve_signal_training_plan(
+            base,
+            signal=Signal.activation(token_selector="mask"),
+            scope=SignalScope.from_values(activation_sites=["emb", "block"]),
+        )
+
+        gradiend = SignalSpaceModelWithGradiendForTest._create_gradiend(
+            base,
+            "mock-base",
+            signal_plan=signal_plan,
+            latent_dim=2,
+        )
+
+        assert gradiend.input_dim == 10
+        assert gradiend.latent_dim == 2
+        assert gradiend.mapping_kind == "activation"
+        assert list(gradiend.param_map) == ["activation:emb", "activation:block"]
+        assert gradiend.param_map["activation:emb"]["shape"] == (4,)
+        assert gradiend.param_map["activation:block"]["shape"] == (6,)
+
+    def test_activation_signal_requires_statically_known_width(self):
+        base = torch.nn.Sequential(torch.nn.ReLU())
+
+        with pytest.raises(ValueError, match="Cannot statically infer activation width"):
+            resolve_signal_training_plan(
+                base,
+                signal=Signal.activation(token_selector="mean"),
+                scope=SignalScope.from_values(activation_sites=["0"]),
+            )
+
+    def test_from_pretrained_resolves_signal_plan_from_training_args(self):
+        args = TrainingArguments(
+            signal=Signal.activation(token_selector="mask"),
+            signal_scope=SignalScope.from_values(activation_sites=["embeddings", "encoder.0"]),
+            latent_dim=3,
+        )
+
+        model = SignalSpaceModelWithGradiendForTest.from_pretrained(
+            "mock-base",
+            training_args=args,
+        )
+
+        assert model.gradiend.mapping_kind == "activation"
+        assert model.gradiend.input_dim == 128
+        assert model.gradiend.latent_dim == 3
+        assert list(model.gradiend.param_map) == [
+            "activation:embeddings",
+            "activation:encoder.0",
+        ]
+
+    def test_from_pretrained_activation_without_scope_uses_default_scope(self):
+        args = TrainingArguments(
+            signal=Signal.activation(token_selector="mask"),
+            latent_dim=2,
+        )
+
+        model = SignalSpaceModelWithGradiendForTest.from_pretrained(
+            "mock-base",
+            training_args=args,
+        )
+
+        assert model.gradiend.mapping_kind == "activation"
+        assert model.gradiend.input_dim > 0
+        assert "activation:embeddings" in model.gradiend.param_map
+        assert not any(name.startswith("activation:classifier") for name in model.gradiend.param_map)
+
+    def test_from_pretrained_activation_full_scope_includes_prediction_head(self):
+        args = TrainingArguments(
+            signal=Signal.activation(token_selector="mask"),
+            signal_scope=SignalScope.full(),
+            latent_dim=2,
+        )
+
+        model = SignalSpaceModelWithGradiendForTest.from_pretrained(
+            "mock-base",
+            training_args=args,
+        )
+
+        assert any(name.startswith("activation:classifier") for name in model.gradiend.param_map)
 
 
 class TestBaseModelPathVsModelPath:

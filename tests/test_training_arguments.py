@@ -10,6 +10,7 @@ import os
 import pytest
 import torch
 
+from gradiend.trainer.core.signals import Signal, SignalScope, SignalSet
 from gradiend.trainer.core.arguments import TrainingArguments
 
 
@@ -33,6 +34,46 @@ class TestTrainingArguments:
     def test_include_other_classes_defaults_false(self):
         args = TrainingArguments()
         assert args.include_other_classes is False
+
+    def test_training_arguments_default_signal_is_gradient(self):
+        args = TrainingArguments()
+
+        assert args.signal == Signal.gradient()
+        assert isinstance(args.signals, SignalSet)
+        assert args.signals.ids == ("gradient",)
+
+    def test_training_arguments_accepts_single_signal(self):
+        signal = Signal.activation(name="activation", token_selector="mask")
+
+        args = TrainingArguments(signal=signal)
+
+        assert args.signal == signal
+        assert args.signals.ids == ("activation",)
+        assert args.signals.single == signal
+
+    def test_training_arguments_accepts_signal_string(self):
+        args = TrainingArguments(signal="gradient")
+
+        assert args.signal == Signal.gradient()
+        assert args.signals.ids == ("gradient",)
+
+    def test_training_arguments_accepts_multi_signal_set(self):
+        signals = SignalSet(
+            Signal.gradient(name="gradient"),
+            Signal.activation(name="activation", token_selector="mask"),
+        )
+
+        args = TrainingArguments(signals=signals)
+
+        assert args.signal is None
+        assert args.signals.ids == ("gradient", "activation")
+
+    def test_training_arguments_rejects_conflicting_signal_and_signals(self):
+        with pytest.raises(ValueError, match="Pass either signal"):
+            TrainingArguments(
+                signal=Signal.gradient(name="gradient"),
+                signals=SignalSet(Signal.activation(name="activation")),
+            )
     
     def test_training_arguments_from_dict(self):
         """Test creation from dict."""
@@ -81,6 +122,47 @@ class TestTrainingArguments:
         assert loaded_args.learning_rate == args.learning_rate
         assert loaded_args.max_steps == args.max_steps
         assert loaded_args.train_batch_size == args.train_batch_size
+
+    def test_training_arguments_signal_serialization(self, temp_dir):
+        """Signal config should be JSON-serializable and round-trip."""
+        args = TrainingArguments(
+            signals=SignalSet(
+                Signal.gradient(name="gradient"),
+                Signal.activation(name="activation", token_selector="mask"),
+            ),
+            signal_scope=SignalScope.from_values(activation_sites=["emb", "encoder.layer.*"]),
+        )
+
+        config_dict = args.to_dict()
+        assert config_dict["signal"] is None
+        assert config_dict["signals"] == [
+            {"kind": "gradient", "name": "gradient", "options": {}},
+            {"kind": "activation", "name": "activation", "options": {"token_selector": "mask"}},
+        ]
+        assert config_dict["signal_scope"] == {
+            "params": None,
+            "activation_sites": ["emb", "encoder.layer.*"],
+        }
+
+        json_path = os.path.join(temp_dir, "signal_config.json")
+        with open(json_path, "w") as f:
+            json.dump(config_dict, f)
+        with open(json_path, "r") as f:
+            loaded_dict = json.load(f)
+
+        loaded_args = TrainingArguments.from_dict(loaded_dict)
+        assert loaded_args.signal is None
+        assert loaded_args.signals.ids == ("gradient", "activation")
+        assert loaded_args.signals["activation"].options == {"token_selector": "mask"}
+        assert loaded_args.signal_scope == SignalScope.from_values(
+            activation_sites=["emb", "encoder.layer.*"],
+        )
+
+    def test_training_arguments_params_is_deprecated_signal_scope_alias(self):
+        with pytest.warns(DeprecationWarning, match="params is deprecated"):
+            args = TrainingArguments(params=["encoder.*"])
+
+        assert args.signal_scope == SignalScope.from_values(params=["encoder.*"])
     
     def test_training_arguments_override(self):
         """Test parameter override behavior."""

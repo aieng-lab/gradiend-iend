@@ -441,21 +441,21 @@ class FeatureLearningDefinition(DataProvider, ABC):
             **kwargs: Keyword arguments defined by the concrete trainer.
 
         Returns:
-            Training dataset compatible with GradientTrainingDataset
+            Training dataset compatible with SignalTrainingDatasetBase.
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement create_training_data")
 
     @abstractmethod
     def create_gradient_training_dataset(self, *args, **kwargs):
         """
-        Create training dataset with gradient computation, wrapping the raw training data.
+        Create signal training dataset, wrapping the raw training data.
 
         Args:
             *args: Positional arguments defined by the concrete trainer.
             **kwargs: Keyword arguments defined by the concrete trainer.
 
         Returns:
-            Gradient-aware dataset used by the core training loop.
+            Signal-aware dataset used by the core training loop.
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement create_gradient_training_dataset")
 
@@ -476,7 +476,8 @@ class FeatureLearningDefinition(DataProvider, ABC):
         Create evaluation data for encoder/decoder evaluation.
 
         Generic implementation: create raw training data via create_training_data,
-        then wrap via create_gradient_training_dataset (modality-specific).
+        then wrap via create_gradient_training_dataset (legacy name; modality-specific
+        signal dataset construction).
 
         Uses encoder_eval_balance from training args to set balance_column for
         create_training_data. For factual-source evaluation the natural balancing
@@ -485,7 +486,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
         Args:
             model_with_gradiend:
-                Model used to create gradients / encoder values for evaluation.
+                Model used to create signal tensors / encoder values for evaluation.
             split:
                 Dataset split to evaluate. Defaults to ``"validation"``.
             source:
@@ -515,8 +516,8 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
         Returns:
             Evaluation dataset compatible with encoder analysis. The returned
-            gradient dataset always uses ``target=None`` because encoder
-            evaluation only encodes ``source`` gradients.
+            signal dataset always uses ``target=None`` because encoder
+            evaluation only encodes ``source`` signals.
         """
         source = self._default_from_training_args(source, "source", fallback="factual")
         validate_source_target("source", source)

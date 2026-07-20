@@ -2,6 +2,7 @@
 Factory functions for creating ModelWithGradiend instances for training.
 """
 
+import warnings
 from typing import Any, Optional, List, Type
 
 import torch
@@ -51,6 +52,13 @@ def create_model_with_gradiend(
     """
     if param_map is not None and not isinstance(param_map, list):
         raise TypeError(f"param_map must be a list or None, got {type(param_map).__name__}")
+    if param_map is not None:
+        warnings.warn(
+            "create_model_with_gradiend(param_map=...) is deprecated; use "
+            "TrainingArguments(signal_scope=SignalScope.from_values(params=...)) instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if not isinstance(activation_encoder, str):
         raise TypeError(f"activation_encoder must be str, got {type(activation_encoder).__name__}")
     if not isinstance(activation_decoder, str):

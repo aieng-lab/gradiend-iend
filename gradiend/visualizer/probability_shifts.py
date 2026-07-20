@@ -19,6 +19,7 @@ from gradiend.model._source_target import (
     resolve_model_source,
 )
 from gradiend.util.logging import get_logger
+from gradiend.visualizer.labels import escape_matplotlib_usetex_text
 
 logger = get_logger(__name__)
 
@@ -369,7 +370,7 @@ def plot_probability_shifts(
         selection_dataset_class = other_classes[0] if other_classes else base_metric
     else:
         selection_dataset_class = base_metric
-    selection_metric_label = f"P({selection_metric_class})"
+    selection_metric_label = escape_matplotlib_usetex_text(f"P({selection_metric_class})")
 
     # Plot 2+: Dataset probability shifts — P(3PL) and P(3SG) on each dataset; highlight selection metric
     for dataset_idx, dataset_class in enumerate(dataset_classes):
@@ -386,7 +387,14 @@ def plot_probability_shifts(
             x_p, y_p = _with_base(lrs, probs_c, lr0_x, base_p)
             # Emphasize the curve that is the selection metric (used to choose learning rate)
             is_selection_curve = is_selection_dataset and class_name == selection_metric_class
-            ax.plot(x_p, y_p, marker="o", label=class_name, alpha=0.7, linewidth=2.5 if is_selection_curve else 1.5)
+            ax.plot(
+                x_p,
+                y_p,
+                marker="o",
+                label=escape_matplotlib_usetex_text(class_name),
+                alpha=0.7,
+                linewidth=2.5 if is_selection_curve else 1.5,
+            )
         if summary_key in (summary or {}) and is_selection_dataset:
             selected_lr = summary[summary_key].get("learning_rate")
             if selected_lr is not None:
@@ -395,7 +403,7 @@ def plot_probability_shifts(
                 sp = entry.get(selection_metric_class, 0.0) if isinstance(entry, dict) else 0.0
                 ax.scatter([selected_lr], [sp], marker="*", s=280, zorder=5, alpha=0.95, color="red", label="Selected")
         ax.set_ylabel("Probability")
-        ax.set_title(f"Dataset: {dataset_class} — P(class)")
+        ax.set_title(escape_matplotlib_usetex_text(f"Dataset: {dataset_class} — P(class)"))
         _apply_lr_xscale(ax, x_scale, linthresh)
         ax.grid(True, alpha=0.3)
         if dataset_idx == len(dataset_classes) - 1:

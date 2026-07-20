@@ -225,7 +225,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
     The trainer provides convenient methods for encoder and decoder evaluation:
     
     ```python
-    # Encoder evaluation: analyze gradient encodings
+    # Encoder evaluation: analyze signal encodings
     enc_results = trainer.evaluate_encoder(split="test", max_size=1000)
     # Returns: correlation, encoded values, mean_by_class, etc.
     
@@ -1111,6 +1111,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             device=model_with_gradiend.gradiend.device_encoder,
             timing_steps=config.gradient_timing_steps,
             timing_label="train-gradient",
+            signal=config.signal,
+            signals=config.signals,
         )
         if runtime_monitor is not None:
             runtime_monitor.mark("trainer:create_gradient_dataset:done", size=len(gradient_dataset))
@@ -1302,10 +1304,16 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
 
         # Merge TrainingArguments: start with stored args, then apply overrides
         args: Optional[TrainingArguments] = self._training_args
+        overrides = dict(training_args_overrides)
         if args is not None:
-            args = TrainingArguments.from_dict({**args.to_dict(), **training_args_overrides})
-        elif training_args_overrides:
-            args = TrainingArguments.from_dict(training_args_overrides)
+            base_args = args.to_dict()
+            if "signal" in overrides and "signals" not in overrides:
+                base_args["signals"] = None
+            if "signals" in overrides and "signal" not in overrides:
+                base_args["signal"] = None
+            args = TrainingArguments.from_dict({**base_args, **overrides})
+        elif overrides:
+            args = TrainingArguments.from_dict(overrides)
         else:
             args = TrainingArguments()
         args.__post_init__()  # validate e.g. not both supervised_encoder and supervised_decoder

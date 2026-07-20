@@ -12,6 +12,16 @@ from .callbacks import (
     get_default_callbacks,
 )
 from .transition_selection import TransitionSpec, pair, identity, expand_transition_selection
+from .signals import (
+    Signal,
+    SignalSet,
+    SignalScope,
+    SignalSpace,
+    SignalBatch,
+    GradientSignalExtractor,
+    ActivationSignalExtractor,
+)
+from .dataset import SignalTrainingDatasetBase
 
 __all__ = [
     'train',
@@ -25,4 +35,12 @@ __all__ = [
     'pair',
     'identity',
     'expand_transition_selection',
+    'Signal',
+    'SignalSet',
+    'SignalScope',
+    'SignalSpace',
+    'SignalBatch',
+    'GradientSignalExtractor',
+    'ActivationSignalExtractor',
+    'SignalTrainingDatasetBase',
 ]
