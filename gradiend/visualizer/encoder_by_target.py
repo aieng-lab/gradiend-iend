@@ -16,6 +16,7 @@ from gradiend.util.logging import get_logger
 from gradiend.util.paths import ARTIFACT_ENCODER_PLOT, resolve_output_path
 from gradiend.visualizer.labels import (
     converged_for_trainer,
+    escape_matplotlib_usetex_text,
     format_label_with_convergence,
     format_plotly_label,
     plotly_labels_for,
@@ -211,7 +212,7 @@ def _add_feature_class_group_brackets(
         ax.text(
             mid,
             y_line + 0.045,
-            str(cls),
+            escape_matplotlib_usetex_text(cls),
             transform=trans,
             ha="center",
             va="bottom",
@@ -549,9 +550,14 @@ def _plot_encoder_by_target_seed_errorbar(
     ax.set_ylabel("Mean encoded value")
     ax.set_xlabel("Target")
     if title:
-        ax.set_title(title, pad=30)
+        ax.set_title(escape_matplotlib_usetex_text(title), pad=30)
     ax.set_xticks(list(range(len(target_order))))
-    ax.set_xticklabels(list(target_order), rotation=90, ha="center", fontsize=8)
+    ax.set_xticklabels(
+        [escape_matplotlib_usetex_text(label) for label in target_order],
+        rotation=90,
+        ha="center",
+        fontsize=8,
+    )
     _add_feature_class_group_brackets(
         ax,
         target_order=target_order,
@@ -564,7 +570,12 @@ def _plot_encoder_by_target_seed_errorbar(
             plt.Line2D([0], [0], marker="o", color="none", markerfacecolor=colors.get(str(split), "0.2"), markersize=5)
             for split in split_hue_order
         ]
-        ax.legend(handles, [str(split) for split in split_hue_order], title="Split", loc="upper right")
+        ax.legend(
+            handles,
+            [escape_matplotlib_usetex_text(split) for split in split_hue_order],
+            title="Split",
+            loc="upper right",
+        )
     fig.tight_layout()
 
     out = output or resolve_output_path(
@@ -639,7 +650,14 @@ def _plot_encoder_by_target_seed_strip_combined(
 
     for seed in seed_order:
         offset = seed_to_offset[seed]
-        ax.scatter([], [], color="0.35", s=max(1.0, point_size * 4.0), label=f"seed {seed}", alpha=0.35)
+        ax.scatter(
+            [],
+            [],
+            color="0.35",
+            s=max(1.0, point_size * 4.0),
+            label=escape_matplotlib_usetex_text(f"seed {seed}"),
+            alpha=0.35,
+        )
         for idx in range(len(target_order)):
             ax.plot(
                 [idx + offset, idx + offset],
@@ -654,9 +672,14 @@ def _plot_encoder_by_target_seed_strip_combined(
     ax.set_ylabel("Encoded value")
     ax.set_xlabel("Target")
     if title:
-        ax.set_title(title, pad=30)
+        ax.set_title(escape_matplotlib_usetex_text(title), pad=30)
     ax.set_xticks(list(range(len(target_order))))
-    ax.set_xticklabels(list(target_order), rotation=90, ha="center", fontsize=8)
+    ax.set_xticklabels(
+        [escape_matplotlib_usetex_text(label) for label in target_order],
+        rotation=90,
+        ha="center",
+        fontsize=8,
+    )
     _add_feature_class_group_brackets(
         ax,
         target_order=target_order,
@@ -669,7 +692,7 @@ def _plot_encoder_by_target_seed_strip_combined(
     if split_handles:
         ax.legend(
             [h for h, _ in split_handles],
-            [l for _, l in split_handles],
+            [escape_matplotlib_usetex_text(l) for _, l in split_handles],
             title="Split",
             loc="upper right",
         )
@@ -826,7 +849,7 @@ def plot_encoder_by_target_seed_grid(
             size=point_size,
             alpha=0.85,
         )
-        ax.set_ylabel(f"seed {seed}")
+        ax.set_ylabel(escape_matplotlib_usetex_text(f"seed {seed}"))
         ax.set_xlabel("")
         if row_idx < len(seed_order) - 1:
             ax.tick_params(axis="x", labelbottom=False)
@@ -849,9 +872,14 @@ def plot_encoder_by_target_seed_grid(
     first_ax = axes[0][0]
     handles, labels = first_ax.get_legend_handles_labels()
     if handles and labels:
-        first_ax.legend(handles, labels, title="Split", loc="upper right")
+        first_ax.legend(
+            handles,
+            [escape_matplotlib_usetex_text(label) for label in labels],
+            title="Split",
+            loc="upper right",
+        )
     if title:
-        fig.suptitle(title, y=0.995)
+        fig.suptitle(escape_matplotlib_usetex_text(title), y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.985 if title else 1))
     fig.subplots_adjust(hspace=0.04)
 
@@ -1135,8 +1163,10 @@ def plot_encoder_by_target(
     ax.set_ylabel("Encoded value")
     ax.set_xlabel("Target")
     if plot_title:
-        ax.set_title(plot_title, pad=30)
+        ax.set_title(escape_matplotlib_usetex_text(plot_title), pad=30)
     ax.tick_params(axis="x", labelsize=8)
+    ax.set_xticks(list(range(len(target_order))))
+    ax.set_xticklabels([escape_matplotlib_usetex_text(label) for label in target_order])
     plt.setp(ax.get_xticklabels(), rotation=90, ha="center")
     handles, labels = ax.get_legend_handles_labels()
     mark_colors = (
@@ -1156,7 +1186,13 @@ def plot_encoder_by_target(
         for handle in handles:
             if hasattr(handle, "set_edgecolor"):
                 handle.set_edgecolor("none")
-        ax.legend(handles, labels, title="Split", loc=legend_loc, fontsize=8)
+        ax.legend(
+            handles,
+            [escape_matplotlib_usetex_text(label) for label in labels],
+            title="Split",
+            loc=legend_loc,
+            fontsize=8,
+        )
     _add_feature_class_group_brackets(
         ax,
         target_order=target_order,

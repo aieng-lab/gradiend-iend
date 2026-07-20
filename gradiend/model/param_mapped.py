@@ -255,6 +255,7 @@ class ParamMappedGradiendModel(GradiendModel):
             **kwargs,
         )
         self.param_map = param_map
+        self.mapping_kind = str(kwargs.get("mapping_kind", "gradient") or "gradient")
         self._base_global_index_map: Optional[torch.Tensor] = None
         self._base_global_index_map_version: int = 0
         self._param_map_version: int = 0

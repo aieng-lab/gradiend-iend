@@ -14,7 +14,7 @@ import pandas as pd
 
 from gradiend.evaluator import Evaluator
 from gradiend.evaluator.encoder import EncoderEvaluator
-from gradiend.trainer.core.dataset import GradientTrainingDataset
+from gradiend.trainer.core.dataset import SignalTrainingDatasetBase
 from gradiend.util.encoding_rows import encode_dataset_to_rows
 from gradiend.util.logging import get_logger
 
@@ -64,7 +64,7 @@ class ClassificationEncoderEvaluator(EncoderEvaluator):
                 ``create_eval_data``.
             encoder_df: Optional precomputed encoder DataFrame. If it contains
                 one or zero label classes, returns a zero-correlation summary.
-            eval_data: Optional precomputed ``GradientTrainingDataset``.
+            eval_data: Optional precomputed ``SignalTrainingDatasetBase``.
             use_cache: Forwarded to the base encoder evaluator for multi-class
                 data.
             split: Dataset split used when creating eval data.
@@ -103,8 +103,8 @@ class ClassificationEncoderEvaluator(EncoderEvaluator):
             create_kwargs["max_size"] = max_size
         if eval_data is None:
             eval_data = trainer.create_eval_data(model, **create_kwargs)
-        if not isinstance(eval_data, GradientTrainingDataset):
-            raise TypeError("Encoder evaluation expected a GradientTrainingDataset.")
+        if not isinstance(eval_data, SignalTrainingDatasetBase):
+            raise TypeError("Encoder evaluation expected a SignalTrainingDatasetBase.")
         rows = encode_dataset_to_rows(model, eval_data)
         if not rows:
             return _single_class_result(pd.DataFrame())

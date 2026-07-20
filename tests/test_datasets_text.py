@@ -13,10 +13,11 @@ import pytest
 import torch
 
 from gradiend.trainer.text.common.dataset import TextGradientTrainingDataset
-from gradiend.trainer.text.prediction.dataset import TextTrainingDataset
+from gradiend.trainer.text.prediction.dataset import TextActivationTrainingDataset, TextTrainingDataset
 from gradiend.trainer.text.prediction.trainer import TextPredictionTrainer
 from gradiend.trainer.core.arguments import TrainingArguments
-from tests.testing_mocks import MockTokenizer
+from gradiend.trainer.core.signals import ActivationSignalExtractor, Signal, SignalBatch, SignalScope
+from tests.testing_mocks import MockTokenizer, SimpleMockModel
 
 
 class TestTextGradientTrainingDataset:
@@ -49,6 +50,44 @@ class TestTextGradientTrainingDataset:
         assert dataset.gradient_creator == gradient_creator
         assert dataset.source == "factual"
         assert dataset.target == "diff"
+
+    def test_text_dataset_accepts_gradient_signal(self):
+        tokenizer = MockTokenizer()
+        training_data = MagicMock()
+        training_data.__len__ = MagicMock(return_value=1)
+        training_data.batch_size = 1
+        training_data.__getitem__ = MagicMock(return_value={
+            "factual": {"input_ids": torch.tensor([1, 2, 3])},
+            "alternative": {"input_ids": torch.tensor([4, 5, 6])},
+            "input_text": "test",
+            "label": "positive",
+        })
+        gradient_creator = MagicMock(return_value=torch.randn(100))
+
+        dataset = TextGradientTrainingDataset(
+            training_data=training_data,
+            tokenizer=tokenizer,
+            gradient_creator=gradient_creator,
+            signal=Signal.gradient(),
+        )
+
+        assert dataset.signal == Signal.gradient()
+        assert dataset.signals.ids == ("gradient",)
+
+    def test_text_dataset_rejects_unsupported_activation_signal(self):
+        tokenizer = MockTokenizer()
+        training_data = MagicMock()
+        training_data.__len__ = MagicMock(return_value=1)
+        training_data.batch_size = 1
+        gradient_creator = MagicMock(return_value=torch.randn(100))
+
+        with pytest.raises(NotImplementedError, match="Signal.gradient"):
+            TextGradientTrainingDataset(
+                training_data=training_data,
+                tokenizer=tokenizer,
+                gradient_creator=gradient_creator,
+                signal=Signal.activation(),
+            )
     
     def test_text_dataset_padding_uses_tokenizer_pad_token_id(self):
         """Test that text dataset uses tokenizer.pad_token_id for padding."""
@@ -100,6 +139,132 @@ class TestTextGradientTrainingDataset:
 
         eval_dataset = trainer.create_gradient_training_dataset(raw, model, target=None)
         assert eval_dataset.target is None
+
+    def test_create_gradient_training_dataset_uses_training_args_signal(self):
+        trainer = TextPredictionTrainer.__new__(TextPredictionTrainer)
+        trainer._training_args = TrainingArguments(signal=Signal.gradient())
+
+        tokenizer = MockTokenizer()
+        model = MagicMock()
+        model.tokenizer = tokenizer
+        model.gradiend.torch_dtype = torch.float32
+        model.gradiend.device_encoder = torch.device("cpu")
+        model.gradient_creator = MagicMock(return_value=torch.randn(4))
+
+        raw = MagicMock()
+        raw.__len__ = MagicMock(return_value=1)
+
+        dataset = trainer.create_gradient_training_dataset(raw, model)
+
+        assert dataset.signal == Signal.gradient()
+        assert dataset.signals.ids == ("gradient",)
+
+    def test_create_gradient_training_dataset_uses_activation_signal_extractor(self):
+        trainer = TextPredictionTrainer.__new__(TextPredictionTrainer)
+        trainer._training_args = TrainingArguments(
+            signal=Signal.activation(token_selector="mask"),
+            signal_scope=SignalScope.from_values(activation_sites=["embeddings"]),
+        )
+
+        tokenizer = MockTokenizer()
+        model = MagicMock()
+        model.base_model = SimpleMockModel(vocab_size=200, hidden_size=4)
+        model.tokenizer = tokenizer
+        model.gradiend.torch_dtype = torch.float32
+        model.gradiend.device_encoder = torch.device("cpu")
+
+        raw = MagicMock()
+        raw.__len__ = MagicMock(return_value=1)
+        raw.batch_size = 1
+        raw.__getitem__ = MagicMock(return_value={
+            "factual": {"input_ids": torch.tensor([101, 103, 102])},
+            "alternative": {"input_ids": torch.tensor([101, 7, 103])},
+            "template": "token_1 [MASK]",
+            "input_text": "token_1 [MASK]",
+            "label": "positive",
+            "factual_token": "token_2",
+            "alternative_token": "token_3",
+        })
+
+        dataset = trainer.create_gradient_training_dataset(raw, model)
+
+        assert isinstance(dataset, TextActivationTrainingDataset)
+        assert isinstance(dataset.signal_extractor, ActivationSignalExtractor)
+        assert dataset.signal == Signal.activation(token_selector="mask")
+        row = dataset[0]
+        assert row["source"].shape == (4,)
+        assert row["target"].shape == (4,)
+
+    def test_text_activation_dataset_fills_prediction_slot_before_extracting(self):
+        tokenizer = MockTokenizer()
+        tokenizer.vocab.update({
+            "The": 10,
+            "person": 11,
+            "he": 12,
+            "she": 13,
+            "runs": 14,
+        })
+        raw = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["The person [MASK] runs"],
+                "factual": ["he"],
+                "alternative": ["she"],
+                "factual_class": ["3SG"],
+                "alternative_class": ["3PL"],
+                "factual_id": ["3SG"],
+                "alternative_id": ["3PL"],
+                "label": [1.0],
+                "feature_class_id": ["3SG->3PL"],
+            }),
+            tokenizer=tokenizer,
+            batch_size=1,
+        )
+
+        class InputIdActivationExtractor:
+            signal = Signal.activation(token_selector="prediction")
+
+            def __init__(self):
+                self.factual_inputs = None
+                self.alternative_inputs = None
+
+            def __call__(
+                self,
+                factual_inputs=None,
+                alternative_inputs=None,
+                *,
+                requires_factual=True,
+                requires_alternative=True,
+            ):
+                if factual_inputs is not None:
+                    self.factual_inputs = factual_inputs
+                if alternative_inputs is not None:
+                    self.alternative_inputs = alternative_inputs
+                factual = factual_inputs["input_ids"].float() if requires_factual else None
+                alternative = alternative_inputs["input_ids"].float() if requires_alternative else None
+                return SignalBatch.from_factual_alternative(
+                    factual,
+                    alternative,
+                    signal_id="activation",
+                )
+
+        extractor = InputIdActivationExtractor()
+        dataset = TextActivationTrainingDataset(
+            raw,
+            tokenizer,
+            extractor,
+            signal=Signal.activation(),
+            source="diff",
+            target="diff",
+        )
+
+        row = dataset[0]
+
+        assert dataset.signal == Signal.activation(token_selector="prediction")
+        assert tokenizer.mask_token_id not in extractor.factual_inputs["input_ids"].tolist()
+        assert tokenizer.mask_token_id not in extractor.alternative_inputs["input_ids"].tolist()
+        assert extractor.factual_inputs["prediction_mask"].sum().item() == 1
+        assert extractor.alternative_inputs["prediction_mask"].sum().item() == 1
+        assert row["source"].abs().sum().item() > 0
     
     def test_text_dataset_caching_uses_cache_key_fields(self, temp_dir):
         """Test that text dataset uses correct cache_key_fields for caching."""

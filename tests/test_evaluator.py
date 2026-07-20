@@ -17,8 +17,9 @@ import pandas as pd
 from gradiend.evaluator.decoder import DecoderEvaluator
 from gradiend.evaluator.encoder import EncoderEvaluator
 from gradiend.evaluator.evaluator import Evaluator
-from gradiend.trainer.core.dataset import GradientTrainingDataset
+from gradiend.trainer.core.dataset import GradientTrainingDataset, SignalTrainingDatasetBase
 from gradiend.trainer.core.feature_definition import FeatureLearningDefinition
+from gradiend.trainer.core.signals import Signal, SignalBatch
 from tests.testing_mocks import MockTokenizer
 
 
@@ -224,6 +225,40 @@ class TestEncoderEvaluator:
         assert "correlation" in result
         assert result["n_samples"] > 0
         assert "mean_by_class" in result
+
+    def test_evaluate_encoder_accepts_generic_signal_dataset(self):
+        """Encoder evaluation must operate on signal datasets, not only gradient datasets."""
+        evaluator = EncoderEvaluator()
+        trainer = MockTrainer()
+        trainer._model = MockModelWithGradiend()
+
+        training_data = MockTrainingData([
+            {"factual": torch.tensor([1.0]), "alternative": torch.tensor([0.0]), "label": 1.0},
+            {"factual": torch.tensor([-1.0]), "alternative": torch.tensor([0.0]), "label": -1.0},
+        ])
+
+        class TinySignalExtractor:
+            signal = Signal.activation()
+            signals = None
+
+            def __call__(self, factual_inputs=None, alternative_inputs=None, **_kwargs):
+                return SignalBatch.from_factual_alternative(
+                    factual_inputs,
+                    alternative_inputs,
+                    signal_id=self.signal.id,
+                )
+
+        eval_data = SignalTrainingDatasetBase(
+            training_data=training_data,
+            signal_extractor=TinySignalExtractor(),
+            source="factual",
+            target="diff",
+        )
+
+        result = evaluator.evaluate_encoder(trainer, eval_data=eval_data)
+
+        assert "correlation" in result
+        assert result["n_samples"] == 2
     
     def test_evaluate_encoder_parameter_overwriting(self):
         """Test that parameters override TrainingArguments."""
@@ -233,9 +268,9 @@ class TestEncoderEvaluator:
         trainer = MockTrainer(training_args=training_args)
         trainer._model = MockModelWithGradiend()
         
-        # Create eval_data first to ensure it's a GradientTrainingDataset
+        # Create eval_data first to ensure it satisfies the generic signal dataset contract.
         eval_data = trainer.create_eval_data(trainer._model)
-        assert isinstance(eval_data, GradientTrainingDataset)
+        assert isinstance(eval_data, SignalTrainingDatasetBase)
         
         # Override max_size - pass it directly to evaluate_encoder
         # The parameter overwriting happens in create_eval_data, so we test that
@@ -257,9 +292,9 @@ class TestEncoderEvaluator:
         trainer = MockTrainer(training_args=training_args)
         trainer._model = MockModelWithGradiend()
         
-        # Create eval_data first to ensure it's a GradientTrainingDataset
+        # Create eval_data first to ensure it satisfies the generic signal dataset contract.
         eval_data = trainer.create_eval_data(trainer._model)
-        assert isinstance(eval_data, GradientTrainingDataset)
+        assert isinstance(eval_data, SignalTrainingDatasetBase)
         
         # Don't override max_size - let it use TrainingArguments default
         with patch.object(trainer, 'create_eval_data') as mock_create:

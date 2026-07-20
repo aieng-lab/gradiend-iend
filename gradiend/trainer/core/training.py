@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from gradiend.util.logging import get_logger
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.signals import require_single_signal
 from gradiend.trainer.core.callbacks import (
     TrainingCallback,
     EvaluationCallback,
@@ -139,9 +140,18 @@ def train(
                 else:
                     raise ValueError(f"Invalid training argument: {key} with value {value}. All train() kwargs must be a field in TrainingArguments.")
             if updates:
+                if "signal" in updates and "signals" not in updates:
+                    updates["signals"] = None
+                if "signals" in updates and "signal" not in updates:
+                    updates["signal"] = None
                 training_args = dataclasses.replace(training_args, **updates)
 
     training_args.__post_init__()
+    require_single_signal(
+        signal=training_args.signal,
+        signals=training_args.signals,
+        context="train()",
+    )
 
     # Re-apply seed so training loop (forward/backward, dropout, etc.) starts from a known RNG state
     if getattr(training_args, "seed", None) is not None:

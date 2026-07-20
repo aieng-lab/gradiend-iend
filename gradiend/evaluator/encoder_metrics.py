@@ -154,6 +154,19 @@ def _compute_split_generalization(
 		mask = pair_transition_mask(df_sg, target_classes)
 		df_sg = df_sg[mask]
 		if df_sg.empty:
+			input_types = (
+				df_for_means["input_type"].dropna().astype(str).unique().tolist()
+				if "input_type" in df_for_means.columns
+				else []
+			)
+			if "diff" in input_types:
+				raise ValueError(
+					"split_generalization requires encoder rows whose source_id/target_id "
+					"identify the trained target pair, but source='diff' rows use "
+					"feature_class_id as source_id and do not provide those transitions. "
+					"Evaluate split_generalization with factual/alternative rows or disable "
+					"split_generalization for diff-source encoder evaluation."
+				)
 			raise ValueError(
 				"split_generalization requires encoder rows for the trained target pair, "
 				f"but none were found for target_classes={list(target_classes)!r}."
@@ -195,9 +208,6 @@ def _compute_split_generalization(
 			continue
 		mean_by_fc_by_split[str(fc)] = by_split
 
-	pair = _split_pair_for_agreement(splits)
-	if pair is None:
-		return None
 	s_a, s_b = pair
 
 	for fc, by_split in mean_by_fc_by_split.items():
@@ -543,13 +553,14 @@ def _compute_metrics_from_df(
 	if mean_by_target:
 		result["mean_by_target"] = mean_by_target
 
-	split_generalization = _compute_split_generalization(
-		df_for_means,
-		target_classes=target_classes,
-		compared_splits=generalization_splits,
-	)
-	if split_generalization:
-		result["split_generalization"] = split_generalization
+	if generalization_splits is not None:
+		split_generalization = _compute_split_generalization(
+			df_for_means,
+			target_classes=target_classes,
+			compared_splits=generalization_splits,
+		)
+		if split_generalization:
+			result["split_generalization"] = split_generalization
 
 	if len(all_dimension_scores) > 1:
 		result.update(all_dimension_scores)

@@ -537,7 +537,10 @@ class TestEncoderSplitOptions:
                 "type": ["training"] * 4,
             }
         )
-        metrics = get_encoder_metrics_from_dataframe(encoder_df)
+        metrics = get_encoder_metrics_from_dataframe(
+            encoder_df,
+            generalization_splits=("train", "test"),
+        )
         sg = metrics["split_generalization"]
         assert "agreement" in sg
         assert "white" in sg["agreement_by_feature_class"]

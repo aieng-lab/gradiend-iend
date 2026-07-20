@@ -205,7 +205,7 @@ Example scripts and notebooks: [gradiend/examples](https://github.com/aieng-lab/
 
 ## Citation
 
-The Python package paper:
+The [Python package paper](https://arxiv.org/html/2602.23993):
 ```bibtex
 @misc{drechsel2026gradiendpythonpackage,
       title={The {GRADIEND} Python Package: An End-to-End System for Gradient-Based Feature Learning}, 
@@ -218,16 +218,14 @@ The Python package paper:
 }
 ```
 
-The original GRADIEND method paper:
+The original [GRADIEND method paper](https://openreview.net/forum?id=1vBNAnAgCD):
 ```bibtex
-@misc{drechsel2025gradiend,
-  title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases},
-  author={Jonathan Drechsel and Steffen Herbold},
-  year={2025},
-  eprint={2502.01406},
-  archivePrefix={arXiv},
-  primaryClass={cs.LG},
-  url={https://arxiv.org/abs/2502.01406},
+@inproceedings{drechsel2026gradiend,
+    title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases},
+    author={Jonathan Drechsel and Steffen Herbold},
+    booktitle={The Fourteenth International Conference on Learning Representations},
+    year={2026},
+    url={https://openreview.net/forum?id=1vBNAnAgCD}
 }
 ```
 

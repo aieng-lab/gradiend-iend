@@ -3,14 +3,25 @@ Training arguments for GRADIEND Trainer (HF-like API).
 """
 
 import dataclasses
+import warnings
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Callable, Union, Any, List, Dict
 
 import torch
 import torch.nn as nn
 
+from gradiend.trainer.core.cache_policy import normalize_use_cache
 from gradiend.trainer.core.config import validate_source_target
 from gradiend.trainer.core.pruning import PostPruneConfig, PrePruneConfig, _validate_topk
+from gradiend.trainer.core.signals import (
+    Signal,
+    SignalScope,
+    SignalSet,
+    coerce_signal,
+    coerce_signal_scope,
+    coerce_signal_set,
+    normalize_signal_arguments,
+)
 
 
 @dataclass
@@ -202,6 +213,15 @@ class TrainingArguments:
     params: Optional[List[str]] = None
     """If set, only these parameter names or wildcards are included in the GRADIEND param map when building from a base model. None = include all backbone parameters (default). Enables future params selection processes."""
 
+    signal: Optional[Any] = None
+    """Signal measured for GRADIEND training. Defaults to ``Signal.gradient()``. Scope remains controlled by params/param_map and future split settings."""
+
+    signals: Optional[Any] = None
+    """Optional SignalSet or sequence of signals for future multi-signal training. Mutually exclusive with a distinct ``signal`` value."""
+
+    signal_scope: Optional[Any] = None
+    """Optional SignalScope describing where a signal is measured, e.g. activation module sites. Signal itself remains only the measured quantity."""
+
     activation_encoder: Optional[str] = None
     """Encoder activation name (e.g. 'tanh', 'gelu', 'relu'). None = model default ('tanh')."""
 
@@ -324,14 +344,47 @@ class TrainingArguments:
     # ----- Extra -----
     metadata: dict = field(default_factory=dict)
 
+    @staticmethod
+    def _coerce_signal(value: Any) -> Any:
+        return coerce_signal(value)
+
+    @staticmethod
+    def _coerce_signal_set(value: Any) -> Any:
+        return coerce_signal_set(value)
+
+    def _normalize_signal_arguments(self) -> None:
+        signal, signals = normalize_signal_arguments(signal=self.signal, signals=self.signals)
+        self.signal = signal
+        self.signals = signals
+        self.signal_scope = coerce_signal_scope(self.signal_scope)
+        if self.params is not None:
+            warnings.warn(
+                "TrainingArguments.params is deprecated; use "
+                "TrainingArguments.signal_scope=SignalScope.from_values(params=...) instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            params_tuple = tuple(self.params)
+            if self.signal_scope is None:
+                self.signal_scope = SignalScope.from_values(params=params_tuple)
+            elif self.signal_scope.params is None:
+                self.signal_scope = SignalScope.from_values(
+                    params=params_tuple,
+                    activation_sites=self.signal_scope.activation_sites,
+                    mode=self.signal_scope.mode,
+                )
+            elif self.signal_scope.params != params_tuple:
+                raise ValueError(
+                    "TrainingArguments.params conflicts with signal_scope.params. "
+                    "Use only signal_scope.params."
+                )
+
     def __post_init__(self) -> None:
         # Type checks for key scalar parameters
         if self.experiment_dir is not None and not isinstance(self.experiment_dir, str):
             raise TypeError(f"experiment_dir must be str or None, got {type(self.experiment_dir).__name__}")
         if self.output_dir is not None and not isinstance(self.output_dir, str):
             raise TypeError(f"output_dir must be str or None, got {type(self.output_dir).__name__}")
-        from gradiend.trainer.core.cache_policy import normalize_use_cache
-
         normalize_use_cache(self.use_cache)
         if not isinstance(self.reuse_pre_prune, bool):
             raise TypeError(f"reuse_pre_prune must be bool, got {type(self.reuse_pre_prune).__name__}")
@@ -430,6 +483,8 @@ class TrainingArguments:
         if self.seed is not None and not isinstance(self.seed, int):
             raise TypeError(f"seed must be int or None, got {type(self.seed).__name__}")
 
+        self._normalize_signal_arguments()
+
         validate_source_target("source", self.source)
         validate_source_target("target", self.target)
         if self.torch_dtype is None:
@@ -512,6 +567,12 @@ class TrainingArguments:
                 cfg = dataclasses.asdict(v)
                 cfg["mask"] = None  # do not serialize tensor
                 result[k] = cfg
+            elif k == "signal":
+                result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
+            elif k == "signals":
+                result[k] = list(v.to_list()) if v is not None and hasattr(v, "to_list") else v
+            elif k == "signal_scope":
+                result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
             else:
                 result[k] = v
         return result
@@ -520,6 +581,12 @@ class TrainingArguments:
     def from_dict(cls, d: dict) -> "TrainingArguments":
         """Create from dict (e.g. loaded from JSON). Canonical keys only."""
         d = dict(d)
+        if "signal" in d and isinstance(d.get("signal"), dict):
+            d["signal"] = Signal.from_dict(d["signal"])
+        if "signals" in d and isinstance(d.get("signals"), list):
+            d["signals"] = SignalSet.from_list(d["signals"])
+        if "signal_scope" in d and isinstance(d.get("signal_scope"), dict):
+            d["signal_scope"] = SignalScope.from_dict(d["signal_scope"])
         if "torch_dtype" in d and isinstance(d.get("torch_dtype"), str):
             d["torch_dtype"] = getattr(torch, d["torch_dtype"], torch.float32)
         if "pre_prune_config" in d and isinstance(d.get("pre_prune_config"), dict):

@@ -42,7 +42,10 @@ class TestSplitGeneralization:
                 "type": ["training"] * 5,
             }
         )
-        result = get_encoder_metrics_from_dataframe(encoder_df)
+        result = get_encoder_metrics_from_dataframe(
+            encoder_df,
+            generalization_splits=("train", "test"),
+        )
         sg = result["split_generalization"]
         assert sg["splits_compared"] == ["train", "test"]
         assert sg["agreement_by_feature_class"]["positive"] > 0.95
@@ -68,6 +71,61 @@ class TestSplitGeneralization:
                 "neutral_variant": [None, None, None, None, "neutral_dataset", "neutral_training_masked"],
             }
         )
-        result = get_encoder_metrics_from_dataframe(encoder_df)
+        result = get_encoder_metrics_from_dataframe(
+            encoder_df,
+            generalization_splits=("train", "test"),
+        )
         sg = result["split_generalization"]
         assert "neutral" not in sg["agreement_by_feature_class"]
+
+    def test_split_generalization_is_explicit_only(self):
+        encoder_df = pd.DataFrame(
+            {
+                "encoded": [0.8, 0.82, -0.75, -0.73],
+                "label": [1.0, 1.0, -1.0, -1.0],
+                "source_id": ["positive", "positive", "negative", "negative"],
+                "target_id": ["negative"] * 4,
+                "data_split": ["train", "test", "train", "test"],
+                "type": ["training"] * 4,
+            }
+        )
+        result = get_encoder_metrics_from_dataframe(encoder_df)
+        assert "split_generalization" not in result
+
+    def test_diff_rows_do_not_trigger_split_generalization_by_default(self):
+        encoder_df = pd.DataFrame(
+            {
+                "encoded": [0.3, 0.4, -0.2, -0.1],
+                "label": [1.0, 1.0, -1.0, -1.0],
+                "source_id": ["3SG_to_3PL", "3SG_to_3PL", "3PL_to_3SG", "3PL_to_3SG"],
+                "target_id": [None, None, None, None],
+                "feature_class_id": ["3SG_to_3PL", "3SG_to_3PL", "3PL_to_3SG", "3PL_to_3SG"],
+                "input_type": ["diff"] * 4,
+                "data_split": ["train", "test", "train", "test"],
+                "type": ["training"] * 4,
+            }
+        )
+        result = get_encoder_metrics_from_dataframe(
+            encoder_df,
+            target_classes=["3SG", "3PL"],
+        )
+        assert "split_generalization" not in result
+
+    def test_explicit_split_generalization_on_diff_rows_has_actionable_error(self):
+        encoder_df = pd.DataFrame(
+            {
+                "encoded": [0.3, 0.4, -0.2, -0.1],
+                "label": [1.0, 1.0, -1.0, -1.0],
+                "source_id": ["3SG_to_3PL", "3SG_to_3PL", "3PL_to_3SG", "3PL_to_3SG"],
+                "target_id": [None, None, None, None],
+                "input_type": ["diff"] * 4,
+                "data_split": ["train", "test", "train", "test"],
+                "type": ["training"] * 4,
+            }
+        )
+        with pytest.raises(ValueError, match="source='diff' rows"):
+            get_encoder_metrics_from_dataframe(
+                encoder_df,
+                target_classes=["3SG", "3PL"],
+                generalization_splits=("train", "test"),
+            )

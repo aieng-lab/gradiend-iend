@@ -1,12 +1,13 @@
 """
-Tests for backbone parameter selection (params / param_map) when building GRADIEND from a base model.
+Tests for backbone parameter selection when building GRADIEND from a base model.
 
 Covers _filter_params_by_include wildcard matching and build_gradiend_from_base_model with
-params and param_map list arguments.
+canonical scope_params plus legacy params/param_map compatibility.
 """
 
 import tempfile
 
+import pytest
 import torch
 import torch.nn as nn
 from collections import OrderedDict
@@ -142,14 +143,27 @@ class TestBuildGradiendFromBaseModelParams:
         assert list(gradiend.param_map.keys()) == list(core.keys())
         assert not any("vision_tower" in name for name in gradiend.param_map)
 
-    def test_build_with_params_restricts_to_matching_layers(self):
-        """params list filters backbone to matching parameter names (wildcards)."""
+    def test_full_scope_mode_includes_non_backbone_parameters(self):
+        model = _MinimalMultimodalHFModel(dim=4)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gradiend = build_gradiend_from_base_model(
+                model,
+                tmpdir,
+                latent_dim=1,
+                scope_mode="full",
+            )
+
+        assert any("vision_tower" in name for name in gradiend.param_map)
+
+    def test_build_with_scope_params_restricts_to_matching_layers(self):
+        """scope_params filters backbone to matching parameter names (wildcards)."""
         model = _MinimalHFModel(dim=4)
         with tempfile.TemporaryDirectory() as tmpdir:
             gradiend = build_gradiend_from_base_model(
                 model,
                 tmpdir,
-                params=["base_model.layer0.*"],
+                scope_params=["base_model.layer0.*"],
                 latent_dim=1,
             )
         param_names = list(gradiend.param_map.keys())
@@ -163,14 +177,14 @@ class TestBuildGradiendFromBaseModelParams:
         )
         assert gradiend.input_dim == expected_dim
 
-    def test_build_with_param_map_list_restricts_to_list(self):
-        """param_map as list of names restricts to those params."""
+    def test_build_with_scope_params_list_restricts_to_list(self):
+        """scope_params as list of names restricts to those params."""
         model = _MinimalHFModel(dim=4)
         with tempfile.TemporaryDirectory() as tmpdir:
             gradiend = build_gradiend_from_base_model(
                 model,
                 tmpdir,
-                param_map=["base_model.layer1.weight", "base_model.layer1.bias"],
+                scope_params=["base_model.layer1.weight", "base_model.layer1.bias"],
                 latent_dim=1,
             )
         param_names = list(gradiend.param_map.keys())
@@ -178,17 +192,18 @@ class TestBuildGradiendFromBaseModelParams:
         expected_dim = 4 * 4 + 4
         assert gradiend.input_dim == expected_dim
 
-    def test_build_with_params_and_param_map(self):
-        """params filters first; param_map further restricts (both as lists)."""
+    def test_legacy_params_and_param_map_still_work_with_deprecation_warning(self):
+        """Legacy params/param_map are still usable while deprecated."""
         model = _MinimalHFModel(dim=4)
         with tempfile.TemporaryDirectory() as tmpdir:
-            gradiend = build_gradiend_from_base_model(
-                model,
-                tmpdir,
-                params=["base_model.layer0.weight", "base_model.layer1.weight"],
-                param_map=["base_model.layer1.weight"],
-                latent_dim=1,
-            )
+            with pytest.warns(DeprecationWarning):
+                gradiend = build_gradiend_from_base_model(
+                    model,
+                    tmpdir,
+                    params=["base_model.layer0.weight", "base_model.layer1.weight"],
+                    param_map=["base_model.layer1.weight"],
+                    latent_dim=1,
+                )
         param_names = list(gradiend.param_map.keys())
         assert param_names == ["base_model.layer1.weight"]
         assert gradiend.input_dim == 4 * 4

@@ -17,6 +17,7 @@ import copy
 import json
 import csv
 import threading
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Iterator, List, Optional, Dict, Any, Tuple, Union
@@ -29,6 +30,7 @@ from gradiend.util import unwrap_model
 from gradiend.util.logging import get_logger
 from gradiend.model import ParamMappedGradiendModel
 from gradiend.model.core import build_gradiend_from_base_model
+from gradiend.signal_space import SignalTrainingPlan, resolve_signal_training_plan, scope_mode, scope_params
 from gradiend.model._source_target import (
     resolve_source_from_checkpoint_dir,
     validate_source_target,
@@ -436,6 +438,8 @@ class ModelWithGradiend(nn.Module, ABC):
         raise TypeError(f"gradiend.param_map must be dict-spec, got {type(param_map)}")
 
     def _active_param_map_names(self) -> set:
+        if getattr(self.gradiend, "mapping_kind", self.gradiend.kwargs.get("mapping_kind", "gradient")) != "gradient":
+            return set()
         active = set()
         for name, spec in self.gradiend.param_map.items():
             r = spec.get("repr")
@@ -982,12 +986,69 @@ class ModelWithGradiend(nn.Module, ABC):
         Subclasses may override for custom behavior.
         """
         create_kwargs = dict(kwargs)
+        signal_plan = create_kwargs.pop("signal_plan", None)
+        if signal_plan is None:
+            signal_plan = resolve_signal_training_plan(base_model)
+        if not isinstance(signal_plan, SignalTrainingPlan):
+            raise TypeError(f"signal_plan must be SignalTrainingPlan, got {type(signal_plan).__name__}")
+        signal_space = signal_plan.single_space
+        if signal_space.kind == "activation":
+            if create_kwargs.get("pre_prune_config") is not None:
+                raise NotImplementedError(
+                    "pre_prune_config is not yet defined for activation signal spaces. "
+                    "Use activation signals without pre-pruning for now."
+                )
+            param_map_spec = {
+                f"activation:{entry['name']}": {
+                    "shape": tuple(entry["shape"]),
+                    "repr": entry["repr"],
+                }
+                for entry in signal_space.mapping
+            }
+            gradiend_kwargs = {
+                k: v for k, v in create_kwargs.items()
+                if k not in ("source", "target", "params", "param_map")
+            }
+            return ParamMappedGradiendModel(
+                signal_space.input_dim,
+                param_map=param_map_spec,
+                latent_dim=int(gradiend_kwargs.pop("latent_dim", 1)),
+                base_model=load_directory,
+                mapping_kind="activation",
+                signal_id=signal_space.signal_id,
+                signal_space={
+                    "kind": signal_space.kind,
+                    "signal_id": signal_space.signal_id,
+                    "mapping": list(signal_space.mapping),
+                },
+                torch_dtype=gradiend_kwargs.pop("torch_dtype", torch.float32),
+                device_encoder=gradiend_kwargs.pop("device_encoder", None),
+                device_decoder=gradiend_kwargs.pop("device_decoder", None),
+                **gradiend_kwargs,
+            )
+        if signal_space.kind != "gradient":
+            raise NotImplementedError(
+                f"Model construction for Signal(kind={signal_space.kind!r}) is not implemented yet."
+            )
         lazy_init = bool(create_kwargs.get("pre_prune_config") is not None)
+        legacy_params = create_kwargs.pop("params", None)
+        if legacy_params is not None:
+            warnings.warn(
+                "params is deprecated; use signal_scope=SignalScope.from_values(params=...) instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        selected_params = scope_params(signal_space.scope)
+        if selected_params is None:
+            selected_params = tuple(legacy_params) if legacy_params is not None else None
+        elif legacy_params is not None and tuple(legacy_params) != tuple(selected_params):
+            raise ValueError("Legacy params conflicts with signal_scope.params. Use only signal_scope.params.")
         return build_gradiend_from_base_model(
             base_model,
             load_directory,
             param_map=create_kwargs.pop("param_map", None),
-            params=create_kwargs.pop("params", None),
+            scope_params=list(selected_params) if selected_params is not None else None,
+            scope_mode=scope_mode(signal_space.scope),
             lazy_init=lazy_init,
             **create_kwargs,
         )
@@ -1036,7 +1097,7 @@ class ModelWithGradiend(nn.Module, ABC):
 
         if training_args is not None:
             gradiend_keys = (
-                "params", "param_map", "trust_remote_code", "torch_dtype",
+                "param_map", "trust_remote_code", "torch_dtype",
                 "activation_encoder", "activation_decoder", "bias_decoder", "latent_dim",
                 "encoder_decoder_same_device", "pre_prune_config",
                 "base_model_device_map", "base_model_max_memory",
@@ -1048,6 +1109,7 @@ class ModelWithGradiend(nn.Module, ABC):
                 val = _training_arg_value(key, None)
                 if val is not None and key not in kwargs:
                     kwargs.setdefault(key, val)
+        signal_plan = kwargs.pop("signal_plan", None)
         require_gradiend_model = kwargs.pop("require_gradiend_model", require_gradiend_model)
         feature_definition = kwargs.pop("feature_definition", feature_definition)
         base_model_device_map = kwargs.pop("base_model_device_map", None)
@@ -1100,9 +1162,15 @@ class ModelWithGradiend(nn.Module, ABC):
             )
             create_gradiend_kwargs = dict(kwargs)
             create_gradiend_kwargs.pop("base_model", None)
+            if signal_plan is None:
+                signal_plan = resolve_signal_training_plan(
+                    base_model,
+                    training_args=training_args,
+                )
             gradiend = cls._create_gradiend(
                 base_model,
                 load_directory_str,
+                signal_plan=signal_plan,
                 **create_gradiend_kwargs,
                 **gradiend_device_config,
             )

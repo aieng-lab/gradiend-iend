@@ -120,6 +120,33 @@ def test_plot_comparison_heatmap_sets_axis_labels():
         plt.close("all")
 
 
+def test_plot_comparison_heatmap_percent_axis_labels_survive_usetex(monkeypatch):
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("seaborn")
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+    try:
+        plot_comparison_heatmap(
+            {
+                "measure": "anchor_aligned_encoding_factual_mean",
+                "model_ids": ["A", "B"],
+                "column_ids": ["A", "B"],
+                "matrix": [[0.74, -0.23], [0.50, 0.86]],
+            },
+            xlabel="Probe (%)",
+            ylabel="Orienting (%)",
+            show=False,
+            return_data=True,
+        )
+        ax = plt.gcf().axes[0]
+        assert ax.get_xlabel() == r"Probe (\%)"
+        assert ax.get_ylabel() == r"Orienting (\%)"
+    finally:
+        plt.close("all")
+
+
 def test_plot_comparison_heatmap_cbar_percent_label_survives_usetex(monkeypatch):
     pytest.importorskip("matplotlib")
     pytest.importorskip("seaborn")

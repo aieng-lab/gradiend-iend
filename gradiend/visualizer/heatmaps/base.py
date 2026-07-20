@@ -18,6 +18,7 @@ from gradiend.visualizer.labels import (
     format_label_with_convergence,
     format_transition_label,
     label_contains_matplotlib_latex,
+    escape_matplotlib_usetex_text,
     resolve_axis_convergence_for_comparison_heatmap,
 )
 
@@ -565,9 +566,15 @@ def plot_comparison_heatmap(
         resolved_axis_label_fontsize = float(tick_label_fontsize) + 2
 
     if xlabel:
-        ax.set_xlabel(xlabel, fontsize=resolved_axis_label_fontsize)
+        ax.set_xlabel(
+            escape_matplotlib_usetex_text(xlabel),
+            fontsize=resolved_axis_label_fontsize,
+        )
     if ylabel:
-        ax.set_ylabel(ylabel, fontsize=resolved_axis_label_fontsize)
+        ax.set_ylabel(
+            escape_matplotlib_usetex_text(ylabel),
+            fontsize=resolved_axis_label_fontsize,
+        )
 
     active_groups = comparison_data.get("pretty_groups")
     if active_groups is not None:

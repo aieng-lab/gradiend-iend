@@ -3,7 +3,7 @@ Evaluator bound to a trainer; orchestrates encoder/decoder evaluation and
 optionally delegates plotting to a Visualizer.
 
 This module provides the high-level entry points to:
-1) run encoder evaluation (gradient encodings + correlation metrics),
+1) run encoder evaluation (signal encodings + correlation metrics),
 2) run decoder evaluation (grid search over feature_factor/lr + summaries),
 3) merge results for convenience, and
 4) produce evaluation-related plots if a Visualizer is configured.
@@ -87,7 +87,7 @@ class Evaluator:
             encoder_df: Optional DataFrame or dict with "encoder_df" key. If provided,
                 skips encoding and computes metrics from this data. Use
                 evaluate_encoder(return_df=True) to get such a dict.
-            eval_data: Optional pre-computed GradientTrainingDataset. If None and
+            eval_data: Optional pre-computed SignalTrainingDatasetBase. If None and
                 encoder_df is None, the trainer creates eval data via create_eval_data.
             use_cache: If True, reuse cached JSON result under experiment_dir when
                 available. If None, defaults come from trainer training args.

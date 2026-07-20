@@ -11,7 +11,11 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, Set
 import numpy as np
 
 from gradiend.util.paths import resolve_output_path, ARTIFACT_CONVERGENCE_PLOT
-from gradiend.visualizer.labels import resolve_highlight_non_convergence, resolve_plot_title_with_convergence
+from gradiend.visualizer.labels import (
+    escape_matplotlib_usetex_text,
+    resolve_highlight_non_convergence,
+    resolve_plot_title_with_convergence,
+)
 from gradiend.visualizer.plot_optional import _require_matplotlib
 from gradiend.util.logging import get_logger
 
@@ -42,7 +46,7 @@ def _class_spread_title_suffix(mode: Literal["minmax", "iqr", "ci95"]) -> str:
     if mode == "iqr":
         return " (shaded: IQR)"
     if mode == "ci95":
-        return " (shaded: 95% CI)"
+        return escape_matplotlib_usetex_text(" (shaded: 95% CI)")
     return " (shaded: min-max)"
 
 
@@ -202,7 +206,13 @@ def _plot_mean_series_with_range(
         if not pts:
             continue
         xs, ys = zip(*pts)
-        (line,) = ax.plot(xs, ys, label=name_fn(label_key), marker=".", markersize=2)
+        (line,) = ax.plot(
+            xs,
+            ys,
+            label=escape_matplotlib_usetex_text(name_fn(label_key)),
+            marker=".",
+            markersize=2,
+        )
         if show_range and range_series:
             range_pts = sorted(range_series.get(label_key, []))
             if range_pts:
@@ -394,7 +404,7 @@ def draw_convergence_axes(
         title = "Mean by class"
         if spread_mode and range_by_class:
             title += _class_spread_title_suffix(spread_mode)
-        ax.set_title(title)
+        ax.set_title(escape_matplotlib_usetex_text(title))
         ax_idx += 1
 
     legend_fontsize_fc = 6 if use_external_legend else 8
@@ -424,7 +434,7 @@ def draw_convergence_axes(
         title = "Mean by feature class"
         if spread_mode and range_by_fc:
             title += _class_spread_title_suffix(spread_mode)
-        ax.set_title(title)
+        ax.set_title(escape_matplotlib_usetex_text(title))
         ax_idx += 1
 
     if use_external_legend and axes:
@@ -645,7 +655,7 @@ def plot_training_convergence(
         highlight_non_convergence=highlight,
     )
     if resolved_title is not False:
-        fig.suptitle(str(resolved_title), fontsize=10)
+        fig.suptitle(escape_matplotlib_usetex_text(resolved_title), fontsize=10)
     plt.tight_layout()
 
     out_path = None

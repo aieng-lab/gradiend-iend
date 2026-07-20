@@ -17,12 +17,14 @@ from gradiend.trainer.text.prediction.seq2seq import (
     mask_placeholder_for_tokenizer,
 )
 from gradiend.trainer.text.common.dataset_base import TextBatchedDatasetBase
+from gradiend.trainer.core.dataset import SignalTrainingDatasetBase
 from gradiend.trainer.core.unified_schema import (
     UNIFIED_ALTERNATIVE,
     UNIFIED_FACTUAL,
     UNIFIED_MASKED,
     UNIFIED_SPLIT,
 )
+from gradiend.trainer.core.signals import Signal
 from gradiend.util import normalize_split_name
 from gradiend.util.logging import suppress_tokenizer_length_warning
 
@@ -34,7 +36,7 @@ def _ids_for_text(tokenizer: Any, text: str) -> List[int]:
         tokenizer: Tokenizer used for encoding.
         text: Text to tokenize.
     """
-    return tokenizer(str(text), add_special_tokens=False)["input_ids"]
+    return tokenizer(str(text), add_special_tokens=False, padding=False)["input_ids"]
 
 
 def _continuation_ids_from_prefix(tokenizer: Any, prefix: str, continuation: str) -> List[int]:
@@ -53,6 +55,64 @@ def _continuation_ids_from_prefix(tokenizer: Any, prefix: str, continuation: str
     if full_ids[: len(prefix_ids)] == prefix_ids:
         return full_ids[len(prefix_ids) :]
     return _ids_for_text(tokenizer, continuation)
+
+
+def _find_subsequence(values: List[int], needle: List[int], start: int = 0) -> int:
+    """Return the first index of ``needle`` in ``values`` at or after ``start``."""
+    if not needle:
+        return -1
+    max_start = len(values) - len(needle)
+    for idx in range(max(0, start), max_start + 1):
+        if values[idx : idx + len(needle)] == needle:
+            return idx
+    return -1
+
+
+def _prediction_positions_for_filled_text(
+    tokenizer: Any,
+    *,
+    template: str,
+    target: str,
+    input_ids: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> List[int]:
+    """Locate the target span inserted into a filled prediction template."""
+    if "[MASK]" not in template:
+        raise ValueError("Activation prediction-position selection requires a template with [MASK].")
+    prefix, _suffix = str(template).split("[MASK]", 1)
+    prefix_ids = _ids_for_text(tokenizer, prefix)
+    target_ids = _continuation_ids_from_prefix(tokenizer, prefix, str(target))
+    if not target_ids:
+        target_ids = _ids_for_text(tokenizer, str(target))
+    if not target_ids:
+        raise ValueError(f"Could not tokenize prediction target {target!r}.")
+
+    ids = [int(v) for v in input_ids.tolist()]
+    if attention_mask is not None:
+        valid_len = int(attention_mask.to(dtype=torch.long).sum().item())
+        ids = ids[:valid_len]
+
+    prefix_end = 0
+    if prefix_ids:
+        prefix_start = _find_subsequence(ids, [int(v) for v in prefix_ids])
+        if prefix_start >= 0:
+            prefix_end = prefix_start + len(prefix_ids)
+
+    start = _find_subsequence(ids, [int(v) for v in target_ids], start=prefix_end)
+    if start < 0:
+        start = _find_subsequence(ids, [int(v) for v in target_ids])
+    if start < 0:
+        raise ValueError(
+            f"Could not locate filled prediction target {target!r} in tokenized template {template!r}."
+        )
+    return list(range(start, start + len(target_ids)))
+
+
+def _stack_text_items(items: List[dict]) -> dict:
+    """Stack same-shaped tokenized text items into one batch dictionary."""
+    if len(items) == 1:
+        return items[0]
+    return {key: torch.stack([item[key] for item in items]) for key in items[0]}
 
 
 def _targetable_token_text(token: str) -> str:
@@ -412,3 +472,146 @@ class TextTrainingDataset(TextBatchedDataset):
         elif "split" in entry.index:
             out["data_split"] = normalize_split_name(str(entry["split"]))
         return out
+
+
+class TextActivationTrainingDataset(SignalTrainingDatasetBase):
+    """
+    Text-prediction activation signal dataset.
+
+    Unlike gradient signals, plain activations are not label-conditioned. This
+    wrapper therefore constructs factual/alternative inputs by filling the
+    prediction slot before activation extraction, and adds ``prediction_mask``
+    so token_selector="prediction" can select the filled span.
+    """
+
+    CACHE_KEY_FIELDS: List[str] = ["template", "factual_token", "alternative_token", "label"]
+
+    def __init__(
+        self,
+        training_data: Any,
+        tokenizer: Any,
+        signal_extractor: Any,
+        *,
+        source: str = "factual",
+        target: str = "diff",
+        cache_dir: Optional[str] = None,
+        use_cached_signals: bool = True,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[torch.device] = None,
+        return_metadata: bool = False,
+        timing_steps: int = 0,
+        timing_label: str = "text-activation",
+        signal: Any = None,
+        signals: Any = None,
+    ):
+        if signal is not None:
+            signal = self.default_signal(signal)
+        elif getattr(signal_extractor, "signal", None) is not None:
+            signal = self.default_signal(signal_extractor.signal)
+        pad_token_id = getattr(tokenizer, "pad_token_id", 0) if tokenizer is not None else 0
+
+        def get_padding_value(subkey: str) -> int:
+            return pad_token_id if "input_ids" in subkey else 0
+
+        super().__init__(
+            training_data,
+            signal_extractor,
+            source=source,
+            target=target,
+            cache_dir=cache_dir,
+            use_cached_signals=use_cached_signals,
+            cache_key_fields=self.CACHE_KEY_FIELDS if (cache_dir and use_cached_signals) else None,
+            dtype=dtype,
+            device=device,
+            return_metadata=return_metadata,
+            get_padding_value=get_padding_value,
+            timing_steps=timing_steps,
+            timing_label=timing_label,
+            signal=signal,
+            signals=signals,
+        )
+        self.tokenizer = tokenizer
+
+    @staticmethod
+    def default_signal(signal: Signal) -> Signal:
+        """Text-prediction default for activation signals: select the prediction span."""
+        if signal.kind != "activation":
+            return signal
+        options = dict(signal.options or {})
+        if options.get("token_selector") is None:
+            options["token_selector"] = "prediction"
+            return Signal(signal.kind, name=signal.name, options=options)
+        return signal
+
+    @staticmethod
+    def _as_list(value: Any) -> List[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
+    def _create_filled_prediction_item(self, template: str, target_token: Any) -> dict:
+        template = str(template)
+        target_token = str(target_token)
+        if "[MASK]" not in template:
+            raise ValueError("Text activation training requires templates with a [MASK] prediction slot.")
+        filled_text = template.replace("[MASK]", target_token, 1)
+        max_length = getattr(self.training_data, "max_length", 256)
+        if not isinstance(max_length, int) or max_length <= 0:
+            max_length = 256
+        with suppress_tokenizer_length_warning():
+            encoded = self.tokenizer(
+                filled_text,
+                return_tensors="pt",
+                add_special_tokens=True,
+                truncation=True,
+                max_length=max_length,
+                padding="max_length",
+            )
+        input_ids = encoded["input_ids"].squeeze(0)
+        attention_mask = encoded.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.squeeze(0)
+        positions = _prediction_positions_for_filled_text(
+            self.tokenizer,
+            template=template,
+            target=target_token,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        prediction_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for position in positions:
+            if 0 <= position < prediction_mask.numel():
+                prediction_mask[position] = True
+        if not bool(prediction_mask.any().item()):
+            raise ValueError(
+                f"Filled prediction target {target_token!r} was truncated out of template {template!r}."
+            )
+        item = {
+            "input_ids": input_ids,
+            "prediction_mask": prediction_mask,
+        }
+        if attention_mask is not None:
+            item["attention_mask"] = attention_mask
+        return item
+
+    def _filled_side_batch(self, templates: List[Any], target_tokens: List[Any]) -> dict:
+        items = [
+            self._create_filled_prediction_item(template, target_token)
+            for template, target_token in zip(templates, target_tokens)
+        ]
+        return _stack_text_items(items)
+
+    def _merge_batch(self, indices: list) -> dict:
+        batch = super()._merge_batch(indices)
+        templates = self._as_list(batch.get("template"))
+        factual_tokens = self._as_list(batch.get("factual_token"))
+        alternative_tokens = self._as_list(batch.get("alternative_token"))
+        if not (len(templates) == len(factual_tokens) == len(alternative_tokens)):
+            raise ValueError(
+                "Text activation batch metadata lengths must match for template, factual_token, and alternative_token."
+            )
+        batch["factual"] = self._filled_side_batch(templates, factual_tokens)
+        batch["alternative"] = self._filled_side_batch(templates, alternative_tokens)
+        return batch
