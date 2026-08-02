@@ -38,7 +38,12 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
-from gradiend.model.model import GradiendModel
+from gradiend.model.model import (
+    DEFAULT_INIT_FAN_IN_FLOOR,
+    GradiendComponent,
+    GradiendModel,
+    _coerce_saved_component_slices,
+)
 from gradiend.model.utils import (
     _load_tensor_dict,
     _save_tensor_dict,
@@ -212,12 +217,16 @@ class ParamMappedGradiendModel(GradiendModel):
         param_map: Dict[str, Dict[str, Any]],
         activation_encoder: str = "tanh",
         activation_decoder: str = "id",
+        bias_encoder: bool = False,
         bias_decoder: bool = True,
         torch_dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         device_encoder: Optional[torch.device] = None,
         device_decoder: Optional[torch.device] = None,
         lazy_init: bool = False,
+        init_fan_in_floor: Optional[int] = DEFAULT_INIT_FAN_IN_FLOOR,
+        component_slices: Optional[List[Union[GradiendComponent, Dict[str, Any]]]] = None,
+        component_split_mode: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -231,6 +240,7 @@ class ParamMappedGradiendModel(GradiendModel):
                 any selection tensor required by the repr.
             activation_encoder: Encoder activation name.
             activation_decoder: Decoder activation name.
+            bias_encoder: Whether the encoder linear layer uses a bias term.
             bias_decoder: Whether the decoder linear layer uses a bias term.
             torch_dtype: dtype used for model parameters.
             device: Optional default device for both encoder and decoder when specific
@@ -238,6 +248,11 @@ class ParamMappedGradiendModel(GradiendModel):
             device_encoder: Device for encoder parameters.
             device_decoder: Device for decoder parameters.
             lazy_init: If True, do not create encoder/decoder weights; build on prune.
+            init_fan_in_floor: Optional lower bound for component/input fan-in
+                used by fresh encoder/decoder initialization. The default keeps
+                small activation-space components on a conservative random scale
+                while leaving larger gradient-space models unchanged.
+            component_slices: Optional default split metadata over the flattened GRADIEND input space.
             **kwargs: Stored in `self.kwargs` and serialized into config.json metadata
                 on save.
         """
@@ -246,12 +261,16 @@ class ParamMappedGradiendModel(GradiendModel):
             latent_dim=latent_dim,
             activation_encoder=activation_encoder,
             activation_decoder=activation_decoder,
+            bias_encoder=bias_encoder,
             bias_decoder=bias_decoder,
             torch_dtype=torch_dtype,
             device=device,
             device_encoder=device_encoder,
             device_decoder=device_decoder,
             lazy_init=lazy_init,
+            init_fan_in_floor=init_fan_in_floor,
+            component_slices=component_slices,
+            component_split_mode=component_split_mode,
             **kwargs,
         )
         self.param_map = param_map
@@ -1230,6 +1249,11 @@ class ParamMappedGradiendModel(GradiendModel):
 
         arch = cfg["architecture"]
         meta = cfg.get("metadata") or {}
+        component_slices = cfg.get("components")
+        component_split_mode = cfg.get("component_split_mode")
+        component_slices = _coerce_saved_component_slices(
+            component_slices, component_split_mode, arch["input_dim"]
+        )
 
         model = cls(
             input_dim=arch["input_dim"],
@@ -1237,10 +1261,14 @@ class ParamMappedGradiendModel(GradiendModel):
             param_map=param_map_spec,
             activation_encoder=arch.get("activation_encoder", "tanh"),
             activation_decoder=arch.get("activation_decoder", "id"),
+            bias_encoder=arch.get("bias_encoder", core.bias_encoder),
             bias_decoder=arch.get("bias_decoder", True),
+            init_fan_in_floor=core.init_fan_in_floor,
             torch_dtype=core.torch_dtype,
             device_encoder=core.device_encoder,
             device_decoder=core.device_decoder,
+            component_slices=component_slices,
+            component_split_mode=component_split_mode,
             **meta,
         )
 

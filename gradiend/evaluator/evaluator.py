@@ -9,7 +9,7 @@ This module provides the high-level entry points to:
 4) produce evaluation-related plots if a Visualizer is configured.
 """
 
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Type, Union
 
 import pandas as pd
 
@@ -118,6 +118,16 @@ class Evaluator:
         model_with_gradiend: Any = None,
         feature_factors: Optional[list] = None,
         lrs: Optional[list] = None,
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Any] = None,
+        threshold: Optional[float] = None,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: Optional[float] = None,
+        intervention_kwargs: Optional[Mapping[str, Any]] = None,
+        output_path: Optional[str] = None,
+        raw_output_path: Optional[str] = None,
         use_cache: Optional[bool] = None,
         split: Optional[Any] = "test",
         max_size: Optional[int] = None,
@@ -147,6 +157,18 @@ class Evaluator:
             feature_factors: Optional list of feature factors to test. If None,
                 derived from direction and target classes.
             lrs: Optional list of learning rates to test. If None, defaults are used.
+            token_selector: Optional intervention token selector forwarded to
+                ``ModelWithGradiend.intervene``.
+            activation_gate: Optional ACTIEND encoder gate composed with the token selector.
+            activation_modules: Optional ACTIEND activation module filter.
+            threshold: Optional encoder selector threshold.
+            direction: Optional encoder-direction value.
+            target_encoding: Optional encoder-range target value.
+            tolerance: Optional encoder-range tolerance.
+            intervention_kwargs: Additional low-level intervention kwargs.
+            output_path: Optional explicit decoder-grid cache path.
+            raw_output_path: Optional CSV path for per-sample decoder probabilities
+                for every evaluated grid entry.
             use_cache: If True, cached decoder grid results are reused when
                 available under the trainer's experiment_dir. If None, defaults
                 come from trainer training args.
@@ -186,6 +208,16 @@ class Evaluator:
             model_with_gradiend=model_with_gradiend,
             feature_factors=feature_factors,
             lrs=lrs,
+            token_selector=token_selector,
+            activation_gate=activation_gate,
+            activation_modules=activation_modules,
+            threshold=threshold,
+            direction=direction,
+            target_encoding=target_encoding,
+            tolerance=tolerance,
+            intervention_kwargs=intervention_kwargs,
+            output_path=output_path,
+            raw_output_path=raw_output_path,
             use_cache=use_cache,
             split=split,
             max_size=max_size,

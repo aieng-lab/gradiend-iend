@@ -17,6 +17,7 @@ from gradiend.util.encoder_splits import order_split_names
 from gradiend.util.logging import get_logger
 from gradiend.util.paths import ARTIFACT_ENCODER_PLOT, resolve_output_path
 from gradiend.visualizer.labels import (
+    ENCODED_VALUE_LABEL,
     escape_matplotlib_usetex_text,
     resolve_highlight_non_convergence,
     resolve_plot_title_with_convergence,
@@ -521,7 +522,7 @@ def plot_encoder_strip_by_split(
 
     ax.set_xticks(range(len(group_order)))
     ax.set_xticklabels(group_order)
-    ax.set_ylabel("Encoded value")
+    ax.set_ylabel(ENCODED_VALUE_LABEL)
     ax.set_xlabel(encoder_plot_xlabel(includes_neutral_groups=includes_neutral))
     if plot_title:
         ax.set_title(escape_matplotlib_usetex_text(plot_title))

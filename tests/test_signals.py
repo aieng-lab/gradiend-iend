@@ -17,7 +17,7 @@ from gradiend.trainer.core.signals import (
     normalize_signal_arguments,
     require_single_gradient_signal,
 )
-from gradiend.signal_space import default_activation_sites
+from gradiend.signal_space import default_activation_sites, resolve_activation_modules
 
 
 def test_gradient_signal_has_no_scope_options():
@@ -137,6 +137,32 @@ def test_signal_scope_default_and_full_presets_roundtrip():
     assert SignalScope.from_dict(full_scope.to_dict()) == full_scope
 
 
+def test_signal_scope_semantic_shortcuts_roundtrip():
+    all_layers = SignalScope.layers()
+    star_layers = SignalScope.layers("*")
+    one_layer = SignalScope.layer(1)
+    embeddings = SignalScope.embeddings()
+    word_embedding = SignalScope.word_embedding()
+
+    assert all_layers == star_layers
+    assert all_layers.activation_selector == ("layers", None)
+    assert one_layer.activation_selector == ("layers", (1,))
+    assert embeddings.activation_selector == ("embeddings",)
+    assert word_embedding.activation_selector == ("word_embedding",)
+    assert SignalScope.from_dict(all_layers.to_dict()) == all_layers
+    assert SignalScope.from_dict(one_layer.to_dict()) == one_layer
+    assert SignalScope.from_dict(embeddings.to_dict()) == embeddings
+    assert SignalScope.from_dict(word_embedding.to_dict()) == word_embedding
+
+
+def test_signal_scope_rejects_mixed_raw_and_semantic_activation_scopes():
+    with pytest.raises(ValueError, match="either activation_sites or a semantic"):
+        SignalScope.from_values(
+            activation_sites=["encoder.layer.0"],
+            activation_selector=("layers", (0,)),
+        )
+
+
 def test_signal_space_validates_positive_input_dim():
     signal = Signal.gradient()
     space = SignalSpace(signal=signal, input_dim=4, mapping={"kind": "param_map"})
@@ -245,6 +271,7 @@ class BertishEncoder(nn.Module):
 class BertishActivationModel(nn.Module):
     def __init__(self, hidden_size=4):
         super().__init__()
+        self.config = type("Config", (), {"model_type": "bert", "architectures": ["BertForMaskedLM"]})()
         self.embeddings = BertishEmbeddings(hidden_size=hidden_size)
         self.encoder = BertishEncoder(hidden_size=hidden_size)
         self.cls = nn.Linear(hidden_size, 12)
@@ -282,6 +309,111 @@ class TinyConceptActivationModel(nn.Module):
 
 def _concept_inputs(ids):
     return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+
+class GPT2ishBlock(nn.Module):
+    def __init__(self, hidden_size=5):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(hidden_size)
+
+    def forward(self, hidden_states):
+        return self.ln_1(hidden_states)
+
+
+class GPT2ishTransformer(nn.Module):
+    def __init__(self, hidden_size=5):
+        super().__init__()
+        self.wte = nn.Embedding(13, hidden_size)
+        self.h = nn.ModuleList([GPT2ishBlock(hidden_size), GPT2ishBlock(hidden_size)])
+
+
+class GPT2ishActivationModel(nn.Module):
+    def __init__(self, hidden_size=5):
+        super().__init__()
+        self.config = type("Config", (), {"model_type": "gpt2", "architectures": ["GPT2LMHeadModel"]})()
+        self.transformer = GPT2ishTransformer(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, 13)
+
+
+class LlamaishLayer(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(hidden_size)
+
+    def forward(self, hidden_states):
+        return self.input_layernorm(hidden_states)
+
+
+class LlamaishCore(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(17, hidden_size)
+        self.layers = nn.ModuleList([LlamaishLayer(hidden_size), LlamaishLayer(hidden_size)])
+
+
+class LlamaishActivationModel(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.config = type("Config", (), {"model_type": "llama", "architectures": ["LlamaForCausalLM"]})()
+        self.model = LlamaishCore(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, 17)
+
+
+class DistilbertishBlock(nn.Module):
+    def __init__(self, hidden_size=4):
+        super().__init__()
+        self.sa_layer_norm = nn.LayerNorm(hidden_size)
+        self.output_layer_norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, hidden_states):
+        return self.output_layer_norm(self.sa_layer_norm(hidden_states))
+
+
+class DistilbertishTransformer(nn.Module):
+    def __init__(self, hidden_size=4):
+        super().__init__()
+        self.layer = nn.ModuleList([DistilbertishBlock(hidden_size), DistilbertishBlock(hidden_size)])
+
+
+class DistilbertishCore(nn.Module):
+    def __init__(self, hidden_size=4):
+        super().__init__()
+        self.embeddings = BertishEmbeddings(hidden_size=hidden_size)
+        self.transformer = DistilbertishTransformer(hidden_size=hidden_size)
+
+
+class DistilbertishActivationModel(nn.Module):
+    def __init__(self, hidden_size=4):
+        super().__init__()
+        self.config = type(
+            "Config",
+            (),
+            {"model_type": "distilbert", "architectures": ["DistilBertForMaskedLM"]},
+        )()
+        self.distilbert = DistilbertishCore(hidden_size=hidden_size)
+        self.vocab_transform = nn.Linear(hidden_size, hidden_size)
+        self.vocab_projector = nn.Linear(hidden_size, 12)
+
+
+class OPTishDecoder(nn.Module):
+    def __init__(self, hidden_size=5):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(11, hidden_size)
+        self.layers = nn.ModuleList([LlamaishLayer(hidden_size), LlamaishLayer(hidden_size)])
+
+
+class OPTishModel(nn.Module):
+    def __init__(self, hidden_size=5):
+        super().__init__()
+        self.decoder = OPTishDecoder(hidden_size)
+
+
+class OPTishActivationModel(nn.Module):
+    def __init__(self, hidden_size=5):
+        super().__init__()
+        self.config = type("Config", (), {"model_type": "opt", "architectures": ["OPTForCausalLM"]})()
+        self.model = OPTishModel(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, 11)
 
 
 def test_activation_signal_extractor_captures_site_and_token_index():
@@ -374,6 +506,108 @@ def test_activation_signal_extractor_static_input_dim_returns_none_when_unreliab
     assert callable_selector.infer_input_dim_static() is None
 
 
+class MisleadingStaticWidthSite(nn.Module):
+    def __init__(self, *, static_width=5, actual_width=3):
+        super().__init__()
+        self.hidden_size = static_width
+        self.actual_width = actual_width
+        self.forward_count = 0
+
+    def forward(self, input_ids):
+        self.forward_count += 1
+        return torch.zeros(input_ids.shape[0], input_ids.shape[1], self.actual_width)
+
+
+class MisleadingStaticWidthModel(nn.Module):
+    def __init__(self, *, static_width=5, actual_width=3):
+        super().__init__()
+        self.site = MisleadingStaticWidthSite(
+            static_width=static_width,
+            actual_width=actual_width,
+        )
+
+    def forward(self, input_ids, attention_mask=None):
+        return self.site(input_ids.float())
+
+
+def test_activation_signal_extractor_detects_wrong_static_width_on_first_real_forward():
+    model = MisleadingStaticWidthModel(static_width=5, actual_width=3)
+    extractor = ActivationSignalExtractor(
+        model,
+        signal=Signal.activation(token_selector="mean"),
+        scope=SignalScope.from_values(activation_sites=["site"]),
+    )
+
+    assert extractor.infer_input_dim_static() == 5
+    with pytest.raises(ValueError) as exc_info:
+        extractor(
+            factual_inputs={"input_ids": torch.ones(2, 4)},
+            alternative_inputs=None,
+            requires_alternative=False,
+        )
+
+    message = str(exc_info.value)
+    assert "Activation signal width mismatch" in message
+    assert "expected 5" in message
+    assert "width 3" in message
+    assert "site (MisleadingStaticWidthSite)" in message
+    assert "SignalScope.from_values" in message
+    assert model.site.forward_count == 1
+
+
+def test_activation_signal_extractor_prefers_configured_gradiend_width_for_validation():
+    base_model = MisleadingStaticWidthModel(static_width=3, actual_width=3)
+
+    class WrappedModel:
+        def __init__(self, base):
+            self.base_model = base
+            self.gradiend = type("TinyGradiend", (), {"input_dim": 7})()
+
+    extractor = ActivationSignalExtractor(
+        WrappedModel(base_model),
+        signal=Signal.activation(token_selector="mean"),
+        scope=SignalScope.from_values(activation_sites=["site"]),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        extractor(
+            factual_inputs={"input_ids": torch.ones(2, 4)},
+            alternative_inputs=None,
+            requires_alternative=False,
+        )
+
+    message = str(exc_info.value)
+    assert "configured GRADIEND input_dim" in message
+    assert "expected 7" in message
+    assert "width 3" in message
+    assert "checkpoint does not match" in message
+
+
+def test_activation_signal_width_validation_runs_once_after_success():
+    model = MisleadingStaticWidthModel(static_width=3, actual_width=3)
+    extractor = ActivationSignalExtractor(
+        model,
+        signal=Signal.activation(token_selector="mean"),
+        scope=SignalScope.from_values(activation_sites=["site"]),
+    )
+
+    first = extractor(
+        factual_inputs={"input_ids": torch.ones(2, 4)},
+        alternative_inputs=None,
+        requires_alternative=False,
+    )
+    model.site.hidden_size = 99
+    second = extractor(
+        factual_inputs={"input_ids": torch.ones(2, 4)},
+        alternative_inputs=None,
+        requires_alternative=False,
+    )
+
+    assert first.factual.shape == (3,)
+    assert second.factual.shape == (3,)
+    assert model.site.forward_count == 2
+
+
 def test_activation_signal_extractor_pools_all_tokens_for_all_selector():
     model = TinyActivationModel()
     extractor = ActivationSignalExtractor(
@@ -461,6 +695,131 @@ def test_default_activation_scope_uses_representation_stream_not_embedding_inter
 
     assert extractor.infer_input_dim_static() == 12
     assert batch.factual.shape == (12,)
+
+
+def test_semantic_layer_scope_resolves_through_supported_topology():
+    model = BertishActivationModel(hidden_size=4)
+
+    all_layers = resolve_activation_modules(model, (), scope=SignalScope.layers())
+    layer_one = resolve_activation_modules(model, (), scope=SignalScope.layer(1))
+
+    assert tuple(name for name, _module in all_layers) == (
+        "encoder.layer.0",
+        "encoder.layer.1",
+    )
+    assert tuple(name for name, _module in layer_one) == ("encoder.layer.1",)
+
+    extractor = ActivationSignalExtractor(
+        model,
+        signal=Signal.activation(token_selector="mask"),
+        scope=SignalScope.layers(),
+        tokenizer=TinyTokenizer(),
+    )
+
+    assert extractor.infer_input_dim_static() == 8
+
+
+def test_semantic_embedding_scopes_resolve_distinct_sites():
+    model = BertishActivationModel(hidden_size=4)
+
+    embeddings = resolve_activation_modules(model, (), scope=SignalScope.embeddings())
+    word_embedding = resolve_activation_modules(model, (), scope=SignalScope.word_embedding())
+
+    assert tuple(name for name, _module in embeddings) == ("embeddings",)
+    assert tuple(name for name, _module in word_embedding) == ("embeddings.word_embeddings",)
+
+
+def test_semantic_scope_requires_supported_topology():
+    with pytest.raises(ValueError, match="SignalScope.from_values"):
+        resolve_activation_modules(TinyActivationModel(), (), scope=SignalScope.layers())
+
+
+def test_semantic_scope_resolves_distilbert_like_topology():
+    model = DistilbertishActivationModel(hidden_size=4)
+
+    assert default_activation_sites(model) == (
+        "distilbert.embeddings",
+        "distilbert.transformer.layer.0",
+        "distilbert.transformer.layer.1",
+    )
+    assert tuple(name for name, _module in resolve_activation_modules(model, (), scope=SignalScope.layers())) == (
+        "distilbert.transformer.layer.0",
+        "distilbert.transformer.layer.1",
+    )
+    assert tuple(
+        name for name, _module in resolve_activation_modules(model, (), scope=SignalScope.word_embedding())
+    ) == ("distilbert.embeddings.word_embeddings",)
+
+    extractor = ActivationSignalExtractor(
+        model,
+        signal=Signal.activation(token_selector="mean"),
+        scope=SignalScope.layers(),
+    )
+
+    assert extractor.infer_input_dim_static() == 8
+
+
+def test_semantic_scope_resolves_opt_like_topology():
+    model = OPTishActivationModel(hidden_size=5)
+
+    assert default_activation_sites(model) == (
+        "model.decoder.embed_tokens",
+        "model.decoder.layers.0",
+        "model.decoder.layers.1",
+    )
+    assert tuple(name for name, _module in resolve_activation_modules(model, (), scope=SignalScope.layers())) == (
+        "model.decoder.layers.0",
+        "model.decoder.layers.1",
+    )
+
+
+def test_semantic_scope_resolves_gpt2_like_topology():
+    model = GPT2ishActivationModel(hidden_size=5)
+
+    assert default_activation_sites(model) == (
+        "transformer.wte",
+        "transformer.h.0",
+        "transformer.h.1",
+    )
+    assert tuple(name for name, _module in resolve_activation_modules(model, (), scope=SignalScope.layers())) == (
+        "transformer.h.0",
+        "transformer.h.1",
+    )
+    assert tuple(
+        name for name, _module in resolve_activation_modules(model, (), scope=SignalScope.word_embedding())
+    ) == ("transformer.wte",)
+
+    extractor = ActivationSignalExtractor(
+        model,
+        signal=Signal.activation(token_selector="mean"),
+        scope=SignalScope.layers(),
+    )
+
+    assert extractor.infer_input_dim_static() == 10
+
+
+def test_semantic_scope_resolves_llama_like_topology():
+    model = LlamaishActivationModel(hidden_size=6)
+
+    assert default_activation_sites(model) == (
+        "model.embed_tokens",
+        "model.layers.0",
+        "model.layers.1",
+    )
+    assert tuple(name for name, _module in resolve_activation_modules(model, (), scope=SignalScope.layer(0))) == (
+        "model.layers.0",
+    )
+    assert tuple(name for name, _module in resolve_activation_modules(model, (), scope=SignalScope.embeddings())) == (
+        "model.embed_tokens",
+    )
+
+    extractor = ActivationSignalExtractor(
+        model,
+        signal=Signal.activation(token_selector="mean"),
+        scope=SignalScope.layers(),
+    )
+
+    assert extractor.infer_input_dim_static() == 12
 
 
 def test_activation_gradiend_toy_workflow_learns_counterfactual_direction():

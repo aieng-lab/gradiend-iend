@@ -16,9 +16,27 @@ from gradiend.trainer import Trainer
 from gradiend.util.paths import resolve_decoder_stats_path
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.core.signals import Signal, SignalScope
+from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
+from gradiend.gradiend_split import GradiendSplit
 from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel, GradiendModel
 from gradiend.signal_space import resolve_signal_training_plan
 from tests.testing_mocks import SimpleMockModel
+
+
+def test_text_prediction_trainer_defaults_activation_signal_to_prediction_selector():
+    original_args = TrainingArguments(signal=Signal.activation())
+
+    trainer = TextPredictionTrainer(
+        model="mock-base",
+        config=TextPredictionConfig(
+            data=None,
+            target_classes=["3SG", "3PL"],
+        ),
+        args=original_args,
+    )
+
+    assert original_args.signal == Signal.activation()
+    assert trainer.training_args.signal == Signal.activation(token_selector="prediction")
 
 
 def _make_param_map_spec():
@@ -151,6 +169,20 @@ class TestGetModelDuringTraining:
         got = trainer.get_model(use_cache=False)
         assert got is mock_model, "get_model should return _model_instance when set (no load_directory)"
 
+    def test_tokenizer_none_when_model_not_loaded(self, temp_dir):
+        args = TrainingArguments(experiment_dir=temp_dir)
+        trainer = MockTrainerForTest(model="mock-base", args=args)
+        assert trainer.tokenizer is None
+
+    def test_tokenizer_from_model_instance(self, temp_dir):
+        args = TrainingArguments(experiment_dir=temp_dir)
+        trainer = MockTrainerForTest(model="mock-base", args=args)
+        mock_tokenizer = MagicMock()
+        mock_model = MagicMock()
+        mock_model.tokenizer = mock_tokenizer
+        trainer._model_instance = mock_model
+        assert trainer.tokenizer is mock_tokenizer
+
     def test_get_model_loads_from_load_directory_when_passed(self, temp_dir):
         """When load_directory is explicitly passed, get_model loads from that path (not _model_instance)."""
         args = TrainingArguments(experiment_dir=temp_dir)
@@ -235,6 +267,52 @@ class TestGetModelDuringTraining:
         assert passed_args.signal == Signal.activation()
         assert passed_args.signals.ids == ("activation",)
 
+    def test_train_wrapper_does_not_resave_when_core_train_saved_final_checkpoint(self, temp_dir, caplog):
+        args = TrainingArguments(
+            experiment_dir=None,
+            do_eval=False,
+            save_only_best=False,
+            num_train_epochs=1,
+        )
+        trainer = MockTrainerForTest(model="mock-base", args=args)
+        output_dir = os.path.join(temp_dir, "model_out")
+        model = MockModelWithGradiendForTest(
+            SimpleMockModel(),
+            ParamMappedGradiendModel(
+                input_dim=64,
+                latent_dim=1,
+                param_map=_make_param_map_spec(),
+            ),
+        )
+
+        def _save_checkpoint(save_directory, **_kwargs):
+            os.makedirs(save_directory, exist_ok=True)
+            with open(os.path.join(save_directory, "config.json"), "w", encoding="utf-8") as handle:
+                json.dump({"architecture": {"input_dim": 64}}, handle)
+            with open(os.path.join(save_directory, "model.safetensors"), "wb") as handle:
+                handle.write(b"")
+
+        model.save_pretrained = MagicMock(side_effect=_save_checkpoint)
+
+        def _core_train(model_with_gradiend, _dataloader, training_args=None, **_kwargs):
+            model_with_gradiend.save_pretrained(training_args.output_dir)
+
+        with patch.object(trainer, "create_training_data", return_value=[{"item": 1}]):
+            with patch.object(trainer, "create_gradient_training_dataset", return_value=[{"source": torch.randn(64)}]):
+                with patch("gradiend.trainer.trainer.core_train", side_effect=_core_train):
+                    caplog.set_level("INFO", logger="gradiend.trainer.trainer")
+                    selected = trainer._train(
+                        output_dir=output_dir,
+                        args=args,
+                        model=model,
+                        model_with_gradiend_cls=MockModelWithGradiendForTest,
+                        callbacks=None,
+                    )
+
+        assert selected == output_dir
+        assert model.save_pretrained.call_count == 1
+        assert "Saved trained model to" not in caplog.text
+
     def test_activation_signal_constructs_activation_width_gradiend(self):
         base = TinyActivationBase()
         signal_plan = resolve_signal_training_plan(
@@ -257,6 +335,28 @@ class TestGetModelDuringTraining:
         assert gradiend.param_map["activation:emb"]["shape"] == (4,)
         assert gradiend.param_map["activation:block"]["shape"] == (6,)
 
+    def test_activation_signal_split_creates_component_per_activation_site(self):
+        base = TinyActivationBase()
+        signal_plan = resolve_signal_training_plan(
+            base,
+            signal=Signal.activation(token_selector="mask"),
+            scope=SignalScope.from_values(activation_sites=["emb", "block"]),
+        )
+
+        gradiend = SignalSpaceModelWithGradiendForTest._create_gradiend(
+            base,
+            "mock-base",
+            signal_plan=signal_plan,
+            gradiend_split=GradiendSplit.by_tensor(),
+        )
+
+        assert [component.to_dict() for component in gradiend.component_slices] == [
+            {"id": "activation:emb", "start": 0, "end": 4},
+            {"id": "activation:block", "start": 4, "end": 10},
+        ]
+        assert gradiend._component_encoders["activation:emb"].weight.shape == (1, 4)
+        assert gradiend._component_encoders["activation:block"].weight.shape == (1, 6)
+
     def test_activation_signal_requires_statically_known_width(self):
         base = torch.nn.Sequential(torch.nn.ReLU())
 
@@ -272,6 +372,8 @@ class TestGetModelDuringTraining:
             signal=Signal.activation(token_selector="mask"),
             signal_scope=SignalScope.from_values(activation_sites=["embeddings", "encoder.0"]),
             latent_dim=3,
+            bias_encoder=False,
+            bias_decoder=False,
         )
 
         model = SignalSpaceModelWithGradiendForTest.from_pretrained(
@@ -282,9 +384,64 @@ class TestGetModelDuringTraining:
         assert model.gradiend.mapping_kind == "activation"
         assert model.gradiend.input_dim == 128
         assert model.gradiend.latent_dim == 3
+        assert model.gradiend.bias_encoder is False
+        assert model.gradiend.bias_decoder is False
+        assert model.gradiend.encoder[0].bias is None
+        assert model.gradiend.decoder[0].bias is None
         assert list(model.gradiend.param_map) == [
             "activation:embeddings",
             "activation:encoder.0",
+        ]
+
+    def test_from_pretrained_applies_bias_options_to_gradient_gradiend(self):
+        args = TrainingArguments(
+            latent_dim=2,
+            bias_encoder=False,
+            bias_decoder=False,
+        )
+
+        model = SignalSpaceModelWithGradiendForTest.from_pretrained(
+            "mock-base",
+            training_args=args,
+        )
+
+        assert model.gradiend.mapping_kind == "gradient"
+        assert model.gradiend.latent_dim == 2
+        assert model.gradiend.bias_encoder is False
+        assert model.gradiend.bias_decoder is False
+        assert model.gradiend.encoder[0].bias is None
+        assert model.gradiend.decoder[0].bias is None
+
+    def test_from_pretrained_gradient_split_creates_component_per_selected_parameter(self):
+        args = TrainingArguments(
+            gradiend_split=GradiendSplit.by_tensor(),
+            signal_scope=SignalScope.from_values(params=["encoder.0.0.weight", "encoder.0.0.bias"]),
+        )
+
+        model = SignalSpaceModelWithGradiendForTest.from_pretrained(
+            "mock-base",
+            training_args=args,
+        )
+
+        assert [component.to_dict() for component in model.gradiend.component_slices] == [
+            {"id": "encoder.0.0.weight", "start": 0, "end": 4096},
+            {"id": "encoder.0.0.bias", "start": 4096, "end": 4160},
+        ]
+        assert model.gradiend.input_dim == 4160
+        assert model.gradiend._component_encoders["encoder.0.0.bias"].weight.shape == (1, 64)
+
+    def test_from_pretrained_gradient_single_split_preserves_partitioned_mode(self):
+        args = TrainingArguments(gradiend_split=GradiendSplit.single())
+
+        model = SignalSpaceModelWithGradiendForTest.from_pretrained(
+            "mock-base",
+            training_args=args,
+        )
+
+        assert model.gradiend.component_split_mode == "single"
+        assert model.gradiend.has_component_split is True
+        assert [component.to_dict() for component in model.gradiend.component_slices] == [
+            {"id": "full", "start": 0, "end": model.gradiend.input_dim},
         ]
 
     def test_from_pretrained_activation_without_scope_uses_default_scope(self):
@@ -299,6 +456,8 @@ class TestGetModelDuringTraining:
         )
 
         assert model.gradiend.mapping_kind == "activation"
+        assert model.gradiend.bias_encoder is False
+        assert model.gradiend.encoder[0].bias is None
         assert model.gradiend.input_dim > 0
         assert "activation:embeddings" in model.gradiend.param_map
         assert not any(name.startswith("activation:classifier") for name in model.gradiend.param_map)
@@ -959,6 +1118,91 @@ class TestSelectAndSaveChangedModel:
             feature_factor=1.0,
         )
 
+    def test_modify_model_prefers_modify_model_and_modified_saver(self, tmp_path):
+        args = TrainingArguments(experiment_dir=None)
+        trainer = MockTrainerForTest(model="mock-base", args=args)
+        modified = MagicMock()
+        modified.save_pretrained_modified = MagicMock()
+        mock_model = MagicMock()
+        mock_model.modify_model = MagicMock(return_value=modified)
+        trainer._model_instance = mock_model
+        trainer._model_arg = "mock-base"
+
+        result = trainer.modify_model(
+            decoder_results=self._decoder_results_with_class_keys(),
+            target_class="masc_nom",
+            output_dir=str(tmp_path / "modified"),
+        )
+
+        assert result == str(tmp_path / "modified")
+        mock_model.modify_model.assert_called_once_with(
+            learning_rate=1e-4,
+            feature_factor=1.0,
+            token_selector=None,
+            threshold=0.5,
+            direction=None,
+            target_encoding=None,
+            tolerance=0.2,
+        )
+        modified.save_pretrained_modified.assert_called_once_with(str(tmp_path / "modified"))
+
+    def test_modify_model_without_output_dir_returns_in_memory_model_and_does_not_save(self):
+        args = TrainingArguments(experiment_dir=None)
+        trainer = MockTrainerForTest(model="mock-base", args=args)
+        modified = MagicMock()
+        modified.save_pretrained_modified = MagicMock()
+        mock_model = MagicMock()
+        mock_model.modify_model = MagicMock(return_value=modified)
+        trainer._model_instance = mock_model
+        trainer._model_arg = "mock-base"
+
+        result = trainer.modify_model(
+            decoder_results=self._decoder_results_with_class_keys(),
+            target_class="masc_nom",
+        )
+
+        assert result is modified
+        mock_model.modify_model.assert_called_once_with(
+            learning_rate=1e-4,
+            feature_factor=1.0,
+            token_selector=None,
+            threshold=0.5,
+            direction=None,
+            target_encoding=None,
+            tolerance=0.2,
+        )
+        modified.save_pretrained_modified.assert_not_called()
+
+    def test_modify_model_forwards_activation_application_policy(self):
+        args = TrainingArguments(experiment_dir=None)
+        trainer = MockTrainerForTest(model="mock-base", args=args)
+        modified = MagicMock()
+        mock_model = MagicMock()
+        mock_model.modify_model = MagicMock(return_value=modified)
+        trainer._model_instance = mock_model
+        trainer._model_arg = "mock-base"
+
+        result = trainer.modify_model(
+            decoder_results=self._decoder_results_with_class_keys(),
+            target_class="masc_nom",
+            token_selector="prediction",
+            activation_gate="encoder_direction",
+            activation_modules=["transformer.h.9"],
+        )
+
+        assert result is modified
+        mock_model.modify_model.assert_called_once_with(
+            learning_rate=1e-4,
+            feature_factor=1.0,
+            token_selector="prediction",
+            activation_gate="encoder_direction",
+            activation_modules=["transformer.h.9"],
+            threshold=0.5,
+            direction=None,
+            target_encoding=None,
+            tolerance=0.2,
+        )
+
     def test_rewrite_base_model_accepts_target_class_as_class_id_for_fem_nom(self):
         """target_class 'fem_nom' should match decoder result key directly."""
         args = TrainingArguments(experiment_dir=None)
@@ -1077,7 +1321,7 @@ class TestSelectAndSaveChangedModel:
         """When output_dir is provided, rewrite_base_model saves models and returns paths."""
         args = TrainingArguments(experiment_dir=str(tmp_path))
         trainer = MockTrainerForTest(model="mock-base", args=args)
-        
+
         # Create a mock model that can be saved
         mock_model = MagicMock()
         mock_rewritten = MagicMock()
@@ -1144,7 +1388,7 @@ class TestSelectAndSaveChangedModel:
         """When multiple target classes and experiment_dir, rewrite_base_model saves all models."""
         args = TrainingArguments(experiment_dir=str(tmp_path))
         trainer = MockTrainerForTest(model="mock-base", args=args)
-        
+
         mock_model = MagicMock()
         mock_rewritten1 = MagicMock()
         mock_rewritten2 = MagicMock()
@@ -1189,7 +1433,7 @@ class TestSelectAndSaveChangedModel:
         """When single target_class with output_dir, rewrite_base_model returns single path string."""
         args = TrainingArguments(experiment_dir=str(tmp_path))
         trainer = MockTrainerForTest(model="mock-base", args=args)
-        
+
         mock_model = MagicMock()
         mock_rewritten = MagicMock()
         mock_model.rewrite_base_model = MagicMock(return_value=mock_rewritten)

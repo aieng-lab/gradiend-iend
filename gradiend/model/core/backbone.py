@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 from gradiend.model import ParamMappedGradiendModel
+from gradiend.gradiend_split import coerce_gradiend_split, resolve_gradiend_components
 from gradiend.model.utils import freeze_params_until_target
 from gradiend.util import get_logger, unwrap_model
 
@@ -159,6 +160,7 @@ def build_gradiend_from_base_model(
     params: Optional[List[str]] = None,
     scope_params: Optional[List[str]] = None,
     scope_mode: str = "default",
+    gradiend_split: Any = None,
     latent_dim: int = 1,
     torch_dtype: Optional[torch.dtype] = None,
     device_encoder: Optional[torch.device] = None,
@@ -277,6 +279,12 @@ def build_gradiend_from_base_model(
         param_map_spec[name] = {"shape": tuple(p.shape), "repr": "all"}
 
     input_dim = int(sum(p.numel() for p in (param_lookup[n] for n in param_map)))
+    split_config = coerce_gradiend_split(gradiend_split)
+    component_slices = resolve_gradiend_components(
+        param_map_spec,
+        split_config,
+        input_dim=input_dim,
+    )
 
     gradiend_kwargs = {
         k: v for k, v in kwargs.items()
@@ -292,6 +300,8 @@ def build_gradiend_from_base_model(
         device_encoder=device_encoder,
         device_decoder=device_decoder,
         lazy_init=lazy_init,
+        component_slices=component_slices,
+        component_split_mode=split_config.mode if split_config is not None else None,
         **gradiend_kwargs,
     )
 

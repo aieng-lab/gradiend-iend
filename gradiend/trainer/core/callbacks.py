@@ -9,7 +9,7 @@ Provided callbacks:
 - EvaluationCallback: periodic evaluation (correlation, mean_by_class).
 - NormalizationCallback: invert encoding when correlation < -0.5 (single latent).
 - CheckpointCallback: save best model and optional periodic checkpoints.
-- LoggingCallback: log loss, correlation, encoder/decoder norms.
+- LoggingCallback: log mean loss over the report window, correlation, class means.
 - EarlyStoppingCallback: stop when metric has not improved for N steps.
 - TensorBoardCallback: log metrics to TensorBoard (optional).
 """
@@ -18,6 +18,16 @@ from typing import Optional, Callable, Dict, Any, Union, List
 from abc import ABC
 
 from gradiend.util.logging import get_logger
+from gradiend.util.component_logging import format_component_convergence_fragment
+from gradiend.trainer.core.component_seed import (
+    merge_rank_from_summary,
+    model_has_component_split,
+    payload_from_component_best_states,
+    save_component_best_states,
+    save_merged_component_best_checkpoint,
+    summary_from_component_best_states,
+    update_component_best_states,
+)
 
 logger = get_logger(__name__)
 
@@ -40,6 +50,10 @@ def _current_step_correlation(
     training_stats: Dict[str, Any],
     eval_result: Optional[Dict[str, Any]],
 ) -> Optional[float]:
+    if isinstance(eval_result, dict):
+        component_summary = eval_result.get("component_summary")
+        if isinstance(component_summary, dict) and component_summary.get("correlation_mean") is not None:
+            return float(component_summary["correlation_mean"])
     if isinstance(eval_result, dict) and eval_result.get("correlation") is not None:
         return float(eval_result["correlation"])
     scores = training_stats.get("scores")
@@ -48,7 +62,90 @@ def _current_step_correlation(
     return None
 
 
-def _format_loss_for_log(loss: float) -> str:
+def _target_mean_converged(mean_by_class: Any, mean_threshold: Any) -> tuple[bool, Optional[float], Optional[float]]:
+    if not isinstance(mean_by_class, dict):
+        return False, None, None
+    target_means = [
+        float(value)
+        for label, value in mean_by_class.items()
+        if str(label) not in {"0", "0.0"} and isinstance(value, (int, float))
+    ]
+    if len(target_means) != 2:
+        return False, None, None
+    product = target_means[0] * target_means[1]
+    min_abs = min(abs(value) for value in target_means)
+    mean_ok = mean_threshold is None or min_abs >= float(mean_threshold)
+    return product < 0 and mean_ok, product, min_abs
+
+
+def _attach_component_convergence(eval_result: Dict[str, Any], config: Any) -> None:
+    components = eval_result.get("components")
+    if not isinstance(components, dict):
+        return
+    metrics_by_component = components.get("metrics_by_component")
+    summary = dict(components.get("summary") or {})
+    if not isinstance(metrics_by_component, dict) or not metrics_by_component:
+        return
+    threshold = _config_get(config, "convergent_score_threshold", None)
+    mean_threshold = _config_get(config, "convergent_mean_by_class_threshold", None)
+    n_converged = 0
+    convergence_by_component: Dict[str, Any] = {}
+    correlations = []
+    min_abs_means = []
+    for component_id, metrics in metrics_by_component.items():
+        corr = metrics.get("correlation") if isinstance(metrics, dict) else None
+        if isinstance(corr, (int, float)):
+            correlations.append(float(corr))
+        mean_by_class = metrics.get("mean_by_class") if isinstance(metrics, dict) else None
+        means_ok, product, min_abs = _target_mean_converged(mean_by_class, mean_threshold)
+        if isinstance(min_abs, (int, float)):
+            min_abs_means.append(float(min_abs))
+        score_ok = threshold is None or (isinstance(corr, (int, float)) and abs(float(corr)) >= float(threshold))
+        converged = bool(score_ok and means_ok)
+        if converged:
+            n_converged += 1
+        convergence_by_component[str(component_id)] = {
+            "converged": converged,
+            "correlation": float(corr) if isinstance(corr, (int, float)) else None,
+            "target_mean_product": product,
+            "min_target_class_abs_mean": min_abs,
+        }
+    n_components = int(summary.get("n_components") or len(metrics_by_component))
+    summary.update({
+        "n_components": n_components,
+        "n_converged": n_converged,
+        "convergence_rate": float(n_converged / n_components) if n_components else 0.0,
+        "convergence_policy": "all",
+        "converged": n_components > 0 and n_converged == n_components,
+    })
+    if correlations:
+        sorted_corr = sorted(correlations)
+        mid = len(sorted_corr) // 2
+        median = (
+            sorted_corr[mid]
+            if len(sorted_corr) % 2
+            else (sorted_corr[mid - 1] + sorted_corr[mid]) / 2.0
+        )
+        summary.update({
+            "correlation_mean": sum(correlations) / len(correlations),
+            "correlation_median": median,
+            "correlation_min": min(correlations),
+            "correlation_max": max(correlations),
+            "correlation_abs_mean": sum(abs(v) for v in correlations) / len(correlations),
+            "correlation_abs_min": min(abs(v) for v in correlations),
+            "correlation_abs_max": max(abs(v) for v in correlations),
+        })
+    if min_abs_means:
+        summary["min_target_class_abs_mean"] = min(min_abs_means)
+    components["summary"] = summary
+    components["convergence_by_component"] = convergence_by_component
+    eval_result["components"] = components
+    eval_result["component_summary"] = summary
+
+
+def _format_loss_for_log(loss: Optional[float]) -> str:
+    if loss is None:
+        return "None"
     value = float(loss)
     if value != 0.0 and abs(value) < 1e-4:
         return f"{value:.3e}"
@@ -138,6 +235,7 @@ class EvaluationCallback(TrainingCallback):
                 eval_result = self.evaluate_fn(config=config, training_stats=training_stats)
 
                 if eval_result:
+                    _attach_component_convergence(eval_result, config)
                     # Store label_value_to_class_name once (same for all steps); used for display
                     if "label_value_to_class_name" in eval_result:
                         training_stats["label_value_to_class_name"] = eval_result["label_value_to_class_name"]
@@ -159,8 +257,15 @@ class EvaluationCallback(TrainingCallback):
                             training_stats[key] = {step: value}
 
                     # Ensure correlation is set (and per-step history)
-                    if 'correlation' in eval_result:
-                        val = eval_result['correlation']
+                    current_corr = _current_step_correlation(
+                        step=step,
+                        training_stats=training_stats,
+                        eval_result=eval_result,
+                    )
+                    if current_corr is not None:
+                        if "component_summary" in eval_result and eval_result.get("correlation") is not None:
+                            training_stats.setdefault("aggregate_correlation", {})[step] = eval_result["correlation"]
+                        val = current_corr
                         training_stats['correlation'] = val
                         if 'scores' not in training_stats:
                             training_stats['scores'] = {}
@@ -208,6 +313,62 @@ class NormalizationCallback(TrainingCallback):
         if not self.normalize or eval_result is None:
             return
         
+        if (
+            model.gradiend.latent_dim == 1
+            and bool(getattr(model.gradiend, "has_component_split", False))
+            and isinstance(eval_result.get("components"), dict)
+        ):
+            metrics_by_component = eval_result["components"].get("metrics_by_component", {})
+            normalized = []
+            for component_id, metrics in metrics_by_component.items():
+                if not isinstance(metrics, dict):
+                    continue
+                corr_raw = metrics.get("correlation")
+                if corr_raw is None:
+                    continue
+                corr = float(corr_raw)
+                if corr < -0.6:
+                    index = metrics.get("component_index")
+                    try:
+                        model.gradiend._component_view(int(index)).invert_encoding()
+                        metrics["correlation"] = -corr
+                        for key in (
+                            "mean_by_class",
+                            "mean_by_feature_class",
+                            "mean_by_type",
+                            "neutral_mean_by_type",
+                        ):
+                            means = metrics.get(key)
+                            if isinstance(means, dict):
+                                metrics[key] = {
+                                    k: (-float(v) if isinstance(v, (int, float)) else v)
+                                    for k, v in means.items()
+                                }
+                        normalized.append(component_id)
+                    except Exception as exc:
+                        logger.warning("Could not normalize component %s: %s", component_id, exc)
+            if normalized:
+                method_name = getattr(model.gradiend, "method_name", "GRADIEND")
+                n_components = len(normalized)
+                noun = "component encoding" if n_components == 1 else "component encodings"
+                logger.info(
+                    "Inverted %s %s %s: %s",
+                    n_components,
+                    method_name,
+                    noun,
+                    ", ".join(map(str, normalized)),
+                )
+                _attach_component_convergence(eval_result, config)
+                if isinstance(training_stats.get("components"), dict):
+                    training_stats["components"][step] = eval_result.get("components")
+                if isinstance(training_stats.get("component_summary"), dict):
+                    training_stats["component_summary"][step] = eval_result.get("component_summary")
+                corr = _current_step_correlation(step=step, training_stats=training_stats, eval_result=eval_result)
+                if corr is not None:
+                    training_stats["correlation"] = corr
+                    training_stats.setdefault("scores", {})[step] = corr
+            return
+
         if model.gradiend.latent_dim == 1 and 'mean_by_class' in eval_result:
             # For normalization, if the correlation is strongly negative, invert the encoding.
             try:
@@ -285,10 +446,23 @@ class NormalizationCallback(TrainingCallback):
                         mbfc_hist = training_stats.get('mean_by_feature_class')
                         if isinstance(mbfc_hist, dict):
                             mbfc_hist[step] = flipped_mbfc
+
+                    for mean_key in ("mean_by_type", "neutral_mean_by_type"):
+                        mean_by_type = eval_result.get(mean_key)
+                        if isinstance(mean_by_type, dict):
+                            flipped_mean_by_type = {
+                                k: (-float(v) if isinstance(v, (int, float)) else v)
+                                for k, v in mean_by_type.items()
+                            }
+                            eval_result[mean_key] = flipped_mean_by_type
+                            mean_type_hist = training_stats.get(mean_key)
+                            if isinstance(mean_type_hist, dict):
+                                mean_type_hist[step] = flipped_mean_by_type
             except Exception as e:
                 logger.warning(f"Error during normalization: {e}")
         elif model.gradiend.latent_dim > 1:
-            logger.warning('Normalization is only implemented for single feature GRADIENDs')
+            method_name = getattr(model.gradiend, "method_name", "GRADIEND")
+            logger.warning("Normalization is only implemented for single-feature %s models", method_name)
     
     def on_epoch_end(self, epoch: int, model, config: Dict[str, Any], **kwargs):
         """No action needed at epoch end."""
@@ -328,64 +502,158 @@ class CheckpointCallback(TrainingCallback):
         self.best_score = None
         self.best_step = None
         self.best_epoch = None
+        self.component_best_states: Dict[str, Dict[str, Any]] = {}
+        self._best_merge_rank: Optional[tuple] = None
+        self._best_merge_summary: Optional[Dict[str, Any]] = None
 
     def on_step_end(self, step: int, loss: float, model, config: Dict[str, Any],
                     training_stats: Dict[str, Any], **kwargs):
         """Save checkpoint if needed."""
-        if self.use_loss_for_best:
-            # Best = lowest loss (e.g. supervised_decoder; correlation not meaningful)
-            is_better = self.best_score is None or loss < self.best_score
-            score_for_log = loss
-        else:
-            corr = _current_step_correlation(
-                step=step,
-                training_stats=training_stats,
-                eval_result=kwargs.get("eval_result"),
-            )
-            # No current-step evaluation result; do not treat stale/sentinel correlation as a checkpoint score.
-            if corr is None:
-                is_better = False
-                score_for_log = None
-            else:
-                is_better = self.best_score is None or abs(corr) > abs(self.best_score)
-                score_for_log = corr
-
-        if is_better:
-            was_first = self.best_score is None
-            old_score = self.best_score
-            self.best_score = loss if self.use_loss_for_best else corr
-            self.best_step = step
-            self.best_epoch = kwargs.get('epoch', 0)
-
-            if was_first:
-                logger.debug(f'First {"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f} at step {step}')
-            elif score_for_log is not None:
-                logger.debug(f'New best {"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f} at step {step} (previous: {old_score:.4f})')
-
-            if step > 0:
-                best_output = f'{self.output}_best'
-                training_info = {
-                    'losses': kwargs.get('losses', []),
-                    'best_score_checkpoint': {
-                        'correlation': None if self.use_loss_for_best else self.best_score,
-                        'loss': loss,
-                        'global_step': step,
-                        'epoch': self.best_epoch,
-                    },
-                    'training_stats': training_stats,
-                    'training_args': config,
-                }
-                model.save_pretrained(best_output, training=training_info)
-                if score_for_log is not None:
-                    logger.debug(
-                        f'Saved best model checkpoint at step {step} '
-                        f'({"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f})'
-                    )
-            else:
+        # Always refresh running local-best component slices first. For
+        # component-split models these define the best merged checkpoint.
+        updated_components = update_component_best_states(
+            self.component_best_states,
+            model=model,
+            eval_result=kwargs.get("eval_result"),
+            step=step,
+            epoch=kwargs.get("epoch"),
+        )
+        if updated_components:
+            path = save_component_best_states(self.output, self.component_best_states)
+            if path:
                 logger.debug(
-                    "Initial step-0 evaluation is currently best, but is not saved as a selectable "
-                    "checkpoint; trained or final model state will be used instead."
+                    "Saved component-best tensor state(s) for %s component(s) to %s",
+                    len(updated_components),
+                    path,
                 )
+
+        component_split = model_has_component_split(model)
+        if component_split and self.component_best_states and not self.use_loss_for_best:
+            merge_summary = summary_from_component_best_states(self.component_best_states)
+            merge_rank = merge_rank_from_summary(merge_summary)
+            is_better = self._best_merge_rank is None or merge_rank > self._best_merge_rank
+            score_for_log = (
+                None
+                if merge_summary is None
+                else merge_summary.get("correlation_mean")
+            )
+            if is_better and merge_summary is not None:
+                was_first = self._best_merge_rank is None
+                old_score = self.best_score
+                self._best_merge_rank = merge_rank
+                self._best_merge_summary = merge_summary
+                self.best_score = score_for_log
+                self.best_step = step
+                self.best_epoch = kwargs.get("epoch", 0)
+                if was_first:
+                    logger.debug(
+                        "First component-best merge correlation_mean: %s at step %s (%s/%s converged)",
+                        f"{score_for_log:.4f}" if isinstance(score_for_log, (int, float)) else score_for_log,
+                        step,
+                        merge_summary.get("n_converged"),
+                        merge_summary.get("n_components"),
+                    )
+                elif isinstance(score_for_log, (int, float)):
+                    logger.debug(
+                        "New best component-best merge: correlation_mean=%s at step %s "
+                        "(%s/%s converged; previous mean=%s)",
+                        f"{score_for_log:.4f}",
+                        step,
+                        merge_summary.get("n_converged"),
+                        merge_summary.get("n_components"),
+                        f"{old_score:.4f}" if isinstance(old_score, (int, float)) else old_score,
+                    )
+                if step > 0:
+                    best_output = f"{self.output}_best"
+                    merge_payload = payload_from_component_best_states(self.component_best_states)
+                    training_info = {
+                        "losses": kwargs.get("losses", []),
+                        "best_score_checkpoint": {
+                            "correlation": score_for_log,
+                            "loss": loss,
+                            "global_step": step,
+                            "epoch": self.best_epoch,
+                            "selection": "component_best_merge",
+                            "component_best_steps": merge_summary.get("component_best_steps"),
+                            "n_converged": merge_summary.get("n_converged"),
+                            "n_components": merge_summary.get("n_components"),
+                        },
+                        "training_stats": training_stats,
+                        "training_args": config,
+                        "component_best_merge": merge_payload,
+                    }
+                    save_merged_component_best_checkpoint(
+                        model,
+                        self.component_best_states,
+                        best_output=best_output,
+                        training_info=training_info,
+                    )
+                    logger.debug(
+                        "Saved component-best merged checkpoint at step %s "
+                        "(correlation_mean: %s)",
+                        step,
+                        f"{score_for_log:.4f}" if isinstance(score_for_log, (int, float)) else score_for_log,
+                    )
+                else:
+                    logger.debug(
+                        "Initial step-0 evaluation updated component-best slices, but is not saved "
+                        "as a selectable merged checkpoint; trained or final merge will be used instead."
+                    )
+        else:
+            if self.use_loss_for_best:
+                # Best = lowest loss (e.g. supervised_decoder; correlation not meaningful)
+                is_better = self.best_score is None or loss < self.best_score
+                score_for_log = loss
+            else:
+                corr = _current_step_correlation(
+                    step=step,
+                    training_stats=training_stats,
+                    eval_result=kwargs.get("eval_result"),
+                )
+                # No current-step evaluation result; do not treat stale/sentinel correlation as a checkpoint score.
+                if corr is None:
+                    is_better = False
+                    score_for_log = None
+                else:
+                    is_better = self.best_score is None or abs(corr) > abs(self.best_score)
+                    score_for_log = corr
+
+            if is_better:
+                was_first = self.best_score is None
+                old_score = self.best_score
+                self.best_score = loss if self.use_loss_for_best else corr
+                self.best_step = step
+                self.best_epoch = kwargs.get('epoch', 0)
+
+                if was_first:
+                    logger.debug(f'First {"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f} at step {step}')
+                elif score_for_log is not None:
+                    logger.debug(f'New best {"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f} at step {step} (previous: {old_score:.4f})')
+
+                if step > 0:
+                    best_output = f'{self.output}_best'
+                    training_info = {
+                        'losses': kwargs.get('losses', []),
+                        'best_score_checkpoint': {
+                            'correlation': None if self.use_loss_for_best else self.best_score,
+                            'loss': loss,
+                            'global_step': step,
+                            'epoch': self.best_epoch,
+                        },
+                        'training_stats': training_stats,
+                        'training_args': config,
+                    }
+                    model.save_pretrained(best_output, training=training_info)
+                    if score_for_log is not None:
+                        logger.debug(
+                            f'Saved best model checkpoint at step {step} '
+                            f'({"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f})'
+                        )
+                else:
+                    logger.debug(
+                        "Initial step-0 evaluation is currently best, but is not saved as a selectable "
+                        "checkpoint; trained or final model state will be used instead."
+                    )
         
         # Save periodic checkpoint
         if self.checkpoint_step > 0 and step % self.checkpoint_step == 0 and step > 0:
@@ -405,6 +673,11 @@ class CheckpointCallback(TrainingCallback):
             best_score_checkpoint['correlation'] = None
         else:
             best_score_checkpoint['correlation'] = self.best_score
+        if isinstance(self._best_merge_summary, dict):
+            best_score_checkpoint['selection'] = 'component_best_merge'
+            best_score_checkpoint['component_best_steps'] = self._best_merge_summary.get('component_best_steps')
+            best_score_checkpoint['n_converged'] = self._best_merge_summary.get('n_converged')
+            best_score_checkpoint['n_components'] = self._best_merge_summary.get('n_components')
         training_info = {
             'losses': losses,
             'best_score_checkpoint': best_score_checkpoint,
@@ -413,8 +686,19 @@ class CheckpointCallback(TrainingCallback):
         }
         # Save full model (including gradiend_context.json) so the directory is always loadable.
         # When save_only_best is True, _handle_keep_only_best may replace this with output_best.
+        # For component-split, epoch output is the live training weights; the selectable best
+        # remains the merged component-best checkpoint under output_best.
         model.save_pretrained(self.output, training=training_info)
         logger.info(f'Saved model after epoch {epoch + 1} to {self.output}')
+
+
+def _mean_recent_loss(last_losses, n_loss_report: int) -> Optional[float]:
+    """Mean of losses in the current report window (last ``n_loss_report`` steps)."""
+    if not last_losses:
+        return None
+    window = n_loss_report if n_loss_report and n_loss_report > 0 else len(last_losses)
+    recent = last_losses[-window:]
+    return float(sum(recent) / len(recent))
 
 
 class LoggingCallback(TrainingCallback):
@@ -423,7 +707,7 @@ class LoggingCallback(TrainingCallback):
     def __init__(self, n_loss_report: int = 100, loss_only: bool = False):
         """
         Args:
-            n_loss_report: Log every N steps
+            n_loss_report: Log every N steps. Reported Loss is the mean over that window.
             loss_only: If True (e.g. supervised_decoder), correlation is N/A; log loss only.
         """
         self.n_loss_report = n_loss_report
@@ -483,6 +767,28 @@ class LoggingCallback(TrainingCallback):
                 ]
                 mean_str = ", ".join(parts)
 
+            neutral_str = ""
+            neutral_means = eval_result.get("neutral_mean_by_type") if isinstance(eval_result, dict) else None
+            if not isinstance(neutral_means, dict):
+                neutral_hist = training_stats.get("neutral_mean_by_type")
+                neutral_means = neutral_hist.get(step) if isinstance(neutral_hist, dict) else None
+            neutral_abs_means = eval_result.get("abs_mean_by_type") if isinstance(eval_result, dict) else None
+            if not isinstance(neutral_abs_means, dict):
+                neutral_abs_hist = training_stats.get("abs_mean_by_type")
+                neutral_abs_means = neutral_abs_hist.get(step) if isinstance(neutral_abs_hist, dict) else None
+            if isinstance(neutral_means, dict) and neutral_means:
+                neutral_parts = []
+                for key, value in sorted(neutral_means.items(), key=lambda item: str(item[0])):
+                    if not isinstance(value, (int, float)):
+                        continue
+                    part = f"{key}: {float(value):.4f}"
+                    if isinstance(neutral_abs_means, dict):
+                        abs_value = neutral_abs_means.get(key)
+                        if isinstance(abs_value, (int, float)):
+                            part += f" abs={float(abs_value):.4f}"
+                    neutral_parts.append(part)
+                neutral_str = ", ".join(neutral_parts)
+
             suffix = ""
             if eval_is_enabled and corr is not None:
                 # Compare against the best correlation seen so far (including step 0)
@@ -491,12 +797,27 @@ class LoggingCallback(TrainingCallback):
                 if self._best_corr_including_start is None or abs(corr) > abs(self._best_corr_including_start):
                     suffix = " (new best)"
                     self._best_corr_including_start = float(corr)
-            parts = [f"Step {step}", f"Loss: {_format_loss_for_log(loss)}"]
+            # Prefer mean over the report window so class cycling (e.g. M/F vs neutral
+            # identity) does not make the logged loss look like a crash.
+            reported_loss = _mean_recent_loss(last_losses, self.n_loss_report)
+            if reported_loss is None and loss is not None:
+                reported_loss = float(loss)
+            parts = [f"Step {step}", f"Loss: {_format_loss_for_log(reported_loss)}"]
             if eval_is_enabled:
                 corr_str = "N/A" if corr is None else f"{corr:.4f}"
                 parts.append(f"Correlation: {corr_str}")
+                component_fragment = ""
+                if isinstance(eval_result, dict):
+                    component_fragment = format_component_convergence_fragment(
+                        eval_result.get("components"),
+                        summary=eval_result.get("component_summary"),
+                    )
+                if component_fragment:
+                    parts.append(component_fragment)
                 if mean_str:
                     parts.append(f"mean: {mean_str}")
+                if neutral_str:
+                    parts.append(f"neutral: {neutral_str}")
             logger.info(", ".join(parts) + suffix)
     
     def on_epoch_end(self, epoch: int, model, config: Dict[str, Any], 

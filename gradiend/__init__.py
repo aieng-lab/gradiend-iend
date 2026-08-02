@@ -56,8 +56,12 @@ except PackageNotFoundError:
 __all__ = [
     # Core model
     "GradiendModel",
+    "GradiendComponent",
+    "GradiendSplit",
     "ParamMappedGradiendModel",
     "ModelWithGradiend",
+    "load_modified_model",
+    "save_modified_model",
     # Data (high-level)
     "TextFilterConfig",
     "TextPredictionDataCreator",
@@ -114,6 +118,10 @@ __all__ = [
     "plot_similarity_heatmap",
     "plot_topk_overlap_heatmap",
     "plot_topk_overlap_venn",
+    "compute_token_encodings",
+    "highlight_token_encoding",
+    "render_token_encoding_html",
+    "resolve_encoding_color_norm",
     "check_plot_environment",
     "configure_plot_style",
     "PlotStyleConfig",
@@ -126,8 +134,12 @@ __all__ = [
 _LAZY_IMPORTS = {
     # Core model classes
     "GradiendModel": ("gradiend.model", "GradiendModel"),
+    "GradiendComponent": ("gradiend.model", "GradiendComponent"),
     "ParamMappedGradiendModel": ("gradiend.model", "ParamMappedGradiendModel"),
     "ModelWithGradiend": ("gradiend.model", "ModelWithGradiend"),
+    "load_modified_model": ("gradiend.model", "load_modified_model"),
+    "save_modified_model": ("gradiend.model", "save_modified_model"),
+    "GradiendSplit": ("gradiend.gradiend_split", "GradiendSplit"),
     # High-level data API
     "TextFilterConfig": ("gradiend.data", "TextFilterConfig"),
     "TextPredictionDataCreator": ("gradiend.data", "TextPredictionDataCreator"),
@@ -170,6 +182,10 @@ _LAZY_IMPORTS = {
     "plot_similarity_heatmap": ("gradiend.visualizer", "plot_similarity_heatmap"),
     "plot_topk_overlap_heatmap": ("gradiend.visualizer", "plot_topk_overlap_heatmap"),
     "plot_topk_overlap_venn": ("gradiend.visualizer", "plot_topk_overlap_venn"),
+    "compute_token_encodings": ("gradiend.visualizer", "compute_token_encodings"),
+    "highlight_token_encoding": ("gradiend.visualizer", "highlight_token_encoding"),
+    "render_token_encoding_html": ("gradiend.visualizer", "render_token_encoding_html"),
+    "resolve_encoding_color_norm": ("gradiend.visualizer", "resolve_encoding_color_norm"),
     "check_plot_environment": ("gradiend.visualizer", "check_plot_environment"),
     "configure_plot_style": ("gradiend.visualizer", "configure_plot_style"),
     "PlotStyleConfig": ("gradiend.visualizer", "PlotStyleConfig"),

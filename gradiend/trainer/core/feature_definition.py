@@ -576,7 +576,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
     def _get_expected_encoder_keys(self, source_type: str) -> FrozenSet[Any]:
         """
         Expected (source_id, target_id) or source_id keys for encoder analysis, without iterating eval data.
-        Modality-independent; uses definition.target_classes, definition.pair, definition.training_args.add_identity_for_other_classes.
+        Modality-independent; uses definition.target_classes, definition.pair, and identity augmentation flags.
         When add_identity_for_other_classes=False: every pair of classes (excluding identities).
         When add_identity_for_other_classes=True: the two training transitions + identity pairs for non-target
         classes only (all_classes \\ target_classes; none if all_classes equals target_classes).
@@ -586,18 +586,25 @@ class FeatureLearningDefinition(DataProvider, ABC):
         pair = self.pair
         if not target_classes:
             return frozenset()
-        neutral_aug = getattr(getattr(self, "training_args", None), "add_identity_for_other_classes", False)
+        args = getattr(self, "training_args", None)
+        neutral_aug = getattr(args, "add_identity_for_other_classes", False)
+        neutral_identity_aug = getattr(args, "add_neutral_identity_transitions", False)
         if source_type == "factual":
-            return frozenset(target_classes)
-        if not neutral_aug:
+            keys = set(target_classes)
+            if neutral_identity_aug:
+                keys.add("neutral")
+            return frozenset(keys)
+        if not neutral_aug and not neutral_identity_aug:
             return frozenset((s, t) for s in target_classes for t in target_classes if s != t)
         if pair is None:
             return frozenset()
         c1, c2 = pair[0], pair[1]
-        training = frozenset({(c1, c2), (c2, c1)})
+        training = {(c1, c2), (c2, c1)}
         # Identity only for non-target classes (all_classes \ target_classes)
-        identity_others = frozenset((c, c) for c in (self.non_target_classes or []))
-        return training | identity_others
+        training.update((c, c) for c in (self.non_target_classes or []) if neutral_aug)
+        if neutral_identity_aug:
+            training.add(("neutral", "neutral"))
+        return frozenset(training)
 
     @abstractmethod
     def _get_decoder_eval_dataframe(

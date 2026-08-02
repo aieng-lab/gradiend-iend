@@ -17,8 +17,9 @@ prediction objectives, and multi-seed analysis.
 |----------|---------|-------------|
 | **experiment_dir** | `None` | Root directory for this experiment. With `run_id`, trainer artifacts go under `experiment_dir/run_id/`. |
 | **output_dir** | `None` | Directory for the trained model. If omitted and `experiment_dir` is set, GRADIEND derives a model path under the experiment directory. |
-| **use_cache** | `False` | Training checkpoint reuse policy: `False`, `True`, `"always"`, or `"only_convergent"`. `True` and `"only_convergent"` require a matching `cache_fingerprint` in `training.json` (pruning config, `source`/`target`, `reuse_pre_prune`, `gradiend_input_dim`). `"always"` reuses any saved checkpoint without fingerprint checks. `"only_convergent"` additionally requires convergence metadata. Fingerprinting is **partial** — it does not compare most hyperparameters, data, or model-selection settings; see [Tutorial: Training](../tutorials/training.md#experiment-directory-and-caching-use_cache). Evaluator/visualizer cache arguments are separate. |
+| **use_cache** | `False` | Training checkpoint reuse policy: `False`, `True`, `"always"`, or `"only_convergent"`. `True` and `"only_convergent"` require a matching `cache_fingerprint` in `training.json` (pruning config, signal/scope/split settings, `source`/`target`, `init_fan_in_floor`, `add_neutral_identity_transitions`, `reuse_pre_prune`, `gradiend_input_dim`). `"always"` reuses any saved checkpoint without fingerprint checks. `"only_convergent"` additionally requires convergence metadata. Fingerprinting is **partial** — it does not compare most hyperparameters, data, or model-selection settings; see [Tutorial: Training](../tutorials/training.md#experiment-directory-and-caching-use_cache). Evaluator/visualizer cache arguments are separate. |
 | **add_identity_for_other_classes** | `False` | Add identity examples (`factual == alternative`) for non-target classes so they are not pushed arbitrarily. |
+| **add_neutral_identity_transitions** | `False` | Add zero-labeled neutral identity transitions from `TextPredictionConfig.neutral_data`. `neutral_data` may be a shared DataFrame/path/HF id or a split mapping such as `{"train": train_df, "test": test_df}`. With `target="diff"`, the decoded update is trained toward the zero vector for neutral rows. |
 | **metadata** | `{}` | Free-form metadata serialized with the training arguments. |
 
 ---
@@ -79,7 +80,11 @@ At call time, [`evaluate_decoder(max_size=N)`][gradiend.trainer.trainer.Trainer.
 uses `N` as a shared convenience cap for both decoder datasets:
 `max_size_training_like=N` and `max_size_neutral=N`, unless either explicit
 decoder cap is passed. `split` selects the training-like decoder rows, just as
-for encoder evaluation; neutral data is still drawn from `eval_neutral_data`.
+for encoder evaluation. Neutral data comes from `eval_neutral_data` when set,
+otherwise from the requested split of shared `neutral_data`. For explicit split
+mappings, the mapping key selects the rows; otherwise split columns are honored
+and local/DataFrame `neutral_data` without split labels is split by the trainer's
+configured ratios and seed.
 
 ---
 
@@ -145,6 +150,7 @@ Supported objectives are `auto`, `mlm_mask_token`, `clm_next_token`,
 | **activation_decoder** | `None` | Decoder activation, e.g. `"id"` or `"tanh"`. `None` uses the model default. |
 | **bias_decoder** | `None` | Whether the decoder linear layer has a bias. `None` uses the model default. |
 | **latent_dim** | `None` | GRADIEND latent dimension. `None` uses the model default, normally one feature dimension. |
+| **init_fan_in_floor** | `10000` | Lower bound for the fan-in used to initialize fresh encoder weights and matching decoder rows. Small activation-space ACTIEND components can have far fewer dimensions than classic parameter-space GRADIEND inputs; the floor keeps their initial random scale conservative and has been empirically helpful for ACTIEND convergence. Large GRADIEND parameter spaces are above the floor, so their initialization is unchanged. Set `None` to use raw component/input fan-in. |
 | **normalize_gradiend** | `True` | Normalize encodings so the first target class maps toward `+1` and the second toward `-1`. |
 | **positive_class** | `None` | Optional canonical positive class for binary cross-encoding comparisons. Normal training usually leaves this unset. |
 

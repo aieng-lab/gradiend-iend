@@ -5,9 +5,11 @@ Tests EarlyStoppingCallback, EvaluationCallback, CheckpointCallback,
 LoggingCallback, and NormalizationCallback.
 """
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from gradiend.trainer.core.callbacks import (
     TrainingCallback,
@@ -153,6 +155,9 @@ class TestNormalizationCallback:
         eval_result = {
             "correlation": -0.7,
             "mean_by_class": {1.0: 0.5, -1.0: -0.5},
+            "mean_by_type": {"training": 0.1, "neutral_dataset": 0.2},
+            "neutral_mean_by_type": {"neutral_dataset": 0.2},
+            "abs_mean_by_type": {"training": 0.1, "neutral_dataset": 0.2},
             "min_by_class": {1.0: 0.4, -1.0: -0.6},
             "max_by_class": {1.0: 0.6, -1.0: -0.4},
             "q1_by_class": {1.0: 0.45, -1.0: -0.55},
@@ -161,6 +166,9 @@ class TestNormalizationCallback:
         training_stats = {
             "scores": {100: -0.7},
             "mean_by_class": {100: eval_result["mean_by_class"]},
+            "mean_by_type": {100: eval_result["mean_by_type"]},
+            "neutral_mean_by_type": {100: eval_result["neutral_mean_by_type"]},
+            "abs_mean_by_type": {100: eval_result["abs_mean_by_type"]},
             "min_by_class": {100: eval_result["min_by_class"]},
             "max_by_class": {100: eval_result["max_by_class"]},
             "q1_by_class": {100: eval_result["q1_by_class"]},
@@ -177,6 +185,10 @@ class TestNormalizationCallback:
         assert training_stats["correlation"] == pytest.approx(0.7)
         assert training_stats["scores"][100] == pytest.approx(0.7)
         assert eval_result["mean_by_class"][1.0] == pytest.approx(-0.5)
+        assert eval_result["mean_by_type"]["training"] == pytest.approx(-0.1)
+        assert eval_result["neutral_mean_by_type"]["neutral_dataset"] == pytest.approx(-0.2)
+        assert training_stats["neutral_mean_by_type"][100]["neutral_dataset"] == pytest.approx(-0.2)
+        assert eval_result["abs_mean_by_type"]["neutral_dataset"] == pytest.approx(0.2)
         assert eval_result["min_by_class"][1.0] == pytest.approx(-0.6)
         assert eval_result["max_by_class"][1.0] == pytest.approx(-0.4)
         assert training_stats["min_by_class"][100][1.0] == pytest.approx(-0.6)
@@ -288,6 +300,107 @@ class TestCheckpointCallback:
         assert callback.best_score == 0.8
         assert model.save_pretrained.call_count == save_count_after_best
 
+    def test_checkpoint_callback_component_split_uses_merged_local_bests(self, temp_dir):
+        """Component-split best checkpoint is the running local-best merge, not one global step."""
+        from gradiend.model import GradiendModel
+        from gradiend.trainer.core.component_seed import (
+            load_component_best_states,
+            finalize_component_best_states,
+        )
+
+        class _Tiny:
+            def __init__(self, gradiend):
+                self.gradiend = gradiend
+
+            def save_pretrained(self, path, **kwargs):
+                os.makedirs(path, exist_ok=True)
+                # Mimic enough of a checkpoint for the test.
+                with open(os.path.join(path, "marker.txt"), "w", encoding="utf-8") as handle:
+                    handle.write(kwargs.get("training", {}).get("best_score_checkpoint", {}).get("selection", ""))
+
+        gradiend = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            bias_encoder=False,
+            bias_decoder=True,
+            activation_decoder="id",
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 2},
+                {"id": "right", "start": 2, "end": 4},
+            ],
+            component_split_mode="tensors",
+        )
+        model = _Tiny(gradiend)
+        callback = CheckpointCallback(
+            output=temp_dir,
+            checkpoints=False,
+            keep_only_best=True,
+            use_loss_for_best=False,
+        )
+
+        def eval_at(step, left_corr, right_corr, left_fill, right_fill):
+            with torch.no_grad():
+                gradiend.encoder[0].linear.weight[:, :2].fill_(left_fill)
+                gradiend.encoder[0].linear.weight[:, 2:].fill_(right_fill)
+                gradiend.decoder[0].linear.weight[:2, :].fill_(left_fill)
+                gradiend.decoder[0].linear.weight[2:, :].fill_(right_fill)
+            return {
+                "correlation": 0.1,  # deliberately weak global score
+                "components": {
+                    "metrics_by_component": {
+                        "left": {"component_index": 0, "correlation": left_corr},
+                        "right": {"component_index": 1, "correlation": right_corr},
+                    },
+                    "convergence_by_component": {
+                        "left": {
+                            "converged": left_corr >= 0.5,
+                            "min_target_class_abs_mean": left_corr,
+                        },
+                        "right": {
+                            "converged": right_corr >= 0.5,
+                            "min_target_class_abs_mean": right_corr,
+                        },
+                    },
+                    "summary": {
+                        "n_components": 2,
+                        "n_converged": int(left_corr >= 0.5) + int(right_corr >= 0.5),
+                        "correlation_mean": 0.5 * (left_corr + right_corr),
+                    },
+                },
+            }
+
+        # Step 10: left is strong, right weak. Global corr is tiny.
+        callback.on_step_end(
+            step=10,
+            loss=1.0,
+            model=model,
+            config={},
+            training_stats={},
+            eval_result=eval_at(10, 0.9, 0.1, 3.0, 0.0),
+        )
+        assert callback.best_score == pytest.approx(0.5)
+        assert os.path.isdir(f"{temp_dir}_best")
+        with open(os.path.join(f"{temp_dir}_best", "marker.txt"), encoding="utf-8") as handle:
+            assert handle.read() == "component_best_merge"
+
+        # Step 20: right improves; merge should update and keep left's earlier fill via stitch.
+        callback.on_step_end(
+            step=20,
+            loss=1.0,
+            model=model,
+            config={},
+            training_stats={},
+            eval_result=eval_at(20, 0.2, 0.8, 0.0, 5.0),
+        )
+        assert callback.best_score == pytest.approx(0.85)
+        assert callback._best_merge_summary["n_converged"] == 2
+
+        finalize_component_best_states(temp_dir)
+        payload = load_component_best_states(temp_dir)
+        assert payload["components"]["left"]["global_step"] == 10
+        assert payload["components"]["right"]["global_step"] == 20
+
     def test_checkpoint_callback_tracks_but_does_not_save_step_zero_best_model(self, temp_dir):
         """Initial step-0 best metrics must not become the selected checkpoint."""
         callback = CheckpointCallback(
@@ -394,7 +507,7 @@ class TestLoggingCallback:
         assert callback.loss_only is False
 
     def test_logging_callback_logs_loss(self):
-        """Test that logging callback emits a step log at report intervals."""
+        """Test that logging callback emits mean loss over the report window."""
         callback = LoggingCallback(n_loss_report=50, loss_only=True)
         training_stats = {}
         with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
@@ -406,8 +519,26 @@ class TestLoggingCallback:
         mock_logger.info.assert_called_once()
         message = mock_logger.info.call_args[0][0]
         assert message.startswith("Step 50,")
-        assert "Loss: 0.5000" in message
+        # Mean of [0.5, 0.4, 0.3] — not the instantaneous last-step loss.
+        assert "Loss: 0.4000" in message
         assert "Correlation:" not in message
+
+    def test_logging_callback_averages_over_report_window_not_full_buffer(self):
+        """When last_losses is longer than n_loss_report, only the recent window is averaged."""
+        callback = LoggingCallback(n_loss_report=2, loss_only=True)
+
+        with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
+            callback.on_step_end(
+                step=2,
+                loss=1.0,
+                model=None,
+                config={"do_eval": False},
+                training_stats={},
+                last_losses=[9.0, 9.0, 1.0, 3.0],
+            )
+
+        message = mock_logger.info.call_args[0][0]
+        assert "Loss: 2.0000" in message
 
     def test_logging_callback_uses_scientific_notation_for_tiny_nonzero_loss(self):
         """Tiny nonzero losses should not be hidden as 0.0000."""
@@ -428,6 +559,27 @@ class TestLoggingCallback:
         assert "Loss: 3.200e-08" in message
         assert "Loss: 0.0000" not in message
 
+    def test_logging_callback_reports_initial_eval_loss_as_none(self):
+        """Initial evaluation has no optimizer loss yet."""
+        callback = LoggingCallback(n_loss_report=50, loss_only=False)
+        training_stats = {"correlation": 0.8}
+
+        with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
+            callback.on_step_end(
+                step=0,
+                loss=None,
+                model=None,
+                config={"do_eval": True},
+                training_stats=training_stats,
+                eval_result={"correlation": 0.8},
+            )
+
+        mock_logger.info.assert_called_once()
+        message = mock_logger.info.call_args[0][0]
+        assert "Step 0," in message
+        assert "Loss: None" in message
+        assert "Loss: 0.0000" not in message
+
     def test_logging_callback_logs_metrics(self):
         """Test that logging callback records correlation and marks new best runs."""
         callback = LoggingCallback(n_loss_report=50, loss_only=False)
@@ -445,6 +597,34 @@ class TestLoggingCallback:
         assert "Step 50," in message
         assert "Correlation: 0.8000" in message
         assert "(new best)" in message
+
+    def test_logging_callback_reports_neutral_mean_when_available(self):
+        """Neutral identity/eval rows should be visible in progress logs."""
+        callback = LoggingCallback(n_loss_report=50, loss_only=False)
+        training_stats = {
+            "correlation": 0.8,
+            "mean_by_class": {50: {-1.0: -0.5, 1.0: 0.5}},
+            "neutral_mean_by_type": {50: {"neutral_dataset": 0.03}},
+            "abs_mean_by_type": {50: {"neutral_dataset": 0.12}},
+        }
+
+        with patch("gradiend.trainer.core.callbacks.logger") as mock_logger:
+            callback.on_step_end(
+                step=50,
+                loss=0.5,
+                model=None,
+                config={"do_eval": True},
+                training_stats=training_stats,
+                eval_result={
+                    "correlation": 0.8,
+                    "neutral_mean_by_type": {"neutral_dataset": 0.03},
+                    "abs_mean_by_type": {"neutral_dataset": 0.12},
+                },
+                last_losses=[0.5],
+            )
+
+        message = mock_logger.info.call_args[0][0]
+        assert "neutral: neutral_dataset: 0.0300 abs=0.1200" in message
 
     def test_logging_callback_does_not_report_sentinel_correlation_without_eval(self):
         """Unevaluated steps must not display the initialized -1.0 as measured correlation."""
@@ -480,7 +660,7 @@ class TestLoggingCallback:
         mock_logger.info.assert_called_once()
         message = mock_logger.info.call_args[0][0]
         assert "Step 50," in message
-        assert "Loss: 0.5000" in message
+        assert "Loss: 0.4000" in message
         assert "Correlation:" not in message
         assert "(new best)" not in message
 

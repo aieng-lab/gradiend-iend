@@ -111,6 +111,80 @@ class TestPlotProbabilityShifts:
         _ax, args, _kwargs = star_scatters[0]
         assert args[1] == [0.55]
 
+    def test_missing_probability_cells_plot_as_nan_not_zero(self):
+        """A missing class/dataset probability is an absent measurement, not P=0."""
+        pytest.importorskip("matplotlib")
+        grid = {
+            "base": {
+                "probs_by_dataset": {
+                    "B": {"A": 0.2, "B": 0.8},
+                },
+                "lms": {"lms": 0.5},
+            },
+            (-1.0, 0.1): {
+                "id": {"feature_factor": -1.0, "learning_rate": 0.1},
+                "probs_by_dataset": {
+                    "B": {"A": 0.3},
+                },
+                "lms": {"lms": 0.5},
+            },
+        }
+        decoder_results = {
+            "A": {"learning_rate": 0.1, "feature_factor": -1.0, "value": 0.3},
+            "grid": {},
+        }
+
+        with patch("matplotlib.pyplot.show"):
+            fig, axes = plot_probability_shifts(
+                decoder_results=decoder_results,
+                plotting_data={"plotting_data": grid},
+                class_ids=["A", "B"],
+                target_class="A",
+                show=False,
+                return_fig_ax=True,
+            )
+
+        try:
+            probability_lines = axes[1].get_lines()
+            missing_class_y = list(probability_lines[1].get_ydata())
+            assert 0.0 not in missing_class_y
+            assert any(value != value for value in missing_class_y)
+        finally:
+            __import__("matplotlib").pyplot.close(fig)
+
+    def test_missing_selected_probability_cell_raises(self):
+        """The selected metric cell must exist; otherwise the star would be fake."""
+        pytest.importorskip("matplotlib")
+        grid = {
+            "base": {
+                "probs_by_dataset": {
+                    "B": {"A": 0.2, "B": 0.8},
+                },
+                "lms": {"lms": 0.5},
+            },
+            (-1.0, 0.1): {
+                "id": {"feature_factor": -1.0, "learning_rate": 0.1},
+                "probs_by_dataset": {
+                    "B": {"B": 0.7},
+                },
+                "lms": {"lms": 0.5},
+            },
+        }
+        decoder_results = {
+            "A": {"learning_rate": 0.1, "feature_factor": -1.0, "value": 0.3},
+            "grid": {},
+        }
+
+        with pytest.raises(ValueError, match=r"probs_by_dataset\['B'\]\['A'\]"):
+            with patch("matplotlib.pyplot.show"):
+                plot_probability_shifts(
+                    decoder_results=decoder_results,
+                    plotting_data={"plotting_data": grid},
+                    class_ids=["A", "B"],
+                    target_class="A",
+                    show=False,
+                )
+
     def test_vertical_line_at_selected_lr(self, tmp_path):
         """Vertical line (axvline) is drawn at selected learning rate on all subplots."""
         pytest.importorskip("matplotlib")
@@ -226,11 +300,42 @@ class TestPlotProbabilityShifts:
         try:
             assert fig._suptitle is None
             assert axes[0].get_title() == "LMS (Language Modeling Score)"
+            assert axes[0].get_legend() is None
             assert axes[1].get_title() == "Dataset: 3PL — P(class)"
             assert axes[2].get_title() == "Dataset: 3SG — P(class)"
             assert fig.legends
             legend = fig.legends[0]
             assert legend._loc == 9  # upper center
+            assert [text.get_text() for text in legend.get_texts()] == ["3PL", "3SG"]
+        finally:
+            __import__("matplotlib").pyplot.close(fig)
+
+    def test_plot_accepts_figure_title_kwarg(self):
+        """Passing title sets a figure-level suptitle with the shared legend still on top."""
+        pytest.importorskip("matplotlib")
+        plotting_data = _make_plotting_data()
+        decoder_results = _make_decoder_results()
+
+        with patch("matplotlib.pyplot.show"):
+            fig, axes = plot_probability_shifts(
+                decoder_results=decoder_results,
+                plotting_data=plotting_data,
+                class_ids=["3PL", "3SG"],
+                target_class="3PL",
+                show=False,
+                return_fig_ax=True,
+                title="gender_en | steering | target=M",
+            )
+
+        try:
+            assert fig._suptitle is not None
+            assert fig._suptitle.get_text() == "gender_en | steering | target=M"
+            assert axes[0].get_title() == "LMS (Language Modeling Score)"
+            assert axes[0].get_legend() is None
+            assert fig.legends
+            legend = fig.legends[0]
+            # Shared legend stays above the panels, under the title.
+            assert float(legend._bbox_to_anchor._bbox.ymax) >= 0.97
             assert [text.get_text() for text in legend.get_texts()] == ["3PL", "3SG"]
         finally:
             __import__("matplotlib").pyplot.close(fig)

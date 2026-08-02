@@ -333,7 +333,9 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
             enhancer_mask = self.get_enhancer_mask(topk=topk, part=topk_part)
             masked_encoder = self.gradiend.encoder[0].weight.flatten()[enhancer_mask]
             masked_input = gradients[enhancer_mask]
-            encoded = torch.matmul(masked_input.unsqueeze(0), masked_encoder.unsqueeze(1)).squeeze(1) + self.gradiend.encoder[0].bias
+            encoded = torch.matmul(masked_input.unsqueeze(0), masked_encoder.unsqueeze(1)).squeeze(1)
+            if self.gradiend.encoder[0].bias is not None:
+                encoded = encoded + self.gradiend.encoder[0].bias
             encoded = self.gradiend.encoder[1](encoded)
         else:
             encoded = self.gradiend.encoder(gradients)

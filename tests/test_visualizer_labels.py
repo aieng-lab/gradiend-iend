@@ -4,6 +4,9 @@ import pytest
 
 from gradiend import TrainingArguments
 from gradiend.visualizer.labels import (
+    CORRELATION_LABEL,
+    ENCODED_VALUE_LABEL,
+    MEAN_ENCODED_VALUE_LABEL,
     NON_CONVERGENCE_MARKER,
     NON_CONVERGENCE_MARKER_TEX,
     converged_for_trainer,
@@ -72,15 +75,20 @@ def test_format_label_with_convergence_uses_tex_safe_marker(monkeypatch):
     assert format_label_with_convergence("run_a", converged=False) == f"run_a {NON_CONVERGENCE_MARKER_TEX}"
 
 
-def test_escape_matplotlib_usetex_text_escapes_unescaped_percent_only(monkeypatch):
+def test_escape_matplotlib_usetex_text_escapes_plain_specials(monkeypatch):
     import matplotlib as mpl
 
     monkeypatch.setitem(mpl.rcParams, "text.usetex", False)
     assert escape_matplotlib_usetex_text("95% CI") == "95% CI"
+    assert escape_matplotlib_usetex_text("direction > 0.5") == "direction > 0.5"
 
     monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
     assert escape_matplotlib_usetex_text("95% CI") == r"95\% CI"
     assert escape_matplotlib_usetex_text(r"95\% CI") == r"95\% CI"
+    assert escape_matplotlib_usetex_text("direction > 0.5") == r"direction \textgreater{} 0.5"
+    assert escape_matplotlib_usetex_text("a < b") == r"a \textless{} b"
+    assert escape_matplotlib_usetex_text(r"already \textgreater{} ok") == r"already \textgreater{} ok"
+    assert escape_matplotlib_usetex_text(r"keep $a>b$ math") == r"keep $a>b$ math"
 
 
 def test_shared_matplotlib_label_formatters_escape_percent_for_usetex(monkeypatch):
@@ -227,6 +235,13 @@ def test_format_plotly_label_hides_hover_helper_names():
     assert format_plotly_label("text_hover") == "Text"
     assert format_plotly_label("text_:hover") == "Text"
     assert format_plotly_label("data_split") == "Split"
+
+
+def test_common_plot_labels_are_shared_with_plotly_formatter():
+    assert ENCODED_VALUE_LABEL == "Encoded value"
+    assert MEAN_ENCODED_VALUE_LABEL == "Mean encoded value"
+    assert CORRELATION_LABEL == "Correlation"
+    assert format_plotly_label("encoded") == ENCODED_VALUE_LABEL
 
 
 def test_plot_functions_expose_highlight_non_convergence_param():

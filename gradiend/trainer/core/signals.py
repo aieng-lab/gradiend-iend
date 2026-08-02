@@ -285,10 +285,15 @@ class SignalScope:
     params: Optional[Tuple[str, ...]] = None
     activation_sites: Optional[Tuple[str, ...]] = None
     mode: Optional[str] = None
+    activation_selector: Optional[Tuple[Any, ...]] = None
 
     def __post_init__(self) -> None:
         if self.mode is not None and self.mode not in {"default", "full"}:
             raise ValueError("SignalScope.mode must be one of None, 'default', or 'full'")
+        if self.activation_sites is not None and self.activation_selector is not None:
+            raise ValueError("Use either activation_sites or a semantic SignalScope shortcut, not both")
+        if self.activation_selector is not None and not self.activation_selector:
+            raise ValueError("SignalScope.activation_selector must be non-empty")
 
     @classmethod
     def from_values(
@@ -297,11 +302,13 @@ class SignalScope:
         params: Optional[Union[str, Sequence[str]]] = None,
         activation_sites: Optional[Union[str, Sequence[str]]] = None,
         mode: Optional[str] = None,
+        activation_selector: Optional[Tuple[Any, ...]] = None,
     ) -> "SignalScope":
         return cls(
             params=_normalize_string_sequence(params, name="params"),
             activation_sites=_normalize_string_sequence(activation_sites, name="activation_sites"),
             mode=mode,
+            activation_selector=activation_selector,
         )
 
     @classmethod
@@ -314,6 +321,55 @@ class SignalScope:
         """Full model scope, including prediction heads and non-text towers when present."""
         return cls(mode="full")
 
+    @classmethod
+    def layers(cls, *layers: Union[int, str]) -> "SignalScope":
+        """
+        Activation scope over transformer-layer outputs.
+
+        ``SignalScope.layers()`` and ``SignalScope.layers("*")`` both mean all
+        transformer layers. This selects one concatenated activation space; it
+        does not imply one GRADIEND per layer.
+        """
+        if not layers or layers == ("*",):
+            selected: Optional[Tuple[int, ...]] = None
+        else:
+            values = []
+            for layer in layers:
+                if isinstance(layer, str):
+                    if layer == "*":
+                        if len(layers) != 1:
+                            raise ValueError("SignalScope.layers('*') cannot be combined with explicit indices")
+                        selected = None
+                        break
+                    if not layer.isdigit():
+                        raise ValueError("SignalScope.layers entries must be integer layer indices or '*'")
+                    value = int(layer)
+                elif isinstance(layer, int):
+                    value = layer
+                else:
+                    raise TypeError("SignalScope.layers entries must be integer layer indices or '*'")
+                if value < 0:
+                    raise ValueError("SignalScope.layers indices must be non-negative")
+                values.append(value)
+            else:
+                selected = tuple(values)
+        return cls(activation_selector=("layers", selected))
+
+    @classmethod
+    def layer(cls, layer: int) -> "SignalScope":
+        """Activation scope over one transformer-layer output."""
+        return cls.layers(layer)
+
+    @classmethod
+    def embeddings(cls) -> "SignalScope":
+        """Activation scope over the model's combined embedding stream when available."""
+        return cls(activation_selector=("embeddings",))
+
+    @classmethod
+    def word_embedding(cls) -> "SignalScope":
+        """Activation scope over the token embedding lookup module."""
+        return cls(activation_selector=("word_embedding",))
+
     def to_dict(self) -> Dict[str, Any]:
         data = {
             "params": list(self.params) if self.params is not None else None,
@@ -321,16 +377,38 @@ class SignalScope:
         }
         if self.mode is not None:
             data["mode"] = self.mode
+        if self.activation_selector is not None:
+            kind = str(self.activation_selector[0])
+            selector_data: Dict[str, Any] = {"kind": kind}
+            if kind == "layers":
+                layers = self.activation_selector[1]
+                selector_data["layers"] = None if layers is None else list(layers)
+            data["activation_selector"] = selector_data
         return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "SignalScope":
         if not isinstance(data, Mapping):
             raise TypeError(f"SignalScope.from_dict expected mapping, got {type(data).__name__}")
+        activation_selector = None
+        raw_selector = data.get("activation_selector")
+        if raw_selector is not None:
+            if not isinstance(raw_selector, Mapping):
+                raise TypeError("activation_selector must be a mapping")
+            kind = raw_selector.get("kind")
+            if kind == "layers":
+                raw_layers = raw_selector.get("layers")
+                layers = None if raw_layers is None else tuple(int(item) for item in raw_layers)
+                activation_selector = ("layers", layers)
+            elif kind in {"embeddings", "word_embedding"}:
+                activation_selector = (kind,)
+            else:
+                raise ValueError(f"Unknown activation_selector kind: {kind!r}")
         return cls.from_values(
             params=data.get("params"),
             activation_sites=data.get("activation_sites"),
             mode=data.get("mode"),
+            activation_selector=activation_selector,
         )
 
 
@@ -483,6 +561,7 @@ class ActivationSignalExtractor:
             raise ValueError("aggregate_batch must be 'mean' or 'none'")
         self.aggregate_batch = aggregate_batch
         self._module_items = self._resolve_modules()
+        self._activation_width_validated = False
 
     def _resolve_modules(self) -> Tuple[Tuple[str, nn.Module], ...]:
         sites = tuple(self.scope.activation_sites or ()) if self.scope is not None else ()
@@ -491,6 +570,24 @@ class ActivationSignalExtractor:
     @classmethod
     def _static_module_output_dim(cls, module: nn.Module) -> Optional[int]:
         return infer_static_module_output_dim(module)
+
+    @staticmethod
+    def _positive_int(value: Any) -> Optional[int]:
+        try:
+            out = int(value)
+        except (TypeError, ValueError):
+            return None
+        return out if out > 0 else None
+
+    def _expected_input_dim(self) -> Tuple[Optional[int], str]:
+        gradiend = getattr(self.model, "gradiend", None)
+        configured = self._positive_int(getattr(gradiend, "input_dim", None))
+        if configured is not None:
+            return configured, "configured GRADIEND input_dim"
+        inferred = self.infer_input_dim_static()
+        if inferred is not None:
+            return int(inferred), "static activation-site width inference"
+        return None, "unknown"
 
     def infer_input_dim_static(self) -> Optional[int]:
         """
@@ -667,7 +764,48 @@ class ActivationSignalExtractor:
             selected = selected.mean(dim=0, keepdim=True)
         return selected
 
-    def _extract(self, inputs: Any) -> torch.Tensor:
+    def _validate_extracted_width_once(
+        self,
+        *,
+        signal: torch.Tensor,
+        captured: Dict[str, torch.Tensor],
+        flattened: Sequence[torch.Tensor],
+    ) -> None:
+        if self._activation_width_validated:
+            return
+        expected, expected_source = self._expected_input_dim()
+        if expected is None:
+            self._activation_width_validated = True
+            return
+        actual = int(signal.shape[-1]) if signal.dim() > 0 else 1
+        if actual == int(expected):
+            self._activation_width_validated = True
+            return
+
+        selector = (self.signal.options or {}).get("token_selector")
+        site_details = []
+        for (name, module), flat in zip(self._module_items, flattened):
+            static_dim = self._static_module_output_dim(module)
+            site_details.append(
+                f"{name} ({module.__class__.__name__}): "
+                f"captured_shape={tuple(captured[name].shape)}, "
+                f"selected_shape={tuple(flat.shape)}, "
+                f"static_width={static_dim if static_dim is not None else 'unknown'}"
+            )
+        resolved_sites = tuple(name for name, _module in self._module_items)
+        raise ValueError(
+            f"Activation signal width mismatch: expected {int(expected)} dimension(s) from "
+            f"{expected_source}, but the first extracted signal has width {actual}. "
+            f"Resolved activation_sites={resolved_sites!r}, token_selector={selector!r}. "
+            f"Per-site widths: {'; '.join(site_details)}. "
+            "This usually means static module-width inference was wrong, the token selector changes "
+            "the activation dimensionality, or the loaded ACTIEND/GRADIEND checkpoint does not match "
+            "the current base model and signal_scope. Choose an activation site with a stable 1D "
+            "hidden width, pass signal_scope=SignalScope.from_values(activation_sites=[...]), or add "
+            "explicit static-width support for this module type."
+        )
+
+    def _extract(self, inputs: Any, *, validate_width: bool = True) -> torch.Tensor:
         captured: Dict[str, torch.Tensor] = {}
         handles = []
 
@@ -689,13 +827,19 @@ class ActivationSignalExtractor:
             raise RuntimeError(f"Activation hooks did not capture expected sites: {missing!r}")
         flattened = [self._flatten_site(captured[name], prepared_inputs) for name, _module in self._module_items]
         signal = torch.cat(flattened, dim=-1)
+        if validate_width:
+            self._validate_extracted_width_once(
+                signal=signal,
+                captured=captured,
+                flattened=flattened,
+            )
         if self.aggregate_batch == "mean":
             return signal.squeeze(0)
         return signal
 
     def infer_input_dim(self, sample_inputs: Any) -> int:
         """Infer flattened activation signal dimensionality from representative inputs."""
-        signal = self._extract(sample_inputs)
+        signal = self._extract(sample_inputs, validate_width=False)
         if signal.dim() == 0:
             return 1
         return int(signal.shape[-1])

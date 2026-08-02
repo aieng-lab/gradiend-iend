@@ -35,6 +35,37 @@ def _normalize_training_stats_step_dicts(training_stats: Dict[str, Any]) -> Dict
     return training_stats
 
 
+def _collapse_legacy_stitched_component_stats(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize transitional stitched-component files to the canonical run layout.
+
+    Early component stitching wrote selected component histories under
+    ``convergence_info.component_stitching.selected_component_training``.  The
+    canonical layout stores those histories directly as ``training_stats`` and
+    leaves ``component_stitching`` as provenance metadata only.
+    """
+    if not isinstance(data, dict):
+        return data
+    convergence_info = data.get("convergence_info")
+    if not isinstance(convergence_info, dict):
+        return data
+    stitching = convergence_info.get("component_stitching")
+    if not isinstance(stitching, dict) or not bool(stitching.get("applied")):
+        return data
+    selected = stitching.get("selected_component_training")
+    if not isinstance(selected, dict) or not isinstance(selected.get("training_stats"), dict):
+        return data
+
+    data["training_stats"] = selected["training_stats"]
+    if isinstance(selected.get("best_score_checkpoint"), dict):
+        data["best_score_checkpoint"] = selected["best_score_checkpoint"]
+    stitching = dict(stitching)
+    stitching.pop("selected_component_training", None)
+    stitching["selected_component_training_collapsed"] = True
+    convergence_info["component_stitching"] = stitching
+    return data
+
+
 def _best_step_abs_mean_by_type(
     training_stats: Dict[str, Any],
     best_score_checkpoint: Dict[str, Any],
@@ -387,6 +418,7 @@ def load_training_stats(model_path: str) -> Optional[dict]:
     except Exception as e:
         logger.warning(f"Could not load training stats from {training_path}: {e}")
         return None
+    data = _collapse_legacy_stitched_component_stats(data)
     if isinstance(data.get("training_stats"), dict):
         _normalize_training_stats_step_dicts(data["training_stats"])
     # Ensure stats["abs_mean_by_type"] is the best-step snapshot (type -> value) for convenience

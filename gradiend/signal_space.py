@@ -10,6 +10,12 @@ from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
+from gradiend.model_topology import (
+    ModelTopology,
+    describe_model_for_topology_error,
+    infer_model_topology,
+)
+
 
 @dataclass(frozen=True)
 class ResolvedSignalSpace:
@@ -20,6 +26,7 @@ class ResolvedSignalSpace:
     input_dim: int
     mapping: Tuple[Dict[str, Any], ...]
     scope: Any = None
+    signal: Optional[Dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.input_dim <= 0:
@@ -129,8 +136,13 @@ def infer_static_module_output_dim(module: nn.Module) -> Optional[int]:
         "layer_norm",
         "norm",
         "ln_f",
+        "ln_1",
+        "ln_2",
+        "input_layernorm",
+        "post_attention_layernorm",
         "final_layer_norm",
         "output_layer_norm",
+        "sa_layer_norm",
         "word_embeddings",
         "embed_tokens",
         "output",
@@ -168,6 +180,26 @@ def activation_sites_from_scope(scope: Any) -> Tuple[str, ...]:
     if isinstance(raw, str):
         return (raw,)
     return tuple(str(item) for item in raw)
+
+
+def activation_selector_from_scope(scope: Any) -> Optional[Tuple[Any, ...]]:
+    """Return semantic activation selector metadata from a SignalScope-like object."""
+    if scope is None:
+        return None
+    if isinstance(scope, Mapping):
+        raw = scope.get("activation_selector")
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping):
+            raise TypeError("activation_selector must be a mapping")
+        kind = raw.get("kind")
+        if kind == "layers":
+            layers = raw.get("layers")
+            return ("layers", None if layers is None else tuple(int(item) for item in layers))
+        if kind in {"embeddings", "word_embedding"}:
+            return (kind,)
+        raise ValueError(f"Unknown activation_selector kind: {kind!r}")
+    return getattr(scope, "activation_selector", None)
 
 
 def scope_mode(scope: Any) -> str:
@@ -349,21 +381,72 @@ def _full_scope_boundary_sites(base_model: nn.Module) -> Tuple[str, ...]:
     return tuple(sites)
 
 
+def _topology_default_activation_sites(topology: ModelTopology, *, mode: str) -> Tuple[str, ...]:
+    if mode == "full":
+        return tuple(
+            site
+            for site in (
+                *topology.embeddings,
+                *topology.layers,
+                *topology.prediction_heads,
+            )
+            if site
+        )
+    return tuple(site for site in (*topology.embeddings, *topology.layers) if site)
+
+
 def default_activation_sites(base_model: nn.Module, *, mode: str = "default") -> Tuple[str, ...]:
     """Resolve the default/full activation scope to method-level activation sites."""
     if mode not in {"default", "full"}:
         raise ValueError("scope mode must be 'default' or 'full'")
-    if mode == "full":
+    topology = infer_model_topology(base_model)
+    if topology is not None:
+        selected = _topology_default_activation_sites(topology, mode=mode)
+    elif mode == "full":
         selected = _full_scope_boundary_sites(base_model)
     else:
         root_name, root = _default_scope_root_module_named(base_model, mode)
         selected = _representation_stream_sites(root_name, root)
     if not selected:
         raise ValueError(
-            f"Could not infer activation stream sites for SignalScope.{mode}(). "
-            "Pass signal_scope=SignalScope.from_values(activation_sites=[...]) for this architecture."
+            f"Could not infer activation stream sites for SignalScope.{mode}().\n"
+            + describe_model_for_topology_error(base_model)
         )
     return tuple(selected)
+
+
+def _activation_sites_from_selector(base_model: nn.Module, selector: Tuple[Any, ...]) -> Tuple[str, ...]:
+    topology = infer_model_topology(base_model)
+    if topology is None:
+        raise ValueError(
+            "Cannot resolve semantic activation scope "
+            f"{selector!r} for this model.\n"
+            + describe_model_for_topology_error(base_model)
+        )
+
+    kind = selector[0]
+    if kind == "layers":
+        selected_layers = selector[1]
+        if selected_layers is None:
+            return topology.layers
+        sites = []
+        for layer in selected_layers:
+            if layer >= len(topology.layers):
+                raise ValueError(
+                    f"SignalScope.layer({layer}) is out of range for {topology.model_type}; "
+                    f"available layers are 0..{len(topology.layers) - 1}."
+                )
+            sites.append(topology.layers[layer])
+        return tuple(sites)
+    if kind == "embeddings":
+        if not topology.embeddings:
+            raise ValueError(f"{topology.model_type} topology has no combined embedding activation site")
+        return topology.embeddings
+    if kind == "word_embedding":
+        if topology.word_embedding is None:
+            raise ValueError(f"{topology.model_type} topology has no word embedding activation site")
+        return (topology.word_embedding,)
+    raise ValueError(f"Unknown activation selector: {kind!r}")
 
 
 def resolve_activation_modules(
@@ -374,7 +457,11 @@ def resolve_activation_modules(
 ) -> Tuple[Tuple[str, nn.Module], ...]:
     """Resolve exact or wildcard activation site patterns against named modules."""
     if not activation_sites:
-        activation_sites = default_activation_sites(base_model, mode=scope_mode(scope))
+        selector = activation_selector_from_scope(scope)
+        if selector is None:
+            activation_sites = default_activation_sites(base_model, mode=scope_mode(scope))
+        else:
+            activation_sites = _activation_sites_from_selector(base_model, selector)
     modules = dict(base_model.named_modules())
     selected: Dict[str, nn.Module] = {}
     for pattern in activation_sites:
@@ -420,6 +507,7 @@ def resolve_activation_signal_space(base_model: nn.Module, signal: Any, scope: A
         input_dim=input_dim,
         mapping=tuple(mapping),
         scope=scope,
+        signal=dict(signal.to_dict()) if hasattr(signal, "to_dict") else None,
     )
 
 

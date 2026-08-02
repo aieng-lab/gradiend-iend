@@ -15,6 +15,7 @@ from gradiend.visualizer.encoder_scatter import plot_encoder_scatter as _plot_en
 from gradiend.visualizer.encoder_strip_split import plot_encoder_strip_by_split as _plot_encoder_strip_by_split
 from gradiend.visualizer.encoder_by_target import plot_encoder_by_target as _plot_encoder_by_target
 from gradiend.visualizer.probability_shifts import plot_probability_shifts as _plot_probability_shifts
+from gradiend.visualizer.token_encoding import highlight_token_encoding as _highlight_token_encoding
 from gradiend.visualizer.plot_delegation import see_implementation
 from gradiend.visualizer.topk.venn_ import (
     compute_topk_sets,
@@ -370,6 +371,7 @@ class Visualizer:
             decoder_results=decoder_results,
             class_ids=class_ids,
             use_cache=use_cache,
+            intervention_kwargs=(decoder_results or {}).get("intervention_kwargs"),
         )
 
         return _plot_probability_shifts(
@@ -390,6 +392,46 @@ class Visualizer:
         "Plot decoder probability shifts vs learning rate."
         + see_implementation("gradiend.visualizer.probability_shifts.plot_probability_shifts")
     )
+
+    def highlight_token_encoding(
+        self,
+        text: str,
+        *,
+        label: Optional[str] = None,
+        component: Union[str, int, None] = None,
+        interactive: bool = False,
+        show: bool = True,
+        return_rows: bool = False,
+        color_center: Union[str, float, int, None] = "zero",
+        neutral_values: Any = None,
+        neutral_value: Optional[float] = None,
+        color_range: Union[str, Tuple[float, float], List[float], None] = "symmetric",
+        color_extent: Optional[float] = 1.0,
+        **kwargs: Any,
+    ) -> Any:
+        """Highlight editable text tokens by their encoded GRADIEND response."""
+        if (
+            color_center == "neutral"
+            and neutral_value is None
+            and neutral_values is None
+            and hasattr(self._trainer, "resolve_neutral_encoding_baseline")
+        ):
+            neutral_value = self._trainer.resolve_neutral_encoding_baseline(component=component)
+        return _highlight_token_encoding(
+            self._trainer.get_model(),
+            text,
+            label=label,
+            component=component,
+            interactive=interactive,
+            show=show,
+            return_rows=return_rows,
+            color_center=color_center,
+            neutral_values=neutral_values,
+            neutral_value=neutral_value,
+            color_range=color_range,
+            color_extent=color_extent,
+            **kwargs,
+        )
 
     @staticmethod
     def compute_topk_sets(models: Dict[str, Any], topk: int = 100, part: str = "decoder-weight"):

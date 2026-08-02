@@ -13,10 +13,12 @@ import copy
 import json
 import math
 import os
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from gradiend.model.layers import LargeLinear
 from gradiend.model.utils import get_activation
@@ -25,6 +27,278 @@ from gradiend.util import convert_tuple_keys_recursively
 
 logger = get_logger(__name__)
 
+DEFAULT_INIT_FAN_IN_FLOOR = 10_000
+"""Default fan-in floor for fresh GRADIEND-family initialization.
+
+Empirically, ACTIEND components over activation vectors can be much smaller than
+classic GRADIEND parameter spaces (for example, a single transformer hidden
+state vs millions of model-weight gradients). A raw ``1/sqrt(n)`` init then
+starts those activation components with much larger weights. The floor keeps
+small signal components on a conservative random scale while leaving larger
+GRADIEND spaces unchanged.
+"""
+
+
+def _coerce_init_fan_in_floor(value: Optional[int]) -> Optional[int]:
+    """Validate the optional fan-in floor used for fresh GRADIEND initialization."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            "init_fan_in_floor must be a positive int or None, "
+            f"got {type(value).__name__}"
+        )
+    if value < 1:
+        raise ValueError(f"init_fan_in_floor must be >= 1 or None, got {value}")
+    return int(value)
+
+
+def gradiend_signal_kind_from_metadata(metadata: Optional[Dict[str, Any]]) -> str:
+    """Resolve the persisted signal kind for a GRADIEND-family model."""
+    if not isinstance(metadata, dict):
+        return "gradient"
+    signal_space = metadata.get("signal_space")
+    if isinstance(signal_space, dict) and signal_space.get("kind"):
+        return str(signal_space["kind"]).strip().lower()
+    mapping_kind = metadata.get("mapping_kind")
+    if isinstance(mapping_kind, str) and mapping_kind.strip():
+        return mapping_kind.strip().lower()
+    signal = metadata.get("signal")
+    if isinstance(signal, dict) and signal.get("kind"):
+        return str(signal["kind"]).strip().lower()
+    kind = getattr(signal, "kind", None)
+    if isinstance(kind, str) and kind.strip():
+        return kind.strip().lower()
+    return "gradient"
+
+
+def gradiend_method_name_from_signal_kind(kind: str) -> str:
+    """Return the human-facing method name for a signal kind."""
+    normalized = str(kind or "gradient").strip().lower()
+    if normalized == "activation":
+        return "ACTIEND"
+    if normalized == "activation_gradient":
+        return "activation-gradient GRADIEND"
+    if normalized == "gradient":
+        return "GRADIEND"
+    return f"{normalized} GRADIEND"
+
+
+@dataclass(frozen=True)
+class GradiendComponent:
+    """A non-overlapping contiguous view into the GRADIEND input space."""
+
+    id: str
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id.strip():
+            raise ValueError("GradiendComponent.id must be a non-empty string")
+        if not isinstance(self.start, int) or not isinstance(self.end, int):
+            raise TypeError("GradiendComponent.start/end must be integers")
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError("GradiendComponent requires 0 <= start < end")
+
+    @property
+    def input_dim(self) -> int:
+        return self.end - self.start
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "start": self.start, "end": self.end}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GradiendComponent":
+        return cls(id=str(data["id"]), start=int(data["start"]), end=int(data["end"]))
+
+
+def _normalize_component_slices(
+    component_slices: Optional[List[Union[GradiendComponent, Dict[str, Any]]]],
+    *,
+    input_dim: int,
+) -> Tuple[GradiendComponent, ...]:
+    if component_slices is None:
+        return (GradiendComponent("full", 0, int(input_dim)),)
+    components = tuple(
+        item if isinstance(item, GradiendComponent) else GradiendComponent.from_dict(dict(item))
+        for item in component_slices
+    )
+    if not components:
+        raise ValueError("component_slices must contain at least one component")
+    seen_ids = set()
+    occupied = torch.zeros(int(input_dim), dtype=torch.bool)
+    for component in components:
+        if component.id in seen_ids:
+            raise ValueError(f"Duplicate component id: {component.id!r}")
+        seen_ids.add(component.id)
+        if component.end > input_dim:
+            raise ValueError(
+                f"Component {component.id!r} ends at {component.end}, beyond input_dim={input_dim}"
+            )
+        if occupied[component.start:component.end].any().item():
+            raise ValueError(f"Component {component.id!r} overlaps another component")
+        occupied[component.start:component.end] = True
+    return components
+
+
+def _is_full_component_config(component_slices: Any, input_dim: int) -> bool:
+    """Return True for legacy serialized full-component metadata."""
+    if not isinstance(component_slices, list) or len(component_slices) != 1:
+        return False
+    item = component_slices[0]
+    if not isinstance(item, dict):
+        return False
+    return (
+        str(item.get("id")) == "full"
+        and int(item.get("start", -1)) == 0
+        and int(item.get("end", -1)) == int(input_dim)
+    )
+
+
+def _is_no_component_split_mode(component_split_mode: Any) -> bool:
+    return component_split_mode is None or (
+        isinstance(component_split_mode, str) and component_split_mode.strip().lower() == "none"
+    )
+
+
+def _coerce_saved_component_slices(
+    component_slices: Any,
+    component_split_mode: Any,
+    input_dim: int,
+) -> Any:
+    """
+    Normalize component metadata loaded from config.json.
+
+    Pre-pruned checkpoints written before lazy-init pruning remapped components may
+    store a stale full-space ``end`` while ``architecture.input_dim`` is already pruned.
+    """
+    if not _is_no_component_split_mode(component_split_mode):
+        return component_slices
+    if _is_full_component_config(component_slices, input_dim):
+        return None
+    if (
+        isinstance(component_slices, list)
+        and len(component_slices) == 1
+        and isinstance(component_slices[0], dict)
+        and str(component_slices[0].get("id")) == "full"
+        and int(component_slices[0].get("end", -1)) > int(input_dim)
+    ):
+        return None
+    return component_slices
+
+
+class _ComponentAccessor:
+    def __init__(self, model: "GradiendModel", kind: str) -> None:
+        self._model = model
+        self._kind = kind
+
+    def __len__(self) -> int:
+        return len(self._model._virtual_component_slices)
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, key: Union[int, str]):
+        component = self._model._component_by_key(key)
+        if self._kind == "encoder":
+            return _VirtualComponentEncoder(self._model, component)
+        if self._kind == "decoder":
+            return _VirtualComponentDecoder(self._model, component)
+        raise ValueError(f"Unknown component accessor kind: {self._kind!r}")
+
+
+class _VirtualComponentEncoder:
+    def __init__(self, model: "GradiendModel", component: GradiendComponent) -> None:
+        self.model = model
+        self.component = component
+
+    @property
+    def weight(self) -> torch.Tensor:
+        self.model._require_built()
+        return self.model.encoder[0].linear.weight[:, self.component.start:self.component.end]
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        self.model._require_built()
+        return self.model.encoder[0].linear.bias
+
+    def _prepare_input(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 0:
+            raise ValueError("Component encoder input must not be scalar")
+        if x.shape[-1] == self.model.input_dim:
+            x = x[..., self.component.start:self.component.end]
+        elif x.shape[-1] != self.component.input_dim:
+            raise ValueError(
+                f"Component {self.component.id!r} expected final dimension "
+                f"{self.component.input_dim} or full dimension {self.model.input_dim}, got {x.shape[-1]}"
+            )
+        x = x.to(dtype=self.model.torch_dtype, device=self.model.device_encoder)
+        return x
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        self.model._require_built()
+        x = self._prepare_input(x)
+        encoded = F.linear(x, self.weight, self.bias)
+        return self.model.encoder[1](encoded)
+
+
+class _VirtualComponentDecoder:
+    def __init__(self, model: "GradiendModel", component: GradiendComponent) -> None:
+        self.model = model
+        self.component = component
+
+    @property
+    def weight(self) -> torch.Tensor:
+        self.model._require_built()
+        return self.model.decoder[0].linear.weight[self.component.start:self.component.end, :]
+
+    @property
+    def bias(self) -> Optional[torch.Tensor]:
+        self.model._require_built()
+        bias = self.model.decoder[0].linear.bias
+        if bias is None:
+            return None
+        return bias[self.component.start:self.component.end]
+
+    def __call__(self, z: torch.Tensor) -> torch.Tensor:
+        self.model._require_built()
+        if z.dim() == 0:
+            raise ValueError("Component decoder input must not be scalar")
+        if z.shape[-1] != self.model.latent_dim:
+            raise ValueError(
+                f"Component decoder expected final dimension {self.model.latent_dim}, got {z.shape[-1]}"
+            )
+        z = z.to(dtype=self.model.torch_dtype, device=self.model.device_decoder)
+        decoded = F.linear(z, self.weight, self.bias)
+        return self.model.decoder[1](decoded)
+
+
+class _VirtualComponent:
+    def __init__(self, model: "GradiendModel", component: GradiendComponent) -> None:
+        self.model = model
+        self.component = component
+        self.encoder = _VirtualComponentEncoder(model, component)
+        self.decoder = _VirtualComponentDecoder(model, component)
+
+    def invert_encoding(self) -> None:
+        """Invert this component's scalar orientation without exposing component plumbing publicly."""
+        self.model._require_built()
+        if self.model.latent_dim != 1:
+            raise ValueError("Component normalization currently requires latent_dim=1")
+        n_virtual = len(self.model._virtual_component_slices)
+        if self.model.bias_encoder and n_virtual > 1:
+            raise ValueError(
+                "Per-component normalization with shared encoder bias is undefined; use bias_encoder=False "
+                "or a single explicit component."
+            )
+        with torch.no_grad():
+            self.encoder.weight.mul_(-1)
+            if self.encoder.bias is not None and n_virtual == 1:
+                self.encoder.bias.mul_(-1)
+            self.decoder.weight.mul_(-1)
+            if self.decoder.bias is not None:
+                self.decoder.bias.mul_(-1)
 
 
 class GradiendModel(nn.Module):
@@ -57,12 +331,16 @@ class GradiendModel(nn.Module):
         latent_dim: int,
         activation_encoder: str = "tanh",
         activation_decoder: str = "id",
+        bias_encoder: bool = False,
         bias_decoder: bool = True,
         torch_dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         device_encoder: Optional[torch.device] = None,
         device_decoder: Optional[torch.device] = None,
         lazy_init: bool = False,
+        init_fan_in_floor: Optional[int] = DEFAULT_INIT_FAN_IN_FLOOR,
+        component_slices: Optional[List[Union[GradiendComponent, Dict[str, Any]]]] = None,
+        component_split_mode: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -79,6 +357,7 @@ class GradiendModel(nn.Module):
             activation_encoder: Encoder activation name (case-insensitive).
             activation_decoder: Decoder activation name. If falsy, uses encoder activation
                 but with decoder-appropriate defaults via get_activation.
+            bias_encoder: Whether the encoder linear layer uses a bias term.
             bias_decoder: Whether the decoder linear layer uses a bias term.
             torch_dtype: dtype used for model parameters.
             device: Optional default device for both encoder and decoder when specific
@@ -87,6 +366,23 @@ class GradiendModel(nn.Module):
             device_decoder: Device for decoder parameters.
             lazy_init: If True, do not create encoder/decoder weights here. Build them later
                 via prune (with pruned size) or _build_encoder_decoder (full size).
+            init_fan_in_floor: Optional lower bound for the fan-in used when
+                initializing encoder weights and matching decoder rows. The
+                default, ``10000``, was added after empirical ACTIEND runs showed
+                that raw activation components such as one transformer hidden
+                state can be much smaller than GRADIEND parameter spaces, making
+                the usual ``1/sqrt(n)`` initialization too large. The floor keeps
+                small components on a conservative random scale while leaving
+                larger gradient spaces unchanged. None uses the raw
+                component/input fan-in.
+            component_slices: Optional non-overlapping contiguous component metadata over
+                the GRADIEND input space. None creates one virtual full component used
+                internally; the public ``component_slices`` property stays empty when
+                ``component_split_mode`` is ``"none"``.
+            component_split_mode: Persisted split mode. ``"none"`` means ordinary
+                GRADIEND behavior (virtual full span only); other modes expose
+                partitions via public ``component_slices``, including a single
+                ``"full"`` partition for ``"single"``.
             **kwargs: Additional metadata stored in `self.kwargs` and serialized into config.json metadata
                 on save. Non-JSONable values are stringified in a safe way.
         """
@@ -98,10 +394,16 @@ class GradiendModel(nn.Module):
             raise TypeError(f"activation_encoder must be str, got {type(activation_encoder).__name__}")
         if not isinstance(activation_decoder, str):
             raise TypeError(f"activation_decoder must be str, got {type(activation_decoder).__name__}")
+        if not isinstance(bias_encoder, bool):
+            raise TypeError(f"bias_encoder must be bool, got {type(bias_encoder).__name__}")
         if not isinstance(bias_decoder, bool):
             raise TypeError(f"bias_decoder must be bool, got {type(bias_decoder).__name__}")
         if not isinstance(lazy_init, bool):
             raise TypeError(f"lazy_init must be bool, got {type(lazy_init).__name__}")
+        if component_split_mode is not None and not isinstance(component_split_mode, str):
+            raise TypeError(
+                f"component_split_mode must be str or None, got {type(component_split_mode).__name__}"
+            )
 
         super().__init__()
         default_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,9 +417,19 @@ class GradiendModel(nn.Module):
 
         self.activation = activation_encoder.lower()
         self.activation_decoder = activation_decoder
+        self.bias_encoder = bool(bias_encoder)
         self.bias_decoder = bool(bias_decoder)
         self.torch_dtype = torch_dtype
         self._lazy_init = bool(lazy_init)
+        self.init_fan_in_floor = _coerce_init_fan_in_floor(init_fan_in_floor)
+        self._virtual_component_slices = _normalize_component_slices(
+            component_slices, input_dim=self.input_dim
+        )
+        self.component_split_mode = (
+            component_split_mode.strip().lower()
+            if isinstance(component_split_mode, str) and component_split_mode.strip()
+            else ("none" if component_slices is None else "custom")
+        )
 
         self.kwargs = kwargs
         if "base_model" in self.kwargs and hasattr(self.kwargs["base_model"], "name_or_path"):
@@ -139,7 +451,13 @@ class GradiendModel(nn.Module):
                 activation_fnc_decoder = get_activation(self.activation, encoder=False)
 
             self.encoder = nn.Sequential(
-                LargeLinear(self.input_dim, self.latent_dim, dtype=torch_dtype, device=self.device_encoder),
+                LargeLinear(
+                    self.input_dim,
+                    self.latent_dim,
+                    bias=self.bias_encoder,
+                    dtype=torch_dtype,
+                    device=self.device_encoder,
+                ),
                 activation_fnc,
             )
             self.decoder = nn.Sequential(
@@ -147,17 +465,13 @@ class GradiendModel(nn.Module):
                 activation_fnc_decoder,
             )
 
-            # initialize decoder similar scale as encoder
-            x = self.encoder[0].weight.max().item()
-            nn.init.uniform_(self.decoder[0].weight, -x, x)
-            if self.bias_decoder:
-                nn.init.uniform_(self.decoder[0].bias, -x, x)
+            self._initialize_encoder_decoder_parameters()
 
     def __str__(self) -> str:
         return (
             f"GradiendModel(input_dim={self.input_dim}, latent_dim={self.latent_dim}, "
             f"activation_encoder={self.activation!r}, activation_decoder={getattr(self, 'activation_decoder', self.activation)!r}, "
-            f"bias_decoder={self.bias_decoder})"
+            f"bias_encoder={self.bias_encoder}, bias_decoder={self.bias_decoder})"
         )
 
     def _build_encoder_decoder(self, input_dim: int) -> None:
@@ -170,6 +484,15 @@ class GradiendModel(nn.Module):
         self.input_dim = int(input_dim)
         if self.input_dim <= 0:
             raise ValueError("input_dim must be positive.")
+        # Lazy-init pre-prune builds encoder/decoder at a smaller input_dim than the
+        # initial component metadata (full unpruned space). Keep slices consistent.
+        if (
+            not self._virtual_component_slices
+            or any(component.end > self.input_dim for component in self._virtual_component_slices)
+        ):
+            self._virtual_component_slices = _normalize_component_slices(
+                None, input_dim=self.input_dim
+            )
 
         activation_fnc = get_activation(self.activation, encoder=True)
         if self.activation_decoder and self.activation_decoder != self.activation:
@@ -178,7 +501,13 @@ class GradiendModel(nn.Module):
             activation_fnc_decoder = get_activation(self.activation, encoder=False)
 
         self.encoder = nn.Sequential(
-            LargeLinear(self.input_dim, self.latent_dim, dtype=self.torch_dtype, device=self.device_encoder),
+            LargeLinear(
+                self.input_dim,
+                self.latent_dim,
+                bias=self.bias_encoder,
+                dtype=self.torch_dtype,
+                device=self.device_encoder,
+            ),
             activation_fnc,
         )
         self.decoder = nn.Sequential(
@@ -186,11 +515,83 @@ class GradiendModel(nn.Module):
             activation_fnc_decoder,
         )
 
-        # initialize decoder similar scale as encoder
-        x = self.encoder[0].weight.max().item()
-        nn.init.uniform_(self.decoder[0].weight, -x, x)
-        if self.bias_decoder:
-            nn.init.uniform_(self.decoder[0].bias, -x, x)
+        self._initialize_encoder_decoder_parameters()
+
+    def _effective_init_fan_in(self, fan_in: int) -> int:
+        """Return the fan-in used for initialization after applying the optional floor."""
+        fan_in = int(fan_in)
+        if fan_in <= 0:
+            raise ValueError(f"fan_in must be positive, got {fan_in}")
+        if self.init_fan_in_floor is None:
+            return fan_in
+        return max(int(self.init_fan_in_floor), fan_in)
+
+    def _init_bound_for_fan_in(self, fan_in: int) -> float:
+        """Return the uniform initialization bound for a raw or component fan-in."""
+        return 1.0 / math.sqrt(float(self._effective_init_fan_in(fan_in)))
+
+    def _initialize_encoder_decoder_parameters(self) -> None:
+        """
+        Initialize encoder columns and decoder rows on the same component scale.
+
+        The physical model stores one full encoder/decoder matrix even for split
+        GRADIENDs. Component-aware initialization therefore works by applying the
+        component fan-in bound to each contiguous component slice. The fan-in
+        floor is intentionally simple: it avoids disproportionately large initial
+        weights for small activation-space components, which was empirically
+        helpful for ACTIEND convergence, without adding signal-specific branches.
+        """
+        self._require_built()
+        enc = self.encoder[0].linear
+        dec = self.decoder[0].linear
+
+        full_bound = self._init_bound_for_fan_in(self.input_dim)
+        default_linear_bound = 1.0 / math.sqrt(float(self.input_dim))
+        virtual_slices = self._virtual_component_slices
+        full_component = (
+            len(virtual_slices) == 1
+            and virtual_slices[0].start == 0
+            and virtual_slices[0].end == self.input_dim
+        )
+
+        with torch.no_grad():
+            # nn.Linear has already initialized encoder weights with the raw
+            # full-matrix fan-in. Reinitialize only when the fan-in floor or
+            # component partitioning changes that intended scale.
+            if (not full_component) or not math.isclose(full_bound, default_linear_bound):
+                nn.init.uniform_(enc.weight, -full_bound, full_bound)
+                if enc.bias is not None:
+                    nn.init.uniform_(enc.bias, -full_bound, full_bound)
+                for component in virtual_slices:
+                    component_bound = self._init_bound_for_fan_in(component.input_dim)
+                    if math.isclose(component_bound, full_bound):
+                        continue
+                    nn.init.uniform_(
+                        enc.weight[:, component.start:component.end],
+                        -component_bound,
+                        component_bound,
+                    )
+
+            overall_scale = float(enc.weight.abs().max().item())
+            nn.init.uniform_(dec.weight, -overall_scale, overall_scale)
+            if dec.bias is not None:
+                nn.init.uniform_(dec.bias, -overall_scale, overall_scale)
+            if not full_component:
+                for component in virtual_slices:
+                    component_scale = float(
+                        enc.weight[:, component.start:component.end].abs().max().item()
+                    )
+                    nn.init.uniform_(
+                        dec.weight[component.start:component.end, :],
+                        -component_scale,
+                        component_scale,
+                    )
+                    if dec.bias is not None:
+                        nn.init.uniform_(
+                            dec.bias[component.start:component.end],
+                            -component_scale,
+                            component_scale,
+                        )
 
     def to(
         self,
@@ -261,6 +662,284 @@ class GradiendModel(nn.Module):
         """Build encoder/decoder with current input_dim if not yet built (lazy init)."""
         if self.encoder is None or self.decoder is None:
             self._build_encoder_decoder(self.input_dim)
+
+    @property
+    def component_slices(self) -> Tuple[GradiendComponent, ...]:
+        """Public component partitions. Empty for ``GradiendSplit.none()``."""
+        if self.component_split_mode == "none":
+            return ()
+        return self._virtual_component_slices
+
+    @property
+    def component_count(self) -> int:
+        """Number of public split components (0 when unpartitioned)."""
+        return len(self.component_slices)
+
+    @property
+    def has_component_split(self) -> bool:
+        """Whether the model exposes a public component split over its input space."""
+        return self.component_split_mode != "none"
+
+    @property
+    def signal_kind(self) -> str:
+        """Signal kind represented by this GRADIEND input space."""
+        return self.signal_kind_from_metadata(self.kwargs)
+
+    @property
+    def uses_gradients(self) -> bool:
+        """Whether this model represents gradient-space signals."""
+        return self.signal_kind == "gradient"
+
+    @property
+    def uses_activations(self) -> bool:
+        """Whether this model represents activation-space signals."""
+        return self.signal_kind == "activation"
+
+    @property
+    def uses_activation_gradients(self) -> bool:
+        """Whether this model represents activation-gradient signals."""
+        return self.signal_kind == "activation_gradient"
+
+    @property
+    def is_gradiend(self) -> bool:
+        """Alias for gradient-space GRADIEND semantics."""
+        return self.uses_gradients
+
+    @property
+    def is_actiend(self) -> bool:
+        """Alias for activation-space ACTIEND semantics."""
+        return self.uses_activations
+
+    @staticmethod
+    def signal_kind_from_metadata(metadata: Optional[Dict[str, Any]]) -> str:
+        """Resolve a signal kind from serialized GRADIEND metadata."""
+        return gradiend_signal_kind_from_metadata(metadata)
+
+    @staticmethod
+    def method_name_from_signal_kind(kind: str) -> str:
+        """Return the human-facing method name for a signal kind."""
+        return gradiend_method_name_from_signal_kind(kind)
+
+    @staticmethod
+    def method_name_from_metadata(metadata: Optional[Dict[str, Any]]) -> str:
+        """Resolve the human-facing method name from serialized GRADIEND metadata."""
+        return GradiendModel.method_name_from_signal_kind(
+            GradiendModel.signal_kind_from_metadata(metadata)
+        )
+
+    @property
+    def method_name(self) -> str:
+        """Human-facing method name for logs and diagnostics."""
+        return self.method_name_from_signal_kind(self.signal_kind)
+
+    @property
+    def input_unit_name(self) -> str:
+        """Human-facing singular unit for one GRADIEND input dimension."""
+        kind = self.signal_kind
+        if kind == "activation":
+            return "activation dimension"
+        if kind == "activation_gradient":
+            return "activation-gradient dimension"
+        if kind == "gradient":
+            return "gradient entry"
+        return "signal dimension"
+
+    @staticmethod
+    def _plural(count: int, singular: str, plural: Optional[str] = None) -> str:
+        if plural is None and singular.endswith("entry"):
+            plural = f"{singular[:-1]}ies"
+        return singular if int(count) == 1 else (plural or f"{singular}s")
+
+    def _component_preview(self, *, max_ids: int = 3) -> str:
+        components = tuple(self.component_slices or ())
+        if not components:
+            return ""
+        ids = [str(component.id) for component in components]
+        shown = ", ".join(ids[:max_ids])
+        if len(ids) <= max_ids:
+            return f" [{shown}]"
+        return f" [first {max_ids}: {shown}]"
+
+    def describe_training_space(self, *, split_loss: Optional[str] = None) -> str:
+        """Return a compact, signal-aware training-start description."""
+        feature_text = f"{self.latent_dim} {self._plural(self.latent_dim, 'feature neuron')}"
+        unit = self.input_unit_name
+        if self.has_component_split:
+            aggregation = str(split_loss or "mean")
+            return (
+                f"Training component-split {self.method_name} over {self.input_dim:,} "
+                f"{self._plural(self.input_dim, unit)} across {self.component_count} "
+                f"{self._plural(self.component_count, 'component')} with {feature_text} per component "
+                f"(loss aggregation={aggregation}){self._component_preview()}."
+            )
+        return (
+            f"Training {self.method_name} over {self.input_dim:,} "
+            f"{self._plural(self.input_dim, unit)} with {feature_text}."
+        )
+
+    @property
+    def _component_encoders(self) -> _ComponentAccessor:
+        """Virtual component encoders over ``_virtual_component_slices``."""
+        return _ComponentAccessor(self, "encoder")
+
+    @property
+    def _component_decoders(self) -> _ComponentAccessor:
+        """Virtual component decoders over ``_virtual_component_slices``."""
+        return _ComponentAccessor(self, "decoder")
+
+    def _component_by_key(self, key: Union[int, str]) -> GradiendComponent:
+        if isinstance(key, int):
+            return self._virtual_component_slices[key]
+        if isinstance(key, str):
+            for component in self._virtual_component_slices:
+                if component.id == key:
+                    return component
+            raise KeyError(f"Unknown GRADIEND component id: {key!r}")
+        raise TypeError(f"Component key must be int or str, got {type(key).__name__}")
+
+    def _component_view(self, key: Union[int, str]) -> _VirtualComponent:
+        return _VirtualComponent(self, self._component_by_key(key))
+
+    def _iter_components(self):
+        """Iterate over virtual component metadata (includes none's full span)."""
+        yield from self._virtual_component_slices
+
+    def _with_components(
+        self,
+        component_slices: List[Union[GradiendComponent, Dict[str, Any]]],
+        *,
+        component_split_mode: str = "custom",
+    ) -> "GradiendModel":
+        """Return a lightweight view of this model with different component metadata."""
+        view = copy.copy(self)
+        view.__dict__ = self.__dict__.copy()
+        view._virtual_component_slices = _normalize_component_slices(
+            component_slices, input_dim=self.input_dim
+        )
+        view.component_split_mode = component_split_mode
+        return view
+
+    def _without_split(self) -> "GradiendModel":
+        """Return a lightweight unpartitioned view (virtual full span only)."""
+        return self._with_components(
+            [GradiendComponent("full", 0, self.input_dim)],
+            component_split_mode="none",
+        )
+
+    def _encode_components(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode all default-split components from one full GRADIEND input tensor.
+
+        Returns shape ``(n_components, latent_dim)`` for a single vector and
+        ``(..., n_components, latent_dim)`` for batched inputs.
+        """
+        self._require_built()
+        x = self._ensure_input(x)
+        encodings = [encoder(x) for encoder in self._component_encoders]
+        return torch.stack(encodings, dim=-2)
+
+    def _decode_components(self, z: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """Decode one latent tensor through every virtual component decoder."""
+        return tuple(decoder(z) for decoder in self._component_decoders)
+
+    def _forward_components(
+        self,
+        x: torch.Tensor,
+        *,
+        return_encoded: bool = False,
+    ) -> Union[Tuple[torch.Tensor, ...], Tuple[Tuple[torch.Tensor, ...], torch.Tensor]]:
+        """
+        Forward each default-split component independently.
+
+        Component encoders read only their input slice and component decoders
+        reconstruct only their output slice. Encoder/decoder tensors are shared
+        with the full GRADIEND model.
+        """
+        self._require_built()
+        x = self._ensure_input(x)
+        encoded = self._encode_components(x)
+        decoded = tuple(
+            decoder(encoded[..., index, :])
+            for index, decoder in enumerate(self._component_decoders)
+        )
+        return (decoded, encoded) if return_encoded else decoded
+
+    def _component_target_slices(self, target: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+        """Slice a full target tensor into default-split component targets."""
+        if target.dim() == 0:
+            raise ValueError("Component target tensor must not be scalar")
+        if target.shape[-1] != self.input_dim:
+            if target.numel() == self.input_dim:
+                target = target.view(-1)
+            else:
+                raise ValueError(
+                    f"Target tensor has incorrect shape {tuple(target.shape)}, "
+                    f"expected final dimension {self.input_dim}"
+                )
+        return tuple(
+            target[..., component.start:component.end]
+            for component in self._virtual_component_slices
+        )
+
+    def reconstruction_loss(
+        self,
+        source: torch.Tensor,
+        target: torch.Tensor,
+        *,
+        criterion: Any,
+        aggregation: str = "mean",
+        return_encoded: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Compute the GRADIEND reconstruction loss for full or component-split training.
+
+        Args:
+            source: Full signal tensor in GRADIEND input space.
+            target: Full target tensor in GRADIEND input space.
+            criterion: Loss callable used per reconstruction.
+            aggregation: For component-split models, one of ``"mean"``, ``"sum"``,
+                ``"size_weighted"``, or ``"full"``. ``"full"`` keeps the classic
+                full-vector objective. Non-split models always use the full-vector
+                objective.
+            return_encoded: If True, also return the full encoding or component
+                encodings used for the loss.
+        """
+        aggregation = str(aggregation or "mean").strip().lower()
+        if aggregation not in {"mean", "sum", "size_weighted", "full"}:
+            raise ValueError(
+                "aggregation must be 'mean', 'sum', 'size_weighted', or 'full', "
+                f"got {aggregation!r}"
+            )
+
+        if aggregation == "full" or not self.has_component_split:
+            decoded, encoded = self(source, return_encoded=True)
+            if target.device != decoded.device:
+                target = target.to(decoded.device)
+            loss = criterion(decoded, target)
+            return (loss, encoded) if return_encoded else loss
+
+        decoded_components, encoded_components = self._forward_components(source, return_encoded=True)
+        target_components = self._component_target_slices(target)
+        losses = []
+        for decoded, component_target in zip(decoded_components, target_components):
+            if component_target.device != decoded.device:
+                component_target = component_target.to(decoded.device)
+            losses.append(criterion(decoded, component_target))
+        component_losses = torch.stack(losses)
+
+        if aggregation == "sum":
+            loss = component_losses.sum()
+        elif aggregation == "size_weighted":
+            weights = torch.tensor(
+                [component.input_dim for component in self._virtual_component_slices],
+                dtype=component_losses.dtype,
+                device=component_losses.device,
+            )
+            loss = (component_losses * (weights / weights.sum())).sum()
+        else:
+            loss = component_losses.mean()
+
+        return (loss, encoded_components) if return_encoded else loss
 
     @property
     def base_model_id(self) -> str:
@@ -508,7 +1187,7 @@ class GradiendModel(nn.Module):
 
         new_in = int(keep_idx_dev.numel())
 
-        new_enc = LargeLinear(new_in, m.latent_dim, bias=True, dtype=m.torch_dtype, device=m.device_encoder)
+        new_enc = LargeLinear(new_in, m.latent_dim, bias=m.bias_encoder, dtype=m.torch_dtype, device=m.device_encoder)
         new_dec = LargeLinear(m.latent_dim, new_in, bias=m.bias_decoder, dtype=m.torch_dtype, device=m.device_decoder)
 
         with torch.no_grad():
@@ -529,6 +1208,7 @@ class GradiendModel(nn.Module):
         m.encoder[0].train(m.training)
         m.decoder[0].train(m.training)
         m.input_dim = new_in
+        m._virtual_component_slices = _normalize_component_slices(None, input_dim=new_in)
 
         return (m, keep_idx.detach().to("cpu").long()) if return_index_map else m
 
@@ -688,9 +1368,17 @@ class GradiendModel(nn.Module):
                 "latent_dim": self.latent_dim,
                 "activation_encoder": self.activation,
                 "activation_decoder": self.activation_decoder,
+                "bias_encoder": self.bias_encoder,
                 "bias_decoder": self.bias_decoder,
+                "init_fan_in_floor": self.init_fan_in_floor,
                 "torch_dtype": str(self.torch_dtype).replace("torch.", ""),
             },
+            "components": (
+                [component.to_dict() for component in self.component_slices]
+                if self.has_component_split
+                else None
+            ),
+            "component_split_mode": self.component_split_mode,
             "mapping": None,  # filled by ParamMappedGradiendModel; core leaves None
             "metadata": meta,
         }
@@ -743,6 +1431,11 @@ class GradiendModel(nn.Module):
             cfg = json.load(f)
 
         arch = cfg["architecture"]
+        component_slices = cfg.get("components")
+        component_split_mode = cfg.get("component_split_mode")
+        component_slices = _coerce_saved_component_slices(
+            component_slices, component_split_mode, arch["input_dim"]
+        )
 
         # dtype
         if torch_dtype is None:
@@ -779,10 +1472,18 @@ class GradiendModel(nn.Module):
             latent_dim=arch["latent_dim"],
             activation_encoder=arch.get("activation_encoder", "tanh"),
             activation_decoder=arch.get("activation_decoder", "id"),
+            bias_encoder=(
+                arch["bias_encoder"]
+                if "bias_encoder" in arch
+                else "encoder.0.linear.bias" in state_dict
+            ),
             bias_decoder=arch.get("bias_decoder", True),
+            init_fan_in_floor=arch.get("init_fan_in_floor", None),
             torch_dtype=torch_dtype,
             device_encoder=device_encoder,
             device_decoder=device_decoder,
+            component_slices=component_slices,
+            component_split_mode=component_split_mode,
             **meta,
         )
 

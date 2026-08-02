@@ -15,8 +15,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from gradiend.visualizer.plot_optional import _require_matplotlib
 from gradiend.model._source_target import (
-    feature_factor_from_encoding_direction,
+    intervention_feature_factor_from_encoding_direction,
     resolve_model_source,
+    resolve_model_signal_kind,
+    resolve_model_target,
 )
 from gradiend.util.logging import get_logger
 from gradiend.visualizer.labels import escape_matplotlib_usetex_text
@@ -33,6 +35,39 @@ def _with_base_point(
     """Return (x, y) with the base point included, sorted by x."""
     points = sorted(zip(list(xs) + [base_x], list(ys) + [base_y]), key=lambda t: t[0])
     return [p[0] for p in points], [p[1] for p in points]
+
+
+def _probability_or_nan(
+    probs_by_dataset: Dict[str, Any],
+    dataset_class: str,
+    class_name: str,
+) -> float:
+    """Return a plotted probability, preserving missing cells as NaN."""
+    dataset_probs = probs_by_dataset.get(dataset_class, {})
+    if not isinstance(dataset_probs, dict) or class_name not in dataset_probs:
+        return math.nan
+    value = dataset_probs[class_name]
+    if value is None:
+        return math.nan
+    return float(value)
+
+
+def _require_probability_cell(
+    probs_by_dataset: Dict[str, Any],
+    dataset_class: str,
+    class_name: str,
+    *,
+    context: str,
+) -> float:
+    value = _probability_or_nan(probs_by_dataset, dataset_class, class_name)
+    if math.isnan(value):
+        raise ValueError(
+            f"Missing decoder probability for selected metric in {context}: "
+            f"probs_by_dataset[{dataset_class!r}][{class_name!r}] is absent. "
+            "Do not interpret missing decoder panels as probability 0.0; re-run "
+            "decoder evaluation with full factual-class coverage."
+        )
+    return value
 
 
 def _apply_lr_xscale(ax: Any, scale: str, linthresh: Optional[float]) -> None:
@@ -140,11 +175,12 @@ def plot_probability_shifts(
         output: Path to save plot. If None and trainer.experiment_dir is set, saves there.
         show: Whether to display the plot
         figsize: Figure size in inches. If None, auto-calculated.
-        highlight_non_convergence: Accepted for API compatibility. Probability-shift plots do
-            not add a figure-level title.
+        highlight_non_convergence: Accepted for API compatibility.
         return_fig_ax: If True, return ``(fig, axes)`` and leave the figure open for
             caller-side customization.
-        **kwargs: Additional arguments passed to matplotlib
+        **kwargs: Additional plotting options. Supported keys include:
+            ``title``/``suptitle`` for a figure-level title, ``img_format``, ``dpi``,
+            and ``use_cache``.
 
     Returns:
         Path to saved plot file (or empty string if not saved). If ``return_fig_ax=True``,
@@ -161,6 +197,7 @@ def plot_probability_shifts(
             decoder_results=decoder_results,
             class_ids=class_ids,
             use_cache=kwargs.get("use_cache"),
+            intervention_kwargs=(decoder_results or {}).get("intervention_kwargs"),
         )
     
     if decoder_results is None or plotting_data is None:
@@ -289,11 +326,19 @@ def plot_probability_shifts(
             direction = getattr(model, "feature_class_encoding_direction", None)
             if isinstance(direction, dict):
                 source = resolve_model_source(model, trainer)
+                target = resolve_model_target(model, trainer)
+                signal_kind = resolve_model_signal_kind(model, trainer)
                 for class_name in class_ids:
                     if class_name in direction:
-                        class_to_feature_factor[class_name] = feature_factor_from_encoding_direction(
-                            direction[class_name], source
+                        class_to_feature_factor[class_name] = intervention_feature_factor_from_encoding_direction(
+                            direction[class_name],
+                            source,
+                            target,
+                            signal_kind=signal_kind,
                         )
+        except ValueError as exc:
+            if "ACTIEND activation interventions currently require target='diff'" in str(exc):
+                raise
         except Exception:
             pass
     if not class_to_feature_factor and feature_factors:
@@ -348,6 +393,14 @@ def plot_probability_shifts(
     fig, axes = plt.subplots(n_subplots, 1, figsize=figsize, sharex=True)
     if n_subplots == 1:
         axes = [axes]
+    title = kwargs.get("title", kwargs.get("suptitle"))
+    suptitle_fontsize = kwargs.get("suptitle_fontsize")
+    if title:
+        fig.suptitle(
+            escape_matplotlib_usetex_text(str(title)),
+            fontsize=suptitle_fontsize,
+            y=0.995,
+        )
 
     # Plot 1: LMS (one line) — use green to distinguish from probability lines (blue, orange)
     ax_lms = axes[0]
@@ -357,7 +410,6 @@ def plot_probability_shifts(
     ax_lms.plot(x_lms, y_lms, marker="o", label="LMS", alpha=0.7, color="#2ca02c")
     ax_lms.set_ylabel("LMS")
     ax_lms.set_title("LMS (Language Modeling Score)")
-    ax_lms.legend(loc="best", fontsize=8)
     _apply_lr_xscale(ax_lms, x_scale, linthresh)
     ax_lms.grid(True, alpha=0.3)
     
@@ -371,19 +423,38 @@ def plot_probability_shifts(
     else:
         selection_dataset_class = base_metric
     selection_metric_label = escape_matplotlib_usetex_text(f"P({selection_metric_class})")
+    selected_lr = None
+    if summary_key in (summary or {}):
+        selected_lr = summary[summary_key].get("learning_rate")
+    if selected_lr is not None:
+        selected_probs_by_dataset = lr_data[ff].get(selected_lr)
+        if selected_probs_by_dataset is None:
+            raise ValueError(
+                f"Selected decoder learning_rate={selected_lr!r} is absent from plotted grid "
+                f"for feature_factor={ff!r}."
+            )
+        _require_probability_cell(
+            selected_probs_by_dataset,
+            selection_dataset_class,
+            selection_metric_class,
+            context=f"feature_factor={ff!r}, learning_rate={selected_lr!r}",
+        )
 
     # Plot 2+: Dataset probability shifts — P(3PL) and P(3SG) on each dataset; highlight selection metric
+    missing_probability_cells = set()
     for dataset_idx, dataset_class in enumerate(dataset_classes):
         ax = axes[1 + dataset_idx]
         is_selection_dataset = dataset_class == selection_dataset_class
         for class_name in class_ids:
             probs_c = []
             for lr in lrs:
-                d = lr_data[ff][lr].get(dataset_class, {})
-                prob = d.get(class_name, 0.0) if isinstance(d, dict) else 0.0
+                prob = _probability_or_nan(lr_data[ff][lr], dataset_class, class_name)
+                if math.isnan(prob):
+                    missing_probability_cells.add((dataset_class, class_name, lr))
                 probs_c.append(prob)
-            d_base = base_probs_by_dataset.get(dataset_class, {})
-            base_p = d_base.get(class_name, 0.0) if isinstance(d_base, dict) else 0.0
+            base_p = _probability_or_nan(base_probs_by_dataset, dataset_class, class_name)
+            if math.isnan(base_p):
+                missing_probability_cells.add((dataset_class, class_name, "base"))
             x_p, y_p = _with_base(lrs, probs_c, lr0_x, base_p)
             # Emphasize the curve that is the selection metric (used to choose learning rate)
             is_selection_curve = is_selection_dataset and class_name == selection_metric_class
@@ -399,8 +470,12 @@ def plot_probability_shifts(
             selected_lr = summary[summary_key].get("learning_rate")
             if selected_lr is not None:
                 # Use same ff as plotted curves so star lies exactly on the selection-metric curve
-                entry = lr_data[ff].get(selected_lr, {}).get(dataset_class, {})
-                sp = entry.get(selection_metric_class, 0.0) if isinstance(entry, dict) else 0.0
+                sp = _require_probability_cell(
+                    lr_data[ff].get(selected_lr, {}),
+                    dataset_class,
+                    selection_metric_class,
+                    context=f"feature_factor={ff!r}, learning_rate={selected_lr!r}",
+                )
                 ax.scatter([selected_lr], [sp], marker="*", s=280, zorder=5, alpha=0.95, color="red", label="Selected")
         ax.set_ylabel("Probability")
         ax.set_title(escape_matplotlib_usetex_text(f"Dataset: {dataset_class} — P(class)"))
@@ -420,15 +495,22 @@ def plot_probability_shifts(
         except Exception:
             pass
 
+    if missing_probability_cells:
+        examples = sorted(missing_probability_cells, key=lambda item: tuple(map(str, item)))[:5]
+        logger.warning(
+            "Decoder probability-shift plot has %d missing probability cell(s); plotting them as NaN gaps. "
+            "Examples: %s",
+            len(missing_probability_cells),
+            examples,
+        )
+
     # Vertical line at selected learning rate (all subplots)
-    selected_lr = None
-    if summary_key in (summary or {}):
-        selected_lr = summary[summary_key].get("learning_rate")
     if selected_lr is not None:
         for ax in axes:
             ax.axvline(x=selected_lr, color="gray", linestyle="--", alpha=0.7, zorder=1)
     
-    # Shared legend for dataset probability plots, restored above the subplots.
+    # Shared class legend for dataset probability plots, always above the panels.
+    # With a figure title, leave a thin band under the title for the legend.
     if len(dataset_classes) > 0:
         handles, labels = [], []
         for ax in axes[1:]:
@@ -448,13 +530,21 @@ def plot_probability_shifts(
             unique_handles,
             unique_labels,
             loc="upper center",
-            bbox_to_anchor=(0.5, 1.0),
+            bbox_to_anchor=(0.5, 0.97 if title else 1.0),
             ncol=min(len(unique_labels), 6),
             fontsize=8,
+            frameon=False,
         )
 
-    top_margin = 0.94 if len(dataset_classes) > 0 else 1.0
-    plt.tight_layout(rect=[0, 0, 1, top_margin])
+    if title and len(dataset_classes) > 0:
+        layout_rect = [0, 0, 1, 0.90]
+    elif title:
+        layout_rect = [0, 0, 1, 0.94]
+    elif len(dataset_classes) > 0:
+        layout_rect = [0, 0, 1, 0.94]
+    else:
+        layout_rect = [0, 0, 1, 1]
+    plt.tight_layout(rect=layout_rect)
     
     # Save plot
     output_path = None

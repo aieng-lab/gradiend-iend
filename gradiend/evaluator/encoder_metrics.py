@@ -23,6 +23,8 @@ from gradiend.util.split_policy import (
 
 logger = get_logger(__name__)
 
+COMPONENT_COLUMNS = ("component_index", "component_id", "component_label")
+
 
 def get_correlation(
 	df: pd.DataFrame,
@@ -264,6 +266,7 @@ def _compute_metrics_from_df(
 
 	# Make a copy to avoid mutating the original
 	df_all = df_all.copy()
+	df_all.attrs = {}
 
 	if "type" not in df_all.columns:
 		# label == 0 is neutral, label != 0 is training
@@ -568,9 +571,84 @@ def _compute_metrics_from_df(
 	return result
 
 
+def _component_metric_summary(metrics_by_component: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+	correlations = [
+		float(metrics.get("correlation"))
+		for metrics in metrics_by_component.values()
+		if isinstance(metrics.get("correlation"), (int, float))
+	]
+	summary: Dict[str, Any] = {
+		"n_components": len(metrics_by_component),
+	}
+	if correlations:
+		values = np.asarray(correlations, dtype=float)
+		summary.update({
+			"correlation_mean": float(values.mean()),
+			"correlation_median": float(np.median(values)),
+			"correlation_min": float(values.min()),
+			"correlation_max": float(values.max()),
+			"correlation_abs_mean": float(np.abs(values).mean()),
+			"correlation_abs_min": float(np.abs(values).min()),
+			"correlation_abs_max": float(np.abs(values).max()),
+		})
+	return summary
+
+
+def get_component_metrics_from_dataframe(
+	component_df: pd.DataFrame,
+	*,
+	neg_boundary: Optional[float] = -0.5,
+	pos_boundary: Optional[float] = 0.5,
+	neutral_boundary: float = 0.0,
+	target_classes: Optional[Sequence[str]] = None,
+	generalization_splits: Optional[Tuple[str, str]] = None,
+) -> Dict[str, Any]:
+	"""Compute encoder metrics independently for each explicit GRADIEND component."""
+	if component_df is None or component_df.empty:
+		return {}
+	if "component_index" not in component_df.columns or "component_id" not in component_df.columns:
+		raise ValueError("component_df must contain component_index and component_id columns")
+	component_df = component_df.copy()
+	component_df.attrs = {}
+	neg_val = neg_boundary if neg_boundary is not None else (neutral_boundary - 0.5)
+	pos_val = pos_boundary if pos_boundary is not None else (neutral_boundary + 0.5)
+	metrics_by_component: Dict[str, Dict[str, Any]] = {}
+	index_rows: List[Dict[str, Any]] = []
+	sort_df = component_df.sort_values(["component_index"])
+	for (component_index, component_id), group in sort_df.groupby(["component_index", "component_id"], sort=False):
+		component_key = str(component_id)
+		metrics = _compute_metrics_from_df(
+			group.copy(),
+			neg_boundary=neg_val,
+			pos_boundary=pos_val,
+			neutral_boundary=neutral_boundary,
+			target_classes=target_classes,
+			generalization_splits=generalization_splits,
+		)
+		component_label = None
+		if "component_label" in group.columns and len(group) > 0:
+			component_label = group["component_label"].iloc[0]
+		metrics["component_index"] = int(component_index)
+		metrics["component_id"] = component_key
+		if component_label is not None:
+			metrics["component_label"] = str(component_label)
+		metrics_by_component[component_key] = metrics
+		index_rows.append({
+			"component_index": int(component_index),
+			"component_id": component_key,
+			"component_label": str(component_label) if component_label is not None else component_key,
+		})
+	return {
+		"index": index_rows,
+		"metrics_by_component": metrics_by_component,
+		"summary": _component_metric_summary(metrics_by_component),
+	}
+
+
 def get_encoder_metrics_from_dataframe(
 	df: pd.DataFrame,
 	*,
+	component_df: Optional[pd.DataFrame] = None,
 	neg_boundary: Optional[float] = -0.5,
 	pos_boundary: Optional[float] = 0.5,
 	neutral_boundary: float = 0.0,
@@ -604,7 +682,7 @@ def get_encoder_metrics_from_dataframe(
 	"""
 	neg_val = neg_boundary if neg_boundary is not None else (neutral_boundary - 0.5)
 	pos_val = pos_boundary if pos_boundary is not None else (neutral_boundary + 0.5)
-	return _compute_metrics_from_df(
+	result = _compute_metrics_from_df(
 		df,
 		neg_boundary=neg_val,
 		pos_boundary=pos_val,
@@ -612,6 +690,16 @@ def get_encoder_metrics_from_dataframe(
 		target_classes=target_classes,
 		generalization_splits=generalization_splits,
 	)
+	if component_df is not None and not component_df.empty:
+		result["components"] = get_component_metrics_from_dataframe(
+			component_df,
+			neg_boundary=neg_boundary,
+			pos_boundary=pos_boundary,
+			neutral_boundary=neutral_boundary,
+			target_classes=target_classes,
+			generalization_splits=generalization_splits,
+		)
+	return result
 
 
 def get_model_metrics(
@@ -700,6 +788,7 @@ def get_model_metrics(
 
 __all__ = [
 	"get_model_metrics",
+	"get_component_metrics_from_dataframe",
 	"get_encoder_metrics_from_dataframe",
 	"get_correlation",
 	"invalidate_encoder_metrics_cache",

@@ -557,3 +557,150 @@ class TestAddIdentityForOtherClasses:
             assert row["factual_id"] in non_target, (
                 f"Identity row should be for non-target class only, got factual_id={row['factual_id']!r}"
             )
+
+
+class TestAddNeutralIdentityTransitions:
+    """Neutral identity transitions add zero-labeled training rows from neutral_data."""
+
+    def test_add_neutral_identity_requires_neutral_data(self):
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        with pytest.raises(ValueError, match="neutral_data"):
+            trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+
+    def test_add_neutral_identity_rows_from_train_split(self):
+        neutral = pd.DataFrame(
+            [
+                {"masked": "quiet [MASK]", "label": "stone", "split": "train"},
+                {"masked": "bright [MASK]", "label": "cloud", "split": "test"},
+            ]
+        )
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        training_data = trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+        df = training_data.data
+        neutral_rows = df[df["neutral_variant"] == "neutral_identity"]
+
+        assert len(neutral_rows) == 1
+        row = neutral_rows.iloc[0]
+        assert row["factual"] == "stone"
+        assert row["alternative"] == "stone"
+        assert row["factual_id"] == "neutral"
+        assert row["alternative_id"] == "neutral"
+        assert row["label"] == 0
+        assert bool(row["is_identity_transition"]) is True
+
+    def test_add_neutral_identity_rows_from_split_mapping(self):
+        neutral = {
+            "train": pd.DataFrame([{"masked": "quiet [MASK]", "label": "stone"}]),
+            "test": pd.DataFrame([{"masked": "bright [MASK]", "label": "cloud"}]),
+        }
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        training_data = trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+        neutral_rows = training_data.data[training_data.data["neutral_variant"] == "neutral_identity"]
+
+        assert neutral_rows["factual"].tolist() == ["stone"]
+        assert neutral_rows["split"].tolist() == ["train"]
+
+    def test_add_neutral_identity_requires_requested_split_in_mapping(self):
+        neutral = {
+            "test": pd.DataFrame([{"masked": "bright [MASK]", "label": "cloud"}]),
+        }
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        with pytest.raises(ValueError, match="available splits"):
+            trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+
+    def test_neutral_data_is_eval_fallback_with_requested_split(self):
+        neutral = pd.DataFrame(
+            [
+                {"text": "train neutral", "split": "train"},
+                {"text": "test neutral", "split": "test"},
+            ]
+        )
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        resolved = trainer._resolve_eval_neutral_dataframe(split="test")
+
+        assert resolved is not None
+        assert resolved["text"].tolist() == ["test neutral"]
+
+    def test_neutral_data_split_mapping_is_eval_fallback(self):
+        neutral = {
+            "train": pd.DataFrame([{"text": "train neutral"}]),
+            "test": pd.DataFrame([{"text": "test neutral"}]),
+        }
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        resolved = trainer._resolve_eval_neutral_dataframe(split="test")
+
+        assert resolved is not None
+        assert resolved["text"].tolist() == ["test neutral"]
+        assert resolved["split"].tolist() == ["test"]
+
+    def test_eval_neutral_data_overrides_shared_split_mapping(self):
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data={"test": pd.DataFrame([{"text": "shared neutral"}])},
+            eval_neutral_data={"test": pd.DataFrame([{"text": "eval neutral"}])},
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        resolved = trainer._resolve_eval_neutral_dataframe(split="test")
+
+        assert resolved is not None
+        assert resolved["text"].tolist() == ["eval neutral"]

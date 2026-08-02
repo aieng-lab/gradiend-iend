@@ -12,6 +12,7 @@ import torch
 
 from gradiend.trainer.core.signals import Signal, SignalScope, SignalSet
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.gradiend_split import GradiendSplit
 
 
 class TestTrainingArguments:
@@ -82,15 +83,21 @@ class TestTrainingArguments:
             "max_steps": 100,
             "train_batch_size": 16,
             "source": "factual",
-            "target": "diff"
+            "target": "diff",
+            "bias_encoder": False,
+            "bias_decoder": False,
+            "init_fan_in_floor": 2048,
         }
-        
+
         args = TrainingArguments.from_dict(config_dict)
         assert args.learning_rate == 1e-4
         assert args.max_steps == 100
         assert args.train_batch_size == 16
         assert args.source == "factual"
         assert args.target == "diff"
+        assert args.bias_encoder is False
+        assert args.bias_decoder is False
+        assert args.init_fan_in_floor == 2048
     
     def test_training_arguments_serialization(self, temp_dir):
         """Test JSON serialization/deserialization."""
@@ -100,7 +107,9 @@ class TestTrainingArguments:
             train_batch_size=16,
             source="factual",
             target="diff",
-            experiment_dir=temp_dir
+            experiment_dir=temp_dir,
+            bias_encoder=False,
+            bias_decoder=False,
         )
         
         # Test to_dict
@@ -108,6 +117,9 @@ class TestTrainingArguments:
         assert isinstance(config_dict, dict)
         assert config_dict["learning_rate"] == 1e-4
         assert config_dict["max_steps"] == 100
+        assert config_dict["bias_encoder"] is False
+        assert config_dict["bias_decoder"] is False
+        assert config_dict["init_fan_in_floor"] == 10_000
         
         # Test JSON serialization
         json_path = os.path.join(temp_dir, "config.json")
@@ -122,6 +134,19 @@ class TestTrainingArguments:
         assert loaded_args.learning_rate == args.learning_rate
         assert loaded_args.max_steps == args.max_steps
         assert loaded_args.train_batch_size == args.train_batch_size
+        assert loaded_args.bias_encoder is False
+        assert loaded_args.bias_decoder is False
+        assert loaded_args.init_fan_in_floor == args.init_fan_in_floor
+
+    def test_training_arguments_validates_init_fan_in_floor(self):
+        assert TrainingArguments(init_fan_in_floor=None).init_fan_in_floor is None
+
+        with pytest.raises(TypeError, match="init_fan_in_floor"):
+            TrainingArguments(init_fan_in_floor=1.5)
+        with pytest.raises(TypeError, match="init_fan_in_floor"):
+            TrainingArguments(init_fan_in_floor=True)
+        with pytest.raises(ValueError, match="init_fan_in_floor"):
+            TrainingArguments(init_fan_in_floor=0)
 
     def test_training_arguments_signal_serialization(self, temp_dir):
         """Signal config should be JSON-serializable and round-trip."""
@@ -157,6 +182,26 @@ class TestTrainingArguments:
         assert loaded_args.signal_scope == SignalScope.from_values(
             activation_sites=["emb", "encoder.layer.*"],
         )
+
+    def test_training_arguments_gradiend_split_serialization(self):
+        args = TrainingArguments(
+            gradiend_split=GradiendSplit.by_tensor(),
+            gradiend_split_loss="size_weighted",
+        )
+
+        assert args.gradiend_split == GradiendSplit.by_tensor()
+        assert args.gradiend_split_loss == "size_weighted"
+        config_dict = args.to_dict()
+        assert config_dict["gradiend_split"] == {"mode": "tensors"}
+        assert config_dict["gradiend_split_loss"] == "size_weighted"
+
+        loaded_args = TrainingArguments.from_dict(config_dict)
+        assert loaded_args.gradiend_split == GradiendSplit.by_tensor()
+        assert loaded_args.gradiend_split_loss == "size_weighted"
+
+    def test_training_arguments_validates_gradiend_split_loss(self):
+        with pytest.raises(ValueError, match="gradiend_split_loss"):
+            TrainingArguments(gradiend_split_loss="median")
 
     def test_training_arguments_params_is_deprecated_signal_scope_alias(self):
         with pytest.warns(DeprecationWarning, match="params is deprecated"):

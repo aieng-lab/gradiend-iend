@@ -24,6 +24,11 @@ from gradiend.trainer.core.callbacks import (
     LoggingCallback,
     get_default_callbacks,
 )
+from gradiend.trainer.core.component_seed import (
+    apply_saved_component_best_states,
+    component_run_from_training_stats,
+    finalize_component_best_states,
+)
 from gradiend.trainer.core.stats import (
     write_training_stats,
     load_training_stats,
@@ -31,8 +36,41 @@ from gradiend.trainer.core.stats import (
     _best_step_min_target_class_abs_mean,
     _best_step_target_class_mean_product,
 )
+from gradiend.util.component_logging import (
+    best_step_component_payload,
+    format_component_convergence_fragment,
+    format_component_seed_summary_fragment,
+    strip_component_prefix,
+)
 
 logger = get_logger(__name__)
+
+
+def format_training_start_message(model_with_gradiend: Any, training_args: TrainingArguments) -> str:
+    """Describe the GRADIEND/ACTIEND training space without hiding split structure."""
+    gradiend = getattr(model_with_gradiend, "gradiend", None)
+    if gradiend is None:
+        return "Training GRADIEND model."
+    describe = getattr(gradiend, "describe_training_space", None)
+    if callable(describe):
+        return describe(split_loss=getattr(training_args, "gradiend_split_loss", None))
+    return (
+        f"Training GRADIEND over {len(model_with_gradiend):,} "
+        "gradient entries."
+    )
+
+
+def _best_step_component_summary(training_stats: dict, best_score_checkpoint: dict) -> Optional[dict]:
+    best_step = best_score_checkpoint.get("global_step") if isinstance(best_score_checkpoint, dict) else None
+    if best_step is None or not isinstance(training_stats, dict):
+        return None
+    payload = best_step_component_payload(training_stats, best_score_checkpoint)
+    if isinstance(payload, dict) and isinstance(payload.get("summary"), dict):
+        return payload["summary"]
+    hist = training_stats.get("component_summary")
+    if not isinstance(hist, dict):
+        return None
+    return hist.get(best_step) or hist.get(str(best_step))
 
 
 def format_non_convergence_error(
@@ -45,6 +83,9 @@ def format_non_convergence_error(
     pair: Any = None,
     output_dir: Optional[str] = None,
     seed_report: Optional[Sequence[dict]] = None,
+    components: Optional[dict] = None,
+    component_summary: Optional[dict] = None,
+    component_seed_summary: Optional[dict] = None,
     convergence_metric: Optional[str] = None,
     threshold: Optional[float] = None,
 ) -> str:
@@ -80,6 +121,19 @@ def format_non_convergence_error(
     mean_thr = getattr(args, "convergent_mean_by_class_threshold", None) if args is not None else None
     if mean_thr is not None:
         lines.append(f"  mean-by-class threshold: {mean_thr}")
+    component_fragment = format_component_convergence_fragment(
+        components,
+        summary=component_summary,
+        show_blockers=True,
+    )
+    if component_fragment:
+        lines.append(f"  component convergence: {strip_component_prefix(component_fragment)}")
+    component_seed_fragment = format_component_seed_summary_fragment(
+        component_seed_summary,
+        show_blockers=True,
+    )
+    if component_seed_fragment:
+        lines.append(f"  component convergence: {strip_component_prefix(component_seed_fragment)}")
     if seed_report:
         lines.append("  seed results:")
         for run in seed_report:
@@ -160,9 +214,7 @@ def train(
 
     # Log training start
     if model_with_gradiend.gradiend is not None:
-        logger.info(
-            f'Training GRADIEND model over {len(model_with_gradiend):,} base model weights with {model_with_gradiend.gradiend.latent_dim} feature neurons'
-        )
+        logger.info(format_training_start_message(model_with_gradiend, training_args))
         logger.info(f'Output: {training_args.output_dir or ""}')
     if runtime_monitor is not None:
         runtime_monitor.mark(
@@ -188,7 +240,6 @@ def train(
     # Initialize training state
     last_losses = []
     losses = []
-    max_losses = 100
     global_step = 0
     total_training_time_start = time.time()
 
@@ -225,6 +276,12 @@ def train(
                 continue
             seen_types.add(ctype)
         all_callbacks.append(c)
+    # Keep enough recent losses for LoggingCallback's report-window average.
+    max_losses = 100
+    for _cb in all_callbacks:
+        n_report = getattr(_cb, "n_loss_report", None)
+        if isinstance(n_report, int) and n_report > max_losses:
+            max_losses = n_report
     control: dict = {"should_stop": False}
     config_dict = training_args.to_dict()
     last_epoch = 0
@@ -270,7 +327,7 @@ def train(
         _corr0 = training_stats.get('correlation', -1.0)
         step_kwargs_0 = dict(
             step=0,
-            loss=0.0,
+            loss=None,
             model=model_with_gradiend,
             config=config_dict,
             training_stats=training_stats,
@@ -284,7 +341,7 @@ def train(
                 'correlation': _corr0,
                 'global_step': 0,
                 'epoch': 0,
-                'loss': 0.0,
+                'loss': None,
             },
         )
         for cb in all_callbacks:
@@ -391,13 +448,14 @@ def train(
                 # Standard GRADIEND: encode and decode
                 if source_tensor.device != model_with_gradiend.gradiend.device_encoder:
                     source_tensor = source_tensor.to(model_with_gradiend.gradiend.device_encoder)
-                outputs_gradiend, encoded_value = model_with_gradiend.gradiend(
-                    source_tensor, return_encoded=True
+                loss, encoded_value = model_with_gradiend.gradiend.reconstruction_loss(
+                    source_tensor,
+                    target_tensor,
+                    criterion=training_args.criterion,
+                    aggregation=getattr(training_args, "gradiend_split_loss", "mean"),
+                    return_encoded=True,
                 )
                 del source_tensor
-                if target_tensor.device != outputs_gradiend.device:
-                    outputs_gradiend = outputs_gradiend.to(target_tensor.device)
-                loss = training_args.criterion(outputs_gradiend, target_tensor)
                 del target_tensor
             
             # Backward pass
@@ -557,7 +615,10 @@ def train(
                     "global_step": cb.best_step,
                     "epoch": cb.best_epoch,
                 }
-                logger.info(f"Training completed. Best correlation: {cb.best_score:.6f}")
+                if cb.best_score is None:
+                    logger.info("Training completed. No encoder evaluation score was recorded.")
+                else:
+                    logger.info(f"Training completed. Best correlation: {cb.best_score:.6f}")
                 if cb.best_step == 0:
                     logger.info("Training did not improve on the initial evaluation; the best checkpoint is step 0.")
             break
@@ -573,16 +634,40 @@ def train(
     converged = True
     convergent_count = None
     min_target_class_abs_mean = None
+    best_component_summary = None
+    best_components = None
     if threshold is not None and min_convergent_seeds is not None and min_convergent_seeds > 0:
         # Check if this single-seed run converged
         best_step_ok = _best_checkpoint_step_is_after_initial(best_score_checkpoint)
         sign_ok = True
         target_mean_product = None
+        component_run = component_run_from_training_stats(
+            {
+                "training_stats": training_stats,
+                "best_score_checkpoint": best_score_checkpoint,
+            },
+            threshold=threshold,
+            mean_threshold=training_args.convergent_mean_by_class_threshold,
+        )
+        if isinstance(component_run, dict) and isinstance(component_run.get("summary"), dict):
+            best_component_summary = component_run["summary"]
+            best_components = {
+                "summary": best_component_summary,
+                "metrics_by_component": component_run.get("metrics_by_component"),
+                "convergence_by_component": component_run.get("convergence_by_component"),
+            }
+        else:
+            best_components = best_step_component_payload(training_stats, best_score_checkpoint)
+            best_component_summary = _best_step_component_summary(training_stats, best_score_checkpoint)
         if convergent_metric == "loss":
             metric_val = best_score_checkpoint.get("loss")
             if metric_val is None:
                 metric_val = training_stats.get("loss")
             converged = best_step_ok and metric_val is not None and metric_val <= threshold
+        elif isinstance(best_component_summary, dict) and best_component_summary.get("n_components"):
+            metric_val = best_component_summary.get("correlation_mean")
+            converged = bool(best_component_summary.get("converged"))
+            min_target_class_abs_mean = best_component_summary.get("min_target_class_abs_mean")
         else:
             metric_val = best_score_checkpoint.get("correlation")
             if metric_val is None:
@@ -603,7 +688,41 @@ def train(
             converged = best_step_ok and metric_val is not None and abs(metric_val) >= threshold and mean_ok and sign_ok
         
         if not converged:
-            if not best_step_ok:
+            if isinstance(best_component_summary, dict) and best_component_summary.get("n_components"):
+                method_name = getattr(model_with_gradiend.gradiend, "method_name", "GRADIEND")
+                component_fragment = strip_component_prefix(
+                    format_component_convergence_fragment(
+                        best_components,
+                        summary=best_component_summary,
+                        show_blockers=True,
+                    )
+                )
+                criteria = []
+                if isinstance(metric_val, (int, float)):
+                    criteria.append(f"mean component correlation={metric_val:.4f} (threshold={threshold:.4f})")
+                if training_args.convergent_mean_by_class_threshold is not None:
+                    if isinstance(min_target_class_abs_mean, (int, float)):
+                        criteria.append(
+                            "minimum per-component target-class |mean|="
+                            f"{min_target_class_abs_mean:.4f} "
+                            f"(required >= {training_args.convergent_mean_by_class_threshold:.4f})"
+                        )
+                    else:
+                        criteria.append(
+                            "minimum per-component target-class |mean| was unavailable "
+                            f"(required >= {training_args.convergent_mean_by_class_threshold:.4f})"
+                        )
+                criteria_text = "; ".join(criteria) if criteria else f"metric={convergent_metric}"
+                logger.warning(
+                    "Training completed but component-split %s did not converge: "
+                    "%s; convergence policy requires all components "
+                    "(required: %s convergent seeds). Component criteria: %s.",
+                    method_name,
+                    component_fragment,
+                    min_convergent_seeds,
+                    criteria_text,
+                )
+            elif not best_step_ok:
                 logger.warning(
                     "Training completed but model did not converge: "
                     "best checkpoint global_step=%s; convergence requires global_step > 0 "
@@ -674,6 +793,13 @@ def train(
             "convergent_mean_by_class_threshold": training_args.convergent_mean_by_class_threshold,
             "convergent_min_target_class_abs_mean": min_target_class_abs_mean,
         }
+        if best_component_summary is not None:
+            convergence_info["convergence_unit"] = "component"
+            convergence_info["component_summary"] = best_component_summary
+            if isinstance(best_components, dict):
+                # Persist the local-best-per-component view used for the decision,
+                # so load-time warnings do not fall back to the global best step.
+                convergence_info["components"] = best_components
 
     if getattr(training_args, "fail_on_non_convergence", False) and int(getattr(training_args, "max_seeds", 1) or 1) <= 1:
         min_req = training_args.min_convergent_seeds
@@ -687,6 +813,8 @@ def train(
                         training_args=training_args,
                         model=model_with_gradiend,
                         output_dir=training_args.output_dir,
+                        components=best_components,
+                        component_summary=best_component_summary,
                         convergence_metric=convergent_metric,
                         threshold=threshold,
                     )
@@ -696,6 +824,23 @@ def train(
     output_dir = training_args.output_dir or ""
     if training_args.save_only_best:
         _handle_keep_only_best(output_dir)
+        finalize_component_best_states(output_dir)
+        # Component-split: delivered weights must be the local-best merge, not the
+        # single global best-correlation step that CheckpointCallback saved.
+        stitched = apply_saved_component_best_states(model_with_gradiend, output_dir)
+        if stitched:
+            logger.info(
+                "Applied local-best component states for %s components into final model at %s",
+                len(stitched),
+                output_dir,
+            )
+            model_with_gradiend.save_pretrained(output_dir)
+            if isinstance(convergence_info, dict):
+                convergence_info["component_stitching"] = {
+                    "applied": True,
+                    "status": "intra_seed_component_best",
+                    "n_components": len(stitched),
+                }
         # Overwrite training.json with full run history (best checkpoint was saved with truncated stats)
         write_training_stats(
             output_dir,
@@ -707,6 +852,21 @@ def train(
             convergence_info=convergence_info,
         )
     else:
+        finalize_component_best_states(output_dir)
+        stitched = apply_saved_component_best_states(model_with_gradiend, output_dir)
+        if stitched:
+            logger.info(
+                "Applied local-best component states for %s components into final model at %s",
+                len(stitched),
+                output_dir,
+            )
+            model_with_gradiend.save_pretrained(output_dir)
+            if isinstance(convergence_info, dict):
+                convergence_info["component_stitching"] = {
+                    "applied": True,
+                    "status": "intra_seed_component_best",
+                    "n_components": len(stitched),
+                }
         # When save_only_best is False, CheckpointCallback saves training.json via save_pretrained.
         # We need to update it with convergence_info. Load existing training.json and rewrite with convergence_info.
         try:
