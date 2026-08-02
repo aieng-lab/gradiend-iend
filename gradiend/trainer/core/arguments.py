@@ -22,6 +22,7 @@ from gradiend.trainer.core.signals import (
     coerce_signal_set,
     normalize_signal_arguments,
 )
+from gradiend.gradiend_split import GradiendSplit, coerce_gradiend_split
 
 
 @dataclass
@@ -53,6 +54,14 @@ class TrainingArguments:
 
     add_identity_for_other_classes: bool = False
     """If True, add identity (factual==alternative) examples for classes not in the target classes used for training."""
+
+    add_neutral_identity_transitions: bool = False
+    """If True, add neutral identity transitions from TextPredictionConfig.neutral_data.
+
+    These rows have factual==alternative and label 0. For target='diff' they
+    train the decoded GRADIEND/ACTIEND update toward the zero vector on neutral
+    examples without adding a separate neutral-specific loss.
+    """
 
     # ----- GRADIEND interpretation -----
     source: str = "alternative"
@@ -222,17 +231,47 @@ class TrainingArguments:
     signal_scope: Optional[Any] = None
     """Optional SignalScope describing where a signal is measured, e.g. activation module sites. Signal itself remains only the measured quantity."""
 
+    gradiend_split: Optional[Any] = None
+    """Optional GradiendSplit describing component partitioning over the resolved signal space.
+
+    ``signal`` defines what is measured and ``signal_scope`` defines where it is
+    measured. ``gradiend_split`` is the separate axis that decides whether the
+    flattened eligible signal space is trained as one model or partitioned into
+    virtual component models. ``None``/``GradiendSplit.none()`` keeps the ordinary
+    unpartitioned ``GradiendModel`` behavior; ``GradiendSplit.single()`` uses the
+    partitioned code path with one full-space component; ``GradiendSplit.by_tensor()``
+    creates one component per resolved signal-space tensor entry.
+    """
+
+    gradiend_split_loss: str = "mean"
+    """Loss aggregation for component-split GRADIEND training: 'mean', 'sum', 'size_weighted', or 'full'. Non-split models always use the classic full-vector objective."""
+
     activation_encoder: Optional[str] = None
     """Encoder activation name (e.g. 'tanh', 'gelu', 'relu'). None = model default ('tanh')."""
 
     activation_decoder: Optional[str] = None
     """Decoder activation name (e.g. 'id', 'tanh'). None = model default ('id')."""
 
+    bias_encoder: Optional[bool] = None
+    """Whether the encoder linear layer uses a bias term. None = model default (False)."""
+
     bias_decoder: Optional[bool] = None
     """Whether the decoder linear layer uses a bias term. None = model default (True)."""
 
     latent_dim: Optional[int] = None
     """GRADIEND latent dimension (number of features). None = model default (1)."""
+
+    init_fan_in_floor: Optional[int] = 10_000
+    """Optional lower bound for fresh GRADIEND/ACTIEND initialization fan-in.
+
+    Encoder weights use ``1 / sqrt(max(init_fan_in_floor, component_fan_in))``
+    and decoder rows are initialized on the matching component scale. The
+    default keeps small activation-space ACTIEND components from starting with
+    much larger random weights than classic parameter-space GRADIENDs; this was
+    empirically helpful for ACTIEND convergence. Large GRADIEND parameter spaces
+    are already above the floor, so their scale is unchanged. Set to ``None``
+    for raw component fan-in initialization.
+    """
 
     normalize_gradiend: bool = True
     """Whether to normalize GRADIEND encodings during training, i.e., first target class is encoded to +1 and second to -1. This is recommended for enhanced comparability between runs."""
@@ -357,6 +396,7 @@ class TrainingArguments:
         self.signal = signal
         self.signals = signals
         self.signal_scope = coerce_signal_scope(self.signal_scope)
+        self.gradiend_split = coerce_gradiend_split(self.gradiend_split)
         if self.params is not None:
             warnings.warn(
                 "TrainingArguments.params is deprecated; use "
@@ -482,6 +522,14 @@ class TrainingArguments:
             raise TypeError(f"do_eval must be bool, got {type(self.do_eval).__name__}")
         if self.seed is not None and not isinstance(self.seed, int):
             raise TypeError(f"seed must be int or None, got {type(self.seed).__name__}")
+        if not isinstance(self.gradiend_split_loss, str):
+            raise TypeError(f"gradiend_split_loss must be str, got {type(self.gradiend_split_loss).__name__}")
+        self.gradiend_split_loss = self.gradiend_split_loss.strip().lower()
+        if self.gradiend_split_loss not in {"mean", "sum", "size_weighted", "full"}:
+            raise ValueError(
+                "gradiend_split_loss must be 'mean', 'sum', 'size_weighted', or 'full', "
+                f"got {self.gradiend_split_loss!r}"
+            )
 
         self._normalize_signal_arguments()
 
@@ -489,6 +537,16 @@ class TrainingArguments:
         validate_source_target("target", self.target)
         if self.torch_dtype is None:
             self.torch_dtype = torch.float32
+        if self.init_fan_in_floor is not None:
+            if isinstance(self.init_fan_in_floor, bool) or not isinstance(self.init_fan_in_floor, int):
+                raise TypeError(
+                    "init_fan_in_floor must be a positive int or None, "
+                    f"got {type(self.init_fan_in_floor).__name__}"
+                )
+            if self.init_fan_in_floor < 1:
+                raise ValueError(
+                    f"init_fan_in_floor must be >= 1 or None, got {self.init_fan_in_floor}"
+                )
         if self.base_model_device_map is not None and self.base_model_device_map is not False and not isinstance(self.base_model_device_map, (str, dict)):
             raise TypeError(
                 "base_model_device_map must be None, False, a string such as 'auto', or a device-map dict; "
@@ -573,6 +631,8 @@ class TrainingArguments:
                 result[k] = list(v.to_list()) if v is not None and hasattr(v, "to_list") else v
             elif k == "signal_scope":
                 result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
+            elif k == "gradiend_split":
+                result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
             else:
                 result[k] = v
         return result
@@ -587,6 +647,8 @@ class TrainingArguments:
             d["signals"] = SignalSet.from_list(d["signals"])
         if "signal_scope" in d and isinstance(d.get("signal_scope"), dict):
             d["signal_scope"] = SignalScope.from_dict(d["signal_scope"])
+        if "gradiend_split" in d and isinstance(d.get("gradiend_split"), dict):
+            d["gradiend_split"] = GradiendSplit.from_dict(d["gradiend_split"])
         if "torch_dtype" in d and isinstance(d.get("torch_dtype"), str):
             d["torch_dtype"] = getattr(torch, d["torch_dtype"], torch.float32)
         if "pre_prune_config" in d and isinstance(d.get("pre_prune_config"), dict):

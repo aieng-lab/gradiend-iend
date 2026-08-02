@@ -20,20 +20,36 @@ import threading
 import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Iterator, List, Optional, Dict, Any, Tuple, Union
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Dict, Any, Tuple, Union, Sequence
 
 import torch
 import torch.nn as nn
 from torch.nn import Parameter
 
 from gradiend.util import unwrap_model
+from gradiend.util.component_logging import (
+    format_component_convergence_fragment,
+    format_component_seed_summary_fragment,
+    format_component_stitching_fragment,
+    strip_component_prefix,
+)
 from gradiend.util.logging import get_logger
 from gradiend.model import ParamMappedGradiendModel
+from gradiend.model.model import GradiendModel
 from gradiend.model.core import build_gradiend_from_base_model
+from gradiend.gradiend_split import coerce_gradiend_split, resolve_gradiend_components
 from gradiend.signal_space import SignalTrainingPlan, resolve_signal_training_plan, scope_mode, scope_params
 from gradiend.model._source_target import (
     resolve_source_from_checkpoint_dir,
     validate_source_target,
+)
+from gradiend.model.modified import (
+    activation_selector_coverage_for_inputs,
+    activation_interventions_from_gradiend,
+    apply_activation_steering,
+    register_activation_steering_hooks,
+    remove_hook_handles,
 )
 from gradiend.model.utils import (
     get_hf_device_map,
@@ -43,6 +59,16 @@ from gradiend.model.utils import (
 )
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class ModelWithGradiendCapabilities:
+    """High-level capability flags for this wrapper instance."""
+
+    activation_interventions: bool
+    activation_selector_coverage: bool
+    activation_module_ablation: bool
+    gradient_rewrite: bool
 
 def effective_rewrite_learning_rate(learning_rate: float, source: str) -> float:
     """
@@ -101,6 +127,32 @@ def _is_gradiend_checkpoint(load_directory: str) -> bool:
         return False
 
 
+def _checkpoint_gradiend_method_name(load_directory: str) -> str:
+    """
+    Resolve the human-facing GRADIEND-family method name from a checkpoint.
+
+    Signal metadata is stored in ``config.json`` under ``metadata`` for current
+    checkpoints.  Minimal or legacy checkpoints fall back to gradient-space
+    ``GRADIEND``.
+    """
+    cfg_path = os.path.join(load_directory, "config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as handle:
+            cfg = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return "GRADIEND"
+    if not isinstance(cfg, dict):
+        return "GRADIEND"
+    metadata = cfg.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    merged = dict(metadata)
+    for key in ("signal_space", "mapping_kind", "signal"):
+        if key in cfg and key not in merged:
+            merged[key] = cfg[key]
+    return GradiendModel.method_name_from_metadata(merged)
+
+
 # Paths we have already logged a non-convergent warning for (avoid duplicate logs when same model is loaded multiple times)
 _convergence_warning_logged: set = set()
 
@@ -118,6 +170,7 @@ def _check_convergence_warning(model_path: str) -> None:
     norm_path = os.path.normpath(os.path.abspath(model_path))
     if norm_path in _convergence_warning_logged:
         return
+    method_name = _checkpoint_gradiend_method_name(model_path)
     # First, try to load convergence info from training.json
     training_json_path = os.path.join(model_path, "training.json")
     if os.path.isfile(training_json_path):
@@ -132,20 +185,87 @@ def _check_convergence_warning(model_path: str) -> None:
                 min_convergent_seeds = convergence_info.get("min_convergent_seeds")
                 convergence_metric = convergence_info.get("convergence_metric", "correlation")
                 threshold = convergence_info.get("threshold")
+                component_summary = convergence_info.get("component_summary")
+                component_seed_summary = convergence_info.get("component_seed_summary")
+                component_stitching = convergence_info.get("component_stitching")
                 
-                # Convergence is OK if at least one convergent run was present
-                # Only warn if convergent_count is 0 (or None) and min_convergent_seeds requires convergence
+                # Warn when the saved convergence count does not satisfy the
+                # configured requirement. For component-split runs this count
+                # is the seed-level result, while component_summary carries the
+                # component-level detail.
                 actual_count = convergent_count if convergent_count is not None else 0
-                if actual_count == 0 and min_convergent_seeds is not None and min_convergent_seeds > 0:
+                if (
+                    min_convergent_seeds is not None
+                    and min_convergent_seeds > 0
+                    and actual_count < min_convergent_seeds
+                ):
                     _convergence_warning_logged.add(norm_path)
-                    logger.warning(
-                        "Loading model from non-convergent training: "
-                        "converged=False (convergent_count=%s, required: %s) for metric=%s threshold=%.4f. ",
-                        actual_count,
-                        min_convergent_seeds,
-                        convergence_metric,
-                        threshold if threshold is not None else 0.0,
+                    component_seed_fragment = format_component_seed_summary_fragment(
+                        component_seed_summary,
+                        show_blockers=True,
                     )
+                    if component_seed_fragment:
+                        stitching_fragment = format_component_stitching_fragment(component_stitching)
+                        stitching_sentence = f" Stitching status: {stitching_fragment}." if stitching_fragment else ""
+                        logger.warning(
+                            "Loading model from non-convergent component-split multi-seed %s training: "
+                            "%s; convergence policy requires at least %s convergent seed(s) for every component "
+                            "for metric=%s threshold=%.4f.%s",
+                            method_name,
+                            strip_component_prefix(component_seed_fragment),
+                            min_convergent_seeds,
+                            convergence_metric,
+                            threshold if threshold is not None else 0.0,
+                            stitching_sentence,
+                        )
+                    elif isinstance(component_summary, dict) and component_summary.get("n_components"):
+                        # Prefer the local-best-per-component payload persisted at train end.
+                        # Never fall back to the global best-correlation step for component
+                        # blockers — that mixes two different selection policies.
+                        component_payload = convergence_info.get("components")
+                        if not isinstance(component_payload, dict):
+                            from gradiend.trainer.core.component_seed import (
+                                component_run_from_training_stats,
+                            )
+                            component_run = component_run_from_training_stats(
+                                training_data,
+                                threshold=threshold,
+                                mean_threshold=convergence_info.get(
+                                    "convergent_mean_by_class_threshold"
+                                ),
+                            )
+                            component_payload = component_run if isinstance(component_run, dict) else None
+                        component_fragment = strip_component_prefix(
+                            format_component_convergence_fragment(
+                                component_payload,
+                                summary=component_summary,
+                                show_blockers=True,
+                            )
+                        )
+                        stitching_fragment = format_component_stitching_fragment(component_stitching)
+                        stitching_sentence = (
+                            f" Stitching status: {stitching_fragment}." if stitching_fragment else ""
+                        )
+                        logger.warning(
+                            "Loading model from non-convergent component-split %s training: "
+                            "%s; convergence policy requires all components "
+                            "(required: %s convergent seeds) for metric=%s threshold=%.4f.%s",
+                            method_name,
+                            component_fragment,
+                            min_convergent_seeds,
+                            convergence_metric,
+                            threshold if threshold is not None else 0.0,
+                            stitching_sentence,
+                        )
+                    else:
+                        logger.warning(
+                            "Loading model from non-convergent training: "
+                            "converged=False (convergent_count=%s, required: %s) for metric=%s threshold=%.4f. ",
+                            actual_count,
+                            min_convergent_seeds,
+                            convergence_metric,
+                            threshold if threshold is not None else 0.0,
+                        )
                 return
         except Exception as e:
             logger.debug("Could not check convergence status from training.json: %s", e)
@@ -189,16 +309,41 @@ def _check_convergence_warning(model_path: str) -> None:
         convergence_metric = report.get("convergence_metric", "correlation")
         threshold = report.get("threshold")
         min_convergent_seeds = report.get("min_convergent_seeds")
+        component_seed_summary = report.get("component_seed_summary")
         
-        if convergent_count == 0 and min_convergent_seeds is not None and min_convergent_seeds > 0:
+        if (
+            min_convergent_seeds is not None
+            and min_convergent_seeds > 0
+            and convergent_count < min_convergent_seeds
+        ):
             _convergence_warning_logged.add(norm_path)
-            logger.warning(
-                "Loading model from non-convergent multi-seed training: "
-                "convergent_count=0 (required: %s) for metric=%s threshold=%.4f. ",
-                min_convergent_seeds,
-                convergence_metric,
-                threshold if threshold is not None else 0.0,
+            component_fragment = format_component_seed_summary_fragment(
+                component_seed_summary,
+                show_blockers=True,
             )
+            stitching_fragment = format_component_stitching_fragment(report.get("component_stitching"))
+            if component_fragment:
+                stitching_sentence = f" Stitching status: {stitching_fragment}." if stitching_fragment else ""
+                logger.warning(
+                    "Loading model from non-convergent component-split multi-seed %s training: "
+                    "%s; convergence policy requires at least %s convergent seed(s) for every component "
+                    "for metric=%s threshold=%.4f.%s",
+                    method_name,
+                    strip_component_prefix(component_fragment),
+                    min_convergent_seeds,
+                    convergence_metric,
+                    threshold if threshold is not None else 0.0,
+                    stitching_sentence,
+                )
+            else:
+                logger.warning(
+                    "Loading model from non-convergent multi-seed training: "
+                    "convergent_count=%s (required: %s) for metric=%s threshold=%.4f. ",
+                    convergent_count,
+                    min_convergent_seeds,
+                    convergence_metric,
+                    threshold if threshold is not None else 0.0,
+                )
     except Exception as e:
         # Silently ignore errors reading seed_report.json (could be corrupted, etc.)
         logger.debug("Could not check convergence status from %s: %s", seed_report_path, e)
@@ -329,6 +474,55 @@ class ModelWithGradiend(nn.Module, ABC):
         self.__dict__.update(state)
         self._base_gradient_lock = threading.RLock()
 
+    @property
+    def signal_kind(self) -> str:
+        """Signal kind represented by the attached GRADIEND model."""
+        return getattr(self.gradiend, "signal_kind", "gradient")
+
+    @property
+    def uses_gradients(self) -> bool:
+        return self.signal_kind == "gradient"
+
+    @property
+    def uses_activations(self) -> bool:
+        return self.signal_kind == "activation"
+
+    @property
+    def uses_activation_gradients(self) -> bool:
+        return self.signal_kind == "activation_gradient"
+
+    @property
+    def is_gradiend(self) -> bool:
+        return self.uses_gradients
+
+    @property
+    def is_actiend(self) -> bool:
+        return self.uses_activations
+
+    @property
+    def capabilities(self) -> ModelWithGradiendCapabilities:
+        uses_activations = self.uses_activations
+        return ModelWithGradiendCapabilities(
+            activation_interventions=uses_activations,
+            activation_selector_coverage=uses_activations,
+            activation_module_ablation=uses_activations,
+            gradient_rewrite=self.uses_gradients,
+        )
+
+    @property
+    def activation_site_modules(self) -> List[str]:
+        """Activation module names registered in this ACTIEND mapping."""
+        if not self.uses_activations:
+            return []
+        param_map = getattr(getattr(self, "gradiend", None), "param_map", {}) or {}
+        modules = [
+            str(name)[len("activation:"):]
+            for name in param_map
+            if str(name).startswith("activation:")
+        ]
+        # Preserve insertion order and drop duplicates.
+        return list(dict.fromkeys(modules))
+
     @contextmanager
     def exclusive_base_gradient_access(self):
         """Serialize base-model tokenization, forward, and backward across threads."""
@@ -438,7 +632,7 @@ class ModelWithGradiend(nn.Module, ABC):
         raise TypeError(f"gradiend.param_map must be dict-spec, got {type(param_map)}")
 
     def _active_param_map_names(self) -> set:
-        if getattr(self.gradiend, "mapping_kind", self.gradiend.kwargs.get("mapping_kind", "gradient")) != "gradient":
+        if not self.uses_gradients:
             return set()
         active = set()
         for name, spec in self.gradiend.param_map.items():
@@ -638,6 +832,10 @@ class ModelWithGradiend(nn.Module, ABC):
         """Return GRADIEND parameters (adapter exposes GRADIEND weights as trainable parameters)."""
         return self.gradiend.parameters(recurse=recurse)
 
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Forward to the wrapped base model."""
+        return self.base_model(*args, **kwargs)
+
     @property
     def name(self):
         return os.path.basename(self.gradiend.name_or_path)
@@ -693,7 +891,10 @@ class ModelWithGradiend(nn.Module, ABC):
         elif hasattr(input, "to"):
             input = input.to(self.gradiend.device_encoder, dtype=self.gradiend.torch_dtype)
 
-        encoded = self.gradiend.encoder(input)
+        if bool(getattr(self.gradiend, "has_component_split", False)):
+            encoded = self.gradiend._encode_components(input).mean(dim=-2)
+        else:
+            encoded = self.gradiend.encoder(input)
 
         if return_float:
             if hasattr(encoded, "tolist"):
@@ -800,6 +1001,582 @@ class ModelWithGradiend(nn.Module, ABC):
                 f"Inconsistent enhancer length vs mapping (used {idx}, enhancer has {enhancer.numel()})")
 
         return enhanced_model
+
+    def modify_model(
+        self,
+        learning_rate,
+        feature_factor,
+        part="decoder",
+        *,
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Union[str, Sequence[str]]] = None,
+        threshold: float = 0.5,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: float = 0.2,
+    ):
+        """
+        Return an in-memory base model with the selected GRADIEND/ACTIEND
+        intervention made permanent for normal downstream inference.
+
+        This is the persistent counterpart to :meth:`intervene`.  ``intervene``
+        changes ``self.base_model`` only inside a context manager and always
+        restores the original state on exit; ``modify_model`` deep-copies the
+        wrapped base model, applies the chosen change to that copy, and returns
+        the copied base model.  It does not mutate ``self.base_model`` and it
+        does not save anything by itself.  Saving is handled by the returned
+        model (ACTIEND exposes ``save_pretrained_modified``) or by the trainer
+        convenience method when ``output_dir`` is provided.
+
+        Signal-specific behavior:
+
+        - Gradient-space GRADIEND checkpoints are converted to an ordinary
+          weight-rewritten base model, equivalent to
+          :meth:`rewrite_base_model` with the same ``learning_rate``,
+          ``feature_factor``, and ``part``.
+        - Activation-space ACTIEND checkpoints are converted to an ordinary
+          base model copy with fixed PyTorch forward hooks.  The hooks add the
+          decoded activation-space update at the activation sites recorded in
+          the GRADIEND mapping.  The returned model owns a copy of the steering
+          tensors and hook metadata, so it can be used independently of the
+          original ``ModelWithGradiend`` instance.
+
+        Args:
+            learning_rate: Scalar intervention strength.  Positive and
+                negative values are supported.  ``0`` produces a no-op update,
+                aside from returning a copied model.  The sign is not adjusted
+                from ``source``; orientation comes from ``feature_factor``.
+            feature_factor: Latent feature value decoded into an update vector.
+                For binary class steering this is usually the selected target
+                class direction returned by decoder evaluation, such as
+                ``-1.0`` or ``1.0``.  A list may be passed for multi-feature
+                GRADIEND models.
+            part: Which GRADIEND decoder/update object to use.  Supported
+                values are ``"decoder"``, ``"decoder-weight"``,
+                ``"decoder-bias"``, ``"decoder-sum"``, and
+                ``"encoder-weight"``.  ``"decoder"`` decodes
+                ``feature_factor``; the other values use fixed GRADIEND weight
+                summaries from :meth:`ParamMappedGradiendModel.get_update_vector`.
+            token_selector: ACTIEND-only selector that decides where activation
+                hooks add the steering vector.  ``None`` defaults to
+                ``"encoder_direction"`` when no ``activation_gate`` is set —
+                the **combined default**: score every token with the ACTIEND
+                encoder and fire only where the score points in ``direction``
+                (equivalent to ``token_selector="all", activation_gate="encoder_direction"``).
+                Other supported selectors include
+                ``"encoder_abs"``, ``"encoder_threshold"``,
+                ``"encoder_range"``, ``"prediction"``, ``"mask"``,
+                ``"cls"``, ``"all"``, ``"mean"``, and an integer token index.
+                ``"prediction"`` means the filled/masked prediction slot:
+                an explicit ``prediction_mask`` if supplied, otherwise MLM
+                mask-token positions, and for decoder-only CLM the last
+                non-padding prefix token.
+            activation_gate: Optional ACTIEND encoder gate composed with
+                ``token_selector``.  Use this to separate where steering is
+                allowed from whether the ACTIEND encoder fired, for example
+                ``token_selector="prediction", activation_gate="encoder_direction"``.
+                Supported values are ``"encoder_direction"``,
+                ``"encoder_range"``, ``"encoder_abs"``, and
+                ``"encoder_threshold"``.  Passing an encoder selector as
+                ``token_selector`` (the combined default above) still works and
+                means the gate is applied over all token positions.
+            activation_modules: Optional activation module name or names to
+                steer.  Names use the base-model module path, e.g.
+                ``"transformer.h.9"``; ``"activation:..."`` prefixes are also
+                accepted.  ``None`` uses all trained activation sites.
+            threshold: ACTIEND encoder-selector threshold.  Used by
+                ``"encoder_abs"``, ``"encoder_threshold"``, and
+                ``"encoder_direction"``.
+            direction: ACTIEND direction for ``"encoder_direction"``.  If
+                omitted, ``feature_factor`` is used.
+            target_encoding: ACTIEND target encoding for ``"encoder_range"``.
+                If omitted for that selector, ``feature_factor`` is used.
+            tolerance: ACTIEND tolerance for ``"encoder_range"``.
+
+        Returns:
+            A copied base-model instance, not a ``ModelWithGradiend`` wrapper.
+            For ACTIEND, the returned model has GRADIEND modified-model metadata
+            and a ``save_pretrained_modified(save_directory, **kwargs)`` method.
+
+        Raises:
+            ValueError: If ``part`` is unsupported, activation hook dimensions
+                do not match the trained activation sites, an ACTIEND selector
+                cannot be resolved, or encoder-based ACTIEND selectors require
+                per-site encoder tensors that the checkpoint cannot provide.
+            KeyError: If a gradient-space update references a parameter that is
+                missing from the copied base model.
+        """
+        if not self.uses_activations:
+            return self.rewrite_base_model(
+                learning_rate=learning_rate,
+                feature_factor=feature_factor,
+                part=part,
+            )
+
+        source_model = unwrap_model(self.base_model)
+        modified_model = copy.deepcopy(source_model)
+        update = self._intervention_update_vector(
+            value=learning_rate,
+            feature_factor=feature_factor,
+            part=part,
+        )
+        interventions, tensors = self._activation_intervention_specs(
+            update,
+            feature_factor=feature_factor,
+            token_selector=token_selector,
+            activation_gate=activation_gate,
+            activation_modules=activation_modules,
+            threshold=threshold,
+            direction=direction,
+            target_encoding=target_encoding,
+            tolerance=tolerance,
+        )
+        return apply_activation_steering(
+            modified_model,
+            interventions=interventions,
+            tensors=tensors,
+        )
+
+    def _intervention_signal_kind(self, signal: str = "auto") -> str:
+        if signal == "auto":
+            return "activation" if self.uses_activations else "gradient"
+        if signal not in {"gradient", "activation"}:
+            raise ValueError("signal must be 'gradient', 'activation', or 'auto'")
+        if signal == "activation" and not self.uses_activations:
+            raise ValueError("signal='activation' requires an activation-space ACTIEND model")
+        if signal == "gradient" and self.uses_activations:
+            raise ValueError("signal='gradient' requires a gradient-space GRADIEND model")
+        return signal
+
+    def _intervention_update_vector(self, *, value: float, feature_factor: Any, part: str) -> torch.Tensor:
+        if not isinstance(feature_factor, list):
+            feature_factor = [feature_factor]
+        model_device = _first_param_device(unwrap_model(self.base_model))
+        if part == "decoder":
+            update = self.gradiend.decoder(
+                torch.tensor(feature_factor, dtype=torch.float, device=model_device)
+            )
+        elif part in {"decoder-bias", "decoder-sum", "decoder-weight", "encoder-weight"}:
+            update = self.gradiend.get_update_vector(part).to(model_device)
+        else:
+            raise ValueError(
+                "part must be 'decoder', 'decoder-bias', 'decoder-sum', 'decoder-weight', or 'encoder-weight', "
+                f"got {part!r}"
+            )
+        effective_value = effective_rewrite_learning_rate(value, self.source)
+        return (float(effective_value) * update.flatten()).detach()
+
+    def _activation_intervention_specs(
+        self,
+        update: torch.Tensor,
+        *,
+        feature_factor: Optional[Any] = None,
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Union[str, Sequence[str]]] = None,
+        threshold: float = 0.5,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: float = 0.2,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]]:
+        """Resolve a flat ACTIEND update vector into persistent hook specs and tensors."""
+        signal_space = dict(getattr(self.gradiend, "kwargs", {}).get("signal_space") or {})
+        signal_cfg = dict(signal_space.get("signal") or {})
+        signal_options = dict(signal_cfg.get("options") or {})
+        resolved_selector = token_selector
+        if resolved_selector is None:
+            resolved_selector = "all" if activation_gate is not None else "encoder_direction"
+        resolved_direction = direction
+        if resolved_direction is None and (
+            resolved_selector == "encoder_direction" or activation_gate == "encoder_direction"
+        ):
+            resolved_direction = feature_factor
+        resolved_target_encoding = target_encoding
+        if resolved_target_encoding is None and (
+            resolved_selector == "encoder_range" or activation_gate == "encoder_range"
+        ):
+            resolved_target_encoding = feature_factor
+        tokenizer = getattr(self, "tokenizer", None)
+        encoder_tensors = (
+            self._activation_encoder_tensors()
+            if (
+                resolved_selector in {"encoder_abs", "encoder_threshold", "encoder_direction", "encoder_range"}
+                or activation_gate in {"encoder_abs", "encoder_threshold", "encoder_direction", "encoder_range"}
+            )
+            else None
+        )
+        interventions, tensors = activation_interventions_from_gradiend(
+            self.gradiend,
+            update.detach().to("cpu"),
+            token_selector=resolved_selector,
+            activation_gate=activation_gate,
+            threshold=threshold,
+            direction=resolved_direction,
+            target_encoding=resolved_target_encoding,
+            tolerance=tolerance,
+            encoder_tensors=encoder_tensors,
+            mask_token_id=getattr(tokenizer, "mask_token_id", None),
+            cls_token_id=getattr(tokenizer, "cls_token_id", None),
+        )
+        return self._filter_activation_interventions(
+            interventions,
+            tensors,
+            activation_modules=activation_modules,
+        )
+
+    @staticmethod
+    def _filter_activation_interventions(
+        interventions: List[Dict[str, Any]],
+        tensors: Dict[str, torch.Tensor],
+        *,
+        activation_modules: Optional[Union[str, Sequence[str]]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, torch.Tensor]]:
+        """Restrict resolved ACTIEND intervention specs to selected activation modules."""
+        if activation_modules is None:
+            return interventions, tensors
+        raw_modules: Sequence[str]
+        if isinstance(activation_modules, str):
+            raw_modules = [activation_modules]
+        else:
+            raw_modules = list(activation_modules)
+        wanted = {
+            str(module)[len("activation:"):] if str(module).startswith("activation:") else str(module)
+            for module in raw_modules
+        }
+        available = [str(intervention["module"]) for intervention in interventions]
+        filtered = [
+            intervention
+            for intervention in interventions
+            if str(intervention["module"]) in wanted
+        ]
+        if not filtered:
+            raise ValueError(
+                "No ACTIEND activation modules matched activation_modules=%s. Available modules: %s"
+                % (sorted(wanted), available)
+            )
+        used_keys = set()
+        for intervention in filtered:
+            used_keys.add(intervention["tensor_key"])
+            application = dict(intervention.get("application") or {})
+            for key in ("encoder_weight_key", "encoder_bias_key"):
+                tensor_key = application.get(key)
+                if tensor_key is not None:
+                    used_keys.add(tensor_key)
+        return filtered, {key: value for key, value in tensors.items() if key in used_keys}
+
+    def activation_selector_coverage(
+        self,
+        *model_args: Any,
+        feature_factor: Union[float, List[float]] = 1.0,
+        part: str = "decoder",
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Union[str, Sequence[str]]] = None,
+        threshold: float = 0.5,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: float = 0.2,
+        **model_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Measure which positions an ACTIEND selector would hook for one forward pass.
+
+        The diagnostic shares the selector resolver used by ``intervene`` and
+        ``modify_model`` but does not add the steering vector. It is therefore a
+        cheap baseline-activation check for operational specificity: how often
+        the chosen selector would fire on target, other, or neutral inputs. For
+        multi-site ACTIEND models, later-site masks are measured on unmodified
+        base activations rather than activations changed by earlier hooks.
+
+        Args:
+            *model_args: Positional arguments passed to the wrapped base model.
+            feature_factor: Feature value used to resolve direction/range
+                selector defaults. The decoded vector magnitude is ignored
+                except for validating activation-site dimensions.
+            part: GRADIEND decoder/update part used to resolve activation sites.
+            token_selector: ACTIEND selector, e.g. ``"encoder_direction"``,
+                ``"encoder_range"``, ``"encoder_abs"``, ``"prediction"``,
+                or ``"all"``. ``None`` follows the same
+                default as ``intervene``.
+            activation_gate: Optional ACTIEND encoder gate composed with
+                ``token_selector``.
+            activation_modules: Optional activation module name or names to
+                measure. ``None`` uses all trained activation sites.
+            threshold: Threshold for encoder-based selectors.
+            direction: Direction for ``"encoder_direction"``. Defaults to
+                ``feature_factor``.
+            target_encoding: Target encoding for ``"encoder_range"``. Defaults
+                to ``feature_factor``.
+            tolerance: Tolerance for ``"encoder_range"``.
+            **model_kwargs: Keyword arguments passed to the wrapped base model.
+
+        Returns:
+            A dictionary with aggregate ``selected_positions``,
+            ``candidate_positions`` (positions allowed by the token scope),
+            ``total_positions``, global ``coverage``,
+            ``scope_coverage``, and per-module rows.
+        """
+        if not self.uses_activations:
+            raise ValueError("activation_selector_coverage requires an activation-space ACTIEND model")
+        update = self._intervention_update_vector(
+            value=1.0,
+            feature_factor=feature_factor,
+            part=part,
+        )
+        interventions, tensors = self._activation_intervention_specs(
+            update,
+            feature_factor=feature_factor,
+            token_selector=token_selector,
+            activation_gate=activation_gate,
+            activation_modules=activation_modules,
+            threshold=threshold,
+            direction=direction,
+            target_encoding=target_encoding,
+            tolerance=tolerance,
+        )
+        summary = activation_selector_coverage_for_inputs(
+            unwrap_model(self.base_model),
+            interventions=interventions,
+            tensors=tensors,
+            args=model_args,
+            kwargs=model_kwargs,
+        )
+        summary.update({
+            "signal": "activation",
+            "part": part,
+            "feature_factor": feature_factor,
+            "token_selector": interventions[0]["application"].get("token_selector") if interventions else token_selector,
+            "activation_gate": activation_gate,
+            "activation_modules": activation_modules,
+            "threshold": threshold,
+            "direction": direction if direction is not None else feature_factor,
+            "target_encoding": target_encoding if target_encoding is not None else feature_factor,
+            "baseline_activations": True,
+        })
+        return summary
+
+    def _activation_encoder_tensors(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Return ACTIEND encoder tensors keyed by activation mapping name."""
+        if not self.uses_activations:
+            raise ValueError("ACTIEND encoder tensors require an activation-space GRADIEND model")
+        entries = [
+            (name, spec)
+            for name, spec in self.gradiend.param_map.items()
+            if str(name).startswith("activation:")
+        ]
+        if not entries:
+            raise ValueError("ACTIEND encoder tensors require activation:* mapping entries")
+
+        tensors: Dict[str, Dict[str, torch.Tensor]] = {}
+        has_split = bool(getattr(self.gradiend, "has_component_split", False))
+        activation_name = str(getattr(self.gradiend, "activation", "tanh") or "tanh")
+        linear = self.gradiend.encoder[0].linear
+        global_weight = linear.weight.detach().cpu()
+        global_bias = linear.bias.detach().cpu() if linear.bias is not None else None
+        global_offset = 0
+        for name, spec in entries:
+            if spec.get("repr") != "all" or len(tuple(spec.get("shape", ()))) != 1:
+                raise NotImplementedError("ACTIEND encoder-threshold hooks support full 1D activation-site mappings only")
+            width = int(tuple(spec.get("shape", ()))[0])
+            if has_split:
+                encoder = self.gradiend._component_encoders[name]
+                weight = encoder.weight.detach().cpu()
+                bias = encoder.bias.detach().cpu() if encoder.bias is not None else None
+            elif len(entries) == 1 and int(getattr(self.gradiend, "input_dim", 0)) == width:
+                weight = global_weight
+                bias = global_bias
+            elif not bool(getattr(self.gradiend, "bias_encoder", True)):
+                weight = global_weight[:, global_offset: global_offset + width]
+                bias = None
+            else:
+                raise ValueError(
+                    "ACTIEND encoder-threshold hooks with multiple activation sites require either "
+                    "bias_encoder=False for after-the-fact site contribution scorers or "
+                    "gradiend_split=GradiendSplit.by_tensor() for independent per-site encoders."
+                )
+            tensors[name] = {"weight": weight, "activation": activation_name}
+            if bias is not None:
+                tensors[name]["bias"] = bias
+            global_offset += width
+        if global_offset != int(getattr(self.gradiend, "input_dim", global_offset)):
+            raise ValueError(
+                f"ACTIEND activation site widths sum to {global_offset}, "
+                f"but GRADIEND input_dim={int(getattr(self.gradiend, 'input_dim', -1))}"
+            )
+        return tensors
+
+    def _apply_gradient_intervention_delta(self, update: torch.Tensor, *, sign: float) -> Dict[str, Any]:
+        base_model = unwrap_model(self.base_model)
+        param_lookup = _build_param_lookup_named(base_model)
+        applied: List[Tuple[torch.nn.Parameter, torch.Tensor]] = []
+        metadata: Dict[str, Any] = {
+            "resolved_params": [],
+            "num_dimensions": int(update.numel()),
+        }
+
+        def _get_param(name: str):
+            p = param_lookup.get(name)
+            if p is not None:
+                return p
+            p = param_lookup.get(_normalize_param_name(name))
+            if p is not None:
+                return p
+            p = param_lookup.get(f"module.{name}")
+            if p is not None:
+                return p
+            raise KeyError(f"Parameter {name!r} not found in model for GRADIEND intervention")
+
+        idx = 0
+        try:
+            with torch.no_grad():
+                for param_name, spec in self.gradiend.param_map.items():
+                    p = _get_param(param_name)
+                    r = spec["repr"]
+                    if r == "all":
+                        n = p.numel()
+                        chunk = update[idx: idx + n].to(device=p.device, dtype=p.dtype).reshape(p.shape)
+                        idx += n
+                    elif r == "mask":
+                        m = spec["mask"].to(device=p.device).bool()
+                        n = int(m.sum().item())
+                        update_values = update[idx: idx + n].to(device=p.device, dtype=p.dtype)
+                        chunk = torch.zeros_like(p)
+                        chunk[m] = update_values
+                        idx += n
+                    elif r == "indices":
+                        flat_idx = spec["indices"].to(device=p.device, dtype=torch.long)
+                        n = int(flat_idx.numel())
+                        update_values = update[idx: idx + n].to(device=p.device, dtype=p.dtype)
+                        flat = torch.zeros(p.numel(), dtype=p.dtype, device=p.device)
+                        flat[flat_idx] = update_values
+                        chunk = flat.reshape(p.shape)
+                        idx += n
+                    else:
+                        raise ValueError(f"Unknown param repr {r!r} for param {param_name}")
+                    p.add_(float(sign) * chunk)
+                    applied.append((p, chunk))
+                    metadata["resolved_params"].append({
+                        "name": param_name,
+                        "repr": r,
+                        "shape": tuple(p.shape),
+                        "num_dimensions": int(n),
+                    })
+        except Exception:
+            with torch.no_grad():
+                for p, chunk in reversed(applied):
+                    p.sub_(float(sign) * chunk)
+            raise
+
+        if idx != int(update.numel()):
+            with torch.no_grad():
+                for p, chunk in reversed(applied):
+                    p.sub_(float(sign) * chunk)
+            raise ValueError(f"Intervention update length mismatch: used {idx}, vector has {update.numel()}")
+        return metadata
+
+    @contextmanager
+    def intervene(
+        self,
+        value: float,
+        signal: str = "auto",
+        part: str = "decoder",
+        feature_factor: Union[float, List[float]] = 1.0,
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Union[str, Sequence[str]]] = None,
+        threshold: float = 0.5,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: float = 0.2,
+        metadata: Optional[dict] = None,
+    ):
+        """
+        Temporarily intervene on the wrapped base model.
+
+        Gradient-space GRADIEND interventions apply a reversible in-place weight
+        delta. Activation-space ACTIEND interventions register forward hooks on
+        the selected activation modules. Hooks and weight deltas are removed on
+        context exit, including exceptional exits. ``value=0`` is a no-op.
+        For ACTIEND, ``token_selector`` chooses allowed token positions and
+        optional ``activation_gate`` composes an encoder-fired condition with
+        those positions. ``token_selector="prediction"`` targets the actual
+        prediction slot: explicit ``prediction_mask`` when present, MLM mask
+        tokens when available, and the last non-padding CLM prefix token for
+        decoder-only next-token prediction. ACTIEND training for text prediction
+        fills the prediction slot before extracting factual/alternative
+        activations, because otherwise MLM factual and alternative inputs would
+        share the same mask-token activation at that position and provide no
+        target-conditioned activation difference to decode.
+        """
+        signal_kind = self._intervention_signal_kind(signal)
+        effective_value = effective_rewrite_learning_rate(value, self.source)
+        info: Dict[str, Any] = {
+            "signal": signal_kind,
+            "part": part,
+            "value": float(value),
+            "effective_value": float(effective_value),
+            "feature_factor": feature_factor,
+            "token_selector": token_selector,
+            "activation_gate": activation_gate,
+            "activation_modules": activation_modules,
+            "mapping_kind": self.signal_kind,
+            "active": False,
+            "metadata": dict(metadata or {}),
+        }
+        previous = getattr(self, "active_intervention_metadata", None)
+        self.active_intervention_metadata = info
+        handles: List[Any] = []
+        gradient_applied = False
+        update: Optional[torch.Tensor] = None
+
+        try:
+            if float(value) != 0.0:
+                update = self._intervention_update_vector(
+                    value=float(value),
+                    feature_factor=feature_factor,
+                    part=part,
+                )
+                info["num_dimensions"] = int(update.numel())
+                if signal_kind == "gradient":
+                    info.update(self._apply_gradient_intervention_delta(update, sign=1.0))
+                    gradient_applied = True
+                else:
+                    interventions, tensors = self._activation_intervention_specs(
+                        update,
+                        feature_factor=feature_factor,
+                        token_selector=token_selector,
+                        activation_gate=activation_gate,
+                        activation_modules=activation_modules,
+                        threshold=threshold,
+                        direction=direction,
+                        target_encoding=target_encoding,
+                        tolerance=tolerance,
+                    )
+                    handles = register_activation_steering_hooks(
+                        unwrap_model(self.base_model),
+                        interventions=interventions,
+                        tensors=tensors,
+                    )
+                    info["resolved_modules"] = [entry["module"] for entry in interventions]
+                    info["interventions"] = interventions
+                info["active"] = True
+            else:
+                info["num_dimensions"] = int(getattr(self.gradiend, "input_dim", 0))
+            yield info
+        finally:
+            if handles:
+                remove_hook_handles(handles)
+            if gradient_applied and update is not None:
+                self._apply_gradient_intervention_delta(update, sign=-1.0)
+            info["active"] = False
+            if previous is None:
+                try:
+                    delattr(self, "active_intervention_metadata")
+                except AttributeError:
+                    pass
+            else:
+                self.active_intervention_metadata = previous
 
     def with_original_base_model(self, new_base: nn.Module) -> "ModelWithGradiend":
         """
@@ -986,6 +1763,7 @@ class ModelWithGradiend(nn.Module, ABC):
         Subclasses may override for custom behavior.
         """
         create_kwargs = dict(kwargs)
+        gradiend_split = coerce_gradiend_split(create_kwargs.pop("gradiend_split", None))
         signal_plan = create_kwargs.pop("signal_plan", None)
         if signal_plan is None:
             signal_plan = resolve_signal_training_plan(base_model)
@@ -1005,6 +1783,11 @@ class ModelWithGradiend(nn.Module, ABC):
                 }
                 for entry in signal_space.mapping
             }
+            component_slices = resolve_gradiend_components(
+                param_map_spec,
+                gradiend_split,
+                input_dim=signal_space.input_dim,
+            )
             gradiend_kwargs = {
                 k: v for k, v in create_kwargs.items()
                 if k not in ("source", "target", "params", "param_map")
@@ -1016,14 +1799,18 @@ class ModelWithGradiend(nn.Module, ABC):
                 base_model=load_directory,
                 mapping_kind="activation",
                 signal_id=signal_space.signal_id,
+                gradiend_split=gradiend_split.to_dict() if gradiend_split is not None else None,
                 signal_space={
                     "kind": signal_space.kind,
                     "signal_id": signal_space.signal_id,
                     "mapping": list(signal_space.mapping),
+                    "signal": dict(signal_space.signal or {}),
                 },
                 torch_dtype=gradiend_kwargs.pop("torch_dtype", torch.float32),
                 device_encoder=gradiend_kwargs.pop("device_encoder", None),
                 device_decoder=gradiend_kwargs.pop("device_decoder", None),
+                component_slices=component_slices,
+                component_split_mode=gradiend_split.mode if gradiend_split is not None else None,
                 **gradiend_kwargs,
             )
         if signal_space.kind != "gradient":
@@ -1049,6 +1836,7 @@ class ModelWithGradiend(nn.Module, ABC):
             param_map=create_kwargs.pop("param_map", None),
             scope_params=list(selected_params) if selected_params is not None else None,
             scope_mode=scope_mode(signal_space.scope),
+            gradiend_split=gradiend_split,
             lazy_init=lazy_init,
             **create_kwargs,
         )
@@ -1098,7 +1886,9 @@ class ModelWithGradiend(nn.Module, ABC):
         if training_args is not None:
             gradiend_keys = (
                 "param_map", "trust_remote_code", "torch_dtype",
-                "activation_encoder", "activation_decoder", "bias_decoder", "latent_dim",
+                "activation_encoder", "activation_decoder", "bias_encoder", "bias_decoder", "latent_dim",
+                "init_fan_in_floor",
+                "gradiend_split",
                 "encoder_decoder_same_device", "pre_prune_config",
                 "base_model_device_map", "base_model_max_memory",
                 "prediction_objective",

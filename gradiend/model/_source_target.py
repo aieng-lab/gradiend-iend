@@ -7,7 +7,8 @@ Training vs decoder evaluation
 
   (``factual``, ``alternative``, or ``diff``).
 
-* **Decoder rewrite** uses ``model.source`` (persisted in ``gradiend_context.json``) to
+* **Decoder rewrite/intervention** uses ``model.source`` and ``model.target``
+  (persisted in ``gradiend_context.json``) to
 
   pick the default ``feature_factor`` sign per class. It is set once before training
   via :func:`sync_model_source_target_from_training_args` and must not be overwritten
@@ -15,15 +16,41 @@ Training vs decoder evaluation
 
 Feature-factor sign (strengthen class ``C``)
 --------------------------------------------
-Rewrite is ``base + learning_rate * decoder(feature_factor)``. Learning rate is never
-negated by source.
+The intervention is ``base + learning_rate * decoder(feature_factor)`` for
+gradient-space rewrites and ``activation + learning_rate * decoder(feature_factor)``
+for ACTIEND hooks. Learning rate is never negated by source.
+
+Gradient-space GRADIEND rewrites move model weights with respect to loss
+gradients. To strengthen a class, the rewrite follows the opposite of the
+factual/diff loss-gradient direction:
 
 +------------------+-------------------------------+
-| ``model.source`` | default ``ff`` for class C  |
+| ``model.source`` | gradient ``ff`` for class C |
 +==================+===============================+
 | factual, diff    | ``-encoding_direction[C]``    |
 | alternative      | ``+encoding_direction[C]``    |
 +------------------+-------------------------------+
+
+Activation-space ACTIEND hooks add decoded activation-space displacements
+directly. For the meaningful steering target ``target="diff"``, this is the
+activation analogue of moving opposite a loss gradient. Therefore ACTIEND uses
+the negated gradient-rewrite feature factor:
+
+``activation_ff = -gradient_ff``
+
+Equivalently:
+
++------------------+-------------------------------+
+| ``model.source`` | activation ``ff`` for class C |
++==================+===============================+
+| factual, diff    | ``+encoding_direction[C]``    |
+| alternative      | ``-encoding_direction[C]``    |
++------------------+-------------------------------+
+
+ACTIEND intervention feature-factor derivation intentionally rejects
+``target!="diff"`` for now. Raw factual or alternative activations are not
+well-defined additive steering directions in this API, so accepting them would
+make the sign look more certain than the method actually is.
 
 ``encoding_direction`` is ``model.feature_class_encoding_direction`` (from training pair:
 ``pair[0] -> +1``, ``pair[1] -> -1``).
@@ -60,12 +87,100 @@ def validate_source_target(name: str, value: object) -> str:
     return value
 
 
-def feature_factor_from_encoding_direction(direction: float, source: str) -> float:
-    """Map ``feature_class_encoding_direction[class]`` to decoder-eval ``feature_factor``."""
+def gradient_feature_factor_from_encoding_direction(direction: float, source: str) -> float:
+    """Map a class encoding direction to a gradient-space rewrite feature factor."""
     validate_source_target("source", source)
     if source == "alternative":
         return float(direction)
     return float(-direction)
+
+
+def feature_factor_from_encoding_direction(direction: float, source: str) -> float:
+    """Backward-compatible gradient-space feature-factor resolver.
+
+    Historically this public helper described GRADIEND weight rewrites. Keep
+    that behavior unchanged; use
+    :func:`intervention_feature_factor_from_encoding_direction` when the model's
+    signal space may be activation-space ACTIEND.
+    """
+    return gradient_feature_factor_from_encoding_direction(direction, source)
+
+
+def activation_feature_factor_from_encoding_direction(
+    direction: float,
+    source: str,
+    target: str = "diff",
+) -> float:
+    """Map a class encoding direction to an ACTIEND activation intervention factor.
+
+    ACTIEND decoders emit activation-space targets, not loss gradients. For the
+    steering target that matters in practice, ``target="diff"``, the decoded
+    vector is an activation displacement that should be added directly. This is
+    the opposite of gradient-space weight rewrites, where strengthening a class
+    means moving against the loss-gradient direction. Keep this as the explicit
+    invariant: ACTIEND feature factor = ``-gradient_feature_factor``.
+
+    ``target`` must be ``"diff"``. Raw factual or alternative activation targets
+    are not yet supported as additive ACTIEND steering directions.
+    """
+    validate_source_target("source", source)
+    target = validate_source_target("target", target)
+    if target != "diff":
+        raise ValueError(
+            "ACTIEND activation interventions currently require target='diff'. "
+            "Raw factual/alternative activation targets are not well-defined additive steering directions."
+        )
+    return -gradient_feature_factor_from_encoding_direction(direction, source)
+
+
+def intervention_feature_factor_from_encoding_direction(
+    direction: float,
+    source: str,
+    target: str = "diff",
+    *,
+    signal_kind: str = "gradient",
+) -> float:
+    """Map a class direction to the decoder feature factor for an intervention.
+
+    ``signal_kind`` is the measured signal space, not the location where it was
+    measured. ``SignalScope`` decides locations such as layers; it must not
+    influence this sign. Gradient-space GRADIEND uses the historical rewrite
+    convention. Activation-space ACTIEND uses direct activation-displacement
+    semantics.
+    """
+    kind = str(signal_kind or "gradient").strip().lower()
+    if kind == "activation":
+        return activation_feature_factor_from_encoding_direction(direction, source, target)
+    return gradient_feature_factor_from_encoding_direction(direction, source)
+
+
+def resolve_model_signal_kind(model: Any, trainer: Any = None, *, default: str = "gradient") -> str:
+    """Return the model's measured signal kind for intervention sign semantics."""
+    gradiend = getattr(model, "gradiend", None) if model is not None else None
+    mapping_kind = getattr(gradiend, "mapping_kind", None)
+    if mapping_kind is not None:
+        return "activation" if str(mapping_kind).strip().lower() == "activation" else "gradient"
+
+    if trainer is not None:
+        args = getattr(trainer, "_training_args", None) or getattr(trainer, "training_args", None)
+        signal = training_arg_value(args, "signal", None)
+        signal_kind = getattr(signal, "kind", None)
+        if signal_kind is not None:
+            return "activation" if str(signal_kind).strip().lower() == "activation" else "gradient"
+    return default
+
+
+def resolve_model_target(model: Any, trainer: Any = None, *, default: str = "diff") -> str:
+    """Return ``model.target``, else ``TrainingArguments.target``, else *default*."""
+    target = getattr(model, "target", None) if model is not None else None
+    if target is not None:
+        return validate_source_target("target", target)
+    if trainer is not None:
+        args = getattr(trainer, "_training_args", None) or getattr(trainer, "training_args", None)
+        args_target = training_arg_value(args, "target", None)
+        if args_target is not None:
+            return validate_source_target("target", args_target)
+    return default
 
 
 def encoding_view_sign_for_source(source: str, alignment: str) -> float:

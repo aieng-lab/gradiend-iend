@@ -8,6 +8,8 @@ for strengthening and weakening.
   result key = "X_weaken", value = 1 - P(X) on X data.
 """
 
+from contextlib import contextmanager
+
 import pytest
 import pandas as pd
 from unittest.mock import MagicMock
@@ -24,10 +26,15 @@ class MockModelWithGradiend3SG3PL:
         self.base_model = MagicMock()
         self.tokenizer = MockTokenizer()
         self.source = "factual"
+        self.target = "diff"
         self.feature_class_encoding_direction = {"3SG": 1.0, "3PL": -1.0}
 
     def rewrite_base_model(self, **kwargs):
         return self
+
+    @contextmanager
+    def intervene(self, **kwargs):
+        yield self.base_model
 
 
 class TrainerForStrengthenWeakenTest:
@@ -41,6 +48,8 @@ class TrainerForStrengthenWeakenTest:
         self._training_args.use_cache = False
         self._training_args.decoder_eval_max_size_training_like = 50
         self._training_args.decoder_eval_max_size_neutral = 50
+        self._training_args.source = "factual"
+        self._training_args.target = "diff"
         self.experiment_dir = None
         self.run_id = None
         self.target_classes = ["3SG", "3PL"]
@@ -117,6 +126,8 @@ class TrainerForStrengthenWeakenTestGrid:
         self._training_args.use_cache = False
         self._training_args.decoder_eval_max_size_training_like = 50
         self._training_args.decoder_eval_max_size_neutral = 50
+        self._training_args.source = "factual"
+        self._training_args.target = "diff"
         self.experiment_dir = None
         self.run_id = None
         self.target_classes = ["3SG", "3PL"]
@@ -204,10 +215,28 @@ class TestDecoderStrengthenWeakenDataset:
                 "Strengthen 3SG must use only the other class's dataset (3PL), not 3SG. "
                 "We maximize P(3SG) on 3PL data."
             )
-        # Summary for 3SG should be present (aliased from 3PL metric)
+        # Summary for 3SG should be present (selection key is the target class)
         assert "3SG" in result
         assert "value" in result["3SG"]
         assert result["3SG"]["value"] == 0.9
+
+    def test_strengthen_row_wise_mode_uses_target_class_summary_key(self):
+        """Row-wise scoring mode must still summarize under the requested target class."""
+        evaluator = DecoderEvaluator()
+        trainer = TrainerForStrengthenWeakenTestGrid()
+        trainer._resolve_decoder_eval_targets = lambda training_like_df=None: (None, True)
+        result = evaluator.evaluate_decoder(
+            trainer,
+            target_class="3SG",
+            increase_target_probabilities=True,
+            feature_factors=[-1.0],
+            lrs=[1e-2],
+            plot=False,
+        )
+        assert "3SG" in result
+        assert result["3SG"]["feature_factor"] == -1.0
+        assert result["3SG"]["value"] == 0.85
+        assert "3PL" not in result
 
     def test_strengthen_summary_value_is_p_target_on_other_dataset(self):
         """Selected summary value for strengthen 3SG is the max P(3SG) on 3PL across candidates."""

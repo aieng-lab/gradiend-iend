@@ -261,6 +261,63 @@ def test_prediction_decoder_plotting_analysis_uses_training_argument_caps(monkey
     assert captured["base_kwargs"]["eval_batch_size"] == 3
 
 
+def test_analyze_decoder_for_plotting_forwards_intervention_kwargs():
+    """Plot refresh must reuse the grid's token_selector / activation_gate, not hardcode encoder_direction."""
+    from contextlib import contextmanager
+
+    trainer = _make_prediction_trainer("prediction-cache-exp")
+    trainer._training_args.decoder_eval_max_size_training_like = 4
+    trainer._training_args.decoder_eval_max_size_neutral = 4
+    trainer._training_args.eval_batch_size = 2
+
+    captured = {}
+
+    @contextmanager
+    def _fake_intervene(**kwargs):
+        captured["intervene"] = kwargs
+        yield SimpleNamespace()
+
+    model = SimpleNamespace(
+        base_model=SimpleNamespace(),
+        tokenizer=_DummyPredictionTokenizer(),
+        intervene=_fake_intervene,
+    )
+    trainer.get_model = lambda: model
+    trainer._get_decoder_eval_dataframe = lambda tokenizer, **kwargs: (
+        pd.DataFrame({"masked": ["[MASK] went home"], "label_class": ["3SG"]}),
+        pd.DataFrame({"text": ["neutral"]}),
+    )
+    trainer._resolve_decoder_eval_targets = lambda training_like_df=None: ({"3SG": ["he"]}, False)
+    trainer.evaluate_base_model = lambda *args, **kwargs: {
+        "probs_by_dataset": {"3SG": {"3SG": 0.8}},
+        "_probs_by_dataset_grouping": "label_class",
+    }
+
+    trainer.analyze_decoder_for_plotting(
+        decoder_results={
+            "grid": {
+                "base": {},
+                (1.0, 10.0): {
+                    "id": {"feature_factor": 1.0, "learning_rate": 10.0},
+                    "probs_by_dataset": {"3SG": {"3SG": 0.5}},
+                },
+            },
+            "intervention_kwargs": {
+                "token_selector": "all",
+                "activation_gate": None,
+                "threshold": 0.5,
+            },
+        },
+        class_ids=["3SG"],
+        use_cache=False,
+    )
+
+    assert captured["intervene"]["token_selector"] == "all"
+    assert captured["intervene"]["value"] == 10.0
+    assert captured["intervene"]["feature_factor"] == 1.0
+    assert "activation_gate" not in captured["intervene"] or captured["intervene"].get("activation_gate") is None
+
+
 def test_classification_cached_train_defers_data_loading(monkeypatch):
     _patch_training_cache_hit(monkeypatch)
     trainer = _make_classification_trainer("classification-cache-exp")

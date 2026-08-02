@@ -41,6 +41,8 @@ For LaTeX fonts, transition arrows (`M -> F`), and environment variables, see **
 
 Shows how training metrics evolve over steps: mean encoded value per class/feature class and correlation. The best checkpoint step (by convergence metric) is marked with a vertical line.
 
+For explicit component-split GRADIEND/ACTIEND runs, saving this plot also writes component sidecars under `components/`: one overview with component correlations over training and one normal convergence plot per component. Ordinary non-split runs do not create component files.
+
 ### Entry points
 
 ```python
@@ -96,6 +98,8 @@ Regenerate: gradiend/examples/start_workflow.py
 ## 2. Encoder distribution plot { #encoder-distributions }
 
 Grouped split violins showing the distribution of encoded values by transition/class. By default the plot shows only the **target (training) transition(s)** and **neutral** data; use `target_and_neutral_only=False` to include all transitions. Each group has left and right halves (e.g. masc→fem vs fem→masc in one split violin). When using [`trainer.evaluate_encoder()`][gradiend.trainer.trainer.Trainer.evaluate_encoder] with `plot=True`, any plot option can be forwarded via `plot_kwargs` (e.g. `plot_kwargs=dict(target_and_neutral_only=False, show=False)`).
+
+For explicit component-split runs, `evaluate_encoder(plot=True)` also writes component sidecars under `components/`: an encoder component correlation overview plus one encoder distribution plot per component. These plots reuse the already computed component encoder DataFrame and do not run the model again.
 
 ### Entry points
 

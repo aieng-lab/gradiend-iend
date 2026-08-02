@@ -15,6 +15,8 @@ from gradiend.util.encoder_splits import order_split_names
 from gradiend.util.logging import get_logger
 from gradiend.util.paths import ARTIFACT_ENCODER_PLOT, resolve_output_path
 from gradiend.visualizer.labels import (
+    ENCODED_VALUE_LABEL,
+    MEAN_ENCODED_VALUE_LABEL,
     converged_for_trainer,
     escape_matplotlib_usetex_text,
     format_label_with_convergence,
@@ -547,7 +549,7 @@ def _plot_encoder_by_target_seed_errorbar(
         )
 
     ax.axhline(0.0, color="0.7", linewidth=0.8, zorder=1)
-    ax.set_ylabel("Mean encoded value")
+    ax.set_ylabel(MEAN_ENCODED_VALUE_LABEL)
     ax.set_xlabel("Target")
     if title:
         ax.set_title(escape_matplotlib_usetex_text(title), pad=30)
@@ -669,7 +671,7 @@ def _plot_encoder_by_target_seed_strip_combined(
             )
 
     ax.axhline(0.0, color="0.7", linewidth=0.8, zorder=1)
-    ax.set_ylabel("Encoded value")
+    ax.set_ylabel(ENCODED_VALUE_LABEL)
     ax.set_xlabel("Target")
     if title:
         ax.set_title(escape_matplotlib_usetex_text(title), pad=30)
@@ -1160,7 +1162,7 @@ def plot_encoder_by_target(
     elif style == "strip":
         sns.stripplot(**common, dodge=effective_dodge, jitter=jitter, size=point_size, alpha=0.85)
 
-    ax.set_ylabel("Encoded value")
+    ax.set_ylabel(ENCODED_VALUE_LABEL)
     ax.set_xlabel("Target")
     if plot_title:
         ax.set_title(escape_matplotlib_usetex_text(plot_title), pad=30)

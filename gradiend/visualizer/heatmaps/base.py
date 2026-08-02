@@ -9,6 +9,7 @@ import math
 
 from gradiend.util.deprecation import warn_deprecated_annot_fmt
 from gradiend.visualizer.heatmaps.ordering import _reorder_comparison_data
+from gradiend.visualizer.color_norm import resolve_encoding_color_norm
 from gradiend.visualizer.plot_optional import _require_matplotlib, _require_seaborn
 from gradiend.visualizer.plot_style import disable_usetex_for_axis_text
 from gradiend.visualizer.labels import (
@@ -151,6 +152,11 @@ def plot_comparison_heatmap(
     models: Optional[Dict[str, object]] = None,
     converged_by_id: Optional[Dict[str, Optional[bool]]] = None,
     highlight_non_convergence: bool = True,
+    color_center: Optional[Union[str, float]] = None,
+    neutral_value: Optional[float] = None,
+    neutral_values: Optional[Any] = None,
+    color_range: Union[str, Tuple[float, float], List[float], None] = "symmetric",
+    color_extent: Optional[float] = 1.0,
 ) -> Any:
     """Plot a precomputed comparison matrix as a heatmap.
 
@@ -203,6 +209,15 @@ def plot_comparison_heatmap(
         models: Optional model mapping for non-convergence label lookup.
         converged_by_id: Optional explicit convergence status by stable model id.
         highlight_non_convergence: Whether labels mark non-converged runs.
+        color_center: Optional diverging color center. Use ``"neutral"`` with
+            ``neutral_value``/``neutral_values`` to put the neutral color at a
+            measured neutral encoding instead of zero.
+        neutral_value: Explicit neutral encoded value for ``color_center="neutral"``.
+        neutral_values: Neutral sample encodings averaged for ``color_center="neutral"``.
+        color_range: ``"symmetric"``, ``"auto"``, or explicit ``(vmin, vmax)`` bounds
+            used when ``color_center`` is provided.
+        color_extent: Symmetric extent around ``color_center``. ``1.0`` means a
+            neutral value of ``0.4`` maps to bounds ``[-0.6, 1.4]``.
     """
     warn_deprecated_annot_fmt(fmt=fmt, annot_fmt=annot_fmt, stacklevel=1)
     if not isinstance(comparison_data, dict):
@@ -236,6 +251,8 @@ def plot_comparison_heatmap(
         raise ValueError("scale must be 'linear', 'log', 'sqrt', or 'power'")
     if scale == "power" and (scale_gamma is None or float(scale_gamma) <= 0):
         raise ValueError("scale_gamma must be > 0 when scale='power'")
+    if color_center is not None and scale != "linear":
+        raise ValueError("color_center is only supported with scale='linear'")
 
     plt = _require_matplotlib()
     sns = _require_seaborn()
@@ -411,6 +428,31 @@ def plot_comparison_heatmap(
     signed_measures = {"cosine_signed", "spearman_signed", "cross_encoding_positive_minus_negative"}
     bounded_unit_measures = {"cosine", "cosine_signed", "spearman", "spearman_signed", "mass_overlap", "cross_encoding_positive_mean", "cross_encoding_negative_mean", "cross_encoding_positive_minus_negative"}
     cmap = _default_colormap_for_measure(measure, cmap)
+    color_norm = None
+    if color_center is not None:
+        color_norm = resolve_encoding_color_norm(
+            mat_arr,
+            neutral_values=neutral_values,
+            neutral_value=neutral_value,
+            center=color_center,
+            color_range=color_range,
+            extent=color_extent,
+        )
+        if custom_vmin or custom_vmax:
+            if vmin is None or vmax is None:
+                raise ValueError("Custom heatmap bounds with color_center require both vmin and vmax")
+            color_norm = resolve_encoding_color_norm(
+                mat_arr,
+                neutral_values=neutral_values,
+                neutral_value=neutral_value,
+                center=color_center,
+                color_range=(float(vmin), float(vmax)),
+                extent=color_extent,
+            )
+        vmin = color_norm.vmin
+        vmax = color_norm.vmax
+        if cbar_label is None:
+            cbar_label = color_norm.legend_label
     if vmin is None:
         if is_dispersion_stat_matrix:
             vmin = float(np.nanmin(mat_arr))
@@ -452,7 +494,11 @@ def plot_comparison_heatmap(
 
     norm = None
     eps = max(1e-10, np.finfo(float).tiny)
-    if scale == "log":
+    if color_norm is not None:
+        from matplotlib.colors import TwoSlopeNorm
+
+        norm = TwoSlopeNorm(vmin=float(vmin), vcenter=color_norm.center, vmax=float(vmax))
+    elif scale == "log":
         norm = LogNorm(vmin=max(eps, float(vmin)), vmax=float(vmax))
     elif scale == "sqrt":
         norm = PowerNorm(gamma=0.5, vmin=float(vmin), vmax=float(vmax))

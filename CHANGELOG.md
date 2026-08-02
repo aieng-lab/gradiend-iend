@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Important structural change:** GRADIEND encoders now default to no linear bias (`bias_encoder=False`), as experiments show that this does not drop convergence metrics. This makes upcoming partitioned/component-wise GRADIEND models cleaner because component encodings depend only on their measured signal slice, not a learned offset. Existing checkpoints that lack `architecture.bias_encoder` remain loadable: loading infers whether the encoder bias exists from the saved state dict.
+- `GradiendModel` now supports default split metadata via `GradiendComponent` and exposes virtual component views through `gradiend.encoders[...]`, `gradiend.decoders[...]`, `encode_components(...)`, `with_components(...)`, and `without_split()`. These views slice the normal GRADIEND weights and do not create separate submodels.
+
 ## [0.2.1] - 2026-07-16
 
 ### Changed

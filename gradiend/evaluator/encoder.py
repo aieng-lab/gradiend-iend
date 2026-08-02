@@ -63,6 +63,10 @@ def _rows_to_encoder_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         "display_text": [],
         "data_split": [],
         "neutral_variant": [],
+        "transition_type": [],
+        "component_index": [],
+        "component_id": [],
+        "component_label": [],
     }
     for r in rows:
         data["encoded"].append(r.get("encoded"))
@@ -86,6 +90,10 @@ def _rows_to_encoder_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         data["display_text"].append(r.get("display_text"))
         data["data_split"].append(r.get("data_split"))
         data["neutral_variant"].append(r.get("neutral_variant"))
+        data["transition_type"].append(r.get("transition_type"))
+        data["component_index"].append(r.get("component_index"))
+        data["component_id"].append(r.get("component_id"))
+        data["component_label"].append(r.get("component_label"))
     df = pd.DataFrame(data)
     for col in (
         "source_token",
@@ -98,6 +106,10 @@ def _rows_to_encoder_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         "display_text",
         "data_split",
         "neutral_variant",
+        "transition_type",
+        "component_index",
+        "component_id",
+        "component_label",
     ):
         if df[col].isna().all():
             df = df.drop(columns=[col])
@@ -115,6 +127,7 @@ class EncoderEvaluator:
         self,
         trainer: Any,
         encoder_df: Optional[pd.DataFrame] = None,
+        component_df: Optional[pd.DataFrame] = None,
         eval_data: Any = None,
         model_with_gradiend: Any = None,
         use_cache: Optional[bool] = None,
@@ -137,6 +150,10 @@ class EncoderEvaluator:
             encoder_df: Optional DataFrame with encoded values. If provided, skips encoding
                 and computes metrics from this DataFrame. Use when you already have
                 encoder outputs (e.g. from evaluate_encoder(return_df=True)).
+            component_df: Optional sidecar DataFrame with per-component encodings for
+                explicit split GRADIEND/ACTIEND models. Keep this separate from
+                ``encoder_df`` because pandas propagates ``DataFrame.attrs`` into
+                Series/groupby internals.
             eval_data: Optional pre-computed SignalTrainingDatasetBase. If None and encoder_df
                 is None, created via trainer.create_eval_data.
             use_cache: If True, use cached encoder evaluation result when available
@@ -247,7 +264,7 @@ class EncoderEvaluator:
             if encoder_df.empty:
                 return {"n_samples": 0, "correlation": None}
             metrics_kw = _encoder_metrics_kwargs_from_trainer(trainer, encoder_df)
-            result = get_encoder_metrics_from_dataframe(encoder_df, **metrics_kw)
+            result = get_encoder_metrics_from_dataframe(encoder_df, component_df=component_df, **metrics_kw)
         else:
             if eval_data is None:
                 eval_data = trainer.create_eval_data(
@@ -269,13 +286,20 @@ class EncoderEvaluator:
                     )
             except TypeError:
                 pass
-            training_rows = encode_dataset_to_rows(model_with_gradiend, eval_data)
+            training_rows, component_training_rows = encode_dataset_to_rows(
+                model_with_gradiend,
+                eval_data,
+                return_component_rows=True,
+            )
             if not training_rows:
                 return {"n_samples": 0, "correlation": None}
             df = _rows_to_encoder_df(training_rows)
+            component_df = _rows_to_encoder_df(component_training_rows) if component_training_rows else None
             metrics_kw = _encoder_metrics_kwargs_from_trainer(trainer, df)
-            result = get_encoder_metrics_from_dataframe(df, **metrics_kw)
+            result = get_encoder_metrics_from_dataframe(df, component_df=component_df, **metrics_kw)
             result["training_rows"] = training_rows
+            if component_training_rows:
+                result["component_training_rows"] = component_training_rows
 
         if metrics_path:
             try:
@@ -283,6 +307,31 @@ class EncoderEvaluator:
                 with open(metrics_path, "w") as f:
                     json.dump(to_jsonable(result), f, indent=2)
                 logger.debug("Saved encoder metrics to %s", metrics_path)
+                components = result.get("components")
+                if isinstance(components, dict) and components.get("metrics_by_component"):
+                    component_dir = os.path.join(os.path.dirname(metrics_path), "components")
+                    os.makedirs(component_dir, exist_ok=True)
+                    stem = os.path.splitext(os.path.basename(metrics_path))[0]
+                    component_metrics_json = os.path.join(component_dir, f"{stem}_metrics.json")
+                    with open(component_metrics_json, "w") as f:
+                        json.dump(to_jsonable(components), f, indent=2)
+                    metric_rows = []
+                    for component_id, metrics in components.get("metrics_by_component", {}).items():
+                        metric_rows.append({
+                            "component_index": metrics.get("component_index"),
+                            "component_id": component_id,
+                            "component_label": metrics.get("component_label"),
+                            "correlation": metrics.get("correlation"),
+                            "accuracy": (metrics.get("training_only") or {}).get("accuracy"),
+                            "target_accuracy": (metrics.get("target_classes_only") or {}).get("accuracy"),
+                            "n_samples": metrics.get("n_samples"),
+                            "mean_by_class": json.dumps(to_jsonable(metrics.get("mean_by_class", {})), sort_keys=True),
+                        })
+                    if metric_rows:
+                        pd.DataFrame(metric_rows).sort_values("component_index").to_csv(
+                            os.path.join(component_dir, f"{stem}_metrics.csv"),
+                            index=False,
+                        )
             except Exception as e:
                 logger.warning("Failed to save encoder metrics to %s: %s", metrics_path, e)
 

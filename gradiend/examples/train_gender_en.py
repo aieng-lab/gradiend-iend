@@ -320,7 +320,7 @@ def build_gender_trainer(
         target_classes=["M", "F"],
         masked_col="masked",
         split_col="split",
-        eval_neutral_data=neutral_df,
+        neutral_data=neutral_df,
     )
     trainer = TextPredictionTrainer(model=model, config=config, args=args)
 

@@ -70,17 +70,19 @@ This enables reusing the same [`TrainingArguments`][gradiend.trainer.core.argume
 
 When a checkpoint is reused, **evaluate_encoder** / **evaluate_decoder** may also skip recomputation when their own caches exist (evaluator `use_cache` is separate).
 
-**Training cache fingerprint:** After each run, `training.json` stores a `cache_fingerprint` derived from pruning and gradient settings. On reuse, the trainer compares this fingerprint to the current [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments]. A mismatch logs a warning and forces retraining. Checked fields include:
+**Training cache fingerprint:** After each run, `training.json` stores a `cache_fingerprint` derived from pruning and signal/model-shape settings. On reuse, the trainer compares this fingerprint to the current [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments]. A mismatch logs a warning and forces retraining. Checked fields include:
 
 - `pre_prune_config` (all [`PrePruneConfig`][gradiend.trainer.core.pruning.PrePruneConfig] fields, e.g. `n_samples`, `topk`, `source`)
 - `post_prune_config`
+- `signal`, `signal_scope`, `gradiend_split`
+- `init_fan_in_floor`
 - `reuse_pre_prune`
 - `source`, `target`
 - `gradiend_input_dim` (saved model size after pruning)
 
 Legacy checkpoints without `cache_fingerprint` are rejected when pre-pruning is requested but the saved `input_dim` looks like an unpruned full model.
 
-> **Incomplete coverage:** Fingerprinting is a best-effort guard, not a full equivalence check on [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments]. It currently covers pruning and source/target settings only. Many arguments that affect training are **not** compared (e.g. `learning_rate`, `max_steps`, `train_batch_size`, `params`, `target_classes`, data splits). Changing those can still reuse an old checkpoint when the fingerprint matches. Treat `use_cache=True` as convenient for iterative analysis, not as proof that two runs used identical settings. Set `use_cache=False`, use `use_cache="always"` only when you intentionally want to skip fingerprint checks, or use a new `experiment_dir` / `run_id`, when you need a guaranteed fresh train.
+> **Incomplete coverage:** Fingerprinting is a best-effort guard, not a full equivalence check on [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments]. It covers settings that change the signal space, pruning, and initialization scale, but many arguments that affect optimization are **not** compared (e.g. `learning_rate`, `max_steps`, `train_batch_size`, `target_classes`, data splits). Changing those can still reuse an old checkpoint when the fingerprint matches. Treat `use_cache=True` as convenient for iterative analysis, not as proof that two runs used identical settings. Set `use_cache=False`, use `use_cache="always"` only when you intentionally want to skip fingerprint checks, or use a new `experiment_dir` / `run_id`, when you need a guaranteed fresh train.
 
 Evaluator caches key on different arguments (e.g. `split` and `max_size` in
 [`evaluate_encoder()`][gradiend.trainer.trainer.Trainer.evaluate_encoder] and

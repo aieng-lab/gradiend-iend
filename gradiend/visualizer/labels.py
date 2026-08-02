@@ -11,6 +11,9 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 # the latter is missing from common Matplotlib fonts and can disappear in PDFs.
 NON_CONVERGENCE_MARKER = "†"
 NON_CONVERGENCE_MARKER_TEX = r"\textdagger{}"
+ENCODED_VALUE_LABEL = "Encoded value"
+MEAN_ENCODED_VALUE_LABEL = "Mean encoded value"
+CORRELATION_LABEL = "Correlation"
 
 _TRANSITION_DIRECTED_RE = re.compile(r"\s*(?:->|→)\s*")
 _TRANSITION_BIDI_RE = re.compile(r"\s*(?:<->|↔)\s*")
@@ -19,7 +22,7 @@ PLOTLY_LABEL_OVERRIDES = {
     "color": "Label",
     "data_split": "Split",
     "display_text": "Text",
-    "encoded": "Encoded value",
+    "encoded": ENCODED_VALUE_LABEL,
     "factual": "Factual",
     "factual_token": "Factual token",
     "feature_class": "Feature class",
@@ -51,15 +54,26 @@ def escape_matplotlib_usetex_text(text: Any) -> str:
     """Escape plain text that Matplotlib will pass through LaTeX.
 
     Matplotlib's ``text.usetex`` sends ordinary labels through LaTeX, where an
-    unescaped percent sign starts a comment and hides the rest of the label.
-    Keep this helper intentionally narrow: GRADIEND currently relies on plain
-    labels plus small inline math snippets, and escaping already-escaped percent
-    signs would corrupt caller-provided TeX.
+    unescaped percent sign starts a comment and ``<``/``>`` are not valid in
+    text mode. Keep math segments (``$...$``) untouched. Avoid double-escaping
+    already-escaped ``%``, ``\\textless``, and ``\\textgreater``.
     """
     value = str(text)
     if not matplotlib_usetex_enabled():
         return value
-    return re.sub(r"(?<!\\)%", r"\\%", value)
+
+    def _escape_plain(segment: str) -> str:
+        segment = re.sub(r"(?<!\\)%", r"\\%", segment)
+        # Protect already-escaped forms, then escape raw < / >.
+        segment = segment.replace(r"\textless", "\0LESS\0").replace(r"\textgreater", "\0GREATER\0")
+        segment = segment.replace("<", r"\textless{}").replace(">", r"\textgreater{}")
+        return segment.replace("\0LESS\0", r"\textless").replace("\0GREATER\0", r"\textgreater")
+
+    parts = re.split(r"(\$[^$]*\$)", value)
+    return "".join(
+        part if part.startswith("$") and part.endswith("$") else _escape_plain(part)
+        for part in parts
+    )
 
 
 def label_contains_matplotlib_latex(text: Any) -> bool:

@@ -209,6 +209,36 @@ class SignalTrainingDatasetBase:
         """Backward-compatible alias for old gradient-specific subclasses."""
         return self._exclusive_signal_access()
 
+    @staticmethod
+    def _all_truthy(value: Any) -> bool:
+        if torch.is_tensor(value):
+            return bool(value.to(dtype=torch.bool).all().item())
+        if isinstance(value, (list, tuple)):
+            return bool(value) and all(SignalTrainingDatasetBase._all_truthy(v) for v in value)
+        return bool(value)
+
+    @staticmethod
+    def _values_equal(left: Any, right: Any) -> bool:
+        if torch.is_tensor(left) or torch.is_tensor(right):
+            if not (torch.is_tensor(left) and torch.is_tensor(right)):
+                return False
+            return bool(torch.equal(left, right))
+        if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+            if not (isinstance(left, (list, tuple)) and isinstance(right, (list, tuple))):
+                return False
+            if len(left) != len(right):
+                return False
+            return all(SignalTrainingDatasetBase._values_equal(l, r) for l, r in zip(left, right))
+        return left == right
+
+    def _is_identity_batch(self, batch: dict) -> bool:
+        """Return True when every row is an explicit factual==alternative identity transition."""
+        if "is_identity_transition" in batch:
+            return self._all_truthy(batch["is_identity_transition"])
+        if "factual_token" in batch and "alternative_token" in batch:
+            return self._values_equal(batch["factual_token"], batch["alternative_token"])
+        return False
+
     def _extract_one_side(self, inputs: Any, *, side: str) -> torch.Tensor:
         if side == "factual":
             batch = self.signal_extractor(
@@ -265,14 +295,17 @@ class SignalTrainingDatasetBase:
 
             factual_signal = None
             alternative_signal = None
+            identity_batch = self._is_identity_batch(batch)
 
             if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
                 if os.path.exists(cache_file_factual):
                     factual_signal = torch.load(cache_file_factual, weights_only=True)
-                if os.path.exists(cache_file_alternative):
+                if not identity_batch and os.path.exists(cache_file_alternative):
                     alternative_signal = torch.load(cache_file_alternative, weights_only=True)
 
             requires_factual = self.source in factual_computation_required_keywords or self.target in factual_computation_required_keywords
+            if identity_batch and (self.source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords):
+                requires_factual = True
             if factual_signal is None and requires_factual:
                 factual_inputs = batch["factual"]
                 factual_signal = self._extract_one_side(factual_inputs, side="factual")
@@ -286,7 +319,17 @@ class SignalTrainingDatasetBase:
                 t_factual = time.perf_counter()
 
             requires_alternative = self.source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords
-            if alternative_signal is None and requires_alternative:
+            if identity_batch and requires_alternative:
+                if factual_signal is None:
+                    factual_inputs = batch["factual"]
+                    factual_signal = self._extract_one_side(factual_inputs, side="factual")
+                    del factual_inputs
+                    factual_signal = factual_signal.to(dtype=self.dtype, device=self.device)
+                    if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
+                        os.makedirs(self.cache_dir, exist_ok=True)
+                        torch.save(factual_signal, cache_file_factual)
+                alternative_signal = factual_signal
+            elif alternative_signal is None and requires_alternative:
                 alternative_inputs = batch['alternative']
                 alternative_signal = self._extract_one_side(alternative_inputs, side="alternative")
                 del alternative_inputs

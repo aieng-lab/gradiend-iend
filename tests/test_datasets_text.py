@@ -16,6 +16,7 @@ from gradiend.trainer.text.common.dataset import TextGradientTrainingDataset
 from gradiend.trainer.text.prediction.dataset import TextActivationTrainingDataset, TextTrainingDataset
 from gradiend.trainer.text.prediction.trainer import TextPredictionTrainer
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.dataset import SignalTrainingDatasetBase
 from gradiend.trainer.core.signals import ActivationSignalExtractor, Signal, SignalBatch, SignalScope
 from tests.testing_mocks import MockTokenizer, SimpleMockModel
 
@@ -23,6 +24,68 @@ from tests.testing_mocks import MockTokenizer, SimpleMockModel
 class TestTextGradientTrainingDataset:
     """Test TextGradientTrainingDataset (text-specific wrapper)."""
     
+    def test_signal_dataset_identity_diff_reuses_factual_signal(self):
+        class OneIdentityRow:
+            batch_size = 1
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, _idx):
+                return {
+                    "factual": torch.tensor([1.0, 2.0]),
+                    "alternative": torch.tensor([99.0, 100.0]),
+                    "is_identity_transition": True,
+                    "label": 0,
+                }
+
+        class RecordingExtractor:
+            signal = Signal.gradient()
+
+            def __init__(self):
+                self.calls = []
+
+            def __call__(
+                self,
+                factual_inputs=None,
+                alternative_inputs=None,
+                *,
+                requires_factual=True,
+                requires_alternative=True,
+            ):
+                self.calls.append(
+                    {
+                        "factual_inputs": factual_inputs,
+                        "alternative_inputs": alternative_inputs,
+                        "requires_factual": requires_factual,
+                        "requires_alternative": requires_alternative,
+                    }
+                )
+                factual = factual_inputs * 2 if requires_factual else None
+                alternative = alternative_inputs * 3 if requires_alternative else None
+                return SignalBatch.from_factual_alternative(
+                    factual,
+                    alternative,
+                    signal_id="gradient",
+                )
+
+        extractor = RecordingExtractor()
+        dataset = SignalTrainingDatasetBase(
+            OneIdentityRow(),
+            extractor,
+            source="factual",
+            target="diff",
+            signal=Signal.gradient(),
+        )
+
+        row = dataset[0]
+
+        assert len(extractor.calls) == 1
+        assert extractor.calls[0]["requires_factual"] is True
+        assert extractor.calls[0]["requires_alternative"] is False
+        assert row["source"].tolist() == [2.0, 4.0]
+        assert row["target"].abs().sum().item() == 0.0
+
     def test_text_dataset_creation(self):
         """Test that TextGradientTrainingDataset can be created."""
         tokenizer = MockTokenizer()
@@ -172,6 +235,7 @@ class TestTextGradientTrainingDataset:
         model.tokenizer = tokenizer
         model.gradiend.torch_dtype = torch.float32
         model.gradiend.device_encoder = torch.device("cpu")
+        model.gradiend.input_dim = 4
 
         raw = MagicMock()
         raw.__len__ = MagicMock(return_value=1)
@@ -265,7 +329,177 @@ class TestTextGradientTrainingDataset:
         assert extractor.factual_inputs["prediction_mask"].sum().item() == 1
         assert extractor.alternative_inputs["prediction_mask"].sum().item() == 1
         assert row["source"].abs().sum().item() > 0
-    
+
+    def test_text_activation_dataset_fills_wordpiece_continuation_by_token_id(self):
+        """WordPiece targets like ##ver must be inserted by id, not string-replaced."""
+        tokenizer = MockTokenizer()
+        tokenizer.vocab.update({
+            "thie": 20,
+            "##ver": 21,
+            "y": 22,
+            ".": 23,
+        })
+        tokenizer.unk_token_id = 1
+        raw = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["thie [MASK] y"],
+                "factual": ["##ver"],
+                "alternative": ["##ver"],
+                "factual_class": ["neutral"],
+                "alternative_class": ["neutral"],
+                "factual_id": ["neutral"],
+                "alternative_id": ["neutral"],
+                "label": [0.0],
+                "feature_class_id": ["neutral"],
+            }),
+            tokenizer=tokenizer,
+            batch_size=1,
+        )
+
+        class InputIdActivationExtractor:
+            signal = Signal.activation(token_selector="prediction")
+
+            def __init__(self):
+                self.factual_inputs = None
+
+            def __call__(
+                self,
+                factual_inputs=None,
+                alternative_inputs=None,
+                *,
+                requires_factual=True,
+                requires_alternative=True,
+            ):
+                if factual_inputs is not None:
+                    self.factual_inputs = factual_inputs
+                factual = factual_inputs["input_ids"].float() if requires_factual else None
+                alternative = (
+                    alternative_inputs["input_ids"].float()
+                    if requires_alternative and alternative_inputs is not None
+                    else factual
+                )
+                return SignalBatch.from_factual_alternative(
+                    factual,
+                    alternative,
+                    signal_id="activation",
+                )
+
+        extractor = InputIdActivationExtractor()
+        dataset = TextActivationTrainingDataset(
+            raw,
+            tokenizer,
+            extractor,
+            signal=Signal.activation(),
+            source="factual",
+            target="diff",
+        )
+
+        row = dataset[0]
+
+        assert tokenizer.mask_token_id not in extractor.factual_inputs["input_ids"].tolist()
+        assert tokenizer.vocab["##ver"] in extractor.factual_inputs["input_ids"].tolist()
+        assert extractor.factual_inputs["prediction_mask"].sum().item() == 1
+        assert row["source"].numel() > 0
+        pred_ids = extractor.factual_inputs["input_ids"][extractor.factual_inputs["prediction_mask"]].tolist()
+        assert pred_ids == [tokenizer.vocab["##ver"]]
+
+    def test_filled_prediction_from_template_splices_multi_token_targets(self):
+        from gradiend.trainer.text.prediction.dataset import _filled_prediction_from_template
+
+        tokenizer = MockTokenizer()
+        tokenizer.vocab.update({"The": 10, "person": 11, "John": 12, "Smith": 13, "runs": 14})
+        tokenizer.unk_token_id = 1
+
+        item = _filled_prediction_from_template(
+            tokenizer,
+            template="The person [MASK] runs",
+            target="John Smith",
+            max_length=16,
+        )
+        ids = item["input_ids"].tolist()
+        assert tokenizer.vocab["John"] in ids
+        assert tokenizer.vocab["Smith"] in ids
+        assert item["prediction_mask"].sum().item() == 2
+        pred_ids = item["input_ids"][item["prediction_mask"]].tolist()
+        assert pred_ids == [tokenizer.vocab["John"], tokenizer.vocab["Smith"]]
+
+    def test_filled_prediction_from_template_fills_every_mask_slot(self):
+        from gradiend.trainer.text.prediction.dataset import _filled_prediction_from_template
+
+        tokenizer = MockTokenizer()
+        tokenizer.vocab.update({
+            "Sabrina": 30,
+            "gave": 31,
+            "no": 32,
+            "indication": 33,
+            "she": 34,
+            "heard": 35,
+            "us": 36,
+            "but": 37,
+            "i": 38,
+            "knew": 39,
+            "was": 40,
+            "listening": 41,
+            ".": 42,
+        })
+        tokenizer.unk_token_id = 1
+
+        item = _filled_prediction_from_template(
+            tokenizer,
+            template="Sabrina gave no indication [MASK] heard us but i knew [MASK] was listening .",
+            target="she",
+            max_length=32,
+        )
+        ids = item["input_ids"].tolist()
+        assert ids.count(tokenizer.vocab["she"]) == 2
+        assert tokenizer.mask_token_id not in ids
+        assert item["prediction_mask"].sum().item() == 2
+
+    def test_filled_prediction_from_template_without_tokenizer_mask_token(self):
+        """Dataset mask placeholder must work when the tokenizer has no MLM mask special."""
+        from gradiend.trainer.text.prediction.dataset import _filled_prediction_from_template
+
+        tokenizer = MockTokenizer()
+        tokenizer.mask_token = None
+        tokenizer.mask_token_id = None
+        tokenizer.vocab.update({"The": 10, "person": 11, "he": 12, "runs": 13, "[MASK]": 103})
+
+        item = _filled_prediction_from_template(
+            tokenizer,
+            template="The person [MASK] runs",
+            target="he",
+            max_length=16,
+        )
+        ids = item["input_ids"].tolist()
+        assert tokenizer.vocab["he"] in ids
+        assert 103 not in ids  # dataset placeholder must be replaced
+        assert item["prediction_mask"].sum().item() == 1
+        assert item["input_ids"][item["prediction_mask"]].tolist() == [tokenizer.vocab["he"]]
+
+    def test_create_masked_pair_skips_wordpiece_continuations(self):
+        from gradiend.trainer.text.prediction.dataset import create_masked_pair_from_text
+
+        tokenizer = MockTokenizer()
+        tokenizer.vocab.update({"thie": 20, "##ver": 21, "y": 22, "hello": 23, "world": 24})
+
+        def tokenize(text, **kwargs):
+            # Simulate BERT pieces for "thievery" plus two whole words.
+            if "thievery" in text:
+                return ["thie", "##ver", "y", "hello", "world"]
+            return text.split()
+
+        tokenizer.tokenize = tokenize
+        pair = create_masked_pair_from_text(
+            "thievery hello world",
+            tokenizer,
+            is_decoder_only_model=False,
+            mask_token="[MASK]",
+        )
+        assert pair is not None
+        masked, target = pair
+        assert not str(target).startswith("##")
+        assert "[MASK]" in masked
+
     def test_text_dataset_caching_uses_cache_key_fields(self, temp_dir):
         """Test that text dataset uses correct cache_key_fields for caching."""
         cache_dir = os.path.join(temp_dir, "cache")
@@ -618,7 +852,152 @@ class TestTextTrainingDataset:
         assert "input_ids" in item["alternative"]
         assert "attention_mask" in item["alternative"]
         assert "labels" in item["alternative"]
-    
+
+    def test_text_training_dataset_labels_all_classic_mlm_prediction_masks(self):
+        """Each classic MLM placeholder is a supervised site for the same target."""
+        dataset = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["[MASK] said that [MASK] was late"],
+                "factual": ["token_1"],
+                "alternative": ["token_2"],
+                "factual_class": ["class1"],
+                "alternative_class": ["class2"],
+                "factual_id": [1],
+                "alternative_id": [2],
+                "label": ["positive"],
+                "feature_class_id": [1],
+            }),
+            tokenizer=MockTokenizer(),
+            batch_size=1,
+            is_decoder_only_model=False,
+        )
+
+        item = dataset._create_item("[MASK] said that [MASK] was late", "token_1")
+        labels = item["labels"]
+        assert labels[labels != -100].tolist() == [1, 1]
+
+    def test_text_training_dataset_expands_one_classic_mlm_mask_for_multi_token_target(self):
+        """A single MLM placeholder may stand for a contiguous multi-token target span."""
+        tokenizer = MockTokenizer()
+        dataset = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["Hello [MASK] world"],
+                "factual": ["token_1 token_2"],
+                "alternative": ["token_3 token_4"],
+                "factual_class": ["class1"],
+                "alternative_class": ["class2"],
+                "factual_id": [1],
+                "alternative_id": [2],
+                "label": ["positive"],
+                "feature_class_id": [1],
+            }),
+            tokenizer=tokenizer,
+            batch_size=1,
+            is_decoder_only_model=False,
+        )
+
+        item = dataset._create_item("Hello [MASK] world", "token_1 token_2")
+
+        labels = item["labels"]
+        assert labels[labels != -100].tolist() == [1, 2]
+
+    def test_text_training_dataset_expands_all_classic_mlm_masks_for_multi_token_target(self):
+        """Multi-site multi-token cloze expands each placeholder to the same target span."""
+        dataset = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["[MASK] met [MASK] today"],
+                "factual": ["token_1 token_2"],
+                "alternative": ["token_3 token_4"],
+                "factual_class": ["class1"],
+                "alternative_class": ["class2"],
+                "factual_id": [1],
+                "alternative_id": [2],
+                "label": ["positive"],
+                "feature_class_id": [1],
+            }),
+            tokenizer=MockTokenizer(),
+            batch_size=1,
+            is_decoder_only_model=False,
+        )
+
+        item = dataset._create_item("[MASK] met [MASK] today", "token_1 token_2")
+        labels = item["labels"]
+        assert labels[labels != -100].tolist() == [1, 2, 1, 2]
+
+    def test_text_training_dataset_classic_mlm_per_site_targets(self):
+        """A sequence of targets assigns one target per prediction site."""
+        dataset = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["[MASK] said that [MASK] was late"],
+                "factual": ["token_1"],
+                "alternative": ["token_2"],
+                "factual_class": ["class1"],
+                "alternative_class": ["class2"],
+                "factual_id": [1],
+                "alternative_id": [2],
+                "label": ["positive"],
+                "feature_class_id": [1],
+            }),
+            tokenizer=MockTokenizer(),
+            batch_size=1,
+            is_decoder_only_model=False,
+        )
+
+        item = dataset._create_item(
+            "[MASK] said that [MASK] was late",
+            ["token_1", "token_2"],
+        )
+        labels = item["labels"]
+        assert labels[labels != -100].tolist() == [1, 2]
+
+    def test_text_training_dataset_classic_mlm_per_site_target_length_mismatch(self):
+        """Per-site target sequences must match the placeholder count."""
+        dataset = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["[MASK] said that [MASK] was late"],
+                "factual": ["token_1"],
+                "alternative": ["token_2"],
+                "factual_class": ["class1"],
+                "alternative_class": ["class2"],
+                "factual_id": [1],
+                "alternative_id": [2],
+                "label": ["positive"],
+                "feature_class_id": [1],
+            }),
+            tokenizer=MockTokenizer(),
+            batch_size=1,
+            is_decoder_only_model=False,
+        )
+
+        with pytest.raises(ValueError, match="per-site targets must match"):
+            dataset._create_item("[MASK] said that [MASK] was late", ["token_1"])
+
+    def test_text_training_dataset_classic_mlm_per_site_multi_token_targets(self):
+        """Per-site targets may differ in tokenized length."""
+        dataset = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["[MASK] met [MASK] today"],
+                "factual": ["token_1"],
+                "alternative": ["token_2"],
+                "factual_class": ["class1"],
+                "alternative_class": ["class2"],
+                "factual_id": [1],
+                "alternative_id": [2],
+                "label": ["positive"],
+                "feature_class_id": [1],
+            }),
+            tokenizer=MockTokenizer(),
+            batch_size=1,
+            is_decoder_only_model=False,
+        )
+
+        item = dataset._create_item(
+            "[MASK] met [MASK] today",
+            ["token_1 token_2", "token_3"],
+        )
+        labels = item["labels"]
+        assert labels[labels != -100].tolist() == [1, 2, 3]
+
     def test_text_training_dataset_feature_class_id_preserved(self):
         """Test that feature_class_id is preserved in items."""
         data = pd.DataFrame({

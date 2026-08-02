@@ -19,6 +19,7 @@ def create_model_with_gradiend(
     param_map: Optional[List[str]] = None,
     activation_encoder: str = 'tanh',
     activation_decoder: str = 'id',
+    bias_encoder: bool = False,
     bias_decoder: bool = True,
     torch_dtype: torch.dtype = torch.float32,
     latent_dim: int = 1,
@@ -35,6 +36,7 @@ def create_model_with_gradiend(
         param_map: List of param names to use (None = all core model params (e.g., excluding prediction layers)
         activation_encoder: Activation function for encoder
         activation_decoder: Activation function for decoder
+        bias_encoder: Whether encoder has bias
         bias_decoder: Whether decoder has bias
         torch_dtype: Data type for model
         latent_dim: Latent dimension (number of features)
@@ -63,6 +65,8 @@ def create_model_with_gradiend(
         raise TypeError(f"activation_encoder must be str, got {type(activation_encoder).__name__}")
     if not isinstance(activation_decoder, str):
         raise TypeError(f"activation_decoder must be str, got {type(activation_decoder).__name__}")
+    if not isinstance(bias_encoder, bool):
+        raise TypeError(f"bias_encoder must be bool, got {type(bias_encoder).__name__}")
     if not isinstance(bias_decoder, bool):
         raise TypeError(f"bias_decoder must be bool, got {type(bias_decoder).__name__}")
     if not isinstance(latent_dim, int):
@@ -78,6 +82,7 @@ def create_model_with_gradiend(
         param_map=param_map,
         activation_encoder=activation_encoder,
         activation_decoder=activation_decoder,
+        bias_encoder=bias_encoder,
         bias_decoder=bias_decoder,
         torch_dtype=torch_dtype,
         latent_dim=latent_dim,

@@ -215,3 +215,108 @@ class TestEvaluateBaseModelProbabilityComputation:
 
         assert targets is None
         assert use_row_wise is True
+
+    def test_evaluate_base_model_row_wise_normalizes_counterfactual_probs(self, monkeypatch):
+        """Row-wise scoring must still expose probs[T]=P(T) on the other class's dataset."""
+        config = TextPredictionConfig(
+            data=_two_class_data("M", "F", "he", "she"),
+            target_classes=["M", "F"],
+            decoder_eval_targets="label",
+            decoder_eval_prob_on_other_class=True,
+            masked_col="masked",
+        )
+        trainer = _trainer(config)
+
+        def fake_score(self, *args, **kwargs):
+            assert kwargs.get("use_row_wise") is True
+            return {
+                "F": {"M": 0.81, "F": 0.19},
+                "M": {"M": 0.55, "F": 0.45},
+            }
+
+        monkeypatch.setattr(PredictionObjective, "score_probability_shift", fake_score)
+        monkeypatch.setattr(PredictionObjective, "compute_lms", lambda *args, **kwargs: {"lms": 0.5})
+
+        result = trainer.evaluate_base_model(
+            model=SimpleMockModel(),
+            tokenizer=MockTokenizer(),
+            training_like_df=pd.DataFrame(
+                [
+                    {
+                        "masked": "[MASK] here",
+                        "label_class": "M",
+                        "label": "he",
+                        "alternative": "she",
+                        "alternative_id": "F",
+                    },
+                    {
+                        "masked": "[MASK] there",
+                        "label_class": "F",
+                        "label": "she",
+                        "alternative": "he",
+                        "alternative_id": "M",
+                    },
+                ]
+            ),
+            neutral_df=pd.DataFrame([{"text": "neutral_data"}]),
+            use_cache=False,
+        )
+
+        assert result["probs"]["M"] == 0.81
+        assert result["probs"]["F"] == 0.45
+        assert result["probs_factual"]["M"] == 0.55
+        assert result["probs_factual"]["F"] == 0.19
+
+    def test_decoder_eval_dataframe_caps_training_like_per_class_and_neutral_separately(self):
+        """Decoder plots need both factual panels; max_size is a per-class cap, not a global first-N cap."""
+        rows = []
+        for split in ("train", "validation", "test"):
+            for index in range(5):
+                rows.append(
+                    {
+                        "masked": f"[MASK] m_{split}_{index}",
+                        "label_class": "M",
+                        "label": "he",
+                        "alternative_class": "F",
+                        "alternative": "she",
+                        "split": split,
+                    }
+                )
+                rows.append(
+                    {
+                        "masked": f"[MASK] f_{split}_{index}",
+                        "label_class": "F",
+                        "label": "she",
+                        "alternative_class": "M",
+                        "alternative": "he",
+                        "split": split,
+                    }
+                )
+        neutral_rows = pd.DataFrame(
+            [
+                {"text": f"neutral {split} {index}", "split": split}
+                for split in ("train", "validation", "test")
+                for index in range(5)
+            ]
+        )
+        config = TextPredictionConfig(
+            data=pd.DataFrame(rows),
+            target_classes=["M", "F"],
+            decoder_eval_targets={"M": ["he"], "F": ["she"]},
+            masked_col="masked",
+            neutral_data=neutral_rows,
+        )
+        trainer = _trainer(config)
+
+        training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
+            MockTokenizer(),
+            max_size_training_like=2,
+            max_size_neutral=2,
+            split="test",
+        )
+
+        dataset_class_col = "label_class" if "label_class" in training_like_df.columns else "factual_id"
+        assert training_like_df[dataset_class_col].value_counts().to_dict() == {"F": 2, "M": 2}
+        assert set(training_like_df["split"]) == {"test"}
+        assert len(neutral_df) == 2
+        assert set(neutral_df["split"]) == {"test"}

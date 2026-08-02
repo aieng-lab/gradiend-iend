@@ -3,7 +3,7 @@ Prediction datasets: TextBatchedDataset, TextTrainingDataset, create_masked_pair
 """
 
 import random
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 import torch
@@ -27,6 +27,48 @@ from gradiend.trainer.core.unified_schema import (
 from gradiend.trainer.core.signals import Signal
 from gradiend.util import normalize_split_name
 from gradiend.util.logging import suppress_tokenizer_length_warning
+
+# Dataset-level cloze placeholder (matches TextFilterConfig.mask). Independent of
+# tokenizer.mask_token, which is an MLM model special and may be absent (e.g. GPT-2).
+DEFAULT_DATASET_MASK_PLACEHOLDER = "[MASK]"
+
+
+def _tokenize_classic_mlm_site_targets(
+    tokenizer: Any,
+    target: Union[str, Sequence[Any]],
+    mask_count: int,
+) -> List[List[int]]:
+    """Resolve classic MLM targets into one token-id list per prediction site.
+
+    A single string target is broadcast to every site. A sequence of targets must
+    have length ``mask_count`` (one target per ``[MASK]`` site); a length mismatch
+    raises ``ValueError`` with an actionable message.
+    """
+    if isinstance(target, (list, tuple)):
+        site_texts = list(target)
+        if len(site_texts) != mask_count:
+            raise ValueError(
+                "Classic MLM per-site targets must match the number of prediction "
+                f"placeholders: got {len(site_texts)} target(s) for {mask_count} "
+                f"placeholder(s). Pass one shared target string to broadcast to all "
+                f"sites, or a sequence of length {mask_count}. targets={site_texts!r}."
+            )
+    else:
+        site_texts = [target] * mask_count
+
+    site_token_lists: List[List[int]] = []
+    for site_idx, site_target in enumerate(site_texts):
+        token_ids = tokenizer(str(site_target), add_special_tokens=False, padding=False)["input_ids"]
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.tolist()
+        if token_ids and isinstance(token_ids[0], list):
+            token_ids = token_ids[0]
+        if not token_ids:
+            raise ValueError(
+                f"Could not tokenize MLM target {site_target!r} for prediction site {site_idx}."
+            )
+        site_token_lists.append(list(token_ids))
+    return site_token_lists
 
 
 def _ids_for_text(tokenizer: Any, text: str) -> List[int]:
@@ -76,10 +118,16 @@ def _prediction_positions_for_filled_text(
     input_ids: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
 ) -> List[int]:
-    """Locate the target span inserted into a filled prediction template."""
+    """Locate the target span inserted into a filled prediction template.
+
+    Prefer :func:`_filled_prediction_from_template` for new call sites; this helper
+    remains for locating spans in already string-filled sequences.
+    """
     if "[MASK]" not in template:
-        raise ValueError("Activation prediction-position selection requires a template with [MASK].")
-    prefix, _suffix = str(template).split("[MASK]", 1)
+        raise ValueError(
+            f"Activation prediction-position selection requires a template with {DEFAULT_DATASET_MASK_PLACEHOLDER!r}."
+        )
+    prefix, _suffix = str(template).split(DEFAULT_DATASET_MASK_PLACEHOLDER, 1)
     prefix_ids = _ids_for_text(tokenizer, prefix)
     target_ids = _continuation_ids_from_prefix(tokenizer, prefix, str(target))
     if not target_ids:
@@ -108,6 +156,216 @@ def _prediction_positions_for_filled_text(
     return list(range(start, start + len(target_ids)))
 
 
+def _target_token_ids_for_fill(tokenizer: Any, target: str, *, prefix: str = "") -> List[int]:
+    """Resolve a fill target to one or more vocabulary ids.
+
+    Single vocab pieces (including WordPiece ``##...``) are preferred so they are
+    inserted by id. Otherwise the target is tokenized as a surface continuation
+    after ``prefix``.
+    """
+    target = str(target)
+    single = _single_vocab_token_id(tokenizer, target)
+    if single is not None:
+        return [single]
+    target_ids = _continuation_ids_from_prefix(tokenizer, prefix, target)
+    if not target_ids:
+        target_ids = _ids_for_text(tokenizer, target)
+    return [int(v) for v in target_ids]
+
+
+def _pad_1d(
+    values: List[int],
+    *,
+    max_length: int,
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Truncate/pad ``values`` to ``max_length`` and build a matching attention mask."""
+    clipped = values[:max_length]
+    attention = [1] * len(clipped) + [0] * (max_length - len(clipped))
+    padded = clipped + [pad_id] * (max_length - len(clipped))
+    return (
+        torch.tensor(padded, dtype=torch.long),
+        torch.tensor(attention, dtype=torch.long),
+    )
+
+
+def _char_spans_for_substring(text: str, substring: str) -> List[Tuple[int, int]]:
+    """Return inclusive-exclusive character spans of every ``substring`` in ``text``."""
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    while True:
+        idx = text.find(substring, start)
+        if idx < 0:
+            break
+        spans.append((idx, idx + len(substring)))
+        start = idx + len(substring)
+    return spans
+
+
+def _token_spans_covering_char_spans(
+    offset_mapping: List[Tuple[int, int]],
+    char_spans: List[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    """Map character spans to inclusive-exclusive token index spans via offset mapping."""
+    token_spans: List[Tuple[int, int]] = []
+    for c_start, c_end in char_spans:
+        token_indices = [
+            i
+            for i, (o_start, o_end) in enumerate(offset_mapping)
+            if int(o_end) > int(o_start) and int(o_start) < c_end and int(o_end) > c_start
+        ]
+        if not token_indices:
+            continue
+        token_spans.append((token_indices[0], token_indices[-1] + 1))
+    return token_spans
+
+
+def _mask_placeholder_token_spans(
+    tokenizer: Any,
+    template: str,
+    *,
+    mask_placeholder: str,
+    max_length: int,
+) -> Tuple[List[int], List[Tuple[int, int]]]:
+    """Tokenize a template that still contains the dataset mask and locate those slots.
+
+    The locator is the **dataset** placeholder (``TextFilterConfig.mask``, usually
+    ``"[MASK]"``), not ``tokenizer.mask_token``. Models without an MLM special token
+    (e.g. GPT-2) must still fill activation templates.
+    """
+    char_spans = _char_spans_for_substring(template, mask_placeholder)
+    if not char_spans:
+        raise ValueError(
+            f"Activation prediction-position selection requires a template with {mask_placeholder!r}."
+        )
+
+    encode_kwargs = dict(
+        return_tensors="pt",
+        add_special_tokens=True,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+    )
+    with suppress_tokenizer_length_warning():
+        try:
+            encoded = tokenizer(template, return_offsets_mapping=True, **encode_kwargs)
+        except TypeError:
+            encoded = tokenizer(template, **encode_kwargs)
+
+    filled_ids = [int(v) for v in encoded["input_ids"].squeeze(0).tolist()]
+    offsets = encoded.get("offset_mapping")
+    if offsets is not None:
+        offset_list = offsets.squeeze(0).tolist() if hasattr(offsets, "tolist") else list(offsets)
+        offset_pairs = [(int(a), int(b)) for a, b in offset_list]
+        token_spans = _token_spans_covering_char_spans(offset_pairs, char_spans)
+        if len(token_spans) == len(char_spans):
+            return filled_ids, token_spans
+
+    # Fallback without offsets: locate the placeholder as its own token subsequence.
+    placeholder_ids = [int(v) for v in _ids_for_text(tokenizer, mask_placeholder)]
+    if placeholder_ids:
+        token_spans = []
+        search_from = 0
+        for _ in char_spans:
+            start = _find_subsequence(filled_ids, placeholder_ids, start=search_from)
+            if start < 0:
+                break
+            token_spans.append((start, start + len(placeholder_ids)))
+            search_from = start + len(placeholder_ids)
+        if len(token_spans) == len(char_spans):
+            return filled_ids, token_spans
+
+    single_id = _single_vocab_token_id(tokenizer, mask_placeholder)
+    if single_id is not None:
+        token_spans = []
+        search_from = 0
+        for _ in char_spans:
+            try:
+                start = filled_ids.index(int(single_id), search_from)
+            except ValueError:
+                break
+            token_spans.append((start, start + 1))
+            search_from = start + 1
+        if len(token_spans) == len(char_spans):
+            return filled_ids, token_spans
+
+    raise ValueError(
+        f"Could not locate dataset mask placeholder {mask_placeholder!r} in tokenized template {template!r}."
+    )
+
+
+def _filled_prediction_from_template(
+    tokenizer: Any,
+    *,
+    template: str,
+    target: str,
+    max_length: int = 256,
+    mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
+) -> dict:
+    """Fill a dataset-mask template in token space and return model inputs + prediction_mask.
+
+    The template uses the **dataset** mask placeholder (default ``"[MASK]"``, same as
+    ``TextFilterConfig.mask``), which is model-agnostic. Filling never requires
+    ``tokenizer.mask_token`` / ``mask_token_id`` (those are MLM specials, not data).
+    This is intentional for ACTIEND training: if factual and alternative examples
+    both kept the literal MLM mask token at the measured position, their activation
+    inputs would be identical there and the factual-vs-alternative activation
+    signal would collapse to zero. Filling the slot with the candidate token makes
+    the measured hidden state target-conditioned while ``prediction_mask`` keeps
+    track of the exact span that was filled.
+
+    Steps:
+      1. Tokenize the template with the dataset mask still present; locate each slot.
+      2. Resolve ``target`` to vocab id(s).
+      3. Splice those id(s) over each mask slot (templates may contain several).
+      4. Mark every spliced span in ``prediction_mask``.
+
+    This avoids string-replacing tokenizer artifacts (e.g. ``##ver``) into surface text.
+    """
+    template = str(template)
+    target = str(target)
+    mask_placeholder = str(mask_placeholder)
+    if mask_placeholder not in template:
+        raise ValueError(
+            f"Activation prediction-position selection requires a template with {mask_placeholder!r}."
+        )
+
+    filled_ids, mask_spans = _mask_placeholder_token_spans(
+        tokenizer,
+        template,
+        mask_placeholder=mask_placeholder,
+        max_length=max_length,
+    )
+    prefix, _suffix = template.split(mask_placeholder, 1)
+    target_ids = _target_token_ids_for_fill(tokenizer, target, prefix=prefix)
+    if not target_ids:
+        raise ValueError(f"Could not tokenize prediction target {target!r}.")
+
+    pad_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+
+    # Splice from the right so earlier indices stay valid.
+    prediction_spans: List[Tuple[int, int]] = []
+    for start, end in reversed(mask_spans):
+        filled_ids = filled_ids[:start] + target_ids + filled_ids[end:]
+        prediction_spans.append((start, start + len(target_ids)))
+
+    input_ids, attention_mask = _pad_1d(filled_ids, max_length=max_length, pad_id=pad_id)
+    prediction_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    for start, end in prediction_spans:
+        clipped_start = min(max(start, 0), max_length)
+        clipped_end = min(max(end, 0), max_length)
+        if clipped_end > clipped_start:
+            prediction_mask[clipped_start:clipped_end] = True
+    if not bool(prediction_mask.any().item()):
+        raise ValueError(
+            f"Filled prediction target {target!r} was truncated out of template {template!r}."
+        )
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "prediction_mask": prediction_mask,
+    }
+
 def _stack_text_items(items: List[dict]) -> dict:
     """Stack same-shaped tokenized text items into one batch dictionary."""
     if len(items) == 1:
@@ -123,6 +381,54 @@ def _targetable_token_text(token: str) -> str:
     """
     token = str(token).strip()
     return token.lstrip("#").lstrip("Ġ").lstrip("▁").strip()
+
+
+def _is_wordpiece_continuation(token: str) -> bool:
+    """Return True for BERT-style WordPiece continuation pieces (``##...``)."""
+    return str(token).startswith("##")
+
+
+def _single_vocab_token_id(tokenizer: Any, token: str) -> Optional[int]:
+    """Return the tokenizer id when ``token`` is a single vocabulary piece.
+
+    Used to fill ``[MASK]`` by id (required for WordPiece targets like ``##ver``),
+    instead of string-replacing tokenizer artifacts into surface text.
+    """
+    token = str(token)
+    if not token or not hasattr(tokenizer, "convert_tokens_to_ids"):
+        return None
+    pieces = None
+    if hasattr(tokenizer, "tokenize"):
+        try:
+            pieces = tokenizer.tokenize(token)
+        except Exception:
+            pieces = None
+    if pieces is not None and pieces != [token]:
+        return None
+    try:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+    except Exception:
+        return None
+    if token_id is None:
+        return None
+    token_id = int(token_id)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if unk_id is not None and token_id == int(unk_id):
+        return None
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    pad_token = getattr(tokenizer, "pad_token", None)
+    if pad_id is not None and token_id == int(pad_id) and token != pad_token:
+        return None
+    if hasattr(tokenizer, "convert_ids_to_tokens"):
+        try:
+            recovered = tokenizer.convert_ids_to_tokens(token_id)
+        except Exception:
+            recovered = None
+        if isinstance(recovered, (list, tuple)):
+            recovered = recovered[0] if recovered else None
+        if recovered is not None and str(recovered) != token:
+            return None
+    return token_id
 
 
 def create_masked_pair_from_text(
@@ -158,6 +464,7 @@ def create_masked_pair_from_text(
         valid_indices = [
             i for i, token in enumerate(tokens)
             if _targetable_token_text(token)
+            and not _is_wordpiece_continuation(token)
             and not (
                 token.startswith("[") and token.endswith("]")
                 or (excluded_tokens and any(excl.lower() in token.lower() for excl in excluded_tokens))
@@ -175,6 +482,7 @@ def create_masked_pair_from_text(
     valid_k = [
         k for k in range(min_prefix_tokens, len(tokens))
         if _targetable_token_text(tokens[k])
+        and not _is_wordpiece_continuation(tokens[k])
         and not (
             tokens[k].startswith("[") and tokens[k].endswith("]")
             or (excluded_tokens and any(excl.lower() in tokens[k].lower() for excl in excluded_tokens))
@@ -240,14 +548,19 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         self.mask_token = getattr(tokenizer, "mask_token", None)
         self.mask_token_id = getattr(tokenizer, "mask_token_id", None)
 
-    def _create_item(self, text: str, target: str):
+    def _create_item(self, text: str, target: Union[str, Sequence[Any]]):
         """Create a single training item: input_ids, attention_mask, labels.
 
-        For decoder-only: labels at last non-pad position. For MLM: labels at mask positions.
+        For decoder-only: labels at last non-pad position. For classic encoder
+        MLM: every prediction placeholder is an independent supervised site.
+        A single target string is broadcast to all sites; a sequence of targets
+        must have one entry per site (length mismatch raises ``ValueError``).
+        Each site expands to a contiguous mask span of
+        ``len(tokenize(site_target))`` tokens.
 
         Args:
             text: Input text or template used for the prediction objective.
-            target: Target token/text to predict.
+            target: Shared target string, or per-site sequence of targets.
         """
         is_decoder_only_model = getattr(self, "is_decoder_only_model", False)
         prediction_objective = getattr(self, "prediction_objective", None)
@@ -262,6 +575,11 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                 raise ValueError("clm_mlm_head requires tokenizer.mask_token.")
             if "[MASK]" not in text:
                 raise ValueError("clm_mlm_head training requires a [MASK] placeholder in the input text.")
+            if isinstance(target, (list, tuple)):
+                raise ValueError(
+                    "Per-site MLM targets (a sequence of targets) are only supported for "
+                    "classic encoder MLM; clm_mlm_head expects a single target string."
+                )
             expanded_text = text.replace("[MASK]", self.mask_token, 1)
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(
@@ -289,6 +607,11 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         if prediction_objective == "clm_sequence_cloze":
             if "[MASK]" not in text:
                 raise ValueError("clm_sequence_cloze training requires a [MASK] placeholder.")
+            if isinstance(target, (list, tuple)):
+                raise ValueError(
+                    "Per-site MLM targets (a sequence of targets) are only supported for "
+                    "classic encoder MLM; clm_sequence_cloze expects a single target string."
+                )
             prefix, rhs = text.split("[MASK]", 1)
             expanded_text = text.replace("[MASK]", str(target), 1)
             with suppress_tokenizer_length_warning():
@@ -310,6 +633,11 @@ class TextBatchedDataset(TextBatchedDatasetBase):
             return {"input_ids": input_ids.squeeze(0), "attention_mask": attention_mask.squeeze(0), "labels": labels.squeeze(0)}
         is_seq2seq_model = getattr(self, "is_seq2seq_model", False)
         if is_seq2seq_model:
+            if isinstance(target, (list, tuple)):
+                raise ValueError(
+                    "Per-site MLM targets (a sequence of targets) are only supported for "
+                    "classic encoder MLM; seq2seq training expects a single target string."
+                )
             prediction_objective = getattr(self, "prediction_objective", None)
             common = dict(
                 masked_text=text,
@@ -327,21 +655,18 @@ class TextBatchedDataset(TextBatchedDatasetBase):
             else:
                 item = create_seq2seq_decoder_item(**common)
             return {k: v.squeeze(0) for k, v in item.items()}
-        if not is_decoder_only_model and self.mask_token and self.mask_token not in text:
-            raise ValueError("Input text must contain at least one [MASK] token placeholder.")
-        mask_count = 0 if is_decoder_only_model else (text.count(self.mask_token) if self.mask_token else 0)
-        target_tokens = self.tokenizer(target, add_special_tokens=False)["input_ids"]
-        num_target_tokens = len(target_tokens)
         if is_decoder_only_model:
+            if isinstance(target, (list, tuple)):
+                raise ValueError(
+                    "Per-site MLM targets (a sequence of targets) are only supported for "
+                    "classic encoder MLM; decoder-only training expects a single target string."
+                )
             expanded_text = text.split("[MASK]")[0] if "[MASK]" in text else text
-        else:
-            expanded_text = text.replace(self.mask_token, " ".join([self.mask_token] * num_target_tokens), 1) if mask_count == 1 and self.mask_token else text
-        with suppress_tokenizer_length_warning():
-            encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded["attention_mask"]
-        labels = torch.full_like(input_ids, -100)
-        if is_decoder_only_model:
+            with suppress_tokenizer_length_warning():
+                encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded["attention_mask"]
+            labels = torch.full_like(input_ids, -100)
             last_idxs = attention_mask.sum(dim=1)
             if hasattr(self.tokenizer, "vocab") and target in self.tokenizer.vocab:
                 target_idx = self.tokenizer.vocab[target]
@@ -350,12 +675,42 @@ class TextBatchedDataset(TextBatchedDatasetBase):
             for i, last_idx in enumerate(last_idxs):
                 if last_idx < input_ids.size(1):
                     labels[i, last_idx - 1] = target_idx
-        else:
-            mask_token_id = self.tokenizer.convert_tokens_to_ids(self.mask_token)
-            mask_positions = (input_ids == mask_token_id).nonzero(as_tuple=False)
-            for i, idx in enumerate(mask_positions):
-                b, pos = idx.tolist()
-                labels[b, pos] = target_tokens[min(i, len(target_tokens) - 1)]
+            return {"input_ids": input_ids.squeeze(0), "attention_mask": attention_mask.squeeze(0), "labels": labels.squeeze(0)}
+
+        if not self.mask_token:
+            raise ValueError("Classic MLM training requires tokenizer.mask_token.")
+        mask_count = text.count(self.mask_token)
+        if mask_count < 1:
+            raise ValueError(
+                "Classic MLM training requires at least one prediction placeholder; "
+                f"found 0 occurrences of {self.mask_token!r} in text={text!r}."
+            )
+        site_token_lists = _tokenize_classic_mlm_site_targets(self.tokenizer, target, mask_count)
+        # Expand each site independently so per-site targets may differ in length.
+        expanded_text = text
+        for site_tokens in site_token_lists:
+            span = " ".join([self.mask_token] * len(site_tokens))
+            expanded_text = expanded_text.replace(self.mask_token, span, 1)
+        with suppress_tokenizer_length_warning():
+            encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
+        input_ids = encoded["input_ids"]
+        attention_mask = encoded["attention_mask"]
+        labels = torch.full_like(input_ids, -100)
+        mask_token_id = self.tokenizer.convert_tokens_to_ids(self.mask_token)
+        mask_positions = (input_ids == mask_token_id).nonzero(as_tuple=False)
+        expected_masks = sum(len(site_tokens) for site_tokens in site_token_lists)
+        if len(mask_positions) != expected_masks:
+            raise ValueError(
+                "Classic MLM training expected "
+                f"{expected_masks} tokenized mask position(s) across {mask_count} site(s), "
+                f"got {len(mask_positions)}. text={text!r}, expanded_text={expanded_text!r}."
+            )
+        offset = 0
+        for site_tokens in site_token_lists:
+            for tok in site_tokens:
+                b, pos = mask_positions[offset].tolist()
+                labels[b, pos] = tok
+                offset += 1
         return {"input_ids": input_ids.squeeze(0), "attention_mask": attention_mask.squeeze(0), "labels": labels.squeeze(0)}
 
 
@@ -465,6 +820,9 @@ class TextTrainingDataset(TextBatchedDataset):
             "alternative_token": entry[UNIFIED_ALTERNATIVE],
             "alternative_id": entry["alternative_id"],
         }
+        for key in ("is_identity_transition", "neutral_variant", "transition_type"):
+            if key in entry:
+                out[key] = entry[key]
         if "feature_class_id" in entry:
             out["feature_class_id"] = entry["feature_class_id"]
         if UNIFIED_SPLIT in entry.index:
@@ -482,6 +840,13 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
     wrapper therefore constructs factual/alternative inputs by filling the
     prediction slot before activation extraction, and adds ``prediction_mask``
     so token_selector="prediction" can select the filled span.
+
+    The filled span is not just a convenience. For MLM-style models, leaving the
+    model's mask token in both factual and alternative inputs would produce the
+    same activation at the measured prediction position for both sides; ACTIEND
+    would then see no factual/alternative distinction to learn from. Filling with
+    the candidate token creates the target-conditioned activation difference that
+    the ACTIEND decoder later turns into an additive steering vector.
     """
 
     CACHE_KEY_FIELDS: List[str] = ["template", "factual_token", "alternative_token", "label"]
@@ -552,49 +917,15 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
         return [value]
 
     def _create_filled_prediction_item(self, template: str, target_token: Any) -> dict:
-        template = str(template)
-        target_token = str(target_token)
-        if "[MASK]" not in template:
-            raise ValueError("Text activation training requires templates with a [MASK] prediction slot.")
-        filled_text = template.replace("[MASK]", target_token, 1)
         max_length = getattr(self.training_data, "max_length", 256)
         if not isinstance(max_length, int) or max_length <= 0:
             max_length = 256
-        with suppress_tokenizer_length_warning():
-            encoded = self.tokenizer(
-                filled_text,
-                return_tensors="pt",
-                add_special_tokens=True,
-                truncation=True,
-                max_length=max_length,
-                padding="max_length",
-            )
-        input_ids = encoded["input_ids"].squeeze(0)
-        attention_mask = encoded.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.squeeze(0)
-        positions = _prediction_positions_for_filled_text(
+        return _filled_prediction_from_template(
             self.tokenizer,
-            template=template,
-            target=target_token,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
+            template=str(template),
+            target=str(target_token),
+            max_length=max_length,
         )
-        prediction_mask = torch.zeros_like(input_ids, dtype=torch.bool)
-        for position in positions:
-            if 0 <= position < prediction_mask.numel():
-                prediction_mask[position] = True
-        if not bool(prediction_mask.any().item()):
-            raise ValueError(
-                f"Filled prediction target {target_token!r} was truncated out of template {template!r}."
-            )
-        item = {
-            "input_ids": input_ids,
-            "prediction_mask": prediction_mask,
-        }
-        if attention_mask is not None:
-            item["attention_mask"] = attention_mask
-        return item
 
     def _filled_side_batch(self, templates: List[Any], target_tokens: List[Any]) -> dict:
         items = [

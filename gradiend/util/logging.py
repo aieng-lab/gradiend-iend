@@ -2,6 +2,10 @@
 Logging configuration for GRADIEND.
 
 This module sets up logging with appropriate levels and formatting.
+
+Only the ``gradiend`` logger namespace is configured — the root logger and
+third-party loggers (httpx, huggingface_hub, transformers, …) are left
+untouched so library users keep full control over their own logging.
 """
 
 import logging
@@ -9,36 +13,43 @@ import sys
 from contextlib import contextmanager
 from typing import Generator
 
+_LIB_LOGGER_NAME = "gradiend"
+
 
 def setup_logging(level=logging.INFO):
     """
-    Set up logging configuration for GRADIEND.
-    
+    Set up logging configuration for the ``gradiend`` namespace.
+
+    Attaches a :class:`~logging.StreamHandler` to the ``gradiend`` logger
+    (not the root logger) so only GRADIEND messages are affected.
+    Third-party loggers (httpx, huggingface_hub, transformers, …) are
+    never touched.
+
     Args:
         level: Logging level (default: INFO)
     """
     if not isinstance(level, int):
         raise TypeError(f"level must be int (e.g. logging.INFO), got {type(level).__name__}")
-    # Get root logger
-    root_logger = logging.getLogger()
-    
-    # If logging is already configured, update the level
-    if root_logger.handlers:
-        root_logger.setLevel(level)
-        # Also update all existing handlers
-        for handler in root_logger.handlers:
-            handler.setLevel(level)
+
+    lib_logger = logging.getLogger(_LIB_LOGGER_NAME)
+    lib_logger.setLevel(level)
+
+    if not lib_logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setLevel(level)
+        handler.setFormatter(logging.Formatter(
+            fmt="%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        lib_logger.addHandler(handler)
     else:
-        # First time setup
-        logging.basicConfig(
-            level=level,
-            # Keep timestamp and level, drop the full logger name to avoid verbose prefixes
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[
-                logging.StreamHandler(sys.stdout)
-            ]
-        )
+        for handler in lib_logger.handlers:
+            handler.setLevel(level)
+
+    # Let applications and pytest's caplog observe GRADIEND records through the
+    # normal root logging path. Applications that want isolated GRADIEND output
+    # can still set logging.getLogger("gradiend").propagate = False.
+    lib_logger.propagate = True
 
 
 def get_logger(name):
@@ -85,7 +96,5 @@ def suppress_tokenizer_length_warning() -> Generator[None, None, None]:
             log.setLevel(level)
 
 
-# Configure default logging once, the first time this module is imported.
-# If the application has already configured logging, this will be a no-op.
-if not logging.getLogger().handlers:
-    setup_logging(logging.INFO)
+# Configure the gradiend logger once on first import.
+setup_logging(logging.INFO)

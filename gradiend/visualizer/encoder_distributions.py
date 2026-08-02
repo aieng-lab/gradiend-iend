@@ -17,6 +17,7 @@ from gradiend.visualizer.encoder_neutral import (
     encoder_plot_xlabel,
 )
 from gradiend.visualizer.labels import (
+    ENCODED_VALUE_LABEL,
     escape_matplotlib_usetex_text,
     format_transition_label,
     resolve_highlight_non_convergence,
@@ -125,7 +126,7 @@ def _plot_encoder_distributions_by_data_split(
             ax.set_title(escape_matplotlib_usetex_text(sp))
             ax.set_xlabel("")
             ax.tick_params(axis="x", rotation=15 if len(panel_groups) > 3 else 0)
-        axes[0].set_ylabel("Encoded value")
+        axes[0].set_ylabel(ENCODED_VALUE_LABEL)
         axes[-1].set_xlabel(x_label)
     if title is True and run_id:
         plt.suptitle(escape_matplotlib_usetex_text(run_id))
@@ -730,7 +731,7 @@ def plot_encoder_distributions(
         plt.title(escape_matplotlib_usetex_text(run_id), fontsize=title_fontsize)
     ax.set_xticklabels([])
     plt.xlabel("", fontsize=axis_label_fontsize)
-    plt.ylabel("Encoded value", fontsize=axis_label_fontsize)
+    plt.ylabel(ENCODED_VALUE_LABEL, fontsize=axis_label_fontsize)
     if label_fontsize is not None:
         ax.tick_params(labelsize=label_fontsize)
 
