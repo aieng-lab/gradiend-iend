@@ -18,6 +18,7 @@ from gradiend.trainer.core.stats import (
     _best_checkpoint_step_is_after_initial,
     _best_step_min_target_class_abs_mean,
     _best_step_target_class_mean_product,
+    correlation_checkpoint_rank,
     load_training_stats,
 )
 from gradiend.model import GradiendModel
@@ -909,6 +910,63 @@ class TestConvergenceCriteria:
         min_abs = _best_step_min_target_class_abs_mean(training_stats, best_score_checkpoint)
 
         assert min_abs == pytest.approx(0.6)
+
+    def test_correlation_checkpoint_rank_prefers_convergent_over_peak_corr(self):
+        """With prefer_convergent=True, peak |corr| with weak means loses to a convergent step."""
+        weak = correlation_checkpoint_rank(
+            step=100,
+            correlation=0.908,
+            mean_by_class={1.0: 0.80, -1.0: -0.2937},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=True,
+        )
+        strong = correlation_checkpoint_rank(
+            step=500,
+            correlation=0.858,
+            mean_by_class={1.0: 0.6425, -1.0: -0.9010},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=True,
+        )
+        assert strong > weak
+        assert strong[0] == 1
+        assert weak[0] == 0
+
+    def test_correlation_checkpoint_rank_default_keeps_peak_corr(self):
+        """Default prefer_convergent=False selects by |correlation| alone."""
+        peak = correlation_checkpoint_rank(
+            step=100,
+            correlation=0.908,
+            mean_by_class={1.0: 0.80, -1.0: -0.2937},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=False,
+        )
+        later = correlation_checkpoint_rank(
+            step=500,
+            correlation=0.858,
+            mean_by_class={1.0: 0.6425, -1.0: -0.9010},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=False,
+        )
+        assert peak > later
+        assert peak[0] == 0
+        assert later[0] == 0
+
+    def test_correlation_checkpoint_rank_without_thresholds_uses_abs_corr(self):
+        higher = correlation_checkpoint_rank(
+            step=10,
+            correlation=0.9,
+            mean_by_class={1.0: 0.1, -1.0: -0.1},
+        )
+        lower = correlation_checkpoint_rank(
+            step=20,
+            correlation=0.5,
+            mean_by_class={1.0: 0.9, -1.0: -0.9},
+        )
+        assert higher > lower
 
 
 class TestFinalStepEvaluation:

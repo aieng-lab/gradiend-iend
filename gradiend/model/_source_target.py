@@ -5,7 +5,17 @@ Training vs decoder evaluation
 
 * **Training** uses ``TrainingArguments.source`` for which gradients feed the encoder
 
-  (``factual``, ``alternative``, or ``diff``).
+  (``factual``, ``alternative``, ``diff``, or ``both``).
+
+* ``source="both"`` alternates the encoder pole **per training batch** (factual on even
+  batch indices, alternative on odd). Internally each batch is compiled to the
+  existing ``factual`` + ``diff`` path by optionally swapping factual/alternative
+  (and inverting the label) so target is always ``input − opposite``.
+
+* **Encoder evaluation** (``target=None``) expands each base example to **both poles**
+  for every training ``source``. That way one-pole training data (only ``A→B`` rows)
+  still yields labels ``+1`` and ``-1`` for correlation, whether training used
+  ``factual``, ``alternative``, ``diff``, or ``both``.
 
 * **Decoder rewrite/intervention** uses ``model.source`` and ``model.target``
   (persisted in ``gradiend_context.json``) to
@@ -27,9 +37,12 @@ factual/diff loss-gradient direction:
 +------------------+-------------------------------+
 | ``model.source`` | gradient ``ff`` for class C |
 +==================+===============================+
-| factual, diff    | ``-encoding_direction[C]``    |
+| factual, diff, both | ``-encoding_direction[C]`` |
 | alternative      | ``+encoding_direction[C]``    |
 +------------------+-------------------------------+
+
+``both`` matches ``factual`` because training compiles each batch to the
+factual/diff geometry via optional fac↔alt swap.
 
 Activation-space ACTIEND hooks add decoded activation-space displacements
 directly. For the meaningful steering target ``target="diff"``, this is the
@@ -43,7 +56,7 @@ Equivalently:
 +------------------+-------------------------------+
 | ``model.source`` | activation ``ff`` for class C |
 +==================+===============================+
-| factual, diff    | ``+encoding_direction[C]``    |
+| factual, diff, both | ``+encoding_direction[C]`` |
 | alternative      | ``-encoding_direction[C]``    |
 +------------------+-------------------------------+
 
@@ -73,7 +86,7 @@ from __future__ import annotations
 
 from typing import Any
 
-SOURCE_TARGET_KEYWORDS: frozenset[str] = frozenset({"factual", "alternative", "diff"})
+SOURCE_TARGET_KEYWORDS: frozenset[str] = frozenset({"factual", "alternative", "diff", "both"})
 
 
 def validate_source_target(name: str, value: object) -> str:
@@ -87,11 +100,31 @@ def validate_source_target(name: str, value: object) -> str:
     return value
 
 
+def validate_source_target_combination(source: str, target: object) -> None:
+    """Reject unsupported source/target pairs.
+
+    ``source="both"`` requires ``target="diff"`` during training. Encoder-only
+    evaluation may pass ``target=None`` (no reconstruction target).
+    """
+    source = validate_source_target("source", source)
+    if source != "both":
+        return
+    if target is None:
+        return
+    target = validate_source_target("target", target)
+    if target != "diff":
+        raise ValueError(
+            "source='both' requires target='diff' "
+            f"(or target=None for encoder-only evaluation), got target={target!r}"
+        )
+
+
 def gradient_feature_factor_from_encoding_direction(direction: float, source: str) -> float:
     """Map a class encoding direction to a gradient-space rewrite feature factor."""
     validate_source_target("source", source)
     if source == "alternative":
         return float(direction)
+    # factual, diff, and both (compiled to factual/diff) share the same sign.
     return float(-direction)
 
 
@@ -197,6 +230,7 @@ def encoding_view_sign_for_source(source: str, alignment: str) -> float:
     counterfactual_view = key in {
         "counterfactual", "cf", "alternative", "alternatives",
     }
+    # both compiles to factual/diff geometry, so treat it as factual-aligned.
     alternative_source = source == "alternative"
     return -1.0 if counterfactual_view != alternative_source else 1.0
 

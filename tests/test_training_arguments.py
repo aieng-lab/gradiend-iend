@@ -36,6 +36,16 @@ class TestTrainingArguments:
         args = TrainingArguments()
         assert args.include_other_classes is False
 
+    def test_mask_placeholder_is_serialized_and_validated(self):
+        args = TrainingArguments(mask_placeholder="[PRONOUN]")
+
+        assert args.mask_placeholder == "[PRONOUN]"
+        assert TrainingArguments.from_dict(args.to_dict()).mask_placeholder == "[PRONOUN]"
+        with pytest.raises(TypeError, match="mask_placeholder"):
+            TrainingArguments(mask_placeholder=None)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="mask_placeholder"):
+            TrainingArguments(mask_placeholder="")
+
     def test_training_arguments_default_signal_is_gradient(self):
         args = TrainingArguments()
 
@@ -245,6 +255,7 @@ class TestTrainingArguments:
         assert args.learning_rate == 1e-5
         assert args.convergent_score_threshold == 0.5
         assert args.convergent_mean_by_class_threshold == 0.5
+        assert args.prefer_convergent_checkpoint is False
         assert args.base_model_device_map is None
         assert args.base_model_max_memory is None
 

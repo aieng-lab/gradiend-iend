@@ -1992,13 +1992,17 @@ class ModelWithGradiend(nn.Module, ABC):
         if feature_class_encoding_direction_from_context is not None:
             model.feature_class_encoding_direction = feature_class_encoding_direction_from_context
         elif feature_definition is not None:
-            pair = getattr(feature_definition, "pair", None)
-            classes = getattr(feature_definition, "classes", None) or []
-            if pair and len(pair) >= 2:
-                class_labels = {pair[0]: 1.0, pair[1]: -1.0}
-                for c in classes:
-                    if c not in class_labels:
-                        class_labels[c] = 0.0
+            labels_fn = getattr(feature_definition, "get_feature_class_encoding_labels", None)
+            class_labels = labels_fn() if callable(labels_fn) else None
+            if not class_labels:
+                pair = getattr(feature_definition, "pair", None)
+                classes = getattr(feature_definition, "classes", None) or []
+                if pair and len(pair) >= 2:
+                    class_labels = {pair[0]: 1.0, pair[1]: -1.0}
+                    for c in classes:
+                        if c not in class_labels:
+                            class_labels[c] = 0.0
+            if class_labels:
                 model.set_feature_class_encoding_direction(class_labels)
 
         model._post_init_from_pretrained()

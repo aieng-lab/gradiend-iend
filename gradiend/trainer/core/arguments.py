@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from gradiend.trainer.core.cache_policy import normalize_use_cache
-from gradiend.trainer.core.config import validate_source_target
+from gradiend.trainer.core.config import validate_source_target, validate_source_target_combination
 from gradiend.trainer.core.pruning import PostPruneConfig, PrePruneConfig, _validate_topk
 from gradiend.trainer.core.signals import (
     Signal,
@@ -55,7 +55,7 @@ class TrainingArguments:
     add_identity_for_other_classes: bool = False
     """If True, add identity (factual==alternative) examples for classes not in the target classes used for training."""
 
-    add_neutral_identity_transitions: bool = False
+    add_neutral_identity_transitions: bool = True
     """If True, add neutral identity transitions from TextPredictionConfig.neutral_data.
 
     These rows have factual==alternative and label 0. For target='diff' they
@@ -65,7 +65,12 @@ class TrainingArguments:
 
     # ----- GRADIEND interpretation -----
     source: str = "alternative"
-    """Source for GRADIEND input: 'factual', 'alternative', or 'diff'."""
+    """Source for GRADIEND input: 'factual', 'alternative', 'diff', or 'both'.
+
+    ``both`` alternates factual/alternative poles across balance-group *visits*
+    (orthogonal to ``feature_class_id`` / neutral balance cycling) and requires
+    ``target='diff'``.
+    """
 
     target: str = "diff"
     """Target for GRADIEND output: 'factual', 'alternative', or 'diff'."""
@@ -166,6 +171,14 @@ class TrainingArguments:
     eval_batch_size: int = 32
     """Batch size for evaluation."""
 
+    max_length: int = 128
+    """Max token length for text training / ACTIEND filled templates.
+
+    Longer inputs are truncated to keep ``[MASK]`` inside this window (left context
+    dropped so the mask sits near the end). Lower values are cheaper; raise for
+    long-context tasks if needed.
+    """
+
     do_eval: bool = True
     """Whether to run evaluation during training."""
 
@@ -203,6 +216,15 @@ class TrainingArguments:
     ``seq2seq_encoder_mlm``.
     ``auto``: seq2seq models → ``seq2seq_encoder_mlm``; decoder-only → ``clm_next_token`` (or cached
     ``clm_mlm_head`` when a saved head exists); else ``mlm_mask_token``."""
+
+    mask_placeholder: str = "[MASK]"
+    """Dataset-level prediction placeholder used inside masked text templates.
+
+    This is independent of ``tokenizer.mask_token``. For example, pass
+    ``mask_placeholder="[PRONOUN]"`` when the data templates use ``[PRONOUN]``;
+    GRADIEND replaces that placeholder with the model/tokenizer-specific mask
+    token or sentinel at encoding time.
+    """
 
     decoder_mlm_head_epochs: int = 5
     """Epochs used when prediction_objective="clm_mlm_head" has to train the auxiliary head."""
@@ -318,7 +340,18 @@ class TrainingArguments:
     convergent_score_threshold. When set, convergence requires BOTH |correlation| >= convergent_score_threshold AND
     min(|mean|) over non-zero target classes >= convergent_mean_by_class_threshold at the best checkpoint step. For
     correlation-based convergence, the two non-zero target classes must also have opposite-sign mean encodings
-    at the best checkpoint step (their product must be negative)."""
+    at the best checkpoint step (their product must be negative).
+
+    This flag only defines the end-of-training convergence check unless
+    ``prefer_convergent_checkpoint=True`` (see that argument)."""
+
+    prefer_convergent_checkpoint: bool = False
+    """If True, correlation-based best-checkpoint selection prefers steps that meet the convergence
+    criteria (score threshold, opposite-sign target means, and optional mean threshold) over a
+    higher-|correlation| step that fails them.
+
+    If False (default), the best checkpoint is selected by ``|correlation|`` alone; convergence is
+    still evaluated afterward at that best step."""
 
     split_resplit_per_seed: bool = False
     """When ``split_col`` is ``\"heldout\"`` or ``None``, re-draw splits per training seed.
@@ -518,6 +551,10 @@ class TrainingArguments:
             raise TypeError(f"eval_batch_size must be int, got {type(self.eval_batch_size).__name__}")
         if self.eval_batch_size < 1:
             raise ValueError(f"eval_batch_size must be >= 1, got {self.eval_batch_size}")
+        if not isinstance(self.max_length, int):
+            raise TypeError(f"max_length must be int, got {type(self.max_length).__name__}")
+        if self.max_length < 8:
+            raise ValueError(f"max_length must be >= 8, got {self.max_length}")
         if not isinstance(self.do_eval, bool):
             raise TypeError(f"do_eval must be bool, got {type(self.do_eval).__name__}")
         if self.seed is not None and not isinstance(self.seed, int):
@@ -530,11 +567,18 @@ class TrainingArguments:
                 "gradiend_split_loss must be 'mean', 'sum', 'size_weighted', or 'full', "
                 f"got {self.gradiend_split_loss!r}"
             )
+        if not isinstance(self.mask_placeholder, str):
+            raise TypeError(
+                f"mask_placeholder must be a non-empty str, got {type(self.mask_placeholder).__name__}"
+            )
+        if not self.mask_placeholder:
+            raise ValueError("mask_placeholder must be a non-empty str")
 
         self._normalize_signal_arguments()
 
         validate_source_target("source", self.source)
         validate_source_target("target", self.target)
+        validate_source_target_combination(self.source, self.target)
         if self.torch_dtype is None:
             self.torch_dtype = torch.float32
         if self.init_fan_in_floor is not None:

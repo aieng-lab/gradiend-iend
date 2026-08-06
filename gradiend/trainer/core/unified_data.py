@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple, Union, Literal
+from typing import Dict, List, Optional, Sequence, Tuple, Union, Literal
 
 from gradiend.util.logging import get_logger
 from gradiend.util import normalize_split_name
@@ -426,6 +426,34 @@ def _counterfactual_distribution(series: pd.Series):
     return unique_lower, weights, lower_to_canonical
 
 
+def resolve_counterfactual_classes(
+    counterfactual_classes: Optional[Union[List[str], Tuple[str, ...], Literal["all"]]] ,
+    *,
+    available_classes: Sequence[str],
+    positive_classes: Optional[Sequence[str]] = None,
+    pair: Optional[Tuple[str, str]] = None,
+) -> Optional[List[str]]:
+    """Resolve ``counterfactual_classes`` for one-pole multi-CF training.
+
+    ``None`` → no expansion (caller keeps binary ``pair`` filtering).
+    ``\"all\"`` → every available class except the + class (``positive_classes`` /
+    sole ``target_classes`` entry).
+    list/tuple → explicit CF set (positive classes removed if present).
+    """
+    if counterfactual_classes is None:
+        return None
+    available = [str(c) for c in available_classes]
+    pos = {str(c) for c in (positive_classes or [])}
+    if counterfactual_classes == "all":
+        out = [c for c in available if c not in pos]
+    else:
+        out = [str(c) for c in list(counterfactual_classes) if str(c) not in pos]
+    if not out and pair is not None and pos:
+        # Fall back to the other pole of the configured pair.
+        out = [str(c) for c in pair if str(c) not in pos]
+    return out
+
+
 def per_class_dict_to_unified(
     class_dfs: Dict[str, pd.DataFrame],
     classes: Union[List[str], Literal["all"]] = "all",
@@ -436,6 +464,8 @@ def per_class_dict_to_unified(
     include_identity_rows: bool = False,
     max_counterfactuals_per_sentence: int = 1,
     random_state: Optional[int] = None,
+    positive_classes: Optional[Sequence[str]] = None,
+    counterfactual_classes: Optional[Union[List[str], Tuple[str, ...], Literal["all"]]] = None,
 ) -> pd.DataFrame:
     """Convert per-class DataFrames into unified schema (unified columns directly).
 
@@ -465,6 +495,10 @@ def per_class_dict_to_unified(
             other_df, max number of unique (case-insensitive) counterfactual
             tokens per base sentence; must be unique (default 1).
         random_state: Seed for reproducible weighted sampling of counterfactuals.
+        positive_classes: Optional one-pole + class allowlist used with
+            ``counterfactual_classes`` to emit only positive→CF edges.
+        counterfactual_classes: ``None`` (default binary pair filter), ``\"all\"``,
+            or an explicit list of alternative classes for one-pole multi-CF.
 
     Returns:
         DataFrame with unified columns: UNIFIED_MASKED, UNIFIED_SPLIT,
@@ -482,9 +516,24 @@ def per_class_dict_to_unified(
     rng = np.random.default_rng(random_state)
     rows = []
     classes_list = list(class_dfs.keys()) if classes == "all" else list(classes)
+    resolved_cf = resolve_counterfactual_classes(
+        counterfactual_classes,
+        available_classes=classes_list,
+        positive_classes=positive_classes,
+        pair=pair,
+    )
+    factual_allow = {str(c) for c in positive_classes} if positive_classes else None
     placeholder_split_col = "__gradiend_split_placeholder__"
     for source_class, df in class_dfs.items():
         if source_class not in classes_list:
+            continue
+        # One-pole multi-CF: only emit factual→CF edges from factual classes.
+        skip_cf_edges = bool(
+            factual_allow is not None
+            and resolved_cf is not None
+            and str(source_class) not in factual_allow
+        )
+        if skip_cf_edges and not include_identity_rows:
             continue
         df = df.copy()
         effective_split_col = split_col
@@ -525,7 +574,12 @@ def per_class_dict_to_unified(
                 })
             continue
 
-        other_classes = [c for c in classes_list if c != source_class]
+        if skip_cf_edges:
+            other_classes = []
+        elif resolved_cf is not None:
+            other_classes = [c for c in resolved_cf if c != source_class]
+        else:
+            other_classes = [c for c in classes_list if c != source_class]
         for target_class in other_classes:
             target_col = col_for_class(target_class, df)
             if target_col is not None:
@@ -550,7 +604,12 @@ def per_class_dict_to_unified(
                 other_df = class_dfs.get(target_class)
                 if other_df is None:
                     continue
-                if pair is not None and (source_class, target_class) != pair and (target_class, source_class) != pair:
+                if (
+                    resolved_cf is None
+                    and pair is not None
+                    and (source_class, target_class) != pair
+                    and (target_class, source_class) != pair
+                ):
                     continue
                 other_factual_col = col_for_class(target_class, other_df) or (target_class if target_class in other_df.columns else "label")
                 if other_factual_col not in other_df.columns:

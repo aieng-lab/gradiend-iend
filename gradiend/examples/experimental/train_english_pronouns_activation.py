@@ -18,12 +18,15 @@ from gradiend import (
     TextPredictionTrainer,
     TrainingArguments,
 )
-from gradiend.examples.create_english_pronoun_data import ensure_english_pronoun_data
+from gradiend.examples.english_pronoun_datasets import (
+    EN_PRONOUN_HF_SPLITS,
+    EN_PRONOUNS_HF_DATASET,
+    load_english_pronoun_neutral_data,
+)
 from gradiend.gradiend_split import GradiendSplit
 from gradiend.trainer.core import SignalScope
 from gradiend.trainer.text.common.loading import AutoModelForLM
 
-DATA_DIR = "data/english_pronouns"
 MODEL_NAME = "bert-base-uncased"
 MODEL_NAME = "gpt2"
 
@@ -75,14 +78,16 @@ def _print_hook_probe(label, reference_model, candidate_model, tokenizer, prompt
 
 
 if __name__ == "__main__":
-    training_path, neutral_path = ensure_english_pronoun_data(output_dir=DATA_DIR)
+    neutral_data = load_english_pronoun_neutral_data()
 
     config = TextPredictionConfig(
         run_id="pronoun_3sg_3pl_activation",
-        data=training_path,
+        hf_dataset=EN_PRONOUNS_HF_DATASET,
+        hf_splits=EN_PRONOUN_HF_SPLITS,
         target_classes=["3SG", "3PL"],
-        neutral_data=neutral_path,
+        neutral_data=neutral_data,
     )
+
 
     args = TrainingArguments(
         experiment_dir="runs/english_pronouns_activation_factual",

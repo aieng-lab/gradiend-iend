@@ -220,6 +220,108 @@ def _token_spans_covering_char_spans(
     return token_spans
 
 
+def _left_truncate_template_keeping_mask(
+    tokenizer: Any,
+    template: str,
+    *,
+    mask_placeholder: str,
+    max_length: int,
+) -> str:
+    """Drop left (and unused right) context so ``[MASK]`` fits in ``max_length`` tokens.
+
+    Naive ``truncation=True`` keeps the *start* of the string and can cut the mask
+    off on long wiki templates. For filled / ACTIEND encoding we instead keep a
+    window that **ends at the last mask** (mask near the end of the window).
+    """
+    template = str(template)
+    mask_placeholder = str(mask_placeholder)
+    last = template.rfind(mask_placeholder)
+    if last < 0:
+        return template
+    # RHS after the mask does not affect causal hidden states at the mask span.
+    clipped = template[: last + len(mask_placeholder)]
+    try:
+        encoded = tokenizer(
+            clipped,
+            add_special_tokens=True,
+            truncation=False,
+            return_offsets_mapping=True,
+        )
+    except TypeError:
+        ids = tokenizer(clipped, add_special_tokens=True, truncation=False)["input_ids"]
+        if len(ids) <= int(max_length):
+            return clipped
+        approx_chars = max(len(mask_placeholder) + 8, int(max_length) * 3)
+        start = max(0, len(clipped) - approx_chars)
+        if start > last:
+            start = last
+        return clipped[start:]
+
+    ids = list(encoded["input_ids"])
+    offsets = [(int(a), int(b)) for a, b in encoded["offset_mapping"]]
+    if len(ids) <= int(max_length):
+        return clipped
+
+    char_spans = _char_spans_for_substring(clipped, mask_placeholder)
+    token_spans = _token_spans_covering_char_spans(offsets, char_spans)
+    if not token_spans:
+        return clipped
+    mask_end = token_spans[-1][1]  # exclusive
+    start_tok = max(0, mask_end - int(max_length))
+    char_start = 0
+    for o_start, o_end in offsets[start_tok:]:
+        if int(o_end) > int(o_start):
+            char_start = int(o_start)
+            break
+    first_mask_char = char_spans[0][0]
+    if char_start > first_mask_char:
+        char_start = first_mask_char
+    return clipped[char_start:]
+
+
+def _locate_mask_spans_in_encoded(
+    *,
+    filled_ids: List[int],
+    offsets: Optional[List[Tuple[int, int]]],
+    char_spans: List[Tuple[int, int]],
+    tokenizer: Any,
+    mask_placeholder: str,
+) -> List[Tuple[int, int]]:
+    """Locate mask token spans via offsets, then id-subsequence fallbacks."""
+    if offsets is not None:
+        token_spans = _token_spans_covering_char_spans(offsets, char_spans)
+        if len(token_spans) == len(char_spans):
+            return token_spans
+
+    placeholder_ids = [int(v) for v in _ids_for_text(tokenizer, mask_placeholder)]
+    if placeholder_ids:
+        token_spans = []
+        search_from = 0
+        for _ in char_spans:
+            start = _find_subsequence(filled_ids, placeholder_ids, start=search_from)
+            if start < 0:
+                break
+            token_spans.append((start, start + len(placeholder_ids)))
+            search_from = start + len(placeholder_ids)
+        if len(token_spans) == len(char_spans):
+            return token_spans
+
+    single_id = _single_vocab_token_id(tokenizer, mask_placeholder)
+    if single_id is not None:
+        token_spans = []
+        search_from = 0
+        for _ in char_spans:
+            try:
+                start = filled_ids.index(int(single_id), search_from)
+            except ValueError:
+                break
+            token_spans.append((start, start + 1))
+            search_from = start + 1
+        if len(token_spans) == len(char_spans):
+            return token_spans
+    return []
+
+
 def _mask_placeholder_token_spans(
     tokenizer: Any,
     template: str,
@@ -232,7 +334,17 @@ def _mask_placeholder_token_spans(
     The locator is the **dataset** placeholder (``TextFilterConfig.mask``, usually
     ``"[MASK]"``), not ``tokenizer.mask_token``. Models without an MLM special token
     (e.g. GPT-2) must still fill activation templates.
+
+    If the template is longer than ``max_length``, left context is dropped so the
+    mask remains inside the window (near the end), instead of HF left-truncation
+    which would discard the mask.
     """
+    template = _left_truncate_template_keeping_mask(
+        tokenizer,
+        str(template),
+        mask_placeholder=str(mask_placeholder),
+        max_length=int(max_length),
+    )
     char_spans = _char_spans_for_substring(template, mask_placeholder)
     if not char_spans:
         raise ValueError(
@@ -254,40 +366,20 @@ def _mask_placeholder_token_spans(
 
     filled_ids = [int(v) for v in encoded["input_ids"].squeeze(0).tolist()]
     offsets = encoded.get("offset_mapping")
+    offset_pairs = None
     if offsets is not None:
         offset_list = offsets.squeeze(0).tolist() if hasattr(offsets, "tolist") else list(offsets)
         offset_pairs = [(int(a), int(b)) for a, b in offset_list]
-        token_spans = _token_spans_covering_char_spans(offset_pairs, char_spans)
-        if len(token_spans) == len(char_spans):
-            return filled_ids, token_spans
 
-    # Fallback without offsets: locate the placeholder as its own token subsequence.
-    placeholder_ids = [int(v) for v in _ids_for_text(tokenizer, mask_placeholder)]
-    if placeholder_ids:
-        token_spans = []
-        search_from = 0
-        for _ in char_spans:
-            start = _find_subsequence(filled_ids, placeholder_ids, start=search_from)
-            if start < 0:
-                break
-            token_spans.append((start, start + len(placeholder_ids)))
-            search_from = start + len(placeholder_ids)
-        if len(token_spans) == len(char_spans):
-            return filled_ids, token_spans
-
-    single_id = _single_vocab_token_id(tokenizer, mask_placeholder)
-    if single_id is not None:
-        token_spans = []
-        search_from = 0
-        for _ in char_spans:
-            try:
-                start = filled_ids.index(int(single_id), search_from)
-            except ValueError:
-                break
-            token_spans.append((start, start + 1))
-            search_from = start + 1
-        if len(token_spans) == len(char_spans):
-            return filled_ids, token_spans
+    token_spans = _locate_mask_spans_in_encoded(
+        filled_ids=filled_ids,
+        offsets=offset_pairs,
+        char_spans=char_spans,
+        tokenizer=tokenizer,
+        mask_placeholder=mask_placeholder,
+    )
+    if len(token_spans) == len(char_spans):
+        return filled_ids, token_spans
 
     raise ValueError(
         f"Could not locate dataset mask placeholder {mask_placeholder!r} in tokenized template {template!r}."
@@ -299,7 +391,7 @@ def _filled_prediction_from_template(
     *,
     template: str,
     target: str,
-    max_length: int = 256,
+    max_length: int = 128,
     mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
 ) -> dict:
     """Fill a dataset-mask template in token space and return model inputs + prediction_mask.
@@ -329,6 +421,14 @@ def _filled_prediction_from_template(
         raise ValueError(
             f"Activation prediction-position selection requires a template with {mask_placeholder!r}."
         )
+    # Keep a window ending at [MASK] so long wiki templates are not left-truncated
+    # in a way that drops the placeholder (see _left_truncate_template_keeping_mask).
+    template = _left_truncate_template_keeping_mask(
+        tokenizer,
+        template,
+        mask_placeholder=mask_placeholder,
+        max_length=max_length,
+    )
 
     filled_ids, mask_spans = _mask_placeholder_token_spans(
         tokenizer,
@@ -515,7 +615,7 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         max_size: Optional[int] = None,
         seed: int = 42,
         shuffle_batches: Optional[bool] = None,
-        max_length: int = 256,
+        max_length: int = 128,
         balance_column: Optional[str] = None,
         shuffle_within: Optional[bool] = None,
     ):
@@ -564,6 +664,7 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         """
         is_decoder_only_model = getattr(self, "is_decoder_only_model", False)
         prediction_objective = getattr(self, "prediction_objective", None)
+        mask_placeholder = getattr(self, "mask_placeholder", DEFAULT_DATASET_MASK_PLACEHOLDER)
         if prediction_objective == "clm_mlm_head":
             target_labels = getattr(self, "mlm_head_target_labels", None)
             if not target_labels:
@@ -573,14 +674,16 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                 )
             if not self.mask_token:
                 raise ValueError("clm_mlm_head requires tokenizer.mask_token.")
-            if "[MASK]" not in text:
-                raise ValueError("clm_mlm_head training requires a [MASK] placeholder in the input text.")
+            if mask_placeholder not in text:
+                raise ValueError(
+                    f"clm_mlm_head training requires a {mask_placeholder!r} placeholder in the input text."
+                )
             if isinstance(target, (list, tuple)):
                 raise ValueError(
                     "Per-site MLM targets (a sequence of targets) are only supported for "
                     "classic encoder MLM; clm_mlm_head expects a single target string."
                 )
-            expanded_text = text.replace("[MASK]", self.mask_token, 1)
+            expanded_text = text.replace(mask_placeholder, self.mask_token, 1)
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(
                     expanded_text,
@@ -605,15 +708,17 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                 "labels": labels,
             }
         if prediction_objective == "clm_sequence_cloze":
-            if "[MASK]" not in text:
-                raise ValueError("clm_sequence_cloze training requires a [MASK] placeholder.")
+            if mask_placeholder not in text:
+                raise ValueError(
+                    f"clm_sequence_cloze training requires a {mask_placeholder!r} placeholder."
+                )
             if isinstance(target, (list, tuple)):
                 raise ValueError(
                     "Per-site MLM targets (a sequence of targets) are only supported for "
                     "classic encoder MLM; clm_sequence_cloze expects a single target string."
                 )
-            prefix, rhs = text.split("[MASK]", 1)
-            expanded_text = text.replace("[MASK]", str(target), 1)
+            prefix, rhs = text.split(mask_placeholder, 1)
+            expanded_text = text.replace(mask_placeholder, str(target), 1)
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
             input_ids = encoded["input_ids"]
@@ -644,6 +749,7 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                 label=str(target),
                 tokenizer=self.tokenizer,
                 base_model=getattr(self, "base_model", None),
+                mask_placeholder=mask_placeholder,
             )
             if prediction_objective == SEQ2SEQ_ENCODER_MLM:
                 item = create_seq2seq_mlm_item(**common)
@@ -661,7 +767,7 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                     "Per-site MLM targets (a sequence of targets) are only supported for "
                     "classic encoder MLM; decoder-only training expects a single target string."
                 )
-            expanded_text = text.split("[MASK]")[0] if "[MASK]" in text else text
+            expanded_text = text.split(mask_placeholder)[0] if mask_placeholder in text else text
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
             input_ids = encoded["input_ids"]
@@ -680,10 +786,13 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         if not self.mask_token:
             raise ValueError("Classic MLM training requires tokenizer.mask_token.")
         mask_count = text.count(self.mask_token)
+        if mask_count < 1 and mask_placeholder != self.mask_token:
+            mask_count = text.count(mask_placeholder)
+            text = text.replace(mask_placeholder, self.mask_token)
         if mask_count < 1:
             raise ValueError(
                 "Classic MLM training requires at least one prediction placeholder; "
-                f"found 0 occurrences of {self.mask_token!r} in text={text!r}."
+                f"found 0 occurrences of {mask_placeholder!r} in text={text!r}."
             )
         site_token_lists = _tokenize_classic_mlm_site_targets(self.tokenizer, target, mask_count)
         # Expand each site independently so per-site targets may differ in length.
@@ -731,11 +840,12 @@ class TextTrainingDataset(TextBatchedDataset):
         max_size: Optional[int] = None,
         target_key: str = "label",
         balance_column: str = "feature_class_id",
-        max_length: int = 256,
+        max_length: int = 128,
         seed: Optional[int] = None,
         prediction_objective: Optional[str] = None,
         rhs_window: int = -1,
         mlm_head_target_labels: Optional[List[str]] = None,
+        mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
     ):
         """Initialize the training dataset.
 
@@ -753,6 +863,7 @@ class TextTrainingDataset(TextBatchedDataset):
             prediction_objective: Optional prediction objective override, such as
                 cloze-sequence or seq2seq objectives.
             rhs_window: Right-context token window for sequence-cloze objectives.
+            mask_placeholder: Dataset-level prediction placeholder in masked templates.
         """
         super().__init__(
             data=data,
@@ -770,6 +881,7 @@ class TextTrainingDataset(TextBatchedDataset):
         self.prediction_objective = prediction_objective
         self.mlm_head_target_labels = list(mlm_head_target_labels) if mlm_head_target_labels else None
         self.rhs_window = rhs_window
+        self.mask_placeholder = str(mask_placeholder)
         if is_decoder_only_model and getattr(self.tokenizer, "pad_token", None) is None:
             eos_token = getattr(self.tokenizer, "eos_token", None)
             if eos_token is not None:
@@ -783,6 +895,7 @@ class TextTrainingDataset(TextBatchedDataset):
         """
         entry = super().__getitem__(idx)
         template = entry[UNIFIED_MASKED]
+        mask_placeholder = self.mask_placeholder
         if self.prediction_objective == "clm_sequence_cloze":
             input_text = template
         elif self.prediction_objective == SEQ2SEQ_DECODER_SEQUENCE_CLOZE:
@@ -791,14 +904,18 @@ class TextTrainingDataset(TextBatchedDataset):
             if self.prediction_objective == "clm_mlm_head":
                 input_text = template
             else:
-                input_text = template.split("[MASK]")[0] if "[MASK]" in template else template
+                input_text = template.split(mask_placeholder)[0] if mask_placeholder in template else template
         elif self.is_seq2seq_model:
-            input_text = mask_placeholder_for_tokenizer(template, self.tokenizer)
+            input_text = mask_placeholder_for_tokenizer(
+                template,
+                self.tokenizer,
+                mask_placeholder=mask_placeholder,
+            )
         elif self.mask_token:
-            input_text = template.replace("[MASK]", self.mask_token)
+            input_text = template.replace(mask_placeholder, self.mask_token)
         else:
             input_text = template
-        text = template.replace("[MASK]", entry[UNIFIED_FACTUAL])
+        text = template.replace(mask_placeholder, entry[UNIFIED_FACTUAL])
         label = entry[self.target_key]
         try:
             import numpy as _np
@@ -868,6 +985,7 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
         timing_label: str = "text-activation",
         signal: Any = None,
         signals: Any = None,
+        mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
     ):
         if signal is not None:
             signal = self.default_signal(signal)
@@ -896,6 +1014,7 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
             signals=signals,
         )
         self.tokenizer = tokenizer
+        self.mask_placeholder = str(mask_placeholder)
 
     @staticmethod
     def default_signal(signal: Signal) -> Signal:
@@ -917,14 +1036,15 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
         return [value]
 
     def _create_filled_prediction_item(self, template: str, target_token: Any) -> dict:
-        max_length = getattr(self.training_data, "max_length", 256)
+        max_length = getattr(self.training_data, "max_length", 128)
         if not isinstance(max_length, int) or max_length <= 0:
-            max_length = 256
+            max_length = 128
         return _filled_prediction_from_template(
             self.tokenizer,
             template=str(template),
             target=str(target_token),
             max_length=max_length,
+            mask_placeholder=self.mask_placeholder,
         )
 
     def _filled_side_batch(self, templates: List[Any], target_tokens: List[Any]) -> dict:

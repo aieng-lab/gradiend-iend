@@ -294,6 +294,40 @@ class TestImgFormatVisualizerOutputPath:
             )
             assert fig._suptitle is None
             assert ax.get_title() == ""
+            assert ax.get_title() != "None"
+        finally:
+            plt.close("all")
+
+    def test_plot_encoder_distributions_missing_run_id_does_not_title_none(self):
+        """title=True with no run_id must not render the literal string 'None'."""
+        pytest.importorskip("matplotlib")
+        import matplotlib.pyplot as plt
+
+        trainer = MagicMock()
+        trainer.run_id = None
+        trainer.pair = None
+        trainer.experiment_dir = None
+        trainer.training_args = None
+        trainer._training_args = None
+        trainer.get_model = MagicMock(return_value=None)
+        encoder_df = pd.DataFrame({
+            "encoded": [0.1, -0.2, 0.2, -0.3],
+            "label": [1.0, -1.0, 1.0, -1.0],
+            "source_id": ["1", "2", "1", "2"],
+            "target_id": ["2", "1", "2", "1"],
+            "type": ["training"] * 4,
+        })
+        try:
+            fig, ax = plot_encoder_distributions(
+                trainer=trainer,
+                encoder_df=encoder_df,
+                title=True,
+                show=False,
+                return_fig_ax=True,
+            )
+            assert fig._suptitle is None
+            assert ax.get_title() == ""
+            assert ax.get_title() != "None"
         finally:
             plt.close("all")
 

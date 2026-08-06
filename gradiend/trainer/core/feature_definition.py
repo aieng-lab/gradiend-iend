@@ -117,7 +117,9 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def _resolve_eval_group(self, source: Optional[str] = None) -> str:
         resolved_source = self._default_from_training_args(source, "source", fallback="factual")
-        return "factual_id" if resolved_source == "factual" else "feature_class_id"
+        # both compiles each batch to factual/diff (with optional fac↔alt swap),
+        # so factual_id describes the encoded pole after that transform.
+        return "factual_id" if resolved_source in ("factual", "both") else "feature_class_id"
 
     @property
     def eval_group(self) -> str:
@@ -215,8 +217,12 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def get_target_feature_class_ids(self) -> Optional[List[Any]]:
         """
-        Feature class IDs used for target classes (for stratification, e.g. pre_prune).
-        Neutral/identity classes are excluded. Override in subclasses; base returns None.
+        Values of the training-data feature-class key used for stratification
+        (e.g. pre-prune over ``feature_class_id``). Neutral/identity classes are excluded.
+
+        These must match the dataset column / item key — typically ints for text
+        prediction. Semantic class *names* belong in :meth:`get_target_feature_classes`.
+        Override in subclasses; base raises.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement get_target_feature_class_ids() "
@@ -225,10 +231,11 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def get_target_feature_classes(self) -> Optional[List[str]]:
         """
-        Return target feature classes as string IDs when possible.
+        Semantic target class names for decoder / metrics (strings).
 
-        Uses get_target_feature_class_ids() and maps via map_target_feature_class_ids().
-        This is used by the target_classes property.
+        Default: map :meth:`get_target_feature_class_ids` via
+        :meth:`map_target_feature_class_ids`. Subclasses may override when names are not
+        a 1:1 map from dataset feature-class ids (e.g. one-pole text prediction).
         """
         ids = self.get_target_feature_class_ids()
         mapped = self.map_target_feature_class_ids(ids)
@@ -517,7 +524,9 @@ class FeatureLearningDefinition(DataProvider, ABC):
         Returns:
             Evaluation dataset compatible with encoder analysis. The returned
             signal dataset always uses ``target=None`` because encoder
-            evaluation only encodes ``source`` signals.
+            evaluation only encodes ``source`` signals. Encoder-only datasets
+            expand each base example to both poles so bipolar metrics remain
+            defined on one-pole training data.
         """
         source = self._default_from_training_args(source, "source", fallback="factual")
         validate_source_target("source", source)
@@ -588,7 +597,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
             return frozenset()
         args = getattr(self, "training_args", None)
         neutral_aug = getattr(args, "add_identity_for_other_classes", False)
-        neutral_identity_aug = getattr(args, "add_neutral_identity_transitions", False)
+        neutral_identity_aug = getattr(args, "add_neutral_identity_transitions", True)
         if source_type == "factual":
             keys = set(target_classes)
             if neutral_identity_aug:

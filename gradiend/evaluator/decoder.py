@@ -368,21 +368,25 @@ def derive_default_feature_factor(
             signal_kind=signal_kind,
         )
 
-    # Fallback: derive from trainer.pair when model was created before data load (e.g. in-memory after train)
-    pair = getattr(trainer, "pair", None)
-    if pair and len(pair) >= 2:
-        class_labels = {pair[0]: 1.0, pair[1]: -1.0}
-        classes = getattr(trainer, "target_classes", None) or getattr(trainer, "all_classes", None) or []
-        for c in classes:
-            if c not in class_labels:
-                class_labels[c] = 0.0
-        if class_name in class_labels:
-            return intervention_feature_factor_from_encoding_direction(
-                class_labels[class_name],
-                source,
-                target,
-                signal_kind=signal_kind,
-            )
+    # Fallback: derive from trainer encoding labels / pair when model was created
+    # before data load (e.g. in-memory after train)
+    labels_fn = getattr(trainer, "get_feature_class_encoding_labels", None)
+    class_labels = labels_fn() if callable(labels_fn) else None
+    if not class_labels:
+        pair = getattr(trainer, "pair", None)
+        if pair and len(pair) >= 2:
+            class_labels = {pair[0]: 1.0, pair[1]: -1.0}
+            classes = getattr(trainer, "target_classes", None) or getattr(trainer, "all_classes", None) or []
+            for c in classes:
+                if c not in class_labels:
+                    class_labels[c] = 0.0
+    if class_labels and class_name in class_labels:
+        return intervention_feature_factor_from_encoding_direction(
+            class_labels[class_name],
+            source,
+            target,
+            signal_kind=signal_kind,
+        )
 
     raise ValueError(
         "Cannot derive default feature factor for class '%s': model does not have feature_class_encoding_direction (%s) or class not found in it." % (class_name, direction)

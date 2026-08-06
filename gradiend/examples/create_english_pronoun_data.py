@@ -30,14 +30,14 @@ DEFAULT_OUTPUT_DIR = "data/english_pronouns"
 TRAINING_BASENAME = "training"
 NEUTRAL_BASENAME = "neutral"
 GENERATION_CONFIG_BASENAME = "generation_config.json"
-GENERATION_CONFIG_VERSION = 3
-MAX_SIZE_PER_CLASS = 1000
-NEUTRAL_MAX_SIZE = 1000
+GENERATION_CONFIG_VERSION = 4
+MAX_SIZE_PER_CLASS = 10_000
+NEUTRAL_MAX_SIZE = 10_000
 MIN_LEFT_CONTEXT_WORDS = 5
 # Parquet-based HF dataset (datasets>=4); legacy ``wikipedia`` loading scripts are unsupported.
 WIKIPEDIA_DATASET = "wikimedia/wikipedia"
 WIKIPEDIA_HF_CONFIG = "20231101.en"
-WIKIPEDIA_BASE_MAX_SIZE = 50_000
+WIKIPEDIA_BASE_MAX_SIZE = None
 
 # English pronouns for neutral data exclusion (example-specific)
 NEUTRAL_EXCLUDE_ENGLISH_PRONOUNS = [

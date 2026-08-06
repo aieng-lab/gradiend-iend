@@ -5,11 +5,11 @@ TextPredictionDataCreator: build training and neutral datasets for text predicti
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, Iterable, List, Literal, Optional, Union
 
 import pandas as pd
 
-from gradiend.data.core.base_loader import resolve_base_data
+from gradiend.data.core.base_loader import iter_resolved_base_data, resolve_base_data
 from gradiend.data.core import (
     SplitGroupKey,
     normalize_split_group_key,
@@ -270,6 +270,35 @@ class TextPredictionDataCreator:
         self._texts_cache = texts
         return texts
 
+    def _iter_texts(
+        self, base_override: Optional[Union[str, pd.DataFrame, List[str]]] = None
+    ) -> Iterable[str]:
+        """Return text rows for generation, streaming HF sources when possible."""
+        if base_override is not None:
+            is_hf_str = isinstance(base_override, str) and Path(base_override).suffix.lower() != ".csv"
+            return iter_resolved_base_data(
+                base_override,
+                text_column=self.text_column,
+                max_size=self.base_max_size,
+                split=self.split,
+                seed=self.seed,
+                hf_config=self.hf_config if is_hf_str else None,
+                trust_remote_code=self.trust_remote_code if is_hf_str else None,
+            )
+        if self._texts_cache is not None:
+            return iter(self._texts_cache)
+        if isinstance(self.base_data, str) and Path(self.base_data).suffix.lower() != ".csv":
+            return iter_resolved_base_data(
+                self.base_data,
+                text_column=self.text_column,
+                max_size=self.base_max_size,
+                split=self.split,
+                seed=self.seed,
+                hf_config=self.hf_config,
+                trust_remote_code=self.trust_remote_code,
+            )
+        return iter(self._get_texts())
+
     def generate_training_data(
         self,
         max_size_per_class: Optional[int] = None,
@@ -342,7 +371,7 @@ class TextPredictionDataCreator:
                 if cached is not None:
                     logger.info("Using cached training data from %s", out_path)
                     return cached
-        texts = self._get_texts()
+        texts = self._iter_texts()
         configs_with_ids = [
             (_class_id(cfg, i), cfg) for i, cfg in enumerate(self.feature_targets)
         ]
@@ -607,7 +636,7 @@ class TextPredictionDataCreator:
                 if cached is not None:
                     logger.info("Using cached neutral data from %s", out_path)
                     return cached
-        texts = self._get_texts(base_override=base_data)
+        texts = self._iter_texts(base_override=base_data)
         sentence_stream = iter_sentences_from_texts(
             texts,
             self.preprocess,

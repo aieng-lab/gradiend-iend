@@ -16,6 +16,13 @@ This guide describes how to provide text data to [`TextPredictionTrainer`][gradi
 
 ---
 
+Published English pronoun datasets follow the merged path: use
+`hf_dataset="aieng-lab/en-pronouns"` for labeled rows and
+`aieng-lab/en-pronoun-neutral` for neutral evaluation contexts. See
+[`train_english_pronouns.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.py).
+
+---
+
 ## 1. Per-class HuggingFace format
 
 Use when your dataset is on HuggingFace and has **one config/subset per class** (e.g. `masc_nom`, `fem_nom` or `white`, `black`, `asian`).

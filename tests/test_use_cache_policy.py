@@ -88,12 +88,12 @@ def test_training_cache_fingerprint_includes_init_fan_in_floor():
 
 def test_training_cache_fingerprint_includes_neutral_identity_toggle_only_when_enabled():
     default_fp = build_training_cache_fingerprint(TrainingArguments())
-    enabled_fp = build_training_cache_fingerprint(
-        TrainingArguments(add_neutral_identity_transitions=True)
+    disabled_fp = build_training_cache_fingerprint(
+        TrainingArguments(add_neutral_identity_transitions=False)
     )
 
-    assert "add_neutral_identity_transitions" not in default_fp
-    assert enabled_fp["add_neutral_identity_transitions"] is True
+    assert default_fp["add_neutral_identity_transitions"] is True
+    assert "add_neutral_identity_transitions" not in disabled_fp
 
 
 @pytest.mark.parametrize(

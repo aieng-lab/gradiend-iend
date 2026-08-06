@@ -43,10 +43,24 @@ Hence, if more than two classes are provided via `data`, `target_classes` become
 
 Each training example has a **factual** token (what appears in the text at the mask) and an **alternative** (counterfactual) token. GRADIEND is trained on gradients derived from these.
 
-- **source** — Which gradient feeds the encoder: `"factual"`, `"alternative"`, or `"diff"`. Common choice: `"alternative"`.
+- **source** — Which gradient feeds the encoder: `"factual"`, `"alternative"`, `"diff"`, or `"both"`. Common choice: `"alternative"`.
 - **target** — What the decoder is trained to predict: `"factual"`, `"alternative"`, or `"diff"`. Common choice: `"diff"`.
 
 The default `source="alternative"` and `target="diff"` works well for “change the model toward the alternative” use cases (e.g. debiasing).
+
+`source="both"` (requires `target="diff"`) alternates the encoder pole across
+**balance-group visits**, not raw batch parity: with `n` balance groups
+(e.g. feature `feature_class_id` plus neutral identity), visit
+`batch_idx // n` chooses factual (even) vs alternative (odd). That keeps pole
+selection orthogonal to balance-group cycling (`batch_idx % n`), so neutrals
+cannot lock feature batches onto a single pole. Each batch is compiled to the
+existing factual/`diff` path by swapping factual↔alternative (and inverting the
+label) on alternative batches, so the decoder target is always
+`input − opposite` and labels describe the encoded pole.
+
+For **encoder evaluation** (`target=None`), every training `source` expands each
+example to both poles so a single factual class still yields `+1` and `-1` labels
+for correlation (one-pole data under `factual` / `alternative` / `diff` / `both`).
 
 ### Target and Identity Transitions
 

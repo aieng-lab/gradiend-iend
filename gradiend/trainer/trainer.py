@@ -547,7 +547,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             if "trust_remote_code" not in kwargs:
                 kwargs.setdefault("trust_remote_code", getattr(self._training_args, "trust_remote_code", False))
         load_directory = load_directory if load_directory is not None else self.model_path
-        model = super().create_model_with_gradiend(load_directory, **kwargs)
+        model = self.create_model_with_gradiend(load_directory, **kwargs)
         # Always cache in memory; use_cache elsewhere is for disk/output only
         self._model_instance = model
         self._model_manually_unloaded = False
@@ -1120,10 +1120,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             from_gradiend_checkpoint = bool(
                 load_path_str and _is_gradiend_checkpoint(load_path_str)
             )
-            model_with_gradiend = create_model_with_gradiend(
+            model_with_gradiend = self.create_model_with_gradiend(
                 load_path,
                 feature_definition=self,
-                model_class=model_with_gradiend_cls,
+                model_with_gradiend_cls=model_with_gradiend_cls,
                 training_args=config,
                 trust_remote_code=getattr(config, "trust_remote_code", False),
             )
@@ -1625,9 +1625,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     seed_selection_eval_max_size = getattr(args, "encoder_eval_max_size", None)
 
                 if not isinstance(model, str):
-                    model_path = getattr(model, "name_or_path", None)
+                    model_path = getattr(model, "name_or_path", None) or getattr(
+                        getattr(model, "base_model", None), "name_or_path", None
+                    )
                     if not model_path:
-                        raise ValueError("Multi-seed training requires a model path (string) or a model with name_or_path.")
+                        raise ValueError(
+                            "Multi-seed training requires a model path (string), a model with "
+                            "name_or_path, or a model whose base_model has name_or_path."
+                        )
                     model_for_runs = model_path
                 else:
                     model_for_runs = model
@@ -1695,10 +1700,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                     runtime_monitor.mark("trainer:seed:pre_prune:start", seed=seed_value)
                                     getattr(self, "_ensure_data_for_training", lambda: None)()
                                     runtime_monitor.mark("trainer:seed:create_model_with_gradiend:start", seed=seed_value)
-                                    model_instance = create_model_with_gradiend(
+                                    model_instance = self.create_model_with_gradiend(
                                         load_model_path,
                                         feature_definition=self,
-                                        model_class=model_with_gradiend_cls,
+                                        model_with_gradiend_cls=model_with_gradiend_cls,
                                         training_args=args,
                                         trust_remote_code=getattr(args, "trust_remote_code", False),
                                     )

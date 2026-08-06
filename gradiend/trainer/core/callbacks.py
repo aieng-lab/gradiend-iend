@@ -28,6 +28,11 @@ from gradiend.trainer.core.component_seed import (
     summary_from_component_best_states,
     update_component_best_states,
 )
+from gradiend.trainer.core.stats import (
+    _mean_by_class_for_step,
+    _target_class_mean_stats,
+    correlation_checkpoint_rank,
+)
 
 logger = get_logger(__name__)
 
@@ -63,19 +68,7 @@ def _current_step_correlation(
 
 
 def _target_mean_converged(mean_by_class: Any, mean_threshold: Any) -> tuple[bool, Optional[float], Optional[float]]:
-    if not isinstance(mean_by_class, dict):
-        return False, None, None
-    target_means = [
-        float(value)
-        for label, value in mean_by_class.items()
-        if str(label) not in {"0", "0.0"} and isinstance(value, (int, float))
-    ]
-    if len(target_means) != 2:
-        return False, None, None
-    product = target_means[0] * target_means[1]
-    min_abs = min(abs(value) for value in target_means)
-    mean_ok = mean_threshold is None or min_abs >= float(mean_threshold)
-    return product < 0 and mean_ok, product, min_abs
+    return _target_class_mean_stats(mean_by_class, mean_threshold)
 
 
 def _attach_component_convergence(eval_result: Dict[str, Any], config: Any) -> None:
@@ -476,6 +469,9 @@ class CheckpointCallback(TrainingCallback):
     Behavior:
 
     - Saves the best model based on evaluation correlation (or loss when use_loss_for_best=True)
+    - For correlation selection, uses ``|correlation|`` by default; when
+      ``prefer_convergent_checkpoint=True``, prefers steps that meet convergence thresholds
+      over a higher-|correlation| step that fails the mean criterion
     - When use_loss_for_best=True (e.g. supervised_decoder), correlation is meaningless; best = lowest loss
     - Saves periodic checkpoints every checkpoint_interval steps (if checkpoints enabled)
     - Tracks step-0 metrics but does not materialize step-0 as a selectable best checkpoint
@@ -502,6 +498,7 @@ class CheckpointCallback(TrainingCallback):
         self.best_score = None
         self.best_step = None
         self.best_epoch = None
+        self._best_rank: Optional[tuple] = None
         self.component_best_states: Dict[str, Dict[str, Any]] = {}
         self._best_merge_rank: Optional[tuple] = None
         self._best_merge_summary: Optional[Dict[str, Any]] = None
@@ -600,6 +597,8 @@ class CheckpointCallback(TrainingCallback):
                         "as a selectable merged checkpoint; trained or final merge will be used instead."
                     )
         else:
+            corr = None
+            rank = None
             if self.use_loss_for_best:
                 # Best = lowest loss (e.g. supervised_decoder; correlation not meaningful)
                 is_better = self.best_score is None or loss < self.best_score
@@ -615,7 +614,22 @@ class CheckpointCallback(TrainingCallback):
                     is_better = False
                     score_for_log = None
                 else:
-                    is_better = self.best_score is None or abs(corr) > abs(self.best_score)
+                    mean_by_class = _mean_by_class_for_step(
+                        training_stats,
+                        step,
+                        kwargs.get("eval_result"),
+                    )
+                    rank = correlation_checkpoint_rank(
+                        step=step,
+                        correlation=corr,
+                        mean_by_class=mean_by_class,
+                        score_threshold=_config_get(config, "convergent_score_threshold", None),
+                        mean_threshold=_config_get(config, "convergent_mean_by_class_threshold", None),
+                        prefer_convergent=bool(
+                            _config_get(config, "prefer_convergent_checkpoint", False)
+                        ),
+                    )
+                    is_better = self._best_rank is None or rank > self._best_rank
                     score_for_log = corr
 
             if is_better:
@@ -624,6 +638,8 @@ class CheckpointCallback(TrainingCallback):
                 self.best_score = loss if self.use_loss_for_best else corr
                 self.best_step = step
                 self.best_epoch = kwargs.get('epoch', 0)
+                if rank is not None:
+                    self._best_rank = rank
 
                 if was_first:
                     logger.debug(f'First {"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f} at step {step}')
@@ -712,8 +728,9 @@ class LoggingCallback(TrainingCallback):
         """
         self.n_loss_report = n_loss_report
         self.loss_only = loss_only
-        # Track best correlation across ALL evaluations (including the initial step 0 eval)
-        # so "(new best)" logging matches the same best-checkpoint selection used by training.
+        # Track best checkpoint across ALL evaluations (including the initial step 0 eval)
+        # with the same convergent-preferring rank used by CheckpointCallback.
+        self._best_checkpoint_rank: Optional[tuple] = None
         self._best_corr_including_start: Optional[float] = None
     
     def on_step_end(self, step: int, loss: float, model, config: Dict[str, Any],
@@ -791,11 +808,21 @@ class LoggingCallback(TrainingCallback):
 
             suffix = ""
             if eval_is_enabled and corr is not None:
-                # Compare against the best correlation seen so far (including step 0)
-                # so that "(new best)" in logs matches the global best used in plots
-                # and final training stats.
-                if self._best_corr_including_start is None or abs(corr) > abs(self._best_corr_including_start):
+                # Match CheckpointCallback ranking (correlation-only by default).
+                mean_by_class = _mean_by_class_for_step(training_stats, step, eval_result)
+                rank = correlation_checkpoint_rank(
+                    step=step,
+                    correlation=corr,
+                    mean_by_class=mean_by_class,
+                    score_threshold=_config_get(config, "convergent_score_threshold", None),
+                    mean_threshold=_config_get(config, "convergent_mean_by_class_threshold", None),
+                    prefer_convergent=bool(
+                        _config_get(config, "prefer_convergent_checkpoint", False)
+                    ),
+                )
+                if self._best_checkpoint_rank is None or rank > self._best_checkpoint_rank:
                     suffix = " (new best)"
+                    self._best_checkpoint_rank = rank
                     self._best_corr_including_start = float(corr)
             # Prefer mean over the report window so class cycling (e.g. M/F vs neutral
             # identity) does not make the logged loss look like a crash.
