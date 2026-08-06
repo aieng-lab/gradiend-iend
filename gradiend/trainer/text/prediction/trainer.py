@@ -47,6 +47,7 @@ from gradiend.trainer.core.unified_data import (
     has_explicit_alternative_columns,
     merge_per_class_dfs,
     per_class_dict_to_unified,
+    resolve_counterfactual_classes,
     unified_from_per_class_merge_map,
     resolve_dataframe,
     resolve_training_data_path,
@@ -310,6 +311,13 @@ class TextPredictionConfig(TrainerConfig):
     # (and are different) are kept (e.g. [["1SG","1PL"], ["3SG","3PL"]] keeps 1SG↔1PL and 3SG↔3PL).
     class_merge_transition_groups: Optional[List[List[str]]] = None
 
+    # One-pole: ``target_classes=[A]`` + ``counterfactual_classes``.
+    # None = binary pair filtering (default).
+    # "all" = every available class except the sole target class.
+    # Explicit list = those CF classes only.
+    # Requires a single ``target_classes`` entry.
+    counterfactual_classes: Optional[Union[List[str], Literal["all"]]] = None
+
     # Neutral data
     neutral_data: Optional[Union[pd.DataFrame, str, Path, Mapping[str, Union[pd.DataFrame, str, Path]]]] = None
     # Shared neutral data pool. When split labels are present, train/eval use
@@ -340,6 +348,13 @@ class TextPredictionConfig(TrainerConfig):
         object.__setattr__(self, "split_train_ratio", train)
         object.__setattr__(self, "split_val_ratio", val)
         object.__setattr__(self, "split_test_ratio", test)
+        if self.counterfactual_classes is not None:
+            tc = self.target_classes
+            if tc is None or len(tc) != 1:
+                raise ValueError(
+                    "counterfactual_classes requires a single target_classes entry "
+                    "(one-pole: target_classes=[A] + counterfactual_classes)."
+                )
 
     def __str__(self) -> str:
         return (
@@ -381,13 +396,29 @@ class TextPredictionTrainer(Trainer):
         return TextPredictionModelWithGradiend
 
     def get_target_feature_class_ids(self):
+        """Dataset ``feature_class_id`` values for the ± training poles.
+
+        ``create_training_data`` assigns ``0`` / ``1`` to the bipolar pair transitions and
+        to one-pole factual→CF / reverse edges; identity/neutral ids start at ``2``.
+        These ints are what pre-prune stratifies on — not semantic class names.
+
+        For decoder / metric class *names* (one-pole: + class plus CFs), use
+        :meth:`get_target_feature_classes` / :meth:`_decoder_eval_class_names`.
         """
-        Feature class IDs for target classes (pair transitions only; excludes identity/neutral).
-        In create_training_data the pair transitions are assigned 0 and 1; identity classes follow.
-        """
-        if self.pair is not None:
+        if self._is_one_pole_config() or self.pair is not None:
             return [0, 1]
         return None
+
+    def get_target_feature_classes(self):
+        """Semantic class names for decoder/metrics (not dataset ``feature_class_id`` ints).
+
+        One-pole expands to the + class plus resolved counterfactual names so decoder
+        token sets / per-class strengthen grids cover the CF vocabulary. Bipolar pairs
+        map ``[0, 1]`` via :meth:`map_target_feature_class_ids`.
+        """
+        if self._is_one_pole_config():
+            return self._decoder_eval_class_names()
+        return super().get_target_feature_classes()
 
     @staticmethod
     def _training_args_with_text_activation_defaults(args: Optional[TrainingArguments]) -> Optional[TrainingArguments]:
@@ -719,6 +750,7 @@ class TextPredictionTrainer(Trainer):
             img_dpi: Optional[int] = None,
             class_merge_map: Optional[Dict[str, List[str]]] = None,
             class_merge_transition_groups: Optional[List[List[str]]] = None,
+            counterfactual_classes: Optional[Union[List[str], Literal["all"]]] = None,
             split_group_col: Optional[str] = None,
             split_group_key: SplitGroupKey = None,
             split_ratios: Optional[SplitRatiosInput] = None,
@@ -878,6 +910,7 @@ class TextPredictionTrainer(Trainer):
                 "img_dpi": img_dpi,
                 "class_merge_map": class_merge_map,
                 "class_merge_transition_groups": class_merge_transition_groups,
+                "counterfactual_classes": counterfactual_classes,
                 "split_group_col": split_group_col,
                 "split_group_key": split_group_key,
                 "split_ratios": split_ratios,
@@ -1290,6 +1323,25 @@ class TextPredictionTrainer(Trainer):
                 return None
             return pair if set(classes).issubset(set(pair)) else None
 
+        def _validate_merged_columns(df: pd.DataFrame, *, source: str) -> None:
+            split_col = loading_split_col(config.split_col)
+            required = [config.masked_col, config.label_class_col, config.label_col]
+            missing = [col for col in required if col not in df.columns]
+            if not missing:
+                return
+            configured = {
+                "masked_col": config.masked_col,
+                "label_class_col": config.label_class_col,
+                "label_col": config.label_col,
+                "split_col": split_col,
+            }
+            raise ValueError(
+                f"{source} is configured as merged text-prediction data, but it is missing "
+                f"required column(s) {missing}. Available columns: {list(df.columns)}. "
+                f"Configured column names: {configured}. "
+                "Pass the column names that exist in the data, or preprocess/rename the data."
+            )
+
         if materialize_all_class_transitions is None:
             materialize_all_class_transitions = bool(
                 self._default_from_training_args(None, "include_other_classes", fallback=False)
@@ -1314,6 +1366,7 @@ class TextPredictionTrainer(Trainer):
             self.data = raw
             merge_map = config.class_merge_map
             data_df = raw
+            _validate_merged_columns(data_df, source=f"HF dataset {config.hf_dataset!r}")
             if (
                 merge_map
                 and config.alternative_col
@@ -1342,8 +1395,15 @@ class TextPredictionTrainer(Trainer):
             )
         elif is_hf_id:
             # HF per-class: load configs/subsets as class_dfs, merge by class_merge_map if set, then per_class_dict_to_unified
+            cf_cfg = self._config_counterfactual_classes()
+            fac_cfg = self._one_pole_positive_classes()
             if materialize_all_class_transitions and config.all_classes is not None:
                 classes_to_load = config.all_classes
+            elif cf_cfg is not None and config.all_classes is not None:
+                classes_to_load = list(config.all_classes)
+            elif cf_cfg is not None and config.target_classes is not None:
+                # Need CF classes from the dataset; load all configs when all_classes unset.
+                classes_to_load = "all"
             elif config.target_classes is not None:
                 classes_to_load = config.target_classes
             else:
@@ -1372,6 +1432,10 @@ class TextPredictionTrainer(Trainer):
                 self._set_all_classes(config.all_classes)
             else:
                 self._set_all_classes(sorted(inferred_classes))
+            resolved_cf = self._resolved_counterfactual_classes(inferred_classes)
+            if resolved_cf is not None:
+                need = set(config.target_classes or []) | set(fac_cfg or []) | set(resolved_cf)
+                inferred_classes = [c for c in inferred_classes if c in need] or inferred_classes
             unified = per_class_dict_to_unified(
                 class_dfs,
                 classes=inferred_classes,
@@ -1382,6 +1446,8 @@ class TextPredictionTrainer(Trainer):
                 include_identity_rows=False,
                 max_counterfactuals_per_sentence=getattr(config, "max_counterfactuals_per_sentence", 1),
                 random_state=getattr(config, "random_state", getattr(config, "seed", None)),
+                positive_classes=fac_cfg,
+                counterfactual_classes=resolved_cf if resolved_cf is not None else None,
             )
             self._combined_data = unified
         elif config.data is not None:
@@ -1390,13 +1456,22 @@ class TextPredictionTrainer(Trainer):
                 all_classes_from_data = sorted(list(config.data.keys()))
                 configured_all_classes = list(config.all_classes) if config.all_classes is not None else None
                 self._set_all_classes(configured_all_classes or all_classes_from_data)
-                classes_for_transitions = (
-                    configured_all_classes
-                    if materialize_all_class_transitions and configured_all_classes is not None
-                    else self.target_classes or all_classes_from_data
+                fac_cfg = self._one_pole_positive_classes()
+                resolved_cf = self._resolved_counterfactual_classes(
+                    configured_all_classes or all_classes_from_data
                 )
+                if materialize_all_class_transitions and configured_all_classes is not None:
+                    classes_for_transitions = configured_all_classes
+                elif resolved_cf is not None:
+                    classes_for_transitions = sorted(
+                        set(self.target_classes or [])
+                        | set(fac_cfg or [])
+                        | set(resolved_cf)
+                    )
+                else:
+                    classes_for_transitions = self.target_classes or all_classes_from_data
                 if self._target_classes is None:
-                    self._target_classes = classes_for_transitions
+                    self._target_classes = list(config.target_classes or classes_for_transitions)
                 self.data = config.data
                 class_dfs = config.data
                 merge_map = getattr(config, "class_merge_map", None)
@@ -1418,6 +1493,8 @@ class TextPredictionTrainer(Trainer):
                     include_identity_rows=False,
                     max_counterfactuals_per_sentence=getattr(config, "max_counterfactuals_per_sentence", 1),
                     random_state=getattr(config, "random_state", getattr(config, "seed", None)),
+                    positive_classes=fac_cfg,
+                    counterfactual_classes=resolved_cf if resolved_cf is not None else None,
                 )
                 self._combined_data = unified
             elif isinstance(config.data, pd.DataFrame):
@@ -1444,6 +1521,7 @@ class TextPredictionTrainer(Trainer):
                         random_state=getattr(config, "random_state", getattr(config, "seed", None)),
                     )
                 else:
+                    _validate_merged_columns(data_df, source="DataFrame data")
                     if merge_map and has_explicit_alternative_columns(
                         data_df,
                         alternative_col=config.alternative_col,
@@ -1497,6 +1575,7 @@ class TextPredictionTrainer(Trainer):
                         random_state=getattr(config, "random_state", getattr(config, "seed", None)),
                     )
                 else:
+                    _validate_merged_columns(data_df, source=f"training data {str(config.data)!r}")
                     if merge_map and has_explicit_alternative_columns(
                         data_df,
                         alternative_col=config.alternative_col,
@@ -1530,6 +1609,7 @@ class TextPredictionTrainer(Trainer):
                     f"config.data must be a DataFrame, dict, local path, or HuggingFace dataset id; "
                     f"got {type(config.data).__name__}"
                 )
+        self._apply_one_pole_factual_filter()
         self._check_data_non_empty()
         self._resolve_split_col_strategy()
         if is_heldout_split_mode(config.split_col):
@@ -1566,6 +1646,158 @@ class TextPredictionTrainer(Trainer):
                     self.config.decoder_eval_targets = inferred
             except Exception as e:
                 logger.warning(f"Could not auto-infer decoder_eval_targets: {e}")
+
+    def _apply_one_pole_factual_filter(self) -> None:
+        """Keep only unified rows whose factual_class is the one-pole + class.
+
+        One-pole: sole ``target_classes`` entry when ``counterfactual_classes`` is set.
+        """
+        classes = self._one_pole_positive_classes()
+        if not classes:
+            return
+        if self._combined_data is None:
+            return
+        keep = {str(c) for c in classes}
+        combined = self._combined_data
+        if UNIFIED_FACTUAL_CLASS not in combined.columns:
+            raise RuntimeError(
+                "one-pole factual filter requires unified combined_data with "
+                f"{UNIFIED_FACTUAL_CLASS!r} column"
+            )
+        filtered = combined[combined[UNIFIED_FACTUAL_CLASS].astype(str).isin(keep)].copy()
+        if filtered.empty:
+            present = sorted(combined[UNIFIED_FACTUAL_CLASS].dropna().astype(str).unique().tolist())
+            raise RuntimeError(
+                f"one-pole factual filter={sorted(keep)} matched no rows "
+                f"(present factual classes: {present})"
+            )
+        n_before, n_after = len(combined), len(filtered)
+        self._combined_data = filtered
+        logger.info(
+            "one-pole factual filter %s: %d -> %d rows",
+            sorted(keep),
+            n_before,
+            n_after,
+        )
+
+    def _one_pole_positive_class(self) -> Optional[str]:
+        """Return the + class for one-pole mode, else None.
+
+        One-pole contract: sole ``target_classes`` entry with ``counterfactual_classes``.
+        """
+        cf = self._config_counterfactual_classes()
+        tc = self._target_classes or getattr(self.config, "target_classes", None)
+        if cf is not None and tc is not None and len(tc) == 1:
+            return str(tc[0])
+        return None
+
+    def _is_one_pole_config(self) -> bool:
+        """True when training is one-pole (+ class vs CF rest)."""
+        return self._one_pole_positive_class() is not None
+
+    def _one_pole_positive_classes(self) -> Optional[List[str]]:
+        """Factual-row allowlist for one-pole unified construction / filtering."""
+        pos = self._one_pole_positive_class()
+        return [pos] if pos is not None else None
+
+    def _config_counterfactual_classes(self) -> Optional[Union[List[str], Literal["all"]]]:
+        return getattr(self.config, "counterfactual_classes", None)
+
+    def _resolved_counterfactual_classes(
+        self, available_classes: Sequence[str]
+    ) -> Optional[List[str]]:
+        return resolve_counterfactual_classes(
+            self._config_counterfactual_classes(),
+            available_classes=available_classes,
+            positive_classes=self._one_pole_positive_classes(),
+            pair=self.pair,
+        )
+
+    def _decoder_eval_class_names(self) -> Optional[List[str]]:
+        """Classes whose tokens are kept for decoder eval (target + CFs for one-pole)."""
+        tc = list(self.target_classes) if self.target_classes else None
+        if not self._is_one_pole_config():
+            return tc
+        pos = self._one_pole_positive_class()
+        if pos is None:
+            return tc
+        cfs = self._resolved_counterfactual_classes(self.all_classes or tc or []) or []
+        out: List[str] = []
+        for c in [pos] + list(cfs) + list(tc or []):
+            s = str(c)
+            if s not in out:
+                out.append(s)
+        return out or tc
+
+    def get_feature_class_encoding_labels(self) -> Optional[Dict[str, float]]:
+        """Class → expected encoding direction (+1 / −1 / 0) for model metadata."""
+        pos = self._one_pole_positive_class()
+        if pos is not None:
+            available = list(self.all_classes or self.target_classes or [])
+            cfs = self._resolved_counterfactual_classes(available)
+            if cfs is None and self.pair is not None:
+                cfs = [str(c) for c in self.pair if str(c) != pos]
+            if cfs:
+                labels: Dict[str, float] = {pos: 1.0}
+                for c in cfs:
+                    labels[str(c)] = -1.0
+                for c in available:
+                    if str(c) not in labels:
+                        labels[str(c)] = 0.0
+                return labels
+        pair = self.pair
+        if pair is not None and len(pair) >= 2:
+            labels = {str(pair[0]): 1.0, str(pair[1]): -1.0}
+            for c in self.all_classes or self.target_classes or []:
+                if str(c) not in labels:
+                    labels[str(c)] = 0.0
+            return labels
+        return None
+
+    def _get_expected_encoder_keys(self, source_type: str):
+        if source_type != "factual" and self._is_one_pole_config():
+            pos = self._one_pole_positive_class()
+            available = list(self.all_classes or self.target_classes or [])
+            cfs = self._resolved_counterfactual_classes(available)
+            if pos and cfs:
+                keys = {(pos, str(c)) for c in cfs} | {(str(c), pos) for c in cfs}
+                args = getattr(self, "training_args", None)
+                if getattr(args, "add_neutral_identity_transitions", True):
+                    keys.add(("neutral", "neutral"))
+                if getattr(args, "add_identity_for_other_classes", False):
+                    cf_set = {str(c) for c in cfs}
+                    for c in self.non_target_classes or []:
+                        if str(c) not in cf_set:
+                            keys.add((str(c), str(c)))
+                return frozenset(keys)
+        return super()._get_expected_encoder_keys(source_type)
+
+    @staticmethod
+    def _balance_one_pole_both_rows(
+        pair_data: pd.DataFrame,
+        *,
+        seed: int,
+    ) -> pd.DataFrame:
+        """Keep one CF edge per prompt so ``|target| ≈ |sum(rest)|`` under ``source=both``.
+
+        Does not change row counts for other sources; callers must gate on ``source=both``.
+        """
+        if pair_data is None or pair_data.empty:
+            return pair_data
+        group_cols = [UNIFIED_MASKED]
+        if UNIFIED_SPLIT in pair_data.columns:
+            group_cols.append(UNIFIED_SPLIT)
+        rng = random.Random(int(seed))
+        pieces: List[pd.DataFrame] = []
+        for _, group in pair_data.groupby(group_cols, sort=False):
+            if len(group) == 1:
+                pieces.append(group)
+            else:
+                pick = int(rng.randrange(len(group)))
+                pieces.append(group.iloc[[pick]])
+        if not pieces:
+            return pair_data
+        return pd.concat(pieces, ignore_index=True)
 
     @classmethod
     def peek_unified_training_data(cls, *args: Any, **kwargs: Any) -> Optional[pd.DataFrame]:
@@ -2168,6 +2400,7 @@ class TextPredictionTrainer(Trainer):
             *,
             is_decoder_only_model: bool,
             neutral_feature_class_id: int,
+            mask_placeholder: str,
     ) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         if neutral_df is None or neutral_df.empty:
@@ -2207,6 +2440,8 @@ class TextPredictionTrainer(Trainer):
                 if pair is None:
                     continue
                 masked_text, neutral_token = pair
+                if mask_placeholder != "[MASK]":
+                    masked_text = masked_text.replace("[MASK]", mask_placeholder)
             if not masked_text or neutral_token is None:
                 continue
             entry: Dict[str, Any] = {
@@ -2311,8 +2546,17 @@ class TextPredictionTrainer(Trainer):
                 f"Available: {sorted(set(norm_col.tolist()))}."
             )
 
+        configured_targets = list(self._target_classes) if self._target_classes else None
+        fac_cfg = self._one_pole_positive_classes()
+        resolved_cf = self._resolved_counterfactual_classes(
+            self.all_classes or configured_targets or []
+        )
+
         if class_pair is None and self.pair is not None:
             class_pair = self.pair
+        if class_pair is None and fac_cfg and resolved_cf:
+            # One-pole polarity pair: (+ class, first CF). Do not treat as target_classes.
+            class_pair = (str(fac_cfg[0]), str(resolved_cf[0]))
         if class_pair is None:
             trans = split_data[UNIFIED_TRANSITION].unique().tolist()
             if not trans:
@@ -2320,9 +2564,11 @@ class TextPredictionTrainer(Trainer):
             t = trans[0]
             a, _, b = t.partition("→")
             class_pair = (a, b) if (a and b) else (trans[0], trans[0])
-        # Set target_classes from the pair (validation via __setattr__)
-        self._target_classes = list(class_pair)
-        class_pair = tuple(self._target_classes)
+        class_pair = (str(class_pair[0]), str(class_pair[1]))
+        # Never collapse an explicit target_classes list (esp. one-pole [A]) to an
+        # invented binary pair — that previously dropped other CF classes (white bug).
+        if configured_targets is None:
+            self._target_classes = list(class_pair)
 
         train_transitions = {transition_id(class_pair[0], class_pair[1]), transition_id(class_pair[1], class_pair[0])}
         transition_edges = None
@@ -2338,34 +2584,83 @@ class TextPredictionTrainer(Trainer):
             pair_data = split_data[split_data[UNIFIED_TRANSITION].isin(selected_transition_ids)].copy()
         elif include_other_classes and self.all_classes is not None and len(self.all_classes) > 2:
             pair_data = split_data.copy()
+        elif fac_cfg and resolved_cf:
+            # One-pole multi-CF: keep factual→each CF (and reverse edges if present).
+            fac_set = {str(c) for c in fac_cfg}
+            cf_set = {str(c) for c in resolved_cf}
+            allowed = {
+                transition_id(f, c) for f in fac_set for c in cf_set
+            } | {
+                transition_id(c, f) for f in fac_set for c in cf_set
+            }
+            pair_data = split_data[split_data[UNIFIED_TRANSITION].isin(allowed)].copy()
         else:
             pair_data = split_data[split_data[UNIFIED_TRANSITION].isin(train_transitions)].copy()
 
         if len(pair_data) == 0:
             raise ValueError(f"No data for transitions {train_transitions} in split '{split}'.")
 
+        # source=both only: one CF edge per prompt so |target| ≈ |sum(rest)|.
+        training_args = getattr(self, "training_args", None)
+        source_mode = str(getattr(training_args, "source", "") or "").strip().lower()
+        if (
+            fac_cfg
+            and resolved_cf
+            and source_mode == "both"
+            and not requested_all_transitions
+            and not transition_selection
+        ):
+            seed_bal = getattr(training_args, "seed", None)
+            if seed_bal is None:
+                seed_bal = getattr(self.config, "seed", 42) or 42
+            n_before = len(pair_data)
+            pair_data = self._balance_one_pole_both_rows(pair_data, seed=int(seed_bal))
+            if len(pair_data) != n_before:
+                logger.debug(
+                    "one-pole source=both balance: %d -> %d rows (|target|≈|rest|)",
+                    n_before,
+                    len(pair_data),
+                )
+
         training_pairs = []
         feature_class_id_map = {
             (class_pair[0], class_pair[1]): 0,
             (class_pair[1], class_pair[0]): 1,
         }
+        # One-pole multi-CF: all factual→CF edges share the + pole id; reverse share −.
+        if fac_cfg and resolved_cf:
+            for f in fac_cfg:
+                for c in resolved_cf:
+                    feature_class_id_map[(str(f), str(c))] = 0
+                    feature_class_id_map[(str(c), str(f))] = 1
         next_fcid = 2
-        training_args = getattr(self, "training_args", None)
         add_identity = bool(getattr(training_args, "add_identity_for_other_classes", False))
-        add_neutral_identity = bool(getattr(training_args, "add_neutral_identity_transitions", False))
+        add_neutral_identity = bool(getattr(training_args, "add_neutral_identity_transitions", True))
+        mask_placeholder = getattr(training_args, "mask_placeholder", "[MASK]") if training_args is not None else "[MASK]"
 
         def _feature_class_id(src: str, tgt: str) -> int:
             nonlocal next_fcid
-            key = (src, tgt)
+            key = (str(src), str(tgt))
             if key not in feature_class_id_map:
                 feature_class_id_map[key] = next_fcid
                 next_fcid += 1
             return feature_class_id_map[key]
 
+        fac_set = {str(c) for c in fac_cfg} if fac_cfg else set()
+        cf_set = {str(c) for c in resolved_cf} if resolved_cf else set()
         for _, row in pair_data.iterrows():
             src = row[UNIFIED_FACTUAL_CLASS]
             tgt = row[UNIFIED_ALTERNATIVE_CLASS]
-            label = 1 if src == class_pair[0] else (-1 if src == class_pair[1] else 0)
+            if fac_cfg and resolved_cf:
+                # One-pole: + class factual → +1; CF factual (reverse) → −1.
+                if str(src) in fac_set:
+                    label = 1
+                elif str(src) in cf_set:
+                    label = -1
+                else:
+                    label = 0
+            else:
+                label = 1 if src == class_pair[0] else (-1 if src == class_pair[1] else 0)
             pair_entry = {
                 "masked": row[UNIFIED_MASKED],
                 "factual": row[UNIFIED_FACTUAL],
@@ -2380,8 +2675,11 @@ class TextPredictionTrainer(Trainer):
                 pair_entry[UNIFIED_SPLIT] = row[UNIFIED_SPLIT]
             training_pairs.append(pair_entry)
 
-        # Identity transitions only for classes in all_classes that are not in target_classes
-        neutral_classes = [c for c in (self.all_classes or []) if c not in (self.target_classes or [])]
+        # Identity transitions only for classes in all_classes that are not target or CFs.
+        exclude_identity = set(self.target_classes or []) | cf_set | fac_set
+        neutral_classes = [
+            c for c in (self.all_classes or []) if str(c) not in {str(x) for x in exclude_identity}
+        ]
         if add_identity and neutral_classes:
                 neutral_data = split_data[split_data[UNIFIED_FACTUAL_CLASS].isin(neutral_classes)].copy()
                 for _, row in neutral_data.iterrows():
@@ -2443,6 +2741,7 @@ class TextPredictionTrainer(Trainer):
                 tokenizer,
                 is_decoder_only_model=bool(is_decoder_only_model),
                 neutral_feature_class_id=neutral_feature_class_id,
+                mask_placeholder=mask_placeholder,
             )
             if not neutral_identity_rows:
                 raise ValueError(
@@ -2487,6 +2786,7 @@ class TextPredictionTrainer(Trainer):
                     mlm_head_target_labels = None
 
         # Create text-specific training dataset (seed for deterministic batch ordering)
+        max_length = int(getattr(args, "max_length", 128) or 128) if args is not None else 128
         return TextTrainingDataset(
             training_df,
             tokenizer,
@@ -2496,9 +2796,11 @@ class TextPredictionTrainer(Trainer):
             target_key="label",
             balance_column=balance_column,
             seed=seed,
+            max_length=max_length,
             prediction_objective=objective_name,
-            rhs_window=getattr(getattr(self, "_training_args", None), "decoder_sequence_cloze_rhs_window", -1),
+            rhs_window=getattr(getattr(self, "training_args", None), "decoder_sequence_cloze_rhs_window", -1),
             mlm_head_target_labels=mlm_head_target_labels,
+            mask_placeholder=mask_placeholder,
         )
 
     def create_gradient_training_dataset(
@@ -2558,6 +2860,9 @@ class TextPredictionTrainer(Trainer):
             kwargs.pop("signal", None)
             scope = kwargs.pop("signal_scope", getattr(args, "signal_scope", None) if args is not None else None)
             signal = TextActivationTrainingDataset.default_signal(signal)
+            activation_mask_placeholder = getattr(raw_training_data, "mask_placeholder", "[MASK]")
+            if not isinstance(activation_mask_placeholder, str):
+                activation_mask_placeholder = "[MASK]"
             return TextActivationTrainingDataset(
                 raw_training_data,
                 tokenizer,
@@ -2575,6 +2880,7 @@ class TextPredictionTrainer(Trainer):
                 device=device,
                 timing_label=kwargs.pop("timing_label", "text-activation"),
                 signal=signal,
+                mask_placeholder=activation_mask_placeholder,
                 **kwargs,
             )
         return TextGradientTrainingDataset(
@@ -2590,19 +2896,19 @@ class TextPredictionTrainer(Trainer):
             **kwargs,
         )
 
-    def _infer_decoder_eval_targets(self) -> Tuple[Dict[str, List[str]], bool]:
-        """
-        Infer decoder evaluation targets from unified data and, when needed, from per-class datasets.
-        For each class, collects tokens used as factual (when factual_class=C) and as alternative (when alternative_class=C).
-        Returns (targets, has_overlap). When has_overlap is True, the resolver will use row-wise evaluation instead.
+    def _collect_class_tokens_from_data(self) -> Dict[str, List[str]]:
+        """Collect factual/alternative surface tokens per class from training data.
+
+        This is the feature vocabulary present in the data (training labels), not the
+        decoder-eval scoring set. Callers that need decoder-eval targets must go through
+        ``_resolve_decoder_eval_targets`` (honors explicit ``decoder_eval_targets``).
         """
         self._ensure_data()
         if self.combined_data is None:
-            raise ValueError("No data available to infer decoder eval targets")
+            raise ValueError("No data available to collect class tokens")
         if UNIFIED_TRANSITION not in self.combined_data.columns:
-            raise ValueError("combined_data must use unified schema to infer decoder eval targets")
-        # Prefer explicit target_classes; fall back to all classes present in data when missing.
-        classes: Optional[List[str]] = self.target_classes
+            raise ValueError("combined_data must use unified schema to collect class tokens")
+        classes: Optional[List[str]] = self._decoder_eval_class_names()
         if not classes:
             src_classes = (
                 self.combined_data[UNIFIED_FACTUAL_CLASS]
@@ -2638,6 +2944,18 @@ class TextPredictionTrainer(Trainer):
                 if factual_col is not None:
                     tokens = set(df_c[factual_col].dropna().astype(str))
             targets[class_name] = list(tokens)
+        return targets
+
+    def _infer_decoder_eval_targets(self) -> Tuple[Dict[str, List[str]], bool]:
+        """
+        Infer decoder evaluation targets from training data (only when config leaves
+        ``decoder_eval_targets`` unset).
+
+        Returns (targets, has_overlap). When has_overlap is True, the resolver uses
+        row-wise evaluation instead. Do not call this when the user already provided
+        explicit decoder eval targets — use ``_resolve_decoder_eval_targets``.
+        """
+        targets = self._collect_class_tokens_from_data()
 
         # Check for overlapping tokens across classes (used by resolver to decide row-wise fallback).
         token_sets: Dict[str, set] = {cls: set(v) for cls, v in targets.items()}
@@ -2756,14 +3074,17 @@ class TextPredictionTrainer(Trainer):
                 "Set config.decoder_eval_targets explicitly or ensure data and target_classes are loaded." + run_id_part
             )
 
-        # Restrict to target classes when using static targets
+        # Restrict to target (+ CF) classes when using static targets
         if not use_row_wise and getattr(self.config, "decoder_eval_restrict_to_target_classes", True) and self.target_classes is not None:
-            target_classes_set = frozenset(self.target_classes)
+            restrict_classes = self._decoder_eval_class_names() or self.target_classes
+            target_classes_set = frozenset(str(c) for c in restrict_classes)
             targets = {k: v for k, v in targets.items() if k in target_classes_set}
             if not targets:
                 raise ValueError(
-                    f"decoder_eval_restrict_to_target_classes=True but no decoder_eval_targets for target_classes {self.target_classes}. "
-                    "Ensure target classes exist in decoder_eval_targets or set decoder_eval_restrict_to_target_classes=False."
+                    f"decoder_eval_restrict_to_target_classes=True but no decoder_eval_targets for "
+                    f"classes {list(restrict_classes)}. "
+                    "Ensure target/CF classes exist in decoder_eval_targets or set "
+                    "decoder_eval_restrict_to_target_classes=False."
                 )
 
         # Compute feature score: row-wise (P(factual), P(alternative) per row) or static targets
@@ -3188,21 +3509,21 @@ class TextPredictionTrainer(Trainer):
     def _resolve_encoder_neutral_excluded_tokens(self) -> List[str]:
         """Tokens that must not be selected as neutral mask targets.
 
-        Matches ``generate_neutral_data`` exclusion: all feature target tokens plus
-        ``eval_neutral_additional_excluded_words`` (and optional decoder LMS ignores).
+        Uses **training feature tokens from the data** (factual/alternative labels),
+        plus ``eval_neutral_additional_excluded_words`` and optional
+        ``decoder_eval_ignore_tokens``.
+
+        Does **not** use ``decoder_eval_targets``: that config is only for decoder
+        probability scoring and may intentionally differ from training labels (e.g. a
+        large vocab subset). Mixing the two caused spurious target inference and could
+        exclude thousands of unrelated tokens from neutral remasking.
         """
         excluded: List[str] = []
         try:
-            self._ensure_data()
-            inferred, _ = self._infer_decoder_eval_targets()
-            for tokens in inferred.values():
+            for tokens in self._collect_class_tokens_from_data().values():
                 excluded.extend(str(t) for t in tokens)
         except (ValueError, AttributeError, TypeError):
             pass
-        raw_targets = getattr(self.config, "decoder_eval_targets", None)
-        if isinstance(raw_targets, dict):
-            for tokens in raw_targets.values():
-                excluded.extend(str(t) for t in tokens)
         additional = getattr(self.config, "eval_neutral_additional_excluded_words", None) or []
         excluded.extend(str(w) for w in additional)
         ignore = getattr(self.config, "decoder_eval_ignore_tokens", None) or []
@@ -3264,6 +3585,7 @@ class TextPredictionTrainer(Trainer):
         objective_name = self._prediction_objective(getattr(model_with_gradiend, "base_model", tokenizer)).name
         neutral_objective_name = self._neutral_encoder_prediction_objective(objective_name)
         rhs_window = getattr(getattr(self, "_training_args", None), "decoder_sequence_cloze_rhs_window", -1)
+        mask_placeholder = getattr(getattr(self, "_training_args", None), "mask_placeholder", "[MASK]")
         logger.debug(f"Tokenizer: is_decoder_only_model={is_decoder_only_model}, mask_token={mask_token}")
 
         # Collect training data entries and re-mask non-target tokens
@@ -3275,17 +3597,17 @@ class TextPredictionTrainer(Trainer):
             if max_size and i >= max_size:
                 break
 
-            # Get original masked template (TextTrainingDataset provides "template" with [MASK] placeholder)
+            # Get original masked template (TextTrainingDataset provides "template" with the dataset placeholder)
             template = entry["template"]
 
-            # Reconstruct unmasked text by replacing [MASK] with the actual factual token
+            # Reconstruct unmasked text by replacing the dataset placeholder with the actual factual token
             factual_token = entry[factual_token_key]
             if i == 0:
                 logger.debug(
                     f"Sample neutral training masked entry: template={template[:50]}..., "
                     f"factual_token_key={factual_token_key}, factual_token={factual_token}"
                 )
-            unmasked_text = template.replace("[MASK]", factual_token)
+            unmasked_text = template.replace(mask_placeholder, factual_token)
 
             pair = create_masked_pair_from_text(
                 unmasked_text,
@@ -3298,6 +3620,8 @@ class TextPredictionTrainer(Trainer):
             if pair is None:
                 continue
             masked_text, original_token = pair
+            if mask_placeholder != "[MASK]":
+                masked_text = masked_text.replace("[MASK]", mask_placeholder)
 
             if is_seq2seq_model_value and not tokenize_prediction_label(tokenizer, original_token):
                 logger.debug(
@@ -3321,6 +3645,9 @@ class TextPredictionTrainer(Trainer):
         component_rows: List[Dict[str, Any]] = []
         if neutral_training_masked_pairs:
             neutral_training_masked_df = pd.DataFrame(neutral_training_masked_pairs)
+            max_length = int(
+                getattr(getattr(self, "training_args", None), "max_length", 128) or 128
+            )
             neutral_training_masked_dataset = TextTrainingDataset(
                 neutral_training_masked_df,
                 tokenizer,
@@ -3331,6 +3658,8 @@ class TextPredictionTrainer(Trainer):
                 rhs_window=rhs_window,
                 target_key="label",
                 balance_column="feature_class_id",
+                mask_placeholder=mask_placeholder,
+                max_length=max_length,
             )
 
             # Use the same signal-aware dataset factory as training/evaluation.
@@ -3475,6 +3804,9 @@ class TextPredictionTrainer(Trainer):
         neutral_df = pd.DataFrame(neutral_pairs)
 
         # Create TextTrainingDataset for neutral data
+        max_length = int(
+            getattr(getattr(self, "training_args", None), "max_length", 128) or 128
+        )
         neutral_dataset = TextTrainingDataset(
             neutral_df,
             tokenizer,
@@ -3485,6 +3817,7 @@ class TextPredictionTrainer(Trainer):
             rhs_window=rhs_window,
             target_key="label",
             balance_column="feature_class_id",
+            max_length=max_length,
         )
 
         # Use the same signal-aware dataset factory as training/evaluation.
@@ -3848,9 +4181,17 @@ class TextPredictionTrainer(Trainer):
         return df
 
     def _get_decoder_eval_targets(self) -> Dict[str, List[str]]:
-        """Get decoder eval targets (delegates to _infer_decoder_eval_targets). Returns dict only; overlap implies row-wise at eval time."""
-        targets, _ = self._infer_decoder_eval_targets()
-        return targets
+        """Return class -> token lists for decoder scoring / annotation.
+
+        Honors explicit ``config.decoder_eval_targets``. Infers from data only when
+        the config leaves targets unset (``None``). For row-wise mode
+        (``\"label\"`` or overlapping inferred tokens), returns the data-derived
+        class token map as a best-effort static view for callers that require a dict.
+        """
+        targets, use_row_wise = self._resolve_decoder_eval_targets(None)
+        if targets is not None and not use_row_wise:
+            return targets
+        return self._collect_class_tokens_from_data()
 
     def _analyze_encoder(
         self,

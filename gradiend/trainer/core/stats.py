@@ -145,6 +145,98 @@ def _nonzero_target_class_abs_means(mean_by_class: Dict[Any, float]) -> List[flo
     return abs_means
 
 
+def _target_class_mean_stats(
+    mean_by_class: Any,
+    mean_threshold: Any = None,
+) -> tuple[bool, Optional[float], Optional[float]]:
+    """Return ``(means_ok, product, min_abs)`` for the two non-neutral target classes.
+
+    ``means_ok`` requires exactly two non-zero label means with opposite signs, and when
+    ``mean_threshold`` is set also ``min(|mean|) >= mean_threshold``.
+    """
+    if not isinstance(mean_by_class, dict):
+        return False, None, None
+    target_means: List[float] = []
+    for label, mean_value in mean_by_class.items():
+        if not isinstance(mean_value, (int, float)):
+            continue
+        try:
+            numeric_label = float(label)
+        except (TypeError, ValueError):
+            continue
+        if numeric_label == 0.0:
+            continue
+        target_means.append(float(mean_value))
+    if len(target_means) != 2:
+        return False, None, None
+    product = target_means[0] * target_means[1]
+    min_abs = min(abs(value) for value in target_means)
+    mean_ok = mean_threshold is None or min_abs >= float(mean_threshold)
+    return product < 0 and mean_ok, product, min_abs
+
+
+def correlation_checkpoint_rank(
+    *,
+    step: int,
+    correlation: Optional[float],
+    mean_by_class: Any = None,
+    score_threshold: Optional[float] = None,
+    mean_threshold: Optional[float] = None,
+    prefer_convergent: bool = False,
+) -> tuple:
+    """Rank for correlation-based best-checkpoint selection (higher is better).
+
+    By default (``prefer_convergent=False``), rank by ``|correlation|`` then later step.
+
+    When ``prefer_convergent=True``, prefer steps that meet the same convergence criteria used
+    at end of training (``step > 0``, ``|corr|`` threshold, opposite-sign target means and
+    optional min ``|mean|``), then higher ``|correlation|``, then larger min ``|mean|``,
+    then later step.
+    """
+    corr = float(correlation) if isinstance(correlation, (int, float)) else None
+    means_ok, _product, min_abs = _target_class_mean_stats(mean_by_class, mean_threshold)
+    score_ok = score_threshold is None or (corr is not None and abs(corr) >= float(score_threshold))
+    converged = bool(
+        prefer_convergent
+        and (score_threshold is not None or mean_threshold is not None)
+        and step > 0
+        and corr is not None
+        and score_ok
+        and means_ok
+    )
+    try:
+        step_int = int(step)
+    except (TypeError, ValueError):
+        step_int = -1
+    return (
+        1 if converged else 0,
+        abs(corr) if corr is not None else float("-inf"),
+        float(min_abs) if isinstance(min_abs, (int, float)) else float("-inf"),
+        step_int,
+    )
+
+
+def _mean_by_class_for_step(
+    training_stats: Dict[str, Any],
+    step: Any,
+    eval_result: Optional[Dict[str, Any]] = None,
+) -> Dict[Any, float]:
+    """Resolve mean_by_class for a step from eval_result or training_stats history."""
+    if isinstance(eval_result, dict):
+        current = eval_result.get("mean_by_class")
+        if isinstance(current, dict) and current:
+            return {k: float(v) for k, v in current.items() if isinstance(v, (int, float))}
+    mean_hist = training_stats.get("mean_by_class") if isinstance(training_stats, dict) else None
+    if not isinstance(mean_hist, dict):
+        return {}
+    at_step = mean_hist.get(step)
+    if at_step is None:
+        at_step = mean_hist.get(str(step))
+    if isinstance(at_step, dict):
+        return {k: float(v) for k, v in at_step.items() if isinstance(v, (int, float))}
+    return {}
+
+
 def _best_step_min_target_class_abs_mean(
     training_stats: Dict[str, Any],
     best_score_checkpoint: Dict[str, Any],
@@ -158,6 +250,9 @@ def _best_step_min_target_class_abs_mean(
     mean_by_class = _best_step_mean_by_class(training_stats, best_score_checkpoint)
     if not mean_by_class:
         return None
+    _means_ok, _product, min_abs = _target_class_mean_stats(mean_by_class, mean_threshold=None)
+    if min_abs is not None:
+        return float(min_abs)
     abs_means = _nonzero_target_class_abs_means(mean_by_class)
     if not abs_means:
         return None
@@ -177,20 +272,8 @@ def _best_step_target_class_mean_product(
     mean_by_class = _best_step_mean_by_class(training_stats, best_score_checkpoint)
     if not mean_by_class:
         return None
-
-    target_means = []
-    for label, mean_value in mean_by_class.items():
-        try:
-            numeric_label = float(label)
-        except (TypeError, ValueError):
-            continue
-        if numeric_label == 0.0:
-            continue
-        target_means.append(float(mean_value))
-
-    if len(target_means) != 2:
-        return None
-    return target_means[0] * target_means[1]
+    _means_ok, product, _min_abs = _target_class_mean_stats(mean_by_class, mean_threshold=None)
+    return product
 
 
 def summarize_topk_stability(

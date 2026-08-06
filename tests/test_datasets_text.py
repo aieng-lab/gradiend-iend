@@ -876,6 +876,33 @@ class TestTextTrainingDataset:
         labels = item["labels"]
         assert labels[labels != -100].tolist() == [1, 1]
 
+    def test_text_training_dataset_supports_custom_classic_mlm_placeholder(self):
+        """Dataset placeholders are configurable and normalized to tokenizer.mask_token."""
+        dataset = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["[PRONOUN] said that [PRONOUN] was late"],
+                "factual": ["token_1"],
+                "alternative": ["token_2"],
+                "factual_class": ["class1"],
+                "alternative_class": ["class2"],
+                "factual_id": [1],
+                "alternative_id": [2],
+                "label": ["positive"],
+                "feature_class_id": [1],
+            }),
+            tokenizer=MockTokenizer(),
+            batch_size=1,
+            is_decoder_only_model=False,
+            mask_placeholder="[PRONOUN]",
+        )
+
+        item = dataset[0]
+
+        assert item["input_text"] == "[MASK] said that [MASK] was late"
+        assert item["text"] == "token_1 said that token_1 was late"
+        labels = item["factual"]["labels"]
+        assert labels[labels != -100].tolist() == [1, 1]
+
     def test_text_training_dataset_expands_one_classic_mlm_mask_for_multi_token_target(self):
         """A single MLM placeholder may stand for a contiguous multi-token target span."""
         tokenizer = MockTokenizer()

@@ -19,7 +19,7 @@ prediction objectives, and multi-seed analysis.
 | **output_dir** | `None` | Directory for the trained model. If omitted and `experiment_dir` is set, GRADIEND derives a model path under the experiment directory. |
 | **use_cache** | `False` | Training checkpoint reuse policy: `False`, `True`, `"always"`, or `"only_convergent"`. `True` and `"only_convergent"` require a matching `cache_fingerprint` in `training.json` (pruning config, signal/scope/split settings, `source`/`target`, `init_fan_in_floor`, `add_neutral_identity_transitions`, `reuse_pre_prune`, `gradiend_input_dim`). `"always"` reuses any saved checkpoint without fingerprint checks. `"only_convergent"` additionally requires convergence metadata. Fingerprinting is **partial** — it does not compare most hyperparameters, data, or model-selection settings; see [Tutorial: Training](../tutorials/training.md#experiment-directory-and-caching-use_cache). Evaluator/visualizer cache arguments are separate. |
 | **add_identity_for_other_classes** | `False` | Add identity examples (`factual == alternative`) for non-target classes so they are not pushed arbitrarily. |
-| **add_neutral_identity_transitions** | `False` | Add zero-labeled neutral identity transitions from `TextPredictionConfig.neutral_data`. `neutral_data` may be a shared DataFrame/path/HF id or a split mapping such as `{"train": train_df, "test": test_df}`. With `target="diff"`, the decoded update is trained toward the zero vector for neutral rows. |
+| **add_neutral_identity_transitions** | `True` | Add zero-labeled neutral identity transitions from `TextPredictionConfig.neutral_data`. `neutral_data` may be a shared DataFrame/path/HF id or a split mapping such as `{"train": train_df, "test": test_df}`. With `target="diff"`, the decoded update is trained toward the zero vector for neutral rows. |
 | **metadata** | `{}` | Free-form metadata serialized with the training arguments. |
 
 ---
@@ -28,11 +28,14 @@ prediction objectives, and multi-seed analysis.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| **source** | `"alternative"` | Which gradient feeds the encoder: `"factual"`, `"alternative"`, or `"diff"`. |
+| **source** | `"alternative"` | Which gradient feeds the encoder: `"factual"`, `"alternative"`, `"diff"`, or `"both"`. `"both"` alternates factual/alternative poles across balance-group **visits** (`batch_idx // n_groups`; orthogonal to balance-group cycling) and requires `target="diff"`. Internally each batch is compiled to the factual/`diff` path via optional fac↔alt swap so the reconstruction target is always `input − opposite`. For **encoder evaluation** (`target=None`), every source expands each example to both poles so correlation always sees `+1` and `-1` (including one-pole training data). |
 | **target** | `"diff"` | Which gradient quantity the decoder predicts: `"factual"`, `"alternative"`, or `"diff"`. |
 
 The common setting is `source="alternative", target="diff"`: the encoder sees
-the alternative gradient and the decoder learns the difference to apply.
+the alternative gradient and the decoder learns the difference to apply
+(`factual − alternative`). With `source="both"`, half the batches encode the
+factual pole and half the alternative pole, each with a signed `diff` relative
+to the opposite pole.
 
 ---
 
@@ -178,6 +181,7 @@ excluded by the model-loading logic.
 | **convergent_metric** | `None` | `"correlation"` or `"loss"`. `None` defaults to `"correlation"` unless `supervised_decoder=True`. |
 | **convergent_score_threshold** | `None` | Score threshold for convergence. `None` becomes `0.5` for correlation; required for loss. |
 | **convergent_mean_by_class_threshold** | `None` | Additional convergence threshold: every non-zero target class must have \|mean encoded\| ≥ this value at the best step. For correlation mode, `None` becomes `0.5`. |
+| **prefer_convergent_checkpoint** | `False` | If `True`, best-checkpoint selection prefers steps that meet convergence criteria over a higher-\|correlation\| step that fails them. Default keeps max \|correlation\|; convergence is still checked at that best step. |
 | **split_resplit_per_seed** | `False` | For trainer-assigned splits (`split_col="heldout"` or `None`), redraw them per training seed. |
 | **split_resplit_strategy** | `"random"` | Strategy for per-seed resplitting: `"random"` or `"balanced_cycle"`. |
 | **seed** | `0` | Base seed. Multi-seed runs use `seed+i`; `None` requests non-deterministic runs. |

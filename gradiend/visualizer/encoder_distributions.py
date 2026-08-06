@@ -59,7 +59,7 @@ def _plot_encoder_distributions_by_data_split(
     target_and_neutral_only: bool = True,
     training_pair: Optional[tuple] = None,
     show: bool = True,
-    title: Union[str, bool] = True,
+    title: Union[str, bool, None] = True,
     run_id: Optional[str] = None,
     output: Optional[str] = None,
     output_dir: Optional[str] = None,
@@ -128,7 +128,9 @@ def _plot_encoder_distributions_by_data_split(
             ax.tick_params(axis="x", rotation=15 if len(panel_groups) > 3 else 0)
         axes[0].set_ylabel(ENCODED_VALUE_LABEL)
         axes[-1].set_xlabel(x_label)
-    if title is True and run_id:
+    if title is False or title is None:
+        pass
+    elif title is True and run_id:
         plt.suptitle(escape_matplotlib_usetex_text(run_id))
     elif isinstance(title, str):
         plt.suptitle(escape_matplotlib_usetex_text(title))
@@ -164,7 +166,7 @@ def plot_encoder_distributions(
     output: Optional[str] = None,
     output_dir: Optional[str] = None,
     show: bool = True,
-    title: Union[str, bool] = True,
+    title: Union[str, bool, None] = True,
     violin_order: Optional[List[str]] = None,
     paired_legend_labels: Optional[List[str]] = None,
     class_label_mapping: Optional[Dict[Any, str]] = None,
@@ -204,7 +206,7 @@ def plot_encoder_distributions(
         output: Explicit path for saved PDF (overrides experiment_dir / output_dir).
         output_dir: Directory for saved PDF when output and experiment_dir are not set.
         show: If True, call plt.show() to display the plot.
-        title: True (default run_id), False, or custom string for the plot title.
+        title: True (default run_id), False/None (no title), or custom string for the plot title.
         target_and_neutral_only: If True (default), restrict the plot to the target (training)
                     transition(s) and neutral data only; other transitions are excluded. Uses
                     trainer.pair to determine the target transition(s). Set to False to show
@@ -723,7 +725,7 @@ def plot_encoder_distributions(
         lw = 2.5 if (g, side) in train_pair_half_set else 0.7
         coll.set_linewidth(lw)
 
-    if title is False:
+    if title is False or title is None:
         pass
     elif isinstance(title, str):
         plt.title(escape_matplotlib_usetex_text(title), fontsize=title_fontsize)

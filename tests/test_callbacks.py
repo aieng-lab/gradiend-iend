@@ -300,6 +300,99 @@ class TestCheckpointCallback:
         assert callback.best_score == 0.8
         assert model.save_pretrained.call_count == save_count_after_best
 
+    def test_checkpoint_callback_prefers_convergent_means_over_peak_correlation(self, temp_dir):
+        """With prefer_convergent_checkpoint=True, keep a convergent step over peak |corr|."""
+        callback = CheckpointCallback(
+            output=temp_dir,
+            checkpoints=False,
+            keep_only_best=True,
+            use_loss_for_best=False,
+        )
+        model = MagicMock()
+        model.save_pretrained = MagicMock()
+        config = {
+            "convergent_score_threshold": 0.5,
+            "convergent_mean_by_class_threshold": 0.5,
+            "prefer_convergent_checkpoint": True,
+        }
+
+        callback.on_step_end(
+            step=100,
+            loss=1e-4,
+            model=model,
+            config=config,
+            training_stats={
+                "correlation": 0.908,
+                "mean_by_class": {100: {1.0: 0.80, -1.0: -0.2937}},
+            },
+            eval_result={
+                "correlation": 0.908,
+                "mean_by_class": {1.0: 0.80, -1.0: -0.2937},
+            },
+        )
+        assert callback.best_score == pytest.approx(0.908)
+        assert callback.best_step == 100
+
+        callback.on_step_end(
+            step=500,
+            loss=1e-4,
+            model=model,
+            config=config,
+            training_stats={
+                "correlation": 0.858,
+                "mean_by_class": {
+                    100: {1.0: 0.80, -1.0: -0.2937},
+                    500: {1.0: 0.6425, -1.0: -0.9010},
+                },
+            },
+            eval_result={
+                "correlation": 0.8584,
+                "mean_by_class": {1.0: 0.6425, -1.0: -0.9010},
+            },
+        )
+        assert callback.best_step == 500
+        assert callback.best_score == pytest.approx(0.8584)
+
+    def test_checkpoint_callback_default_keeps_peak_correlation(self, temp_dir):
+        """Default prefer_convergent_checkpoint=False keeps max |correlation|."""
+        callback = CheckpointCallback(
+            output=temp_dir,
+            checkpoints=False,
+            keep_only_best=True,
+            use_loss_for_best=False,
+        )
+        model = MagicMock()
+        model.save_pretrained = MagicMock()
+        config = {
+            "convergent_score_threshold": 0.5,
+            "convergent_mean_by_class_threshold": 0.5,
+        }
+
+        callback.on_step_end(
+            step=100,
+            loss=1e-4,
+            model=model,
+            config=config,
+            training_stats={},
+            eval_result={
+                "correlation": 0.908,
+                "mean_by_class": {1.0: 0.80, -1.0: -0.2937},
+            },
+        )
+        callback.on_step_end(
+            step=500,
+            loss=1e-4,
+            model=model,
+            config=config,
+            training_stats={},
+            eval_result={
+                "correlation": 0.8584,
+                "mean_by_class": {1.0: 0.6425, -1.0: -0.9010},
+            },
+        )
+        assert callback.best_step == 100
+        assert callback.best_score == pytest.approx(0.908)
+
     def test_checkpoint_callback_component_split_uses_merged_local_bests(self, temp_dir):
         """Component-split best checkpoint is the running local-best merge, not one global step."""
         from gradiend.model import GradiendModel

@@ -190,7 +190,7 @@ More examples: [gradiend/examples](https://github.com/aieng-lab/gradiend/tree/ma
 Example scripts and notebooks: [gradiend/examples](https://github.com/aieng-lab/gradiend/tree/main/gradiend/examples) on GitHub (not in the pip package; download a file or read to get inspired).
 
 - [start_workflow.py](gradiend/examples/start_workflow.py) — Minimal runnable example
-- [train_english_pronouns.ipynb](gradiend/examples/train_english_pronouns.ipynb) — English pronouns (3SG vs 3PL): data creation from Wikipedia → training → evaluation ([script](gradiend/examples/train_english_pronouns.py))
+- [train_english_pronouns.ipynb](gradiend/examples/train_english_pronouns.ipynb) — English pronouns (3SG vs 3PL): published HF data → training → evaluation ([script](gradiend/examples/train_english_pronouns.py); datasets: [en-pronouns](https://huggingface.co/datasets/aieng-lab/en-pronouns), [en-pronoun-neutral](https://huggingface.co/datasets/aieng-lab/en-pronoun-neutral))
 - [train_sentiment.py](gradiend/examples/train_sentiment.py) — Sentiment example with split-aware evaluation and visualization
 - [train_gender_de.py](gradiend/examples/train_gender_de.py) — German gender (masc_nom vs fem_nom)
 - [train_multi_seed_stability.py](gradiend/examples/train_multi_seed_stability.py) — Multi-seed training and stability comparison

@@ -300,7 +300,7 @@ def resolve_highlight_non_convergence(
 
 
 def format_label_with_convergence(
-    label: str,
+    label: Optional[str],
     *,
     converged: Optional[bool] = None,
     highlight_non_convergence: bool = True,
@@ -313,6 +313,8 @@ def format_label_with_convergence(
         converged: Whether the corresponding run converged.
         highlight_non_convergence: Whether to append the marker for non-converged runs.
     """
+    if label is None:
+        return ""
     text = str(label)
     if not highlight_non_convergence or converged is not False:
         return escape_matplotlib_usetex_text(text)
@@ -340,7 +342,7 @@ def resolve_plot_title_with_convergence(
     trainer: Any = None,
     run_info: Optional[Dict[str, Any]] = None,
     highlight_non_convergence: bool = True,
-    default: str = "Training convergence",
+    default: Optional[str] = "Training convergence",
 ) -> Union[str, bool]:
     """Resolve plot title and append non-convergence marker when applicable.
 
@@ -350,6 +352,7 @@ def resolve_plot_title_with_convergence(
         run_info: Optional parsed training stats.
         highlight_non_convergence: Whether to mark non-converged runs.
         default: Fallback title when no trainer run id is available.
+            ``None`` means no fallback (disable the title when nothing else is available).
     """
     if title is False or title is None:
         return False
@@ -360,9 +363,14 @@ def resolve_plot_title_with_convergence(
         converged = converged_for_trainer(trainer)
     if title is True:
         base = getattr(trainer, "run_id", None) if trainer is not None else None
-        base = base or default
+        base = base if base is not None else default
     else:
-        base = str(title)
+        base = title
+    if base is None:
+        return False
+    base = str(base)
+    if not base.strip():
+        return False
     if not highlight_non_convergence:
         return base
     return format_label_with_convergence(

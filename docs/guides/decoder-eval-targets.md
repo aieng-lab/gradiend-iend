@@ -40,6 +40,10 @@ infers targets from your training data when decoder evaluation runs depending on
   **that row's** factual token (`label`) against **that row's** alternative token
   (`alternative`) — not one global list per class.
 
+When you pass an explicit dict (or `"label"`), GRADIEND does **not** infer decoder eval
+targets from data. Training-label tokens used for neutral remasking are collected
+separately and are independent of `decoder_eval_targets`.
+
 Note that `decoder_eval_targets` is independent of `prediction_objective` (training gradient source).
 
 ---

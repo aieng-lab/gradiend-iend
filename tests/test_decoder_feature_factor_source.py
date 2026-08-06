@@ -41,8 +41,10 @@ class _Trainer:
     [
         ("factual", 1.0, -1.0),
         ("diff", 1.0, -1.0),
+        ("both", 1.0, -1.0),
         ("alternative", 1.0, 1.0),
         ("factual", -1.0, 1.0),
+        ("both", -1.0, 1.0),
         ("alternative", -1.0, -1.0),
     ],
 )
@@ -55,6 +57,7 @@ def test_feature_factor_from_encoding_direction(source, direction, expected):
     [
         ("factual", "diff", 1.0, 1.0),
         ("diff", "diff", 1.0, 1.0),
+        ("both", "diff", 1.0, 1.0),
         ("alternative", "diff", 1.0, -1.0),
     ],
 )
@@ -94,6 +97,7 @@ def test_intervention_feature_factor_uses_signal_kind_not_scope():
     [
         ("factual", -1.0, 1.0),
         ("diff", -1.0, 1.0),
+        ("both", -1.0, 1.0),
         ("alternative", 1.0, -1.0),
     ],
 )

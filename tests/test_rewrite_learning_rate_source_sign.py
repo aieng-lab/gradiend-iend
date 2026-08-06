@@ -69,6 +69,7 @@ def _rewrite_delta(model: _TinyMWG, nominal_lr: float, nominal_ff: float = 1.0) 
     [
         ("factual", 0.1, 0.1),
         ("diff", 0.05, 0.05),
+        ("both", 0.1, 0.1),
         ("alternative", 0.1, 0.1),
     ],
 )

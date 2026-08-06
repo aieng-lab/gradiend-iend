@@ -185,3 +185,7 @@ def test_encoding_view_sign_for_source():
     assert encoding_view_sign_for_source("factual", "counterfactual") == -1.0
     assert encoding_view_sign_for_source("alternative", "counterfactual") == 1.0
     assert encoding_view_sign_for_source("alternative", "transition") == 1.0
+    assert encoding_view_sign_for_source("both", "factual") == 1.0
+    assert encoding_view_sign_for_source("both", "counterfactual") == -1.0
+    assert encoding_view_sign_for_source("both", "transition") == 1.0
+    assert encoding_view_sign_for_source("diff", "factual") == 1.0

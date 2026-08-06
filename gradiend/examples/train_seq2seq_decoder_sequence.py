@@ -9,8 +9,7 @@ demonstration. Prefer ``train_seq2seq_encoder_mlm.py`` (encoder-side MLM, defaul
 for ``prediction_objective="auto"`` on T5/BART); that workflow does converge and
 is covered by the example smoke tests.
 
-Uses the same English pronoun data as ``train_english_pronouns.py`` /
-``create_english_pronoun_data.py``.
+Uses the same published English pronoun data as ``train_english_pronouns.py``.
 
 Run:
     python -m gradiend.examples.train_seq2seq_decoder_sequence
@@ -21,19 +20,20 @@ from __future__ import annotations
 from pathlib import Path
 
 from gradiend import PostPruneConfig, TextPredictionTrainer, TrainingArguments
-from gradiend.examples.create_english_pronoun_data import ensure_english_pronoun_data
+from gradiend.examples.english_pronoun_datasets import (
+    EN_PRONOUN_HF_SPLITS,
+    EN_PRONOUNS_HF_DATASET,
+    load_english_pronoun_neutral_data,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data" / "english_pronouns"
 EXPERIMENT_DIR = PROJECT_ROOT / "runs" / "examples" / "t5_decoder_sequence"
 TARGET_CLASSES = ("3SG", "3PL")
 
 
 if __name__ == "__main__":
-    training_path, neutral_path = ensure_english_pronoun_data(output_dir=str(DATA_DIR))
-    print(f"=== English pronoun data: using CSVs in {DATA_DIR} ===")
-    print(f"  {training_path}")
-    print(f"  {neutral_path}")
+    neutral_data = load_english_pronoun_neutral_data()
+    print(f"=== English pronoun data: using {EN_PRONOUNS_HF_DATASET} ===")
 
     args = TrainingArguments(
         experiment_dir=str(EXPERIMENT_DIR),
@@ -54,9 +54,10 @@ if __name__ == "__main__":
     trainer = TextPredictionTrainer(
         model="t5-small",
         run_id="t5_3sg_3pl_sequence_cloze",
-        data=training_path,
+        hf_dataset=EN_PRONOUNS_HF_DATASET,
+        hf_splits=EN_PRONOUN_HF_SPLITS,
         target_classes=list(TARGET_CLASSES),
-        eval_neutral_data=neutral_path,
+        eval_neutral_data=neutral_data,
         args=args,
     )
 

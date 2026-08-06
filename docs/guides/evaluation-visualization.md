@@ -421,7 +421,7 @@ Plots that save to disk use `img_format` (e.g. `"pdf"`, `"png"`) when available.
 | Script / notebook | Plots demonstrated |
 |-------------------|--------------------|
 | [train_gender_de_detailed.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_gender_de_detailed.py) | Training convergence with `label_name_mapping`; encoder distributions with `legend_group_mapping`; top-k heatmap with `value="intersection_frac"`; top-k Venn per transition. |
-| [train_english_pronouns.ipynb](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.ipynb) | Full workflow: data creation → training (3SG vs 3PL) → encoder/decoder evaluation and probability-shifts plot. |
+| [train_english_pronouns.ipynb](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.ipynb) | Full workflow: published HF data → training (3SG vs 3PL) → encoder/decoder evaluation and probability-shifts plot. |
 | [train_gender_de.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_gender_de.py) | Basic training convergence, encoder distributions, decoder evaluation. |
 | [train_sentiment.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment.py) | Vocabulary-held-out splits; by-target, facet, and multi-seed plots. |
 | [train_sentiment_positive_suite.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment_positive_suite.py) | Suite similarity and cross-encoding heatmaps. |

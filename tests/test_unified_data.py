@@ -295,6 +295,30 @@ class TestPerClassDictToUnified:
         assert len(df1) == len(df2)
         assert set(df1["alternative"]) == set(df2["alternative"])
 
+    def test_one_pole_multi_counterfactual_classes(self):
+        """positive_classes + counterfactual_classes='all' emits A→B and A→C (not only pair)."""
+        class_dfs = {
+            "A": pd.DataFrame({"masked": ["[MASK] a"], "split": ["train"], "label": ["aa"]}),
+            "B": pd.DataFrame({"masked": ["[MASK] b"], "split": ["train"], "label": ["bb"]}),
+            "C": pd.DataFrame({"masked": ["[MASK] c"], "split": ["train"], "label": ["cc"]}),
+        }
+        df = per_class_dict_to_unified(
+            class_dfs,
+            classes=["A", "B", "C"],
+            pair=("A", "B"),
+            positive_classes=["A"],
+            counterfactual_classes="all",
+            random_state=0,
+        )
+        assert set(df["factual_class"]) == {"A"}
+        assert set(df["alternative_class"]) == {"B", "C"}
+        # Default pair-only still only A↔B when counterfactual_classes is unset.
+        df_pair = per_class_dict_to_unified(
+            class_dfs, classes=["A", "B", "C"], pair=("A", "B"), random_state=0,
+        )
+        alts_from_a = set(df_pair.loc[df_pair["factual_class"] == "A", "alternative_class"])
+        assert alts_from_a == {"B"}
+
 
 class TestMergedToUnified:
     """merged_to_unified with pair derives alternative from other class."""

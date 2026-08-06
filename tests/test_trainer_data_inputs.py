@@ -3,6 +3,7 @@
 
 import pandas as pd
 import pytest
+from unittest.mock import patch
 
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
@@ -15,6 +16,7 @@ from gradiend.trainer.core.unified_data import (
     resolve_dataframe,
     transition_id,
 )
+from tests.testing_mocks import MockTokenizer
 
 
 def _merged_factual_df(rows=None):
@@ -114,6 +116,35 @@ class TestTrainerDataAsPath:
         assert trainer._combined_data is not None
         assert len(trainer._combined_data) >= 1
 
+    def test_data_as_path_reports_configured_missing_columns_early(self, tmp_path):
+        path = tmp_path / "training.csv"
+        pd.DataFrame(
+            {
+                "masked": ["[MASK] here"],
+                "split": ["train"],
+                "label": ["M"],
+                "name": ["Alex"],
+            }
+        ).to_csv(path, index=False)
+        config = TextPredictionConfig(
+            data=path,
+            target_classes=["M", "F"],
+            masked_col="training_masked",
+            label_col="target",
+            label_class_col="label",
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        with pytest.raises(ValueError) as exc:
+            trainer._ensure_data()
+
+        message = str(exc.value)
+        assert "training data" in message
+        assert "required column(s) ['training_masked', 'target']" in message
+        assert "Available columns: ['masked', 'split', 'label', 'name']" in message
+        assert "'masked_col': 'training_masked'" in message
+        assert "'label_col': 'target'" in message
+
     def test_data_as_directory_loads_training_csv(self, tmp_path):
         _merged_factual_df().to_csv(tmp_path / "training.csv", index=False)
         config = TextPredictionConfig(data=tmp_path, target_classes=["3SG", "3PL"])
@@ -162,6 +193,37 @@ class TestTrainerDataAsPath:
             trainer._ensure_data()
 
 
+class TestTrainerHfDatasetInput:
+    def test_hf_dataset_reports_configured_missing_columns_early(self):
+        raw = pd.DataFrame(
+            {
+                "masked": ["[MASK] here"],
+                "split": ["train"],
+                "label": ["M"],
+                "name": ["Alex"],
+            }
+        )
+        config = TextPredictionConfig(
+            hf_dataset="org/dataset",
+            target_classes=["M", "F"],
+            masked_col="training_masked",
+            label_col="target",
+            label_class_col="label",
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        with patch.object(TextPredictionTrainer, "_load_hf_dataset", return_value=raw):
+            with pytest.raises(ValueError) as exc:
+                trainer._ensure_data()
+
+        message = str(exc.value)
+        assert "HF dataset 'org/dataset'" in message
+        assert "required column(s) ['training_masked', 'target']" in message
+        assert "Available columns: ['masked', 'split', 'label', 'name']" in message
+        assert "'masked_col': 'training_masked'" in message
+        assert "'label_col': 'target'" in message
+
+
 class TestTrainerDataAsDataFrame:
     """data=DataFrame (merged) builds unified data."""
 
@@ -173,6 +235,27 @@ class TestTrainerDataAsDataFrame:
         assert trainer._combined_data is not None
         assert UNIFIED_FACTUAL in trainer._combined_data.columns
         assert UNIFIED_ALTERNATIVE in trainer._combined_data.columns
+
+    def test_training_args_custom_mask_placeholder_reaches_training_dataset(self):
+        df = pd.DataFrame(
+            [
+                {"masked": "[PRONOUN] is here", "split": "train", "label_class": "3SG", "label": "he"},
+                {"masked": "[PRONOUN] are here", "split": "train", "label_class": "3PL", "label": "they"},
+            ]
+        )
+        config = TextPredictionConfig(data=df, target_classes=["3SG", "3PL"])
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(mask_placeholder="[PRONOUN]"),
+        )
+
+        training_data = trainer.create_training_data(MockTokenizer(), split="train", batch_size=1)
+        item = training_data[0]
+
+        assert training_data.mask_placeholder == "[PRONOUN]"
+        assert item["input_text"].startswith("[MASK]")
+        assert item["text"].startswith("he") or item["text"].startswith("they")
 
     def test_feature_class_ids_follow_target_class_order_not_row_order(self):
         df = pd.DataFrame(

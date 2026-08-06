@@ -129,8 +129,13 @@ def test_resolve_plot_title_with_convergence():
     assert resolve_plot_title_with_convergence(True, trainer=trainer, highlight_non_convergence=False) == "my_run"
     assert resolve_plot_title_with_convergence(False, trainer=trainer) is False
     assert resolve_plot_title_with_convergence(None, trainer=trainer) is False
+    assert resolve_plot_title_with_convergence(True, trainer=None, default=None) is False
+    assert resolve_plot_title_with_convergence(True, default=None) is False
+    assert format_label_with_convergence(None) == ""
     trainer_ok = _TrainerStub(run_id="ok", converged=True)
     assert resolve_plot_title_with_convergence(True, trainer=trainer_ok) == "ok"
+    trainer_no_id = _TrainerStub(run_id=None, converged=True)
+    assert resolve_plot_title_with_convergence(True, trainer=trainer_no_id, default=None) is False
 
 
 def test_converged_for_trainer_uses_current_seed_requirement_over_stale_report():

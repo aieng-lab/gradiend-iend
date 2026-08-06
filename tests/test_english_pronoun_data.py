@@ -53,6 +53,12 @@ def test_pronoun_training_data_is_complete_when_all_classes_present():
         assert pronoun_training_data_is_complete(tmp)
 
 
+def test_english_pronoun_generation_config_scans_full_source_with_publish_cap():
+    config = english_pronoun_generation_config()
+    assert config["base_max_size"] is None
+    assert config["max_size_per_class"] == 10_000
+
+
 @pytest.mark.parametrize("neutral_contents", ["", "text\n"])
 def test_current_pronoun_data_rejects_empty_neutral_csv(neutral_contents):
     with tempfile.TemporaryDirectory() as tmp:

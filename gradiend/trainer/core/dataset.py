@@ -25,6 +25,7 @@ from gradiend.trainer.core.config import (
     factual_computation_required_keywords,
     alternative_computation_required_keywords,
     source_target_keywords,
+    validate_source_target_combination,
 )
 from gradiend.trainer.core.signals import (
     GradientSignalExtractor,
@@ -52,6 +53,55 @@ def _invert_numeric_label(label: Any) -> Any:
     return label
 
 
+# Metadata pairs swapped when compiling source="both" alternative batches to factual/diff.
+_BOTH_SWAP_KEY_PAIRS = (
+    ("factual", "alternative"),
+    ("factual_token", "alternative_token"),
+    ("factual_id", "alternative_id"),
+)
+
+
+def _swap_factual_alternative_batch(batch: dict) -> dict:
+    """Return a shallow-copied batch with factual/alternative poles swapped and label inverted."""
+    out = dict(batch)
+    for left_key, right_key in _BOTH_SWAP_KEY_PAIRS:
+        if left_key in out or right_key in out:
+            out[left_key], out[right_key] = out.get(right_key), out.get(left_key)
+    if "label" in out:
+        out["label"] = _invert_numeric_label(out["label"])
+    return out
+
+
+def _both_side_for_batch(index: int, *, n_balance_groups: int = 1) -> str:
+    """Choose factual vs alternative pole for ``source='both'`` training.
+
+    Training datasets that set ``balance_column`` (e.g. ``feature_class_id``) cycle
+    balance groups with ``batch_idx % n_balance_groups``. Pole selection must be
+    **orthogonal** to that phase. Using ``batch_idx % 2`` alone locks feature
+    batches onto a single pole whenever ``n_balance_groups`` is even — the common
+    case of one feature group plus neutral identity (``add_neutral_identity_transitions``).
+
+    Rule: ``visit = batch_idx // n_balance_groups``; even visit → factual, odd →
+    alternative. With ``n_balance_groups=1`` this is the historical even/odd rule.
+    """
+    n = max(1, int(n_balance_groups))
+    visit = int(index) // n
+    return "factual" if (visit % 2 == 0) else "alternative"
+
+
+def _both_eval_base_and_side(index: int) -> tuple[int, str]:
+    """Map an encoder-eval index to (base_batch_index, side).
+
+    Encoder evaluation expands each base example to both poles so a single
+    factual row still yields labels +1 and -1 (required for correlation),
+    regardless of the training ``source``.
+    """
+    base = int(index) // 2
+    side = "factual" if (int(index) % 2 == 0) else "alternative"
+    return base, side
+
+
+
 class SignalTrainingDatasetBase:
     """
     Modality-agnostic dataset for GRADIEND signal extraction and batching.
@@ -67,8 +117,13 @@ class SignalTrainingDatasetBase:
         training_data: Dataset with __len__ and __getitem__ returning dicts containing
             at least 'factual' and 'alternative' (modality-specific, e.g. tokenizer outputs).
         signal_extractor: Callable producing a SignalBatch from factual/alternative inputs.
-        source: 'factual' | 'alternative' | 'diff' | None. When None (e.g. supervised_decoder), source signals are not computed.
+        source: 'factual' | 'alternative' | 'diff' | 'both' | None. When None (e.g. supervised_decoder),
+            source signals are not computed. ``both`` alternates poles per training batch and compiles to
+            the factual/diff path via optional fac↔alt swap. For encoder evaluation (``target=None``),
+            every source expands each base example to both poles so labels +1 and -1 are always available
+            (needed for one-pole training data under any source).
         target: Same options or None. When None (e.g. supervised_encoder), target signals are not computed.
+            ``source='both'`` requires ``target='diff'`` or ``target=None``.
         cache_dir: Optional directory for caching extracted signals.
         use_cached_signals: If True and cache_dir set, load/save signals.
         cache_key_fields: When caching is used, list of batch keys to include in cache hash.
@@ -101,6 +156,8 @@ class SignalTrainingDatasetBase:
     ):
         assert source in source_target_keywords, f'Invalid source {source}, must be one of {source_target_keywords}'
         assert target in source_target_keywords, f'Invalid target {target}, must be one of {source_target_keywords}'
+        if source == "both":
+            validate_source_target_combination(source, target)
 
         if cache_dir is not None and use_cached_signals and (not cache_key_fields or len(cache_key_fields) == 0):
             raise ValueError(
@@ -150,12 +207,53 @@ class SignalTrainingDatasetBase:
             except Exception:
                 pass
 
+    def _expands_poles_for_encoder_eval(self) -> bool:
+        """Encoder-only datasets expand each pair to both poles for bipolar metrics."""
+        return self.target is None and self.source is not None
+
     def __len__(self) -> int:
-        return len(self.training_data) // self.batch_size
+        n_batches = len(self.training_data) // self.batch_size
+        if self._expands_poles_for_encoder_eval():
+            return 2 * n_batches
+        return n_batches
 
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
+
+    def _n_training_balance_groups(self) -> int:
+        """Balance-group count of the wrapped training dataset (at least 1).
+
+        Used so ``source='both'`` pole visits stay orthogonal to balance-group
+        cycling. Prefer ``training_data.n_balance_groups``, then
+        ``len(training_data.balance_keys)``.
+        """
+        td = self.training_data
+        n = getattr(td, "n_balance_groups", None)
+        if n is not None:
+            try:
+                return max(1, int(n))
+            except (TypeError, ValueError):
+                pass
+        keys = getattr(td, "balance_keys", None)
+        if keys is not None:
+            try:
+                return max(1, len(keys))
+            except TypeError:
+                pass
+        return 1
+
+    def _resolve_encoder_eval_index(self, index: int) -> tuple[int, str]:
+        """Resolve an encoder-eval index into (base_batch_index, pole side)."""
+        return _both_eval_base_and_side(index)
+
+    def _resolve_both_index(self, index: int) -> tuple[int, str]:
+        """Resolve source='both' into (base_batch_index, pole side)."""
+        if self.target is None:
+            return self._resolve_encoder_eval_index(index)
+        return int(index), _both_side_for_batch(
+            index, n_balance_groups=self._n_training_balance_groups()
+        )
 
     def _merge_batch(self, indices: list) -> dict:
         """Collect items at indices and merge into one batch; pad variable-length tensors when needed."""
@@ -272,10 +370,33 @@ class SignalTrainingDatasetBase:
         t_alternative = t0
         t_combine = t0
 
-        indices = list(range(index * self.batch_size, min((index + 1) * self.batch_size, len(self.training_data))))
+        source = self.source
+        fetch_index = index
+        eval_side = None
+        if source == "both":
+            validate_source_target_combination(source, self.target)
+            fetch_index, eval_side = self._resolve_both_index(index)
+        elif self._expands_poles_for_encoder_eval():
+            # Any encoder-only eval expands both poles so one-pole training data
+            # still yields ±1 labels for correlation (not only source="both").
+            fetch_index, eval_side = self._resolve_encoder_eval_index(index)
+
+        indices = list(
+            range(
+                fetch_index * self.batch_size,
+                min((fetch_index + 1) * self.batch_size, len(self.training_data)),
+            )
+        )
 
         with self._exclusive_signal_access():
             batch = self._merge_batch(indices)
+            # Optional fac↔alt swap presents the chosen pole as the "factual" side
+            # for source="both", or as the selected pole for other encoder-eval sources.
+            if eval_side == "alternative":
+                batch = _swap_factual_alternative_batch(batch)
+            if source == "both":
+                # Compile source="both" to the existing factual/diff path.
+                source = "factual"
             if timing_enabled:
                 self._sync_cuda_for_timing()
                 t_merge = time.perf_counter()
@@ -303,8 +424,8 @@ class SignalTrainingDatasetBase:
                 if not identity_batch and os.path.exists(cache_file_alternative):
                     alternative_signal = torch.load(cache_file_alternative, weights_only=True)
 
-            requires_factual = self.source in factual_computation_required_keywords or self.target in factual_computation_required_keywords
-            if identity_batch and (self.source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords):
+            requires_factual = source in factual_computation_required_keywords or self.target in factual_computation_required_keywords
+            if identity_batch and (source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords):
                 requires_factual = True
             if factual_signal is None and requires_factual:
                 factual_inputs = batch["factual"]
@@ -318,7 +439,7 @@ class SignalTrainingDatasetBase:
                 self._sync_cuda_for_timing()
                 t_factual = time.perf_counter()
 
-            requires_alternative = self.source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords
+            requires_alternative = source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords
             if identity_batch and requires_alternative:
                 if factual_signal is None:
                     factual_inputs = batch["factual"]
@@ -341,23 +462,23 @@ class SignalTrainingDatasetBase:
                 self._sync_cuda_for_timing()
                 t_alternative = time.perf_counter()
 
-            if self.source == 'factual':
+            if source == 'factual':
                 source_tensor = factual_signal
-            elif self.source == 'alternative':
+            elif source == 'alternative':
                 source_tensor = alternative_signal
-            elif self.source == 'diff':
+            elif source == 'diff':
                 source_tensor = factual_signal - alternative_signal
-            elif self.source is None:
+            elif source is None:
                 source_tensor = None  # e.g. supervised_decoder: only target needed
             else:
-                raise ValueError(f'Unknown source: {self.source}')
+                raise ValueError(f'Unknown source: {source}')
 
             if self.target == 'factual':
                 target_tensor = factual_signal
             elif self.target == 'alternative':
                 target_tensor = alternative_signal
             elif self.target == 'diff':
-                target_tensor = source_tensor.clone() if self.source == 'diff' else (factual_signal - alternative_signal)
+                target_tensor = source_tensor.clone() if source == 'diff' else (factual_signal - alternative_signal)
             elif self.target is None:
                 target_tensor = None
             else:
@@ -372,7 +493,8 @@ class SignalTrainingDatasetBase:
                     output[key] = batch[key]
             # Label metadata must describe the signal exposed as source.
             # For binary pairs, the alternative side is the opposite feature class.
-            if self.source == 'alternative' and 'label' in output:
+            # source="both" already inverted the label during the fac↔alt swap.
+            if source == 'alternative' and 'label' in output:
                 output['label'] = _invert_numeric_label(output['label'])
             if self.return_metadata and 'metadata' in batch:
                 output['metadata'] = batch['metadata']

@@ -214,7 +214,7 @@ class TextClassificationDataCreator(LabelDataCreator):
                     logger.info("Using cached neutral data from %s", out_path)
                     return cached
 
-        texts = self._get_data(base_override=base_data)
+        texts = self._iter_data(base_override=base_data)
         interrupted = False
         if self.neutral_filter_fn is not None:
             neutral = []
@@ -250,4 +250,3 @@ class TextClassificationDataCreator(LabelDataCreator):
         if out_path is not None:
             _save_dataframe(out_path, self.output_format, df)
         return df
-

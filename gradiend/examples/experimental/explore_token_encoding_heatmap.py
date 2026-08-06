@@ -14,10 +14,13 @@ import os
 from typing import List
 
 from gradiend import Signal, TextPredictionConfig, TextPredictionTrainer, TrainingArguments
-from gradiend.examples.create_english_pronoun_data import ensure_english_pronoun_data
+from gradiend.examples.english_pronoun_datasets import (
+    EN_PRONOUN_HF_SPLITS,
+    EN_PRONOUNS_HF_DATASET,
+    load_english_pronoun_neutral_data,
+)
 from gradiend.trainer.core import SignalScope
 
-DATA_DIR = "data/english_pronouns"
 MODEL_NAME = "gpt2"
 EXPERIMENT_DIR = "runs/english_pronouns_activation_factual"
 RUN_ID = "pronoun_3sg_3pl_activation"
@@ -36,12 +39,13 @@ EXAMPLE_TEXTS: List[str] = [
 
 
 def _make_trainer() -> TextPredictionTrainer:
-    training_path, neutral_path = ensure_english_pronoun_data(output_dir=DATA_DIR)
+    neutral_data = load_english_pronoun_neutral_data()
     config = TextPredictionConfig(
         run_id=RUN_ID,
-        data=training_path,
+        hf_dataset=EN_PRONOUNS_HF_DATASET,
+        hf_splits=EN_PRONOUN_HF_SPLITS,
         target_classes=["3SG", "3PL"],
-        neutral_data=neutral_path,
+        neutral_data=neutral_data,
     )
     args = TrainingArguments(
         experiment_dir=EXPERIMENT_DIR,

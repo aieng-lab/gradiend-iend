@@ -24,7 +24,11 @@ import torch
 
 from gradiend import Signal, TextPredictionConfig, TextPredictionTrainer, TrainingArguments
 from gradiend.evaluator.decoder import derive_default_feature_factor
-from gradiend.examples.create_english_pronoun_data import ensure_english_pronoun_data
+from gradiend.examples.english_pronoun_datasets import (
+    EN_PRONOUN_HF_SPLITS,
+    EN_PRONOUNS_HF_DATASET,
+    load_english_pronoun_neutral_data,
+)
 from gradiend.examples.train_gender_en import build_gender_trainer
 from gradiend.gradiend_split import GradiendSplit
 from gradiend.model.utils import prediction_eval_kind
@@ -47,7 +51,6 @@ TASK_CONFIGS: Dict[str, Dict[str, Any]] = {
         "experiment_dir": "runs/english_pronouns_activation_factual",
         "target_class": "3SG",
         "target_classes": ("3SG", "3PL"),
-        "data_dir": "data/english_pronouns",
         "run_id": "pronoun_3sg_3pl_activation",
     },
 }
@@ -629,12 +632,13 @@ def _strategy_grid(direction: float) -> List[Dict[str, Any]]:
 
 def _make_trainer() -> TextPredictionTrainer:
     task_cfg = TASK_CONFIGS["english_pronouns_activation"]
-    training_path, neutral_path = ensure_english_pronoun_data(output_dir=task_cfg["data_dir"])
+    neutral_data = load_english_pronoun_neutral_data()
     config = TextPredictionConfig(
         run_id=task_cfg["run_id"],
-        data=training_path,
+        hf_dataset=EN_PRONOUNS_HF_DATASET,
+        hf_splits=EN_PRONOUN_HF_SPLITS,
         target_classes=["3SG", "3PL"],
-        neutral_data=neutral_path,
+        neutral_data=neutral_data,
         decoder_eval_export_row_wise_csv=True,
     )
     args = TrainingArguments(
