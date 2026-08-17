@@ -193,14 +193,57 @@ def correlation_checkpoint_rank(
     optional min ``|mean|``), then higher ``|correlation|``, then larger min ``|mean|``,
     then later step.
     """
-    corr = float(correlation) if isinstance(correlation, (int, float)) else None
+    return metric_checkpoint_rank(
+        step=step,
+        score=correlation,
+        metric="correlation",
+        mean_by_class=mean_by_class,
+        score_threshold=score_threshold,
+        mean_threshold=mean_threshold,
+        prefer_convergent=prefer_convergent,
+    )
+
+
+def metric_checkpoint_rank(
+    *,
+    step: int,
+    score: Optional[float],
+    metric: str = "correlation",
+    mean_by_class: Any = None,
+    score_threshold: Optional[float] = None,
+    mean_threshold: Optional[float] = None,
+    prefer_convergent: bool = False,
+) -> tuple:
+    """Rank for best-checkpoint selection (higher is better).
+
+    ``metric``:
+      - ``correlation``: compare ``|score|`` (bipolar)
+      - ``roc_auc`` / ``auroc``: compare raw ``score`` (one-vs-rest; higher better)
+      - ``min_auc_n_o`` / ``min_auc``: compare raw ``min(auc_n, auc_o)`` (higher better)
+    """
+    name = str(metric or "correlation").strip().lower()
+    if name in {"auroc", "auc", "roc-auc"}:
+        name = "roc_auc"
+    if name in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
+        name = "min_auc_n_o"
+    raw = float(score) if isinstance(score, (int, float)) else None
+    if name in {"roc_auc", "min_auc_n_o"}:
+        rank_score = raw if raw is not None else float("-inf")
+        score_ok = score_threshold is None or (raw is not None and raw >= float(score_threshold))
+    else:
+        rank_score = abs(raw) if raw is not None else float("-inf")
+        score_ok = score_threshold is None or (raw is not None and abs(raw) >= float(score_threshold))
     means_ok, _product, min_abs = _target_class_mean_stats(mean_by_class, mean_threshold)
-    score_ok = score_threshold is None or (corr is not None and abs(corr) >= float(score_threshold))
+    # AUROC-family metrics do not require opposite-sign bipolar means unless a mean
+    # threshold is explicitly set (prefer_convergent + mean_threshold).
+    if name in {"roc_auc", "min_auc_n_o"} and mean_threshold is None:
+        means_ok = True
+        min_abs = None
     converged = bool(
         prefer_convergent
         and (score_threshold is not None or mean_threshold is not None)
         and step > 0
-        and corr is not None
+        and raw is not None
         and score_ok
         and means_ok
     )
@@ -210,7 +253,7 @@ def correlation_checkpoint_rank(
         step_int = -1
     return (
         1 if converged else 0,
-        abs(corr) if corr is not None else float("-inf"),
+        float(rank_score),
         float(min_abs) if isinstance(min_abs, (int, float)) else float("-inf"),
         step_int,
     )

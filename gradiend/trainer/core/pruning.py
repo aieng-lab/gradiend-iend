@@ -232,10 +232,22 @@ class PrePruneConfig:
     """Batch size for gradient computation (samples per chunk; one gradient per sample)."""
 
     feature_class_key: str = "feature_class_id"
-    """Key in item dict for stratification (must have exactly two target classes)."""
+    """Item/dataframe key used for stratification.
+
+    Default ``feature_class_id`` (legacy int poles or classification class names).
+    When ``pre_prune(..., definition=trainer)`` is used and training rows expose
+    ``factual_id``, pre-prune prefers semantic class *names* from
+    ``get_target_feature_classes()`` stratified on ``factual_id`` unless this key
+    or ``target_feature_class_ids`` was set explicitly.
+    """
 
     target_feature_class_ids: Optional[List[Any]] = None
-    """Class IDs to stratify over (neutral/identity are ignored). If None and pre_prune(..., definition=trainer) is used, the trainer's target feature class IDs are used automatically."""
+    """Class labels to stratify over (neutral/identity excluded).
+
+    If None and ``definition`` is passed to ``pre_prune``, labels come from the
+    trainer (prefer ``get_target_feature_classes()`` on ``factual_id`` when
+    available; else ``get_target_feature_class_ids()``).
+    """
 
     dataset: Optional[Any] = None
     """Optional override: use this dataset instead of the one passed to pre_prune()."""
@@ -298,6 +310,95 @@ def _is_noop_pre_prune(config: PrePruneConfig) -> bool:
     if topk is None:
         return False
     return isinstance(topk, float) and topk >= 1.0
+
+
+def _dataset_has_column(dataset: Any, key: str) -> bool:
+    raw_data = getattr(dataset, "data", None)
+    if raw_data is not None and hasattr(raw_data, "columns"):
+        return key in raw_data.columns
+    if len(dataset) == 0:
+        return False
+    item = dataset[0]
+    return isinstance(item, dict) and key in item and item.get(key) is not None
+
+
+def _dataset_key_values(dataset: Any, key: str) -> set:
+    """Unique non-None values for ``key`` in ``dataset`` (dataframe or __getitem__)."""
+    raw_data = getattr(dataset, "data", None)
+    values: set = set()
+    if raw_data is not None and hasattr(raw_data, "columns") and key in raw_data.columns:
+        for v in raw_data[key].tolist():
+            if v is not None:
+                values.add(v)
+        return values
+    for idx in range(len(dataset)):
+        item = dataset[idx]
+        if not isinstance(item, dict):
+            continue
+        v = item.get(key)
+        if v is not None:
+            values.add(v)
+    return values
+
+
+def _resolve_pre_prune_stratification(
+    dataset: Any,
+    config: PrePruneConfig,
+    definition: Optional[Any],
+) -> Tuple[str, Optional[List[Any]]]:
+    """Choose stratification key + target labels for pre-prune.
+
+    Prefer semantic class *names* on ``factual_id`` when the trainer exposes
+    ``get_target_feature_classes()`` and the dataset has that column. This avoids
+    mismatches between pole keys (``pos``/``neg`` or deprecated ints) and class names.
+
+    Explicit ``config.target_feature_class_ids`` and a non-default
+    ``config.feature_class_key`` always win.
+    """
+    key = str(config.feature_class_key)
+    explicit_targets = config.target_feature_class_ids is not None
+    explicit_key = key != "feature_class_id"
+    target_ids: Optional[List[Any]] = (
+        list(config.target_feature_class_ids) if explicit_targets else None
+    )
+
+    if not explicit_targets and definition is not None:
+        names = None
+        get_names = getattr(definition, "get_target_feature_classes", None)
+        if callable(get_names):
+            try:
+                names = get_names()
+            except Exception:
+                names = None
+        ids = None
+        get_ids = getattr(definition, "get_target_feature_class_ids", None)
+        if callable(get_ids):
+            try:
+                ids = get_ids()
+            except Exception:
+                ids = None
+
+        name_list = [x for x in (names or []) if x is not None]
+        if (
+            not explicit_key
+            and name_list
+            and _dataset_has_column(dataset, "factual_id")
+        ):
+            present = _dataset_key_values(dataset, "factual_id")
+            matched = [n for n in name_list if n in present]
+            if matched:
+                logger.debug(
+                    "pre_prune: stratifying on factual_id with class names %s",
+                    matched,
+                )
+                return "factual_id", matched
+
+        if ids is not None:
+            target_ids = list(ids)
+        elif name_list:
+            target_ids = name_list
+
+    return key, target_ids
 
 
 def _stratified_indices(
@@ -820,16 +921,18 @@ def pre_prune(
     Call this before train(); typically pass the same dataset you will use for training.
 
     When the dataset has more than two feature classes (e.g. target pair + identity/neutral),
-    pass definition=trainer so stratification uses only the target pair. The trainer supplies
-    the target feature class IDs via get_target_feature_class_ids().
+    pass definition=trainer so stratification uses only the target classes. Prefer semantic
+    class names via ``get_target_feature_classes()`` on ``factual_id`` when available;
+    otherwise ``get_target_feature_class_ids()`` on ``config.feature_class_key``.
 
     Args:
         model_with_gradiend: Model with .gradiend and .gradient_creator (e.g. ModelWithGradiend).
         dataset: Dataset with __len__ and __getitem__ returning dict with 'factual', 'alternative',
-            and config.feature_class_key (e.g. 'feature_class_id'). Ignored if config.dataset is set.
+            and a stratification key (``factual_id`` names or ``feature_class_id``). Ignored if
+            config.dataset is set.
         config: PrePruneConfig (n_samples, topk or threshold, source, etc.).
-        definition: Optional trainer/definition with get_target_feature_class_ids(). When given and
-            the dataset has more feature classes than desired, target feature class IDs are used automatically.
+        definition: Optional trainer/definition. When given and targets are not set on
+            ``config``, supplies class names / ids for stratification.
         inplace: If True, prune the model in place; else return a copy.
         return_mask: If True, also return the combined mask from prune.
 
@@ -864,16 +967,14 @@ def pre_prune(
     requires_factual = source in factual_computation_required_keywords
     requires_alternative = source in alternative_computation_required_keywords
 
-    target_ids = config.target_feature_class_ids
-    if target_ids is None and definition is not None:
-        get_ids = getattr(definition, "get_target_feature_class_ids", None)
-        if callable(get_ids):
-            target_ids = get_ids()
+    feature_class_key, target_ids = _resolve_pre_prune_stratification(
+        data, config, definition
+    )
 
     indices = _stratified_indices(
         data,
         config.n_samples,
-        config.feature_class_key,
+        feature_class_key,
         target_ids,
         config.seed,
     )

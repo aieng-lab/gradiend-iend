@@ -21,7 +21,7 @@ import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Dict, Any, Tuple, Union, Sequence
+from typing import Iterator, List, Optional, Dict, Any, Tuple, Union, Sequence, Mapping
 
 import torch
 import torch.nn as nn
@@ -1165,7 +1165,38 @@ class ModelWithGradiend(nn.Module, ABC):
                 f"got {part!r}"
             )
         effective_value = effective_rewrite_learning_rate(value, self.source)
-        return (float(effective_value) * update.flatten()).detach()
+        update = (float(effective_value) * update.flatten()).detach()
+        if self.uses_activations:
+            update = self._unscale_activation_update(update)
+        return update
+
+    def _unscale_activation_update(self, update: torch.Tensor) -> torch.Tensor:
+        """Map scaled-space ACTIEND decode back to raw residual units when Signal scale is on."""
+        from gradiend.trainer.core.signals import ActivationRunningRms
+
+        kwargs = dict(getattr(self.gradiend, "kwargs", None) or {})
+        scale_state = kwargs.get("activation_scale")
+        if scale_state is None:
+            scale_state = (kwargs.get("signal_space") or {}).get("activation_scale")
+        if not isinstance(scale_state, Mapping) or not scale_state.get("ms"):
+            return update
+        widths: List[int] = []
+        for name, spec in (getattr(self.gradiend, "param_map", None) or {}).items():
+            if not str(name).startswith("activation:"):
+                continue
+            shape = tuple(spec.get("shape") or ())
+            if len(shape) != 1:
+                return update
+            widths.append(int(shape[0]))
+        if not widths:
+            return update
+        scaler = ActivationRunningRms(
+            reduce=str(scale_state.get("reduce") or "per_site"),
+            momentum=float(scale_state.get("momentum") or 0.0),
+            eps=float(scale_state.get("eps") or 1e-6),
+        )
+        scaler.load_state_dict(scale_state)
+        return scaler.unscale_flat(update, widths)
 
     def _activation_intervention_specs(
         self,

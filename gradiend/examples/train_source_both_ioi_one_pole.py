@@ -349,6 +349,7 @@ def _run_causal_decoder_test(trainer: TextPredictionTrainer) -> dict[str, Any]:
         target_class=POS_CLASS,
         split="test",
         max_size=DECODER_EVAL_MAX_SIZE,
+        use_cache=False
     )
     summary = dec.get(POS_CLASS) or {}
     print(

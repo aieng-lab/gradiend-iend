@@ -220,10 +220,10 @@ class TrainingArguments:
     mask_placeholder: str = "[MASK]"
     """Dataset-level prediction placeholder used inside masked text templates.
 
-    This is independent of ``tokenizer.mask_token``. For example, pass
-    ``mask_placeholder="[PRONOUN]"`` when the data templates use ``[PRONOUN]``;
-    GRADIEND replaces that placeholder with the model/tokenizer-specific mask
-    token or sentinel at encoding time.
+    This is independent of ``tokenizer.mask_token``. Prefer setting
+    ``TextPredictionConfig.mask_placeholder`` with the data schema (e.g.
+    ``mask_placeholder=\"[PRONOUN]\"``). A non-default value here still overrides
+    when the config field is left at its default.
     """
 
     decoder_mlm_head_epochs: int = 5
@@ -328,10 +328,15 @@ class TrainingArguments:
     """Stop once this many seeds have converged. None = run max_seeds. 0 is invalid."""
 
     convergent_metric: Optional[str] = None
-    """Metric for convergence: "correlation" or "loss". Defaults to correlation unless supervised_decoder."""
+    """Metric for convergence + best-checkpoint selection: "correlation", "roc_auc"/"auroc",
+    "min_auc_n_o"/"min_auc", or "loss".
+
+    Defaults to correlation unless supervised_decoder (then loss). Use ``min_auc_n_o`` for
+    one-pole runs (``min(auc_n, auc_o)`` so neutrals alone cannot carry selection). Legacy
+    ``roc_auc`` is pooled one-vs-rest (rivals ∪ neutrals as negatives)."""
 
     convergent_score_threshold: Optional[float] = None
-    """Threshold for convergence. Defaults to 0.6 for correlation; required for loss."""
+    """Threshold for convergence. Defaults: 0.5 (correlation), 0.7 (roc_auc / min_auc_n_o); required for loss."""
 
     convergent_mean_by_class_threshold: Optional[float] = None
     """Optional additional convergence criterion: minimum absolute mean encoded value per target class.
@@ -342,16 +347,18 @@ class TrainingArguments:
     correlation-based convergence, the two non-zero target classes must also have opposite-sign mean encodings
     at the best checkpoint step (their product must be negative).
 
+    For ``roc_auc`` / ``min_auc_n_o``, the mean-based opposite-sign check is off unless this threshold is set explicitly.
+
     This flag only defines the end-of-training convergence check unless
     ``prefer_convergent_checkpoint=True`` (see that argument)."""
 
     prefer_convergent_checkpoint: bool = False
-    """If True, correlation-based best-checkpoint selection prefers steps that meet the convergence
-    criteria (score threshold, opposite-sign target means, and optional mean threshold) over a
-    higher-|correlation| step that fails them.
+    """If True, best-checkpoint selection prefers steps that meet the convergence
+    criteria (score threshold, and for correlation: opposite-sign target means / optional mean threshold)
+    over a higher-score step that fails them.
 
-    If False (default), the best checkpoint is selected by ``|correlation|`` alone; convergence is
-    still evaluated afterward at that best step."""
+    If False (default), the best checkpoint is selected by the selection score alone
+    (``|correlation|``, ``roc_auc``, or ``min_auc_n_o``); convergence is still evaluated afterward at that best step."""
 
     split_resplit_per_seed: bool = False
     """When ``split_col`` is ``\"heldout\"`` or ``None``, re-draw splits per training seed.
@@ -640,12 +647,26 @@ class TrainingArguments:
             raise ValueError("seed_stability_part must be a non-empty string.")
 
         metric = (self.convergent_metric or ("loss" if self.supervised_decoder else "correlation")).lower()
-        if metric not in ("correlation", "loss"):
-            raise ValueError(f"convergent_metric must be 'correlation' or 'loss', got {metric!r}")
+        if metric in {"auroc", "auc", "roc-auc"}:
+            metric = "roc_auc"
+            self.convergent_metric = "roc_auc"
+        if metric in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)", "min_auc_n_o"}:
+            metric = "min_auc_n_o"
+            self.convergent_metric = "min_auc_n_o"
+        if metric not in ("correlation", "loss", "roc_auc", "min_auc_n_o"):
+            raise ValueError(
+                "convergent_metric must be 'correlation', 'roc_auc'/'auroc', "
+                "'min_auc_n_o'/'min_auc', or 'loss', "
+                f"got {metric!r}"
+            )
         if metric == "correlation" and self.convergent_score_threshold is None:
             self.convergent_score_threshold = 0.5
         if metric == "correlation" and self.convergent_mean_by_class_threshold is None:
             self.convergent_mean_by_class_threshold = 0.5
+        if metric in {"roc_auc", "min_auc_n_o"} and self.convergent_score_threshold is None:
+            self.convergent_score_threshold = 0.7
+        # roc_auc / min_auc_n_o: do not auto-enable bipolar mean threshold
+        # (identity/neutral at ≤0 is fine).
         if metric == "loss" and self.convergent_score_threshold is None:
             raise ValueError("convergent_score_threshold is required when convergent_metric='loss'.")
 

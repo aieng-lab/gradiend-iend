@@ -31,7 +31,7 @@ from gradiend.trainer.core.component_seed import (
 from gradiend.trainer.core.stats import (
     _mean_by_class_for_step,
     _target_class_mean_stats,
-    correlation_checkpoint_rank,
+    metric_checkpoint_rank,
 )
 
 logger = get_logger(__name__)
@@ -47,6 +47,25 @@ def _eval_enabled(config: Any, *, loss_only: bool = False) -> bool:
     if loss_only:
         return False
     return bool(_config_get(config, "do_eval", True))
+
+
+def _normalize_selection_metric(raw: Any) -> str:
+    name = str(raw or "correlation").strip().lower()
+    if name in {"auroc", "auc", "roc-auc"}:
+        return "roc_auc"
+    if name in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)", "min_auc_n_o"}:
+        return "min_auc_n_o"
+    if name in {"correlation", "corr"}:
+        return "correlation"
+    if name == "loss":
+        return "loss"
+    return name
+
+
+def _selection_metric_from_config(config: Any, *, use_loss_for_best: bool = False) -> str:
+    if use_loss_for_best:
+        return "loss"
+    return _normalize_selection_metric(_config_get(config, "convergent_metric", "correlation"))
 
 
 def _current_step_correlation(
@@ -65,6 +84,39 @@ def _current_step_correlation(
     if isinstance(scores, dict) and step in scores and scores[step] is not None:
         return float(scores[step])
     return None
+
+
+def _hist_float_at_step(hist: Any, step: int) -> Optional[float]:
+    if isinstance(hist, dict) and step in hist and hist[step] is not None:
+        return float(hist[step])
+    if isinstance(hist, (int, float)):
+        return float(hist)
+    return None
+
+
+def _current_step_selection_score(
+    *,
+    step: int,
+    metric: str,
+    training_stats: Dict[str, Any],
+    eval_result: Optional[Dict[str, Any]],
+) -> Optional[float]:
+    name = _normalize_selection_metric(metric)
+    if name == "roc_auc":
+        if isinstance(eval_result, dict) and eval_result.get("roc_auc") is not None:
+            return float(eval_result["roc_auc"])
+        return _hist_float_at_step(training_stats.get("roc_auc"), step)
+    if name == "min_auc_n_o":
+        if isinstance(eval_result, dict) and eval_result.get("min_auc_n_o") is not None:
+            return float(eval_result["min_auc_n_o"])
+        return _hist_float_at_step(training_stats.get("min_auc_n_o"), step)
+    if name == "loss":
+        return None
+    return _current_step_correlation(
+        step=step,
+        training_stats=training_stats,
+        eval_result=eval_result,
+    )
 
 
 def _target_mean_converged(mean_by_class: Any, mean_threshold: Any) -> tuple[bool, Optional[float], Optional[float]]:
@@ -468,11 +520,14 @@ class CheckpointCallback(TrainingCallback):
     
     Behavior:
 
-    - Saves the best model based on evaluation correlation (or loss when use_loss_for_best=True)
-    - For correlation selection, uses ``|correlation|`` by default; when
-      ``prefer_convergent_checkpoint=True``, prefers steps that meet convergence thresholds
-      over a higher-|correlation| step that fails the mean criterion
-    - When use_loss_for_best=True (e.g. supervised_decoder), correlation is meaningless; best = lowest loss
+    - Saves the best model based on ``convergent_metric``
+      (``correlation`` / ``roc_auc`` / ``min_auc_n_o``) or loss when ``use_loss_for_best=True``
+    - For correlation: ``|correlation|`` by default; ``prefer_convergent_checkpoint`` can
+      prefer threshold-satisfying steps
+    - For roc_auc: raw one-vs-rest AUROC (higher better); bipolar mean gating only if
+      ``convergent_mean_by_class_threshold`` is set
+    - For min_auc_n_o: ``min(auc_n, auc_o)`` so neutrals alone cannot carry selection
+    - When use_loss_for_best=True (e.g. supervised_decoder), best = lowest loss
     - Saves periodic checkpoints every checkpoint_interval steps (if checkpoints enabled)
     - Tracks step-0 metrics but does not materialize step-0 as a selectable best checkpoint
     
@@ -502,6 +557,7 @@ class CheckpointCallback(TrainingCallback):
         self.component_best_states: Dict[str, Dict[str, Any]] = {}
         self._best_merge_rank: Optional[tuple] = None
         self._best_merge_summary: Optional[Dict[str, Any]] = None
+        self._selection_metric: str = "loss" if use_loss_for_best else "correlation"
 
     def on_step_end(self, step: int, loss: float, model, config: Dict[str, Any],
                     training_stats: Dict[str, Any], **kwargs):
@@ -597,20 +653,25 @@ class CheckpointCallback(TrainingCallback):
                         "as a selectable merged checkpoint; trained or final merge will be used instead."
                     )
         else:
-            corr = None
+            selection_metric = _selection_metric_from_config(
+                config, use_loss_for_best=self.use_loss_for_best
+            )
+            self._selection_metric = selection_metric
+            score = None
             rank = None
-            if self.use_loss_for_best:
+            if selection_metric == "loss":
                 # Best = lowest loss (e.g. supervised_decoder; correlation not meaningful)
                 is_better = self.best_score is None or loss < self.best_score
                 score_for_log = loss
             else:
-                corr = _current_step_correlation(
+                score = _current_step_selection_score(
                     step=step,
+                    metric=selection_metric,
                     training_stats=training_stats,
                     eval_result=kwargs.get("eval_result"),
                 )
-                # No current-step evaluation result; do not treat stale/sentinel correlation as a checkpoint score.
-                if corr is None:
+                # No current-step evaluation result; do not treat stale/sentinel scores as a checkpoint score.
+                if score is None:
                     is_better = False
                     score_for_log = None
                 else:
@@ -619,9 +680,10 @@ class CheckpointCallback(TrainingCallback):
                         step,
                         kwargs.get("eval_result"),
                     )
-                    rank = correlation_checkpoint_rank(
+                    rank = metric_checkpoint_rank(
                         step=step,
-                        correlation=corr,
+                        score=score,
+                        metric=selection_metric,
                         mean_by_class=mean_by_class,
                         score_threshold=_config_get(config, "convergent_score_threshold", None),
                         mean_threshold=_config_get(config, "convergent_mean_by_class_threshold", None),
@@ -630,32 +692,62 @@ class CheckpointCallback(TrainingCallback):
                         ),
                     )
                     is_better = self._best_rank is None or rank > self._best_rank
-                    score_for_log = corr
+                    score_for_log = score
 
             if is_better:
                 was_first = self.best_score is None
                 old_score = self.best_score
-                self.best_score = loss if self.use_loss_for_best else corr
+                self.best_score = loss if selection_metric == "loss" else score
                 self.best_step = step
                 self.best_epoch = kwargs.get('epoch', 0)
                 if rank is not None:
                     self._best_rank = rank
 
-                if was_first:
-                    logger.debug(f'First {"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f} at step {step}')
+                metric_label = selection_metric
+                if was_first and score_for_log is not None:
+                    logger.debug(f'First {metric_label}: {score_for_log:.4f} at step {step}')
                 elif score_for_log is not None:
-                    logger.debug(f'New best {"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f} at step {step} (previous: {old_score:.4f})')
+                    logger.debug(f'New best {metric_label}: {score_for_log:.4f} at step {step} (previous: {old_score:.4f})')
 
                 if step > 0:
                     best_output = f'{self.output}_best'
+                    best_ckpt = {
+                        'loss': loss,
+                        'global_step': step,
+                        'epoch': self.best_epoch,
+                        'selection_metric': selection_metric,
+                    }
+                    if selection_metric == "loss":
+                        best_ckpt['correlation'] = None
+                        best_ckpt['roc_auc'] = None
+                        best_ckpt['min_auc_n_o'] = None
+                        best_ckpt['loss'] = self.best_score
+                    elif selection_metric in {"roc_auc", "min_auc_n_o"}:
+                        best_ckpt[selection_metric] = self.best_score
+                        best_ckpt['correlation'] = _current_step_correlation(
+                            step=step,
+                            training_stats=training_stats,
+                            eval_result=kwargs.get("eval_result"),
+                        )
+                        ev = kwargs.get("eval_result")
+                        if isinstance(ev, dict):
+                            if selection_metric != "roc_auc":
+                                best_ckpt['roc_auc'] = ev.get("roc_auc")
+                            if selection_metric != "min_auc_n_o":
+                                best_ckpt['min_auc_n_o'] = ev.get("min_auc_n_o")
+                            best_ckpt['roc_auc_neutral'] = ev.get("roc_auc_neutral")
+                            best_ckpt['roc_auc_other'] = ev.get("roc_auc_other")
+                    else:
+                        best_ckpt['correlation'] = self.best_score
+                        if isinstance(kwargs.get("eval_result"), dict):
+                            ev = kwargs["eval_result"]
+                            best_ckpt['roc_auc'] = ev.get("roc_auc")
+                            best_ckpt['min_auc_n_o'] = ev.get("min_auc_n_o")
+                            best_ckpt['roc_auc_neutral'] = ev.get("roc_auc_neutral")
+                            best_ckpt['roc_auc_other'] = ev.get("roc_auc_other")
                     training_info = {
                         'losses': kwargs.get('losses', []),
-                        'best_score_checkpoint': {
-                            'correlation': None if self.use_loss_for_best else self.best_score,
-                            'loss': loss,
-                            'global_step': step,
-                            'epoch': self.best_epoch,
-                        },
+                        'best_score_checkpoint': best_ckpt,
                         'training_stats': training_stats,
                         'training_args': config,
                     }
@@ -663,7 +755,7 @@ class CheckpointCallback(TrainingCallback):
                     if score_for_log is not None:
                         logger.debug(
                             f'Saved best model checkpoint at step {step} '
-                            f'({"loss" if self.use_loss_for_best else "correlation"}: {score_for_log:.4f})'
+                            f'({metric_label}: {score_for_log:.4f})'
                         )
                 else:
                     logger.debug(
@@ -680,15 +772,38 @@ class CheckpointCallback(TrainingCallback):
     def on_epoch_end(self, epoch: int, model, config: Dict[str, Any], 
                     training_stats: Dict[str, Any], losses: list, **kwargs):
         """Save final model at end of epoch."""
+        selection_metric = getattr(self, "_selection_metric", None) or (
+            "loss" if self.use_loss_for_best else "correlation"
+        )
         best_score_checkpoint = {
             'global_step': self.best_step,
             'epoch': epoch,
+            'selection_metric': selection_metric,
         }
-        if self.use_loss_for_best:
+        if selection_metric == "loss" or self.use_loss_for_best:
             best_score_checkpoint['loss'] = self.best_score
             best_score_checkpoint['correlation'] = None
+            best_score_checkpoint['roc_auc'] = None
+            best_score_checkpoint['min_auc_n_o'] = None
+        elif selection_metric in {"roc_auc", "min_auc_n_o"}:
+            best_score_checkpoint[selection_metric] = self.best_score
+            best_score_checkpoint['correlation'] = training_stats.get("correlation")
+            for key in ("roc_auc", "min_auc_n_o", "roc_auc_neutral", "roc_auc_other"):
+                if key == selection_metric:
+                    continue
+                hist = training_stats.get(key)
+                if isinstance(hist, dict) and self.best_step in hist:
+                    best_score_checkpoint[key] = hist[self.best_step]
+                elif isinstance(hist, (int, float)):
+                    best_score_checkpoint[key] = hist
         else:
             best_score_checkpoint['correlation'] = self.best_score
+            for key in ("roc_auc", "min_auc_n_o", "roc_auc_neutral", "roc_auc_other"):
+                hist = training_stats.get(key)
+                if isinstance(hist, dict) and self.best_step in hist:
+                    best_score_checkpoint[key] = hist[self.best_step]
+                elif isinstance(hist, (int, float)):
+                    best_score_checkpoint[key] = hist
         if isinstance(self._best_merge_summary, dict):
             best_score_checkpoint['selection'] = 'component_best_merge'
             best_score_checkpoint['component_best_steps'] = self._best_merge_summary.get('component_best_steps')
@@ -746,6 +861,7 @@ class LoggingCallback(TrainingCallback):
         # Log if we should log AND (have losses OR have eval results for step 0)
         if should_log and (last_losses or (step == 0 and eval_result is not None)):
             eval_is_enabled = _eval_enabled(config, loss_only=self.loss_only)
+            selection_metric = _selection_metric_from_config(config, use_loss_for_best=self.loss_only)
             corr = (
                 _current_step_correlation(
                     step=step,
@@ -753,6 +869,16 @@ class LoggingCallback(TrainingCallback):
                     eval_result=eval_result,
                 )
                 if eval_is_enabled
+                else None
+            )
+            selection_score = (
+                _current_step_selection_score(
+                    step=step,
+                    metric=selection_metric,
+                    training_stats=training_stats,
+                    eval_result=eval_result,
+                )
+                if eval_is_enabled and selection_metric != "loss"
                 else None
             )
 
@@ -807,12 +933,13 @@ class LoggingCallback(TrainingCallback):
                 neutral_str = ", ".join(neutral_parts)
 
             suffix = ""
-            if eval_is_enabled and corr is not None:
-                # Match CheckpointCallback ranking (correlation-only by default).
+            if eval_is_enabled and selection_score is not None:
+                # Match CheckpointCallback ranking for the active selection metric.
                 mean_by_class = _mean_by_class_for_step(training_stats, step, eval_result)
-                rank = correlation_checkpoint_rank(
+                rank = metric_checkpoint_rank(
                     step=step,
-                    correlation=corr,
+                    score=selection_score,
+                    metric=selection_metric,
                     mean_by_class=mean_by_class,
                     score_threshold=_config_get(config, "convergent_score_threshold", None),
                     mean_threshold=_config_get(config, "convergent_mean_by_class_threshold", None),
@@ -823,7 +950,7 @@ class LoggingCallback(TrainingCallback):
                 if self._best_checkpoint_rank is None or rank > self._best_checkpoint_rank:
                     suffix = " (new best)"
                     self._best_checkpoint_rank = rank
-                    self._best_corr_including_start = float(corr)
+                    self._best_corr_including_start = float(selection_score)
             # Prefer mean over the report window so class cycling (e.g. M/F vs neutral
             # identity) does not make the logged loss look like a crash.
             reported_loss = _mean_recent_loss(last_losses, self.n_loss_report)
@@ -833,6 +960,22 @@ class LoggingCallback(TrainingCallback):
             if eval_is_enabled:
                 corr_str = "N/A" if corr is None else f"{corr:.4f}"
                 parts.append(f"Correlation: {corr_str}")
+                if selection_metric == "roc_auc":
+                    auc_str = "N/A" if selection_score is None else f"{selection_score:.4f}"
+                    parts.append(f"AUROC: {auc_str}")
+                elif selection_metric == "min_auc_n_o":
+                    auc_str = "N/A" if selection_score is None else f"{selection_score:.4f}"
+                    parts.append(f"minAUC: {auc_str}")
+                    if isinstance(eval_result, dict):
+                        auc_n = eval_result.get("roc_auc_neutral")
+                        auc_o = eval_result.get("roc_auc_other")
+                        detail = []
+                        if isinstance(auc_n, (int, float)):
+                            detail.append(f"auc_n={float(auc_n):.4f}")
+                        if isinstance(auc_o, (int, float)):
+                            detail.append(f"auc_o={float(auc_o):.4f}")
+                        if detail:
+                            parts.append("(" + " ".join(detail) + ")")
                 component_fragment = ""
                 if isinstance(eval_result, dict):
                     component_fragment = format_component_convergence_fragment(
@@ -879,9 +1022,11 @@ def get_default_callbacks(config: Any) -> List[TrainingCallback]:
     else:
         output = config.get("output_dir", "")
     supervised_decoder = getattr(config, "supervised_decoder", False) or config.get("supervised_decoder", False)
+    selection_metric = _selection_metric_from_config(config, use_loss_for_best=bool(supervised_decoder))
+    use_loss_for_best = bool(supervised_decoder) or selection_metric == "loss"
     if hasattr(config, "eval_steps"):
-        n_eval = config.eval_steps if config.do_eval and not supervised_decoder else 0
-        do_eval = config.do_eval and not supervised_decoder  # skip eval for supervised_decoder (correlation N/A)
+        n_eval = config.eval_steps if config.do_eval and not use_loss_for_best else 0
+        do_eval = config.do_eval and not use_loss_for_best  # skip eval for loss-only selection
         evaluate = config.evaluate_fn
         checkpoints = config.save_strategy == "steps"
         keep_only_best = config.save_only_best
@@ -889,8 +1034,8 @@ def get_default_callbacks(config: Any) -> List[TrainingCallback]:
         normalize_gradiend = config.normalize_gradiend
     else:
         output = config.get("output_dir", "")
-        n_eval = config.get("eval_steps", 250) if (config.get("do_eval", True) and not supervised_decoder) else 0
-        do_eval = config.get("do_eval", True) and not supervised_decoder
+        n_eval = config.get("eval_steps", 250) if (config.get("do_eval", True) and not use_loss_for_best) else 0
+        do_eval = config.get("do_eval", True) and not use_loss_for_best
         evaluate = config.get("evaluate_fn")
         checkpoints = config.get("save_strategy", "best") == "steps"
         keep_only_best = config.get("save_only_best", True)
@@ -905,7 +1050,7 @@ def get_default_callbacks(config: Any) -> List[TrainingCallback]:
             checkpoints=checkpoints,
             keep_only_best=keep_only_best,
             checkpoint_interval=checkpoint_interval,
-            use_loss_for_best=supervised_decoder,
+            use_loss_for_best=use_loss_for_best,
         ),
-        LoggingCallback(n_loss_report=n_eval if n_eval > 0 else 100, loss_only=supervised_decoder),
+        LoggingCallback(n_loss_report=n_eval if n_eval > 0 else 100, loss_only=use_loss_for_best),
     ]

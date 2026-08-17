@@ -217,12 +217,11 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def get_target_feature_class_ids(self) -> Optional[List[Any]]:
         """
-        Values of the training-data feature-class key used for stratification
-        (e.g. pre-prune over ``feature_class_id``). Neutral/identity classes are excluded.
+        Keys used for pole / class stratification (balance groups, legacy pre-prune).
 
-        These must match the dataset column / item key — typically ints for text
-        prediction. Semantic class *names* belong in :meth:`get_target_feature_classes`.
-        Override in subclasses; base raises.
+        Text prediction uses named poles (``pos`` / ``neg``) matching ``feature_pole``.
+        Pre-prune prefers :meth:`get_target_feature_classes` on ``factual_id`` when
+        available. Neutral/identity classes are excluded. Override in subclasses; base raises.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement get_target_feature_class_ids() "
@@ -235,7 +234,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
         Default: map :meth:`get_target_feature_class_ids` via
         :meth:`map_target_feature_class_ids`. Subclasses may override when names are not
-        a 1:1 map from dataset feature-class ids (e.g. one-pole text prediction).
+        a 1:1 map from pole keys (e.g. one-pole text prediction).
         """
         ids = self.get_target_feature_class_ids()
         mapped = self.map_target_feature_class_ids(ids)
@@ -245,11 +244,11 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def map_target_feature_class_ids(self, ids: Optional[List[Any]]) -> Optional[List[Any]]:
         """
-        Map target feature class IDs to string class IDs when possible.
+        Map target feature class IDs / pole keys to string class IDs when possible.
 
         Default behavior:
 
-        - If `pair` is available (exactly 2 target classes) and ids are 0/1 (int or float), map to pair[0]/pair[1].
+        - If `pair` is available and ids are ``pos``/``neg`` (or legacy 0/1), map to pair[0]/pair[1].
         - Else if target_classes are available and ids are integer indices, map to target_classes[idx].
         - Otherwise return ids unchanged.
         """
@@ -260,8 +259,10 @@ class FeatureLearningDefinition(DataProvider, ABC):
         if pair is not None:
             mapped: List[Any] = []
             for v in ids:
-                if isinstance(v, (int, float)) and v in (0, 1):
-                    mapped.append(pair[int(v)])
+                if v in ("pos", 0, 0.0) or (isinstance(v, (int, float)) and int(v) == 0):
+                    mapped.append(pair[0])
+                elif v in ("neg", 1, 1.0) or (isinstance(v, (int, float)) and int(v) == 1):
+                    mapped.append(pair[1])
                 else:
                     mapped.append(v)
             return mapped
@@ -524,9 +525,9 @@ class FeatureLearningDefinition(DataProvider, ABC):
         Returns:
             Evaluation dataset compatible with encoder analysis. The returned
             signal dataset always uses ``target=None`` because encoder
-            evaluation only encodes ``source`` signals. Encoder-only datasets
-            expand each base example to both poles so bipolar metrics remain
-            defined on one-pole training data.
+            evaluation only encodes ``source`` signals. For **one-pole** configs,
+            poles are expanded so bipolar metrics remain defined; normal two-pole
+            runs encode only the configured ``source`` (no fac/alt expand).
         """
         source = self._default_from_training_args(source, "source", fallback="factual")
         validate_source_target("source", source)
@@ -572,6 +573,16 @@ class FeatureLearningDefinition(DataProvider, ABC):
             for k, v in kwargs.items()
             if k not in ("include_other_classes", "use_all_transitions", "transition_selection", "encoder_eval_balance", "target")
         }
+        # One-pole only: expand fac/alt so correlation still sees ±1. Never for
+        # normal two-pole gender/etc. (encode source texts only).
+        is_one_pole = False
+        checker = getattr(self, "_is_one_pole_config", None)
+        if callable(checker):
+            try:
+                is_one_pole = bool(checker())
+            except Exception:
+                is_one_pole = False
+        grad_kwargs.setdefault("expand_encoder_eval_poles", is_one_pole)
         return self.create_gradient_training_dataset(
             raw,
             model_with_gradiend,

@@ -226,6 +226,9 @@ def _refresh_probs_by_dataset_for_plotting(
                 max_size_training_like=max_size_training_like,
                 max_size_neutral=max_size_neutral,
                 eval_batch_size=eval_batch_size,
+                # Plot refresh only needs probs_by_dataset; never rewrite
+                # experiment_dir/decoder_row_wise_scores.csv per grid cell.
+                export_row_wise_csv=False,
             )
 
         if isinstance(result, dict) and result.get("probs_by_dataset"):
@@ -541,10 +544,8 @@ def default_extract_candidates(results: Mapping[Any, Mapping[str, Any]]) -> Tupl
 
     Metrics convention:
 
-      - probs -> keys "<class_name>" (counterfactual: P(other) on class dataset, for strengthen)
-      - probs_factual -> "<class_name>_factual" (P(class) on class dataset) and
-
-        "<class_name>_weaken" (1 - factual, for weaken: maximize = minimize factual)
+      - probs -> keys "<class_name>" (strengthen selection scalar; counterfactual or same-panel)
+      - probs_factual -> "<class_name>_weaken" only (1 - P(class) on class dataset; weaken mode)
 
       - any scalar numeric field at top-level of entry (excluding lms/probs/probs_factual) -> metric with same key
     """
@@ -564,18 +565,100 @@ def default_extract_candidates(results: Mapping[Any, Mapping[str, Any]]) -> Tupl
 
         probs_factual = entry.get("probs_factual") or {}
         for cls, p in probs_factual.items():
-            metrics[f"{cls}_factual"] = float(p)
             metrics[f"{cls}_weaken"] = 1.0 - float(p)
+            # Same-panel strengthen may only populate probs_factual (legacy grids).
+            cls_key = str(cls)
+            if cls_key not in metrics:
+                metrics[cls_key] = float(p)
 
         for k, v in entry.items():
             if k in ("probs", "lms", "probs_factual", "probs_by_dataset"):
                 continue
             if isinstance(v, (int, float)):
                 metrics[k] = float(v)
+                # Legacy top-level ``<class>_factual`` → strengthen metric ``<class>``.
+                key = str(k)
+                if key.endswith("_factual"):
+                    base = key[: -len("_factual")]
+                    if base and base not in metrics:
+                        metrics[base] = float(v)
 
         candidates.append(Candidate(id=entry["id"], lms=lms, metrics=metrics))
 
     return candidates, BaseContext(base_lms=base_lms)
+
+
+def _decoder_results_support_metrics(
+    results: Mapping[Any, Mapping[str, Any]],
+    metrics: Sequence[str],
+    *,
+    extractor: Callable[[Mapping[Any, Mapping[str, Any]]], Tuple[List[Candidate], BaseContext]] = default_extract_candidates,
+) -> Tuple[bool, List[str]]:
+    """Whether cached decoder-grid rows expose every metric needed for summarization."""
+    if not metrics:
+        return True, []
+    try:
+        candidates, _ = extractor(results)
+    except Exception:
+        return False, list(metrics)
+    available: set = set()
+    for candidate in candidates:
+        available.update(candidate.metrics.keys())
+    missing = [m for m in metrics if m not in available]
+    return (not missing), missing
+
+
+def _decoder_cache_selection_context(
+    *,
+    prob_on_other_class: bool,
+    increase_target_probabilities: bool,
+    metrics_for_summary: Sequence[str],
+    classes_to_eval: Sequence[str],
+) -> Dict[str, Any]:
+    """Fingerprint for decoder-grid cache invalidation when selection contract changes."""
+    return {
+        "prob_on_other_class": bool(prob_on_other_class),
+        "increase_target_probabilities": bool(increase_target_probabilities),
+        "metrics_for_summary": sorted(str(m) for m in metrics_for_summary),
+        "classes_to_eval": sorted(str(c) for c in classes_to_eval),
+    }
+
+
+def _decoder_cache_selection_matches(
+    payload: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    cached = payload.get("selection_context")
+    if not isinstance(cached, dict):
+        return True
+    return all(cached.get(key) == value for key, value in expected.items())
+
+
+def _decoder_cache_payload(
+    *,
+    part: str,
+    split_cache_key: str,
+    max_size_training_like: Any,
+    max_size_neutral: Any,
+    feature_factors: Sequence[float],
+    lrs: Sequence[float],
+    intervention_cache_fingerprint: Any,
+    results: Any,
+    selection_context: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "part": part,
+        "split": split_cache_key,
+        "max_size_training_like": max_size_training_like,
+        "max_size_neutral": max_size_neutral,
+        "feature_factors": list(feature_factors),
+        "lrs": list(lrs),
+        "intervention_kwargs": intervention_cache_fingerprint,
+        "results": results,
+    }
+    if selection_context is not None:
+        payload["selection_context"] = dict(selection_context)
+    return payload
 
 
 def compute_metric_summaries(
@@ -901,17 +984,54 @@ class DecoderEvaluator:
             classes_to_eval = target_classes or []
 
         tcs = set(target_classes or [])
-        base_metrics = summary_metrics if summary_metrics is not None else classes_to_eval
-        metrics_for_summary = list(base_metrics) if base_metrics else list(classes_to_eval or [])
-        # Strengthen: maximize P(target) on the other class's dataset. evaluate_base_model always
-        # exposes that scalar as probs[target] (class-based and row-wise), so summary keys are the
-        # requested target classes. Weaken uses "<class>_weaken" from probs_factual.
-        if summary_metrics is None and classes_to_eval:
+        # Strengthen summaries must only request classes actually evaluated.
+        # ``get_target_feature_classes()`` expands one-pole to claim+CFs for token
+        # vocab; those CF names are datasets / weaken rivals, not strengthen metrics.
+        # When ``target_class`` (or an explicit ``summary_metrics``) is set, never
+        # fall through to the expanded CF list.
+        claim_eval = [str(c) for c in classes_to_eval]
+        claim_set = set(claim_eval)
+        if summary_metrics is not None:
+            metrics_for_summary = [
+                str(m)
+                for m in summary_metrics
+                if (str(m).endswith("_weaken") and str(m)[:-7] in claim_set)
+                or (not str(m).endswith("_weaken") and str(m) in claim_set)
+            ]
+            if not metrics_for_summary and claim_eval:
+                metrics_for_summary = (
+                    list(claim_eval)
+                    if increase_target_probabilities
+                    else [f"{c}_weaken" for c in claim_eval]
+                )
+        elif claim_eval:
             if increase_target_probabilities:
-                metrics_for_summary = list(classes_to_eval)
+                metrics_for_summary = list(claim_eval)
             else:
-                metrics_for_summary = [f"{c}_weaken" for c in classes_to_eval]
+                metrics_for_summary = [f"{c}_weaken" for c in claim_eval]
+        else:
+            metrics_for_summary = []
         plot_keys_override = list(classes_to_eval) if target_class is not None else None
+
+        prob_on_other_class = True
+        if trainer_config is not None:
+            prob_on_other_class = bool(
+                getattr(trainer_config, "decoder_eval_prob_on_other_class", True)
+            )
+        if training_args is not None:
+            prob_on_other_class = bool(
+                getattr(
+                    training_args,
+                    "decoder_eval_prob_on_other_class",
+                    prob_on_other_class,
+                )
+            )
+        selection_context = _decoder_cache_selection_context(
+            prob_on_other_class=prob_on_other_class,
+            increase_target_probabilities=increase_target_probabilities,
+            metrics_for_summary=metrics_for_summary,
+            classes_to_eval=classes_to_eval,
+        )
 
         # Per-class strengthen ff (see gradiend.model._source_target module docstring).
         class_to_ff: Optional[Dict[str, float]] = None
@@ -948,7 +1068,7 @@ class DecoderEvaluator:
         if lrs is None:
             lrs = [
                 m * 10 ** e
-                for e in range(2, -4, -1)
+                for e in range(2, -6, -1)
                 for m in [5, 2, 1]
                 if m * 10 ** e <= 100
             ]
@@ -1000,6 +1120,7 @@ class DecoderEvaluator:
                     and cached_max_size_neutral == max_size_neutral
                     and cached_intervention_kwargs == intervention_cache_fingerprint
                 )
+                structural_cache_matches = cache_matches
                 if cache_matches and raw_output_path and not os.path.isfile(raw_output_path):
                     logger.info(
                         "Decoder grid cache matches at %s, but raw per-sample CSV is missing at %s; recomputing.",
@@ -1007,97 +1128,125 @@ class DecoderEvaluator:
                         raw_output_path,
                     )
                     cache_matches = False
+                if cache_matches and not _decoder_cache_selection_matches(payload, selection_context):
+                    logger.info(
+                        "Decoder cache selection context mismatch at %s; recomputing.",
+                        cache_file,
+                    )
+                    cache_matches = False
                 if cache_matches:
                     relevant_results = convert_results_to_dict(payload.get("results", []))
-                    if len(relevant_results) >= expected_results:
-                        logger.info("Using cached decoder grid from %s", cache_file)
-                        summary = self.compute_metric_summaries(
-                            trainer,
-                            relevant_results,
-                            selector=selector,
-                            metrics=metrics_for_summary,
-                            extractor=summary_extractor,
-                            feature_factor_from_id=summary_feature_factor_from_id,
-                            lr_from_id=summary_lr_from_id,
-                            empty_default_id=summary_empty_default_id,
-                            class_to_ff=class_to_ff,
+                    if len(relevant_results) < expected_results:
+                        logger.info(
+                            "Decoder cache at %s has %d/%d grid entries; recomputing.",
+                            cache_file,
+                            len(relevant_results),
+                            expected_results,
                         )
-                        if not plot:
-                            out_cached = {**summary, "grid": relevant_results}
-                            if raw_output_path:
-                                out_cached["raw_output_path"] = raw_output_path
-                            return out_cached
-                        # plot=True: get full df and run fill-in + plot
-                        training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
-                            tokenizer,
+                        cache_matches = False
+                    else:
+                        metrics_ok, missing_metrics = _decoder_results_support_metrics(
+                            relevant_results,
+                            metrics_for_summary,
+                            extractor=summary_extractor,
+                        )
+                        if not metrics_ok:
+                            logger.info(
+                                "Decoder cache at %s lacks required metrics %s; recomputing.",
+                                cache_file,
+                                missing_metrics,
+                            )
+                            cache_matches = False
+                if cache_matches:
+                    logger.info("Using cached decoder grid from %s", cache_file)
+                    summary = self.compute_metric_summaries(
+                        trainer,
+                        relevant_results,
+                        selector=selector,
+                        metrics=metrics_for_summary,
+                        extractor=summary_extractor,
+                        feature_factor_from_id=summary_feature_factor_from_id,
+                        lr_from_id=summary_lr_from_id,
+                        empty_default_id=summary_empty_default_id,
+                        class_to_ff=class_to_ff,
+                    )
+                    if not plot:
+                        out_cached = {**summary, "grid": relevant_results}
+                        if raw_output_path:
+                            out_cached["raw_output_path"] = raw_output_path
+                        return out_cached
+                    # plot=True: get full df and run fill-in + plot
+                    training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
+                        tokenizer,
+                        max_size_training_like=max_size_training_like,
+                        max_size_neutral=max_size_neutral,
+                        split=split,
+                        cached_training_like_df=None,
+                        cached_neutral_df=None,
+                    )
+                    full_training_like_df = training_like_df
+                    dataset_class_col = "label_class" if "label_class" in getattr(training_like_df, "columns", []) else "factual_id"
+                    if full_training_like_df is not None and dataset_class_col in getattr(full_training_like_df, "columns", []):
+                        _refresh_probs_by_dataset_for_plotting(
+                            trainer,
+                            model_with_gradiend=model_with_gradiend,
+                            base_model=base_model,
+                            tokenizer=tokenizer,
+                            relevant_results=relevant_results,
+                            training_like_df=full_training_like_df,
+                            neutral_df=neutral_df,
+                            part=part,
+                            intervention_kwargs=resolved_intervention_kwargs,
                             max_size_training_like=max_size_training_like,
                             max_size_neutral=max_size_neutral,
-                            split=split,
-                            cached_training_like_df=None,
-                            cached_neutral_df=None,
+                            eval_batch_size=eval_batch_size,
                         )
-                        full_training_like_df = training_like_df
-                        dataset_class_col = "label_class" if "label_class" in getattr(training_like_df, "columns", []) else "factual_id"
-                        if full_training_like_df is not None and dataset_class_col in getattr(full_training_like_df, "columns", []):
-                            _refresh_probs_by_dataset_for_plotting(
-                                trainer,
-                                model_with_gradiend=model_with_gradiend,
-                                base_model=base_model,
-                                tokenizer=tokenizer,
-                                relevant_results=relevant_results,
-                                training_like_df=full_training_like_df,
-                                neutral_df=neutral_df,
+                    if cache_file:
+                        try:
+                            payload_update = _decoder_cache_payload(
                                 part=part,
-                                intervention_kwargs=resolved_intervention_kwargs,
+                                split_cache_key=split_cache_key,
                                 max_size_training_like=max_size_training_like,
                                 max_size_neutral=max_size_neutral,
-                                eval_batch_size=eval_batch_size,
+                                feature_factors=feature_factors,
+                                lrs=lrs,
+                                intervention_cache_fingerprint=intervention_cache_fingerprint,
+                                results=convert_results_to_list(relevant_results),
+                                selection_context=selection_context,
                             )
-                        if cache_file:
-                            try:
-                                payload_update = {
-                                    "part": part,
-                                    "split": split_cache_key,
-                                    "max_size_training_like": max_size_training_like,
-                                    "max_size_neutral": max_size_neutral,
-                                    "feature_factors": list(feature_factors),
-                                    "lrs": list(lrs),
-                                    "intervention_kwargs": intervention_cache_fingerprint,
-                                    "results": convert_results_to_list(relevant_results),
-                                }
-                                with open(cache_file, "w") as f:
-                                    json.dump(payload_update, f, indent=2)
-                            except Exception as e:
-                                logger.warning("Error writing decoder cache %s: %s", cache_file, e)
-                        plot_paths: List[str] = []
-                        if hasattr(trainer, "plot_probability_shifts"):
-                            try:
-                                plot_paths = _plot_all_target_classes(
-                                    trainer,
-                                    summary,
-                                    relevant_results,
-                                    experiment_dir=getattr(trainer, "experiment_dir", None),
-                                    run_id=run_id,
-                                    show=show,
-                                    increase_target_probabilities=increase_target_probabilities,
-                                    plot_keys_override=plot_keys_override,
-                                    plot_kwargs=plot_kwargs,
-                                    intervention_kwargs=resolved_intervention_kwargs,
-                                )
-                            except ImportError as e:
-                                logger.warning("Skipping decoder probability-shift plots: %s", e)
-                        out = {
-                            **summary,
-                            "grid": relevant_results,
-                            "intervention_kwargs": resolved_intervention_kwargs,
-                        }
-                        if raw_output_path:
-                            out["raw_output_path"] = raw_output_path
-                        if plot_paths:
-                            out["plot_paths"] = plot_paths
-                            out["plot_path"] = plot_paths[0] if len(plot_paths) == 1 else None
-                        return out
-                else:
+                            with open(cache_file, "w") as f:
+                                json.dump(payload_update, f, indent=2)
+                        except Exception as e:
+                            logger.warning("Error writing decoder cache %s: %s", cache_file, e)
+                    plot_paths: List[str] = []
+                    if hasattr(trainer, "plot_probability_shifts"):
+                        try:
+                            plot_paths = _plot_all_target_classes(
+                                trainer,
+                                summary,
+                                relevant_results,
+                                experiment_dir=getattr(trainer, "experiment_dir", None),
+                                run_id=run_id,
+                                show=show,
+                                increase_target_probabilities=increase_target_probabilities,
+                                plot_keys_override=plot_keys_override,
+                                plot_kwargs=plot_kwargs,
+                                intervention_kwargs=resolved_intervention_kwargs,
+                            )
+                        except ImportError as e:
+                            logger.warning("Skipping decoder probability-shift plots: %s", e)
+                    out = {
+                        **summary,
+                        "grid": relevant_results,
+                        "intervention_kwargs": resolved_intervention_kwargs,
+                    }
+                    if raw_output_path:
+                        out["raw_output_path"] = raw_output_path
+                    if plot_paths:
+                        out["plot_paths"] = plot_paths
+                        out["plot_path"] = plot_paths[0] if len(plot_paths) == 1 else None
+                    return out
+                elif not structural_cache_matches:
                     logger.info("Decoder cache mismatch (part/split/size/feature_factors/lrs); recomputing.")
             except Exception as e:
                 logger.warning("Error loading cached decoder results: %s", e)
@@ -1124,14 +1273,24 @@ class DecoderEvaluator:
             )
 
         # Restrict to datasets required for the requested direction (efficiency).
-        # Strengthen: maximize P(target) on *other* class's dataset → need other's data.
+        # Strengthen + prob_on_other_class: P(target) on the other class's dataset.
+        # Strengthen + same-panel (one-pole): P(target) on target's own dataset.
         # Weaken: maximize (1 - P(class) on class's data) → need class's data.
         full_training_like_df = training_like_df
         dataset_class_col = "label_class" if "label_class" in getattr(training_like_df, "columns", []) else "factual_id"
-        if summary_metrics is not None:
-            required_datasets = tcs
+        if summary_metrics is not None or target_class is not None:
+            # Score P(claim) on rival datasets when needed, but do not treat CF
+            # names as summary metrics. For one-pole, rivals come from the full
+            # expanded class set; for bipolar, from the other claim class(es).
+            if increase_target_probabilities and prob_on_other_class:
+                required_datasets = set(tcs) if tcs else set(classes_to_eval)
+            else:
+                required_datasets = set(classes_to_eval)
         elif increase_target_probabilities:
-            required_datasets = {d for c in classes_to_eval for d in (tcs - {c})}
+            if prob_on_other_class:
+                required_datasets = {d for c in classes_to_eval for d in (tcs - {c})}
+            else:
+                required_datasets = set(classes_to_eval)
         else:
             required_datasets = set(classes_to_eval)
         if dataset_class_col in getattr(training_like_df, "columns", []) and required_datasets:
@@ -1254,16 +1413,17 @@ class DecoderEvaluator:
             )
             if cache_file:
                 try:
-                    payload = {
-                        "part": part,
-                        "split": split_cache_key,
-                        "max_size_training_like": max_size_training_like,
-                        "max_size_neutral": max_size_neutral,
-                        "feature_factors": list(feature_factors),
-                        "lrs": list(lrs),
-                        "intervention_kwargs": intervention_cache_fingerprint,
-                        "results": convert_results_to_list(relevant_results),
-                    }
+                    payload = _decoder_cache_payload(
+                        part=part,
+                        split_cache_key=split_cache_key,
+                        max_size_training_like=max_size_training_like,
+                        max_size_neutral=max_size_neutral,
+                        feature_factors=feature_factors,
+                        lrs=lrs,
+                        intervention_cache_fingerprint=intervention_cache_fingerprint,
+                        results=convert_results_to_list(relevant_results),
+                        selection_context=selection_context,
+                    )
                     with open(cache_file, "w") as f:
                         json.dump(payload, f, indent=2)
                 except Exception as e:
@@ -1287,16 +1447,17 @@ class DecoderEvaluator:
 
         if cache_file and not plot:
             try:
-                payload = {
-                    "part": part,
-                    "split": split_cache_key,
-                    "max_size_training_like": max_size_training_like,
-                    "max_size_neutral": max_size_neutral,
-                    "feature_factors": list(feature_factors),
-                    "lrs": list(lrs),
-                    "intervention_kwargs": intervention_cache_fingerprint,
-                    "results": convert_results_to_list(relevant_results),
-                }
+                payload = _decoder_cache_payload(
+                    part=part,
+                    split_cache_key=split_cache_key,
+                    max_size_training_like=max_size_training_like,
+                    max_size_neutral=max_size_neutral,
+                    feature_factors=feature_factors,
+                    lrs=lrs,
+                    intervention_cache_fingerprint=intervention_cache_fingerprint,
+                    results=convert_results_to_list(relevant_results),
+                    selection_context=selection_context,
+                )
                 with open(cache_file, "w") as f:
                     json.dump(payload, f, indent=2)
             except Exception as e:

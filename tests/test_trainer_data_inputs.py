@@ -247,7 +247,35 @@ class TestTrainerDataAsDataFrame:
         trainer = TextPredictionTrainer(
             model="bert-base-uncased",
             config=config,
-            training_args=TrainingArguments(mask_placeholder="[PRONOUN]"),
+            training_args=TrainingArguments(
+                mask_placeholder="[PRONOUN]",
+                add_neutral_identity_transitions=False,
+            ),
+        )
+
+        training_data = trainer.create_training_data(MockTokenizer(), split="train", batch_size=1)
+        item = training_data[0]
+
+        assert training_data.mask_placeholder == "[PRONOUN]"
+        assert item["input_text"].startswith("[MASK]")
+        assert item["text"].startswith("he") or item["text"].startswith("they")
+
+    def test_config_custom_mask_placeholder_reaches_training_dataset(self):
+        df = pd.DataFrame(
+            [
+                {"masked": "[PRONOUN] is here", "split": "train", "label_class": "3SG", "label": "he"},
+                {"masked": "[PRONOUN] are here", "split": "train", "label_class": "3PL", "label": "they"},
+            ]
+        )
+        config = TextPredictionConfig(
+            data=df,
+            target_classes=["3SG", "3PL"],
+            mask_placeholder="[PRONOUN]",
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=False),
         )
 
         training_data = trainer.create_training_data(MockTokenizer(), split="train", batch_size=1)
@@ -279,15 +307,25 @@ class TestTrainerDataAsDataFrame:
             ]
         )
         config = TextPredictionConfig(data=df, target_classes=["positive", "negative"])
-        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            args=TrainingArguments(
+                source="alternative",
+                target="diff",
+                add_neutral_identity_transitions=False,
+            ),
+        )
 
         dataset = trainer.create_training_data(_DummyPredictionTokenizer(), split="train")
         by_source = dataset.data.set_index("factual_id")
 
         assert by_source.loc["positive", "label"] == 1
-        assert by_source.loc["positive", "feature_class_id"] == 0
+        assert by_source.loc["positive", "feature_pole"] == "pos"
+        assert by_source.loc["positive", "feature_class_id"] == 0  # deprecated mirror
         assert by_source.loc["negative", "label"] == -1
-        assert by_source.loc["negative", "feature_class_id"] == 1
+        assert by_source.loc["negative", "feature_pole"] == "neg"
+        assert by_source.loc["negative", "feature_class_id"] == 1  # deprecated mirror
 
 
 class TestTrainerDataAsDict:
@@ -398,7 +436,10 @@ class TestTrainerDataAsDict:
         trainer = TextPredictionTrainer(
             model="bert-base-uncased",
             config=config,
-            training_args=TrainingArguments(include_other_classes=True),
+            training_args=TrainingArguments(
+                include_other_classes=True,
+                add_neutral_identity_transitions=False,
+            ),
         )
 
         trainer._ensure_data()
@@ -602,7 +643,10 @@ class TestAddIdentityForOtherClasses:
             all_classes=["3SG", "3PL"],
             use_class_names_as_columns=True,
         )
-        training_args = TrainingArguments(add_identity_for_other_classes=True)
+        training_args = TrainingArguments(
+            add_identity_for_other_classes=True,
+            add_neutral_identity_transitions=False,
+        )
         trainer = TextPredictionTrainer(
             model="bert-base-uncased",
             config=config,
@@ -623,7 +667,10 @@ class TestAddIdentityForOtherClasses:
             target_classes=["3SG", "3PL"],
             use_class_names_as_columns=True,
         )
-        training_args = TrainingArguments(add_identity_for_other_classes=True)
+        training_args = TrainingArguments(
+            add_identity_for_other_classes=True,
+            add_neutral_identity_transitions=False,
+        )
         trainer = TextPredictionTrainer(
             model="bert-base-uncased",
             config=config,

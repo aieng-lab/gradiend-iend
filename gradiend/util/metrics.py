@@ -192,3 +192,38 @@ def f1_score(
         supports.append(support)
     return _average_metric(f1s, supports, average)
 
+
+def roc_auc_score(y_true: Sequence, y_score: Sequence) -> float:
+    """Binary ROC-AUC via Mann–Whitney U (no sklearn dependency).
+
+    ``y_true`` must be binary {0,1} (or bool). Returns 0.5 when undefined
+    (empty / single-class). Ties in scores are handled with average ranks.
+    """
+    y_true_l = _to_list(y_true)
+    y_score_l = _to_list(y_score)
+    _validate_inputs(y_true_l, y_score_l)
+    n = len(y_true_l)
+    if n == 0:
+        return 0.5
+    labels = [1 if bool(t) and t != 0 else 0 for t in y_true_l]
+    n_pos = sum(labels)
+    n_neg = n - n_pos
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+    # Average ranks for ties (1-based).
+    order = sorted(range(n), key=lambda i: float(y_score_l[i]))
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and float(y_score_l[order[j + 1]]) == float(y_score_l[order[i]]):
+            j += 1
+        # ranks i..j (0-based positions) → average of (i+1)..(j+1)
+        avg = 0.5 * ((i + 1) + (j + 1))
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    sum_pos_ranks = sum(ranks[i] for i in range(n) if labels[i] == 1)
+    # AUC = (sum ranks_pos - n_pos*(n_pos+1)/2) / (n_pos * n_neg)
+    return float((sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+
