@@ -3,6 +3,7 @@ Prediction datasets: TextBatchedDataset, TextTrainingDataset, create_masked_pair
 """
 
 import random
+import re
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
@@ -31,6 +32,84 @@ from gradiend.util.logging import suppress_tokenizer_length_warning
 # Dataset-level cloze placeholder (matches TextFilterConfig.mask). Independent of
 # tokenizer.mask_token, which is an MLM model special and may be absent (e.g. GPT-2).
 DEFAULT_DATASET_MASK_PLACEHOLDER = "[MASK]"
+
+
+def missing_mask_placeholder_message(template: str, mask_placeholder: str) -> str:
+    """Explain a template/placeholder mismatch (common when data uses ``[PRONOUN]``)."""
+    text = str(template)
+    preview = text if len(text) <= 120 else f"{text[:117]}..."
+    return (
+        f"Masked template does not contain mask_placeholder={mask_placeholder!r}. "
+        f"Got template={preview!r}. "
+        f"Set TextPredictionConfig.mask_placeholder (or TrainingArguments.mask_placeholder) "
+        f"to match the prediction slot in your data (e.g. '[PRONOUN]')."
+    )
+
+
+def require_mask_placeholder(template: str, mask_placeholder: str) -> str:
+    """Return ``template`` or raise if ``mask_placeholder`` is missing."""
+    text = str(template)
+    placeholder = str(mask_placeholder)
+    if placeholder not in text:
+        raise ValueError(missing_mask_placeholder_message(text, placeholder))
+    return text
+
+
+def validate_masked_templates_in_dataframe(
+    data: pd.DataFrame,
+    mask_placeholder: str,
+    *,
+    masked_col: str = UNIFIED_MASKED,
+) -> None:
+    """Fail fast when masked templates omit the configured prediction slot."""
+    if masked_col not in data.columns or len(data) == 0:
+        return
+    masked = data[masked_col].astype(str)
+    placeholder = str(mask_placeholder)
+    missing = ~masked.str.contains(re.escape(placeholder), regex=True)
+    if not bool(missing.any()):
+        return
+    first_bad = masked[missing].iloc[0]
+    raise ValueError(missing_mask_placeholder_message(first_bad, placeholder))
+
+
+def resolve_mask_placeholder(
+    *,
+    config: Any = None,
+    training_args: Any = None,
+    default: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
+) -> str:
+    """Resolve the dataset prediction-slot marker from config and/or training args.
+
+    ``TextPredictionConfig.mask_placeholder`` is the data-schema field. A non-default
+    value on either side is accepted; conflicting non-default values raise.
+    """
+    default = str(default) if default else DEFAULT_DATASET_MASK_PLACEHOLDER
+
+    def _as_placeholder(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return None
+        text = value.strip() if hasattr(value, "strip") else value
+        return text or None
+
+    config_ph = _as_placeholder(getattr(config, "mask_placeholder", None)) if config is not None else None
+    args_ph = (
+        _as_placeholder(getattr(training_args, "mask_placeholder", None))
+        if training_args is not None
+        else None
+    )
+    config_ph = config_ph or default
+    args_ph = args_ph or default
+    if config_ph != default and args_ph != default and config_ph != args_ph:
+        raise ValueError(
+            f"Conflicting mask_placeholder: TextPredictionConfig has {config_ph!r} "
+            f"but TrainingArguments has {args_ph!r}."
+        )
+    if config_ph != default:
+        return config_ph
+    return args_ph
 
 
 def _tokenize_classic_mlm_site_targets(
@@ -123,11 +202,8 @@ def _prediction_positions_for_filled_text(
     Prefer :func:`_filled_prediction_from_template` for new call sites; this helper
     remains for locating spans in already string-filled sequences.
     """
-    if "[MASK]" not in template:
-        raise ValueError(
-            f"Activation prediction-position selection requires a template with {DEFAULT_DATASET_MASK_PLACEHOLDER!r}."
-        )
-    prefix, _suffix = str(template).split(DEFAULT_DATASET_MASK_PLACEHOLDER, 1)
+    template = require_mask_placeholder(template, DEFAULT_DATASET_MASK_PLACEHOLDER)
+    prefix, _suffix = template.split(DEFAULT_DATASET_MASK_PLACEHOLDER, 1)
     prefix_ids = _ids_for_text(tokenizer, prefix)
     target_ids = _continuation_ids_from_prefix(tokenizer, prefix, str(target))
     if not target_ids:
@@ -347,9 +423,7 @@ def _mask_placeholder_token_spans(
     )
     char_spans = _char_spans_for_substring(template, mask_placeholder)
     if not char_spans:
-        raise ValueError(
-            f"Activation prediction-position selection requires a template with {mask_placeholder!r}."
-        )
+        raise ValueError(missing_mask_placeholder_message(template, mask_placeholder))
 
     encode_kwargs = dict(
         return_tensors="pt",
@@ -414,13 +488,9 @@ def _filled_prediction_from_template(
 
     This avoids string-replacing tokenizer artifacts (e.g. ``##ver``) into surface text.
     """
-    template = str(template)
+    template = require_mask_placeholder(template, mask_placeholder)
     target = str(target)
     mask_placeholder = str(mask_placeholder)
-    if mask_placeholder not in template:
-        raise ValueError(
-            f"Activation prediction-position selection requires a template with {mask_placeholder!r}."
-        )
     # Keep a window ending at [MASK] so long wiki templates are not left-truncated
     # in a way that drops the placeholder (see _left_truncate_template_keeping_mask).
     template = _left_truncate_template_keeping_mask(
@@ -767,7 +837,8 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                     "Per-site MLM targets (a sequence of targets) are only supported for "
                     "classic encoder MLM; decoder-only training expects a single target string."
                 )
-            expanded_text = text.split(mask_placeholder)[0] if mask_placeholder in text else text
+            # ``text`` is the CLM prefix (mask slot already removed upstream).
+            expanded_text = text
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
             input_ids = encoded["input_ids"]
@@ -839,7 +910,7 @@ class TextTrainingDataset(TextBatchedDataset):
         is_seq2seq_model: bool = False,
         max_size: Optional[int] = None,
         target_key: str = "label",
-        balance_column: str = "feature_class_id",
+        balance_column: str = "feature_pole",
         max_length: int = 128,
         seed: Optional[int] = None,
         prediction_objective: Optional[str] = None,
@@ -857,7 +928,8 @@ class TextTrainingDataset(TextBatchedDataset):
             is_seq2seq_model: If True, creates encoder-decoder style inputs.
             max_size: Optional maximum number of samples.
             target_key: Key for label/target in data.
-            balance_column: Column for balancing (e.g., feature_class_id).
+            balance_column: Column for balancing (default ``feature_pole``:
+                ``pos`` / ``neg`` / ``neutral``).
             max_length: Maximum sequence length.
             seed: Random seed for batch ordering (default 42). Use training_args.seed for reproducibility.
             prediction_objective: Optional prediction objective override, such as
@@ -882,6 +954,11 @@ class TextTrainingDataset(TextBatchedDataset):
         self.mlm_head_target_labels = list(mlm_head_target_labels) if mlm_head_target_labels else None
         self.rhs_window = rhs_window
         self.mask_placeholder = str(mask_placeholder)
+        validate_masked_templates_in_dataframe(
+            self.data,
+            self.mask_placeholder,
+            masked_col=UNIFIED_MASKED,
+        )
         if is_decoder_only_model and getattr(self.tokenizer, "pad_token", None) is None:
             eos_token = getattr(self.tokenizer, "eos_token", None)
             if eos_token is not None:
@@ -894,8 +971,8 @@ class TextTrainingDataset(TextBatchedDataset):
             idx: Row or batch index resolved by the parent batched dataset.
         """
         entry = super().__getitem__(idx)
-        template = entry[UNIFIED_MASKED]
         mask_placeholder = self.mask_placeholder
+        template = require_mask_placeholder(entry[UNIFIED_MASKED], mask_placeholder)
         if self.prediction_objective == "clm_sequence_cloze":
             input_text = template
         elif self.prediction_objective == SEQ2SEQ_DECODER_SEQUENCE_CLOZE:
@@ -904,7 +981,7 @@ class TextTrainingDataset(TextBatchedDataset):
             if self.prediction_objective == "clm_mlm_head":
                 input_text = template
             else:
-                input_text = template.split(mask_placeholder)[0] if mask_placeholder in template else template
+                input_text = template.split(mask_placeholder)[0]
         elif self.is_seq2seq_model:
             input_text = mask_placeholder_for_tokenizer(
                 template,
@@ -940,6 +1017,8 @@ class TextTrainingDataset(TextBatchedDataset):
         for key in ("is_identity_transition", "neutral_variant", "transition_type"):
             if key in entry:
                 out[key] = entry[key]
+        if "feature_pole" in entry:
+            out["feature_pole"] = entry["feature_pole"]
         if "feature_class_id" in entry:
             out["feature_class_id"] = entry["feature_class_id"]
         if UNIFIED_SPLIT in entry.index:
@@ -976,6 +1055,7 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
         *,
         source: str = "factual",
         target: str = "diff",
+        expand_encoder_eval_poles: bool = False,
         cache_dir: Optional[str] = None,
         use_cached_signals: bool = True,
         dtype: torch.dtype = torch.float32,
@@ -1001,6 +1081,7 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
             signal_extractor,
             source=source,
             target=target,
+            expand_encoder_eval_poles=expand_encoder_eval_poles,
             cache_dir=cache_dir,
             use_cached_signals=use_cached_signals,
             cache_key_fields=self.CACHE_KEY_FIELDS if (cache_dir and use_cached_signals) else None,

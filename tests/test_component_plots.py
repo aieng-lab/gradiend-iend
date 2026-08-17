@@ -36,7 +36,7 @@ def _component_df() -> pd.DataFrame:
     return pd.concat(rows, ignore_index=True)
 
 
-def test_evaluate_encoder_plot_writes_component_sidecars_by_default(tmp_path):
+def test_evaluate_encoder_plot_writes_component_sidecars_by_default(tmp_path, caplog):
     pytest.importorskip("matplotlib")
     pytest.importorskip("seaborn")
 
@@ -54,6 +54,7 @@ def test_evaluate_encoder_plot_writes_component_sidecars_by_default(tmp_path):
     trainer = TextPredictionTrainer(model="bert-base-uncased", config=config, args=args)
     trainer.get_model = MagicMock(return_value=None)
 
+    caplog.set_level("INFO")
     with patch("matplotlib.pyplot.show"):
         result = trainer.evaluate_encoder(
             encoder_df={"encoder_df": _encoder_df(), "component_df": _component_df()},
@@ -66,7 +67,15 @@ def test_evaluate_encoder_plot_writes_component_sidecars_by_default(tmp_path):
     assert (tmp_path / "components" / "encoder_analysis_split_test_components.png").exists()
     assert (tmp_path / "components" / "encoder_analysis_split_test_component_000.png").exists()
     assert (tmp_path / "components" / "encoder_analysis_split_test_component_001.png").exists()
-
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum(message.startswith("Saved encoder distribution plot:") for message in messages) == 1
+    component_messages = [
+        message for message in messages
+        if "encoder component plot" in message
+    ]
+    assert component_messages == [
+        f"Saved 3 encoder component plot(s) under {tmp_path / 'components'}"
+    ]
 
 def test_plot_training_convergence_writes_component_sidecars_by_default(tmp_path, caplog):
     pytest.importorskip("matplotlib")

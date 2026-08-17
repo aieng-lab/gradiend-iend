@@ -267,6 +267,44 @@ class TestEvaluateBaseModelProbabilityComputation:
         assert result["probs_factual"]["M"] == 0.55
         assert result["probs_factual"]["F"] == 0.19
 
+    def test_evaluate_base_model_same_panel_strengthen_ignores_neutral_panel(self, monkeypatch):
+        """One-pole / same-panel strengthen must expose probs[IO], not neutral from first panel."""
+        config = TextPredictionConfig(
+            data=_two_class_data("IO", "SUBJECT", "Alice", "Bob"),
+            target_classes=["IO", "SUBJECT"],
+            decoder_eval_targets="label",
+            decoder_eval_prob_on_other_class=False,
+            masked_col="masked",
+        )
+        trainer = _trainer(config)
+
+        monkeypatch.setattr(
+            PredictionObjective,
+            "score_probability_shift",
+            lambda *args, **kwargs: {
+                "neutral": {"neutral": 0.99, "IO": 0.01, "SUBJECT": 0.01},
+                "IO": {"IO": 0.72, "SUBJECT": 0.28},
+            },
+        )
+        monkeypatch.setattr(PredictionObjective, "compute_lms", lambda *args, **kwargs: {"lms": 0.5})
+
+        result = trainer.evaluate_base_model(
+            model=SimpleMockModel(),
+            tokenizer=MockTokenizer(),
+            training_like_df=pd.DataFrame(
+                [
+                    {"masked": "[MASK] x", "label_class": "neutral", "label": "neutral", "alternative": "x"},
+                    {"masked": "[MASK] y", "label_class": "IO", "label": "Alice", "alternative": "Bob"},
+                ]
+            ),
+            neutral_df=pd.DataFrame([{"text": "neutral_data"}]),
+            use_cache=False,
+        )
+
+        assert result["probs"]["IO"] == 0.72
+        assert "neutral" not in result["probs"]
+        assert result["probs_factual"]["IO"] == 0.72
+
     def test_decoder_eval_dataframe_caps_training_like_per_class_and_neutral_separately(self):
         """Decoder plots need both factual panels; max_size is a per-class cap, not a global first-N cap."""
         rows = []

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import nullcontext
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -14,6 +14,123 @@ from gradiend.signal_space import infer_static_module_output_dim, resolve_activa
 
 
 SignalKind = str
+
+
+class ActivationRunningRms:
+    """Online RMS scale for activation sites (O(n_sites) floats only).
+
+    Never stores activation tensors — only running mean-of-squares (or a freeze
+    after the first batch when ``momentum == 0``).
+    """
+
+    def __init__(
+        self,
+        *,
+        reduce: str = "per_site",
+        momentum: float = 0.0,
+        eps: float = 1e-6,
+    ) -> None:
+        reduce = str(reduce or "per_site").strip().lower()
+        if reduce not in {"per_site", "global"}:
+            raise ValueError(f"reduce must be 'per_site' or 'global', got {reduce!r}")
+        self.reduce = reduce
+        self.momentum = float(momentum)
+        self.eps = float(eps)
+        self._ms: Optional[torch.Tensor] = None  # mean of squares per site
+        self._n_updates = 0
+        self._frozen = False
+
+    @property
+    def n_sites(self) -> int:
+        return 0 if self._ms is None else int(self._ms.numel())
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "reduce": self.reduce,
+            "momentum": self.momentum,
+            "eps": self.eps,
+            "ms": None if self._ms is None else self._ms.detach().cpu().tolist(),
+            "n_updates": int(self._n_updates),
+            "frozen": bool(self._frozen),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        self.reduce = str(state.get("reduce") or self.reduce)
+        self.momentum = float(state.get("momentum", self.momentum))
+        self.eps = float(state.get("eps", self.eps))
+        ms = state.get("ms")
+        if ms is None:
+            self._ms = None
+        else:
+            self._ms = torch.tensor(list(ms), dtype=torch.float32)
+        self._n_updates = int(state.get("n_updates") or 0)
+        self._frozen = bool(state.get("frozen", False))
+
+    def rms(self) -> Optional[torch.Tensor]:
+        if self._ms is None:
+            return None
+        return torch.sqrt(self._ms.clamp_min(self.eps))
+
+    def update_and_scale(self, site_tensors: Sequence[torch.Tensor]) -> List[torch.Tensor]:
+        """Update running stats from ``site_tensors`` and return scaled copies."""
+        if not site_tensors:
+            return []
+        device = site_tensors[0].device
+        dtype = site_tensors[0].dtype
+        # Per-site mean square over all non-batch dims (batch × hidden → scalar).
+        stats = []
+        for t in site_tensors:
+            flat = t.detach().float().reshape(-1)
+            stats.append(flat.pow(2).mean() if flat.numel() else torch.zeros((), device=device))
+        batch_ms = torch.stack(stats).to(device=device)
+        if self.reduce == "global":
+            g = batch_ms.mean().expand_as(batch_ms)
+            batch_ms = g
+
+        if self._ms is None:
+            self._ms = batch_ms.detach().float().cpu()
+            self._n_updates = 1
+            if self.momentum <= 0.0:
+                self._frozen = True
+        elif not self._frozen:
+            cur = batch_ms.detach().float().cpu()
+            if self._ms.numel() != cur.numel():
+                raise ValueError(
+                    f"ActivationRunningRms site count changed: had {self._ms.numel()}, got {cur.numel()}"
+                )
+            if self.momentum <= 0.0:
+                # Already seeded on first batch; freeze.
+                self._frozen = True
+            else:
+                m = float(self.momentum)
+                self._ms.mul_(m).add_(cur, alpha=1.0 - m)
+                self._n_updates += 1
+
+        scales = torch.sqrt(self._ms.clamp_min(self.eps)).to(device=device, dtype=dtype)
+        out: List[torch.Tensor] = []
+        for i, t in enumerate(site_tensors):
+            s = scales[i] if self.reduce == "per_site" else scales[0]
+            out.append(t / s)
+        return out
+
+    def unscale_flat(self, flat: torch.Tensor, site_widths: Sequence[int]) -> torch.Tensor:
+        """Map a scaled concat vector back to raw activation units (for intervene)."""
+        rms = self.rms()
+        if rms is None:
+            return flat
+        if sum(int(w) for w in site_widths) != int(flat.numel()):
+            raise ValueError(
+                f"unscale_flat width mismatch: flat={flat.numel()}, sites={list(site_widths)}"
+            )
+        pieces = []
+        idx = 0
+        rms_d = rms.to(device=flat.device, dtype=flat.dtype)
+        for i, w in enumerate(site_widths):
+            w = int(w)
+            s = rms_d[i] if self.reduce == "per_site" else rms_d[0]
+            pieces.append(flat[idx : idx + w] * s)
+            idx += w
+        return torch.cat(pieces, dim=0)
 
 
 def _normalize_string_sequence(value: Optional[Union[str, Sequence[str]]], *, name: str) -> Optional[Tuple[str, ...]]:
@@ -64,11 +181,56 @@ class Signal:
         return cls("gradient", name=name)
 
     @classmethod
-    def activation(cls, *, token_selector: Optional[Any] = None, name: Optional[str] = None) -> "Signal":
-        """Activation signal. Module/site scope is controlled outside the signal."""
+    def activation(
+        cls,
+        *,
+        token_selector: Optional[Any] = None,
+        target_token_selector: Optional[Any] = None,
+        scale: Optional[str] = None,
+        scale_reduce: str = "per_site",
+        scale_momentum: float = 0.0,
+        scale_eps: float = 1e-6,
+        name: Optional[str] = None,
+    ) -> "Signal":
+        """Activation signal. Module/site scope is controlled outside the signal.
+
+        ``token_selector`` is the encoder/source gather. ``target_token_selector``
+        is the decoder/target gather when it differs (mixed-site ACTIEND: source
+        ``pre_prediction``, target ``prediction``). Omitted or equal selectors
+        keep same-site source and target.
+
+        ``scale`` (optional):
+          - ``None`` / omitted: raw activations (historical default)
+          - ``"running_rms"``: divide each site (or the concat) by a running RMS
+            estimated online from extracted activations. Only O(n_sites) floats
+            of state — never buffers activations. Use for CAA/SAE-comparable
+            activation magnitude before the ACTIEND autoencoder.
+        ``scale_reduce``: ``"per_site"`` (default) or ``"global"``.
+        ``scale_momentum``: ``0`` freezes after the first batch; ``(0,1)`` is EMA.
+        """
         options: Dict[str, Any] = {}
         if token_selector is not None:
             options["token_selector"] = token_selector
+        if target_token_selector is not None and target_token_selector != token_selector:
+            options["target_token_selector"] = target_token_selector
+        if scale is not None:
+            scale_s = str(scale).strip().lower()
+            if scale_s in {"", "none", "off", "raw"}:
+                pass
+            elif scale_s in {"running_rms", "rms"}:
+                options["scale"] = "running_rms"
+                reduce = str(scale_reduce or "per_site").strip().lower()
+                if reduce not in {"per_site", "global"}:
+                    raise ValueError(
+                        f"Signal.activation scale_reduce must be 'per_site' or 'global', got {scale_reduce!r}"
+                    )
+                options["scale_reduce"] = reduce
+                options["scale_momentum"] = float(scale_momentum)
+                options["scale_eps"] = float(scale_eps)
+            else:
+                raise ValueError(
+                    f"Signal.activation scale must be None or 'running_rms', got {scale!r}"
+                )
         return cls("activation", name=name, options=options)
 
     @classmethod
@@ -411,6 +573,33 @@ class SignalScope:
             activation_selector=activation_selector,
         )
 
+    @classmethod
+    def from_signal_space(cls, signal_space: Mapping[str, Any]) -> "SignalScope":
+        """Build explicit activation sites from a saved activation ``signal_space``."""
+        if not isinstance(signal_space, Mapping):
+            raise TypeError(
+                f"SignalScope.from_signal_space expected mapping, got {type(signal_space).__name__}"
+            )
+        kind = str(signal_space.get("kind") or "").strip().lower()
+        if kind and kind != "activation":
+            raise ValueError(
+                f"SignalScope.from_signal_space expects activation signal_space, got {kind!r}"
+            )
+        sites = []
+        for entry in signal_space.get("mapping") or ():
+            if not isinstance(entry, Mapping):
+                continue
+            name = entry.get("name")
+            if not name:
+                continue
+            site = str(name)
+            if site.startswith("activation:"):
+                site = site[len("activation:") :]
+            sites.append(site)
+        if not sites:
+            return cls.default()
+        return cls.from_values(activation_sites=tuple(sites))
+
 
 def coerce_signal_scope(value: Any) -> Optional[SignalScope]:
     """Convert user-facing signal scope shorthand to a SignalScope."""
@@ -446,11 +635,19 @@ class SignalSpace:
 
 @dataclass
 class SignalBatch:
-    """Factual/alternative/diff tensors for one signal extraction batch."""
+    """Factual/alternative/diff tensors for one signal extraction batch.
+
+    Same-site training uses ``factual`` / ``alternative`` for both encoder source
+    and decoder target. Mixed-site ACTIEND fills ``factual_target`` /
+    ``alternative_target`` with a second gather from the same forward
+    (e.g. source ``pre_prediction``, target ``prediction``).
+    """
 
     factual: Optional[torch.Tensor] = None
     alternative: Optional[torch.Tensor] = None
     diff: Optional[torch.Tensor] = None
+    factual_target: Optional[torch.Tensor] = None
+    alternative_target: Optional[torch.Tensor] = None
     signal_id: str = "gradient"
     metadata: Optional[Dict[str, Any]] = None
 
@@ -467,6 +664,8 @@ class SignalBatch:
         *,
         signal_id: str = "gradient",
         metadata: Optional[Dict[str, Any]] = None,
+        factual_target: Optional[torch.Tensor] = None,
+        alternative_target: Optional[torch.Tensor] = None,
     ) -> "SignalBatch":
         diff = None
         if factual is not None and alternative is not None:
@@ -475,6 +674,8 @@ class SignalBatch:
             factual=factual,
             alternative=alternative,
             diff=diff,
+            factual_target=factual_target,
+            alternative_target=alternative_target,
             signal_id=signal_id,
             metadata=metadata,
         )
@@ -562,6 +763,22 @@ class ActivationSignalExtractor:
         self.aggregate_batch = aggregate_batch
         self._module_items = self._resolve_modules()
         self._activation_width_validated = False
+        opts = self.signal.options or {}
+        self._scale: Optional[ActivationRunningRms] = None
+        if str(opts.get("scale") or "").lower() in {"running_rms", "rms"}:
+            self._scale = ActivationRunningRms(
+                reduce=str(opts.get("scale_reduce") or "per_site"),
+                momentum=float(opts.get("scale_momentum") or 0.0),
+                eps=float(opts.get("scale_eps") or 1e-6),
+            )
+            # Restore frozen stats from a loaded checkpoint when present.
+            gradiend = getattr(self.model, "gradiend", None)
+            kwargs = dict(getattr(gradiend, "kwargs", None) or {}) if gradiend is not None else {}
+            saved = kwargs.get("activation_scale") or (kwargs.get("signal_space") or {}).get(
+                "activation_scale"
+            )
+            if isinstance(saved, Mapping):
+                self._scale.load_state_dict(saved)
 
     def _resolve_modules(self) -> Tuple[Tuple[str, nn.Module], ...]:
         sites = tuple(self.scope.activation_sites or ()) if self.scope is not None else ()
@@ -583,7 +800,7 @@ class ActivationSignalExtractor:
         gradiend = getattr(self.model, "gradiend", None)
         configured = self._positive_int(getattr(gradiend, "input_dim", None))
         if configured is not None:
-            return configured, "configured GRADIEND input_dim"
+            return configured, "configured encoder input_dim"
         inferred = self.infer_input_dim_static()
         if inferred is not None:
             return int(inferred), "static activation-site width inference"
@@ -671,8 +888,20 @@ class ActivationSignalExtractor:
                 self.base_model(model_inputs)
         return prepared
 
-    def _select_tokens(self, activation: torch.Tensor, inputs: Any) -> torch.Tensor:
-        selector = (self.signal.options or {}).get("token_selector")
+    def _is_mixed_site(self) -> bool:
+        opts = self.signal.options or {}
+        target = opts.get("target_token_selector")
+        return target is not None and target != opts.get("token_selector")
+
+    def _select_tokens(
+        self,
+        activation: torch.Tensor,
+        inputs: Any,
+        *,
+        selector: Optional[Any] = None,
+    ) -> torch.Tensor:
+        if selector is None:
+            selector = (self.signal.options or {}).get("token_selector")
         if callable(selector):
             return selector(activation, inputs)
         if activation.dim() < 3:
@@ -729,7 +958,45 @@ class ActivationSignalExtractor:
                 prediction_mask,
                 selector_name="prediction",
             )
+        if selector in {"pre_prediction", "unfilled_prediction"}:
+            # One token before the first prediction-span position (context site).
+            # On decoder-only causal LMs this cannot attend to the fill.
+            prediction_mask = inputs.get("prediction_mask") if isinstance(inputs, Mapping) else None
+            if not torch.is_tensor(prediction_mask):
+                raise ValueError(
+                    f"token_selector={selector!r} requires inputs with prediction_mask"
+                )
+            return self._gather_pre_prediction_tokens(
+                activation,
+                prediction_mask,
+                selector_name=str(selector),
+            )
         raise ValueError(f"Unsupported activation token_selector {selector!r}")
+
+    @staticmethod
+    def _gather_pre_prediction_tokens(
+        activation: torch.Tensor,
+        prediction_mask: torch.Tensor,
+        *,
+        selector_name: str,
+    ) -> torch.Tensor:
+        """Gather residual at index = first prediction_mask True − 1 (clamped)."""
+        mask = prediction_mask.to(device=activation.device, dtype=torch.bool)
+        if mask.shape[:2] != activation.shape[:2]:
+            raise ValueError(
+                f"token_selector={selector_name!r} position mask shape {tuple(mask.shape)} "
+                f"does not match activation prefix {tuple(activation.shape[:2])}"
+            )
+        if not bool(mask.any(dim=1).all().item()):
+            raise ValueError(
+                f"token_selector={selector_name!r} requires at least one selected token in every row"
+            )
+        # First True along seq; then step one token left (context / pre-fill site).
+        first = mask.to(dtype=torch.long).argmax(dim=1)
+        pos = (first - 1).clamp(min=0)
+        b, _, d = activation.shape[0], activation.shape[1], activation.shape[-1]
+        idx = pos.view(b, 1, 1).expand(b, 1, d)
+        return activation.gather(1, idx).squeeze(1)
 
     @staticmethod
     def _mean_selected_tokens(
@@ -752,8 +1019,14 @@ class ActivationSignalExtractor:
         denom = weights.sum(dim=1).clamp_min(1.0)
         return (activation * weights).sum(dim=1) / denom
 
-    def _flatten_site(self, activation: torch.Tensor, inputs: Any) -> torch.Tensor:
-        selected = self._select_tokens(activation, inputs)
+    def _flatten_site(
+        self,
+        activation: torch.Tensor,
+        inputs: Any,
+        *,
+        selector: Optional[Any] = None,
+    ) -> torch.Tensor:
+        selected = self._select_tokens(activation, inputs, selector=selector)
         if selected.dim() == 0:
             selected = selected.reshape(1, 1)
         elif selected.dim() == 1:
@@ -799,13 +1072,13 @@ class ActivationSignalExtractor:
             f"Resolved activation_sites={resolved_sites!r}, token_selector={selector!r}. "
             f"Per-site widths: {'; '.join(site_details)}. "
             "This usually means static module-width inference was wrong, the token selector changes "
-            "the activation dimensionality, or the loaded ACTIEND/GRADIEND checkpoint does not match "
+            "the activation dimensionality, or the loaded checkpoint does not match "
             "the current base model and signal_scope. Choose an activation site with a stable 1D "
             "hidden width, pass signal_scope=SignalScope.from_values(activation_sites=[...]), or add "
             "explicit static-width support for this module type."
         )
 
-    def _extract(self, inputs: Any, *, validate_width: bool = True) -> torch.Tensor:
+    def _capture(self, inputs: Any) -> Tuple[Dict[str, torch.Tensor], Any]:
         captured: Dict[str, torch.Tensor] = {}
         handles = []
 
@@ -825,17 +1098,88 @@ class ActivationSignalExtractor:
         missing = [name for name, _module in self._module_items if name not in captured]
         if missing:
             raise RuntimeError(f"Activation hooks did not capture expected sites: {missing!r}")
-        flattened = [self._flatten_site(captured[name], prepared_inputs) for name, _module in self._module_items]
+        return captured, prepared_inputs
+
+    def _cat_flattened(
+        self,
+        captured: Mapping[str, torch.Tensor],
+        prepared_inputs: Any,
+        *,
+        selector: Optional[Any] = None,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        flattened = [
+            self._flatten_site(captured[name], prepared_inputs, selector=selector)
+            for name, _module in self._module_items
+        ]
+        if self._scale is not None:
+            flattened = self._scale.update_and_scale(flattened)
+            self._persist_scale_state()
         signal = torch.cat(flattened, dim=-1)
+        if self.aggregate_batch == "mean":
+            signal = signal.squeeze(0)
+        return signal, flattened
+
+    def _persist_scale_state(self) -> None:
+        """Write O(n_sites) RMS stats onto gradiend.kwargs for checkpointing."""
+        if self._scale is None:
+            return
+        gradiend = getattr(self.model, "gradiend", None)
+        if gradiend is None:
+            return
+        kwargs = dict(getattr(gradiend, "kwargs", None) or {})
+        kwargs["activation_scale"] = self._scale.state_dict()
+        signal_space = dict(kwargs.get("signal_space") or {})
+        signal_space["activation_scale"] = kwargs["activation_scale"]
+        kwargs["signal_space"] = signal_space
+        gradiend.kwargs = kwargs
+
+    def scale_state_dict(self) -> Optional[Dict[str, Any]]:
+        return None if self._scale is None else self._scale.state_dict()
+
+    def unscale_steering_vector(self, flat: torch.Tensor) -> torch.Tensor:
+        """Undo running-RMS scale so ACTIEND hooks write in raw activation units."""
+        if self._scale is None:
+            return flat
+        widths = []
+        for _name, module in self._module_items:
+            dim = self._static_module_output_dim(module)
+            if dim is None:
+                raise ValueError(
+                    "Cannot unscale ACTIEND steering without static per-site widths"
+                )
+            widths.append(int(dim))
+        return self._scale.unscale_flat(flat, widths)
+
+    def _extract_source_and_target(
+        self,
+        inputs: Any,
+        *,
+        validate_width: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        captured, prepared_inputs = self._capture(inputs)
+        source_sel = (self.signal.options or {}).get("token_selector")
+        source, source_flat = self._cat_flattened(
+            captured, prepared_inputs, selector=source_sel
+        )
         if validate_width:
             self._validate_extracted_width_once(
-                signal=signal,
+                signal=source,
                 captured=captured,
-                flattened=flattened,
+                flattened=source_flat,
             )
-        if self.aggregate_batch == "mean":
-            return signal.squeeze(0)
-        return signal
+        if not self._is_mixed_site():
+            return source, None
+        target_sel = (self.signal.options or {}).get("target_token_selector")
+        target, _target_flat = self._cat_flattened(
+            captured, prepared_inputs, selector=target_sel
+        )
+        return source, target
+
+    def _extract(self, inputs: Any, *, validate_width: bool = True) -> torch.Tensor:
+        source, _target = self._extract_source_and_target(
+            inputs, validate_width=validate_width
+        )
+        return source
 
     def infer_input_dim(self, sample_inputs: Any) -> int:
         """Infer flattened activation signal dimensionality from representative inputs."""
@@ -852,11 +1196,19 @@ class ActivationSignalExtractor:
         requires_factual: bool = True,
         requires_alternative: bool = True,
     ) -> SignalBatch:
-        factual = self._extract(factual_inputs) if requires_factual else None
-        alternative = self._extract(alternative_inputs) if requires_alternative else None
+        factual = factual_target = None
+        alternative = alternative_target = None
+        if requires_factual:
+            factual, factual_target = self._extract_source_and_target(factual_inputs)
+        if requires_alternative:
+            alternative, alternative_target = self._extract_source_and_target(
+                alternative_inputs
+            )
         return SignalBatch.from_factual_alternative(
             factual,
             alternative,
+            factual_target=factual_target,
+            alternative_target=alternative_target,
             signal_id=self.signal.id,
         )
 
@@ -864,6 +1216,7 @@ class ActivationSignalExtractor:
 __all__ = [
     "Signal",
     "SignalSet",
+    "ActivationRunningRms",
     "coerce_signal",
     "coerce_signal_set",
     "coerce_signal_scope",

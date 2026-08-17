@@ -68,6 +68,7 @@ def _plot_encoder_distributions_by_data_split(
     dpi: Optional[int] = None,
     cmap: str = "tab20",
     return_fig_ax: bool = False,
+    log_saved: bool = True,
     **kwargs: Any,
 ) -> Any:
     """Violin plot with feature classes on x-axis and train/val/test splits as facets."""
@@ -148,7 +149,8 @@ def _plot_encoder_distributions_by_data_split(
         out_path = f"{base}.{img_format}"
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         plt.savefig(out_path, format=img_format, dpi=dpi, bbox_inches="tight")
-        logger.info("Saved encoder distribution plot: %s", out_path)
+        if log_saved:
+            logger.info("Saved encoder distribution plot: %s", out_path)
     if show:
         plt.show()
     if return_fig_ax and fig is not None:
@@ -191,6 +193,7 @@ def plot_encoder_distributions(
     include_neutral: bool = False,
     highlight_non_convergence: Optional[bool] = None,
     return_fig_ax: bool = False,
+    log_saved: bool = True,
     **kwargs: Any,
 ) -> Any:
     """
@@ -257,6 +260,7 @@ def plot_encoder_distributions(
         figsize: Figure size (width, height) in inches. If None, uses (max(6, 1.5 * n_groups), 3).
         return_fig_ax: If True, return ``(fig, axes)`` and leave the figure open for
             caller-side customization.
+        log_saved: Whether to log the saved plot path at INFO.
         **kwargs: Forwarded to ``trainer.analyze_encoder`` when ``encoder_df`` is not supplied.
 
     Returns:
@@ -357,6 +361,7 @@ def plot_encoder_distributions(
             dpi=dpi,
             cmap=cmap,
             return_fig_ax=return_fig_ax,
+            log_saved=log_saved,
             **kwargs,
         )
 
@@ -808,7 +813,8 @@ def plot_encoder_distributions(
         if dpi is not None:
             save_kwargs["dpi"] = dpi
         plt.savefig(out_path, **save_kwargs)
-        logger.info("Saved encoder distribution plot: %s", out_path)
+        if log_saved:
+            logger.info("Saved encoder distribution plot: %s", out_path)
     elif not show and not return_fig_ax:
         plt.close()
         raise ValueError(

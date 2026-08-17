@@ -601,19 +601,49 @@ def train(
     best_score_checkpoint = {"correlation": training_stats.get("correlation", -1.0), "global_step": None, "epoch": None}
     for cb in all_callbacks:
         if isinstance(cb, CheckpointCallback):
-            if getattr(cb, "use_loss_for_best", False):
+            selection_metric = getattr(cb, "_selection_metric", None) or (
+                "loss" if getattr(cb, "use_loss_for_best", False) else "correlation"
+            )
+            if selection_metric in {"auroc", "auc", "roc-auc"}:
+                selection_metric = "roc_auc"
+            if selection_metric in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
+                selection_metric = "min_auc_n_o"
+            if selection_metric == "loss" or getattr(cb, "use_loss_for_best", False):
                 best_score_checkpoint = {
                     "correlation": None,
+                    "roc_auc": None,
+                    "min_auc_n_o": None,
                     "loss": cb.best_score,
                     "global_step": cb.best_step,
                     "epoch": cb.best_epoch,
+                    "selection_metric": "loss",
                 }
-                logger.info(f"Training completed (supervised_decoder). Best loss: {cb.best_score:.6f}")
+                logger.info(f"Training completed (loss selection). Best loss: {cb.best_score:.6f}")
+            elif selection_metric in {"roc_auc", "min_auc_n_o"}:
+                best_score_checkpoint = {
+                    "correlation": training_stats.get("correlation"),
+                    "roc_auc": training_stats.get("roc_auc"),
+                    "min_auc_n_o": training_stats.get("min_auc_n_o"),
+                    "global_step": cb.best_step,
+                    "epoch": cb.best_epoch,
+                    "selection_metric": selection_metric,
+                }
+                best_score_checkpoint[selection_metric] = cb.best_score
+                label = "AUROC" if selection_metric == "roc_auc" else "min(auc_n,auc_o)"
+                if cb.best_score is None:
+                    logger.info(f"Training completed. No encoder {label} score was recorded.")
+                else:
+                    logger.info(f"Training completed. Best {label}: {cb.best_score:.6f}")
+                if cb.best_step == 0:
+                    logger.info("Training did not improve on the initial evaluation; the best checkpoint is step 0.")
             else:
                 best_score_checkpoint = {
                     "correlation": cb.best_score,
+                    "roc_auc": training_stats.get("roc_auc"),
+                    "min_auc_n_o": training_stats.get("min_auc_n_o"),
                     "global_step": cb.best_step,
                     "epoch": cb.best_epoch,
+                    "selection_metric": "correlation",
                 }
                 if cb.best_score is None:
                     logger.info("Training completed. No encoder evaluation score was recorded.")
@@ -628,6 +658,10 @@ def train(
 
     # Check convergence status and warn if non-convergent
     convergent_metric = (training_args.convergent_metric or ("loss" if training_args.supervised_decoder else "correlation")).lower()
+    if convergent_metric in {"auroc", "auc", "roc-auc"}:
+        convergent_metric = "roc_auc"
+    if convergent_metric in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
+        convergent_metric = "min_auc_n_o"
     threshold = training_args.convergent_score_threshold
     min_convergent_seeds = training_args.min_convergent_seeds
     
@@ -668,6 +702,32 @@ def train(
             metric_val = best_component_summary.get("correlation_mean")
             converged = bool(best_component_summary.get("converged"))
             min_target_class_abs_mean = best_component_summary.get("min_target_class_abs_mean")
+        elif convergent_metric in {"roc_auc", "min_auc_n_o"}:
+            metric_val = best_score_checkpoint.get(convergent_metric)
+            if metric_val is None:
+                metric_val = training_stats.get(convergent_metric)
+            if isinstance(metric_val, dict):
+                step = best_score_checkpoint.get("global_step")
+                metric_val = metric_val.get(step, metric_val.get(str(step))) if step is not None else None
+            # Optional bipolar mean gate only when explicitly configured.
+            mean_ok = True
+            if training_args.convergent_mean_by_class_threshold is not None:
+                target_mean_product = _best_step_target_class_mean_product(training_stats, best_score_checkpoint)
+                min_target_class_abs_mean = _best_step_min_target_class_abs_mean(
+                    training_stats, best_score_checkpoint
+                )
+                mean_ok = (
+                    isinstance(min_target_class_abs_mean, (int, float))
+                    and min_target_class_abs_mean >= training_args.convergent_mean_by_class_threshold
+                )
+                sign_ok = isinstance(target_mean_product, (int, float)) and target_mean_product < 0
+            converged = (
+                best_step_ok
+                and metric_val is not None
+                and float(metric_val) >= threshold
+                and mean_ok
+                and sign_ok
+            )
         else:
             metric_val = best_score_checkpoint.get("correlation")
             if metric_val is None:

@@ -79,6 +79,7 @@ def plot_encoder_component_overview(
     output: str,
     img_format: str = "png",
     dpi: Optional[int] = None,
+    log_saved: bool = True,
 ) -> str:
     """Save a compact overview of encoder metrics for each visible component."""
     metrics_by_component = components.get("metrics_by_component") if isinstance(components, dict) else None
@@ -148,7 +149,8 @@ def plot_encoder_component_overview(
         save_kwargs["dpi"] = dpi
     fig.savefig(out_path, **save_kwargs)
     plt.close(fig)
-    logger.info("Saved encoder component overview plot: %s", out_path)
+    if log_saved:
+        logger.info("Saved encoder component overview plot: %s", out_path)
     return out_path
 
 
@@ -190,17 +192,20 @@ def plot_encoder_component_artifacts(
             output=os.path.join(component_dir, f"{stem}_components.{img_format}"),
             img_format=img_format,
             dpi=dpi,
+            log_saved=False,
         )
         if overview:
             paths.append(overview)
 
     base_kwargs = dict(plot_kwargs or {})
-    for key in ("output", "output_dir", "show", "title", "return_fig_ax", "img_format", "dpi"):
+    for key in ("output", "output_dir", "show", "title", "return_fig_ax", "img_format", "dpi", "log_saved"):
         base_kwargs.pop(key, None)
     base_kwargs.setdefault("target_and_neutral_only", True)
 
     metadata = _component_metadata_from_df(component_df)
     if not metadata:
+        if paths:
+            logger.info("Saved %d encoder component plot(s) under %s", len(paths), component_dir)
         return paths
     for item in metadata:
         component_id = item["component_id"]
@@ -222,10 +227,13 @@ def plot_encoder_component_artifacts(
             title=title,
             img_format=img_format,
             dpi=dpi,
+            log_saved=False,
             **base_kwargs,
         )
         if path:
             paths.append(path)
+    if paths:
+        logger.info("Saved %d encoder component plot(s) under %s", len(paths), component_dir)
     return paths
 
 

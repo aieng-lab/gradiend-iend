@@ -75,7 +75,7 @@ def _swap_factual_alternative_batch(batch: dict) -> dict:
 def _both_side_for_batch(index: int, *, n_balance_groups: int = 1) -> str:
     """Choose factual vs alternative pole for ``source='both'`` training.
 
-    Training datasets that set ``balance_column`` (e.g. ``feature_class_id``) cycle
+    Training datasets that set ``balance_column`` (e.g. ``feature_pole``) cycle
     balance groups with ``batch_idx % n_balance_groups``. Pole selection must be
     **orthogonal** to that phase. Using ``batch_idx % 2`` alone locks feature
     batches onto a single pole whenever ``n_balance_groups`` is even — the common
@@ -90,11 +90,11 @@ def _both_side_for_batch(index: int, *, n_balance_groups: int = 1) -> str:
 
 
 def _both_eval_base_and_side(index: int) -> tuple[int, str]:
-    """Map an encoder-eval index to (base_batch_index, side).
+    """Map an encoder-eval index to (base_batch_index, side) when expanding poles.
 
-    Encoder evaluation expands each base example to both poles so a single
-    factual row still yields labels +1 and -1 (required for correlation),
-    regardless of the training ``source``.
+    Used for ``source='both'`` encoder eval and for **one-pole** encoder eval
+    (where a single factual class would otherwise yield only one label sign).
+    Normal two-pole encoder eval must **not** expand: encode only ``source``.
     """
     base = int(index) // 2
     side = "factual" if (int(index) % 2 == 0) else "alternative"
@@ -120,10 +120,13 @@ class SignalTrainingDatasetBase:
         source: 'factual' | 'alternative' | 'diff' | 'both' | None. When None (e.g. supervised_decoder),
             source signals are not computed. ``both`` alternates poles per training batch and compiles to
             the factual/diff path via optional fac↔alt swap. For encoder evaluation (``target=None``),
-            every source expands each base example to both poles so labels +1 and -1 are always available
-            (needed for one-pole training data under any source).
+            encode only the configured ``source`` unless ``expand_encoder_eval_poles=True`` (one-pole)
+            or ``source='both'`` (both poles are the source).
         target: Same options or None. When None (e.g. supervised_encoder), target signals are not computed.
             ``source='both'`` requires ``target='diff'`` or ``target=None``.
+        expand_encoder_eval_poles: When ``target=None``, expand each base row to factual and
+            alternative poles so one-pole data still yields ±1 labels. Must stay False for
+            normal two-pole encoder eval (encode ``source`` only).
         cache_dir: Optional directory for caching extracted signals.
         use_cached_signals: If True and cache_dir set, load/save signals.
         cache_key_fields: When caching is used, list of batch keys to include in cache hash.
@@ -142,6 +145,7 @@ class SignalTrainingDatasetBase:
         *,
         source: str = 'factual',
         target: str = 'diff',
+        expand_encoder_eval_poles: bool = False,
         cache_dir: Optional[str] = None,
         use_cached_signals: bool = True,
         cache_key_fields: Optional[List[str]] = None,
@@ -187,6 +191,7 @@ class SignalTrainingDatasetBase:
         self.signals = SignalSet(self.signal)
         self.source = source
         self.target = target
+        self.expand_encoder_eval_poles = bool(expand_encoder_eval_poles)
         self.cache_dir = cache_dir
         if self.cache_dir is not None:
             os.makedirs(self.cache_dir, exist_ok=True)
@@ -208,12 +213,19 @@ class SignalTrainingDatasetBase:
                 pass
 
     def _expands_poles_for_encoder_eval(self) -> bool:
-        """Encoder-only datasets expand each pair to both poles for bipolar metrics."""
-        return self.target is None and self.source is not None
+        """One-pole encoder eval: map each index to a fac/alt pole (not ``source='both'``)."""
+        if self.target is not None or self.source is None:
+            return False
+        if self.source == "both":
+            return False
+        return self.expand_encoder_eval_poles
 
     def __len__(self) -> int:
         n_batches = len(self.training_data) // self.batch_size
-        if self._expands_poles_for_encoder_eval():
+        # Dual-pole encoder visits: source='both', or one-pole expand flag.
+        if self.target is None and (
+            self.source == "both" or self.expand_encoder_eval_poles
+        ):
             return 2 * n_batches
         return n_batches
 
@@ -337,7 +349,26 @@ class SignalTrainingDatasetBase:
             return self._values_equal(batch["factual_token"], batch["alternative_token"])
         return False
 
-    def _extract_one_side(self, inputs: Any, *, side: str) -> torch.Tensor:
+    def _is_mixed_site(self) -> bool:
+        opts = getattr(self.signal, "options", None) or {}
+        target = opts.get("target_token_selector")
+        return target is not None and target != opts.get("token_selector")
+
+    @staticmethod
+    def _pack_cached_side(source: torch.Tensor, target: Optional[torch.Tensor], *, mixed: bool) -> Any:
+        if not mixed or target is None:
+            return source
+        return {"source": source, "target": target}
+
+    @staticmethod
+    def _unpack_cached_side(payload: Any) -> tuple:
+        if isinstance(payload, dict) and "source" in payload:
+            target = payload.get("target")
+            source = payload["source"]
+            return source, source if target is None else target
+        return payload, payload
+
+    def _extract_one_side(self, inputs: Any, *, side: str) -> tuple:
         if side == "factual":
             batch = self.signal_extractor(
                 factual_inputs=inputs,
@@ -345,7 +376,8 @@ class SignalTrainingDatasetBase:
                 requires_factual=True,
                 requires_alternative=False,
             )
-            tensor = batch.factual
+            source = batch.factual
+            target = getattr(batch, "factual_target", None)
         elif side == "alternative":
             batch = self.signal_extractor(
                 factual_inputs=None,
@@ -353,12 +385,15 @@ class SignalTrainingDatasetBase:
                 requires_factual=False,
                 requires_alternative=True,
             )
-            tensor = batch.alternative
+            source = batch.alternative
+            target = getattr(batch, "alternative_target", None)
         else:
             raise ValueError(f"Unknown signal side {side!r}")
-        if tensor is None:
+        if source is None:
             raise RuntimeError(f"Signal extractor returned no {side} tensor for signal {self.signal.id!r}")
-        return tensor
+        if target is None:
+            target = source
+        return source, target
 
     def __getitem__(self, index: int) -> dict:
         timing_enabled = self.timing_steps > 0 and (index == 0 or (index + 1) % self.timing_steps == 0)
@@ -377,8 +412,8 @@ class SignalTrainingDatasetBase:
             validate_source_target_combination(source, self.target)
             fetch_index, eval_side = self._resolve_both_index(index)
         elif self._expands_poles_for_encoder_eval():
-            # Any encoder-only eval expands both poles so one-pole training data
-            # still yields ±1 labels for correlation (not only source="both").
+            # One-pole encoder eval only: expand both poles so ±1 labels exist.
+            # Normal two-pole encoder eval encodes ``source`` alone (no expand).
             fetch_index, eval_side = self._resolve_encoder_eval_index(index)
 
         indices = list(
@@ -414,78 +449,105 @@ class SignalTrainingDatasetBase:
                 cache_file_factual = os.path.join(self.cache_dir, f'factual_{h}.pt')
                 cache_file_alternative = os.path.join(self.cache_dir, f'alternative_{h}.pt')
 
-            factual_signal = None
-            alternative_signal = None
+            factual_source = None
+            factual_target = None
+            alternative_source = None
+            alternative_target = None
             identity_batch = self._is_identity_batch(batch)
+            mixed = self._is_mixed_site()
 
             if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
                 if os.path.exists(cache_file_factual):
-                    factual_signal = torch.load(cache_file_factual, weights_only=True)
+                    factual_source, factual_target = self._unpack_cached_side(
+                        torch.load(cache_file_factual, weights_only=True)
+                    )
                 if not identity_batch and os.path.exists(cache_file_alternative):
-                    alternative_signal = torch.load(cache_file_alternative, weights_only=True)
+                    alternative_source, alternative_target = self._unpack_cached_side(
+                        torch.load(cache_file_alternative, weights_only=True)
+                    )
 
             requires_factual = source in factual_computation_required_keywords or self.target in factual_computation_required_keywords
             if identity_batch and (source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords):
                 requires_factual = True
-            if factual_signal is None and requires_factual:
+            if factual_source is None and requires_factual:
                 factual_inputs = batch["factual"]
-                factual_signal = self._extract_one_side(factual_inputs, side="factual")
+                factual_source, factual_target = self._extract_one_side(factual_inputs, side="factual")
                 del factual_inputs
-                factual_signal = factual_signal.to(dtype=self.dtype, device=self.device)
+                factual_source = factual_source.to(dtype=self.dtype, device=self.device)
+                factual_target = factual_target.to(dtype=self.dtype, device=self.device)
                 if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
                     os.makedirs(self.cache_dir, exist_ok=True)
-                    torch.save(factual_signal, cache_file_factual)
+                    torch.save(
+                        self._pack_cached_side(factual_source, factual_target, mixed=mixed),
+                        cache_file_factual,
+                    )
             if timing_enabled:
                 self._sync_cuda_for_timing()
                 t_factual = time.perf_counter()
 
             requires_alternative = source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords
             if identity_batch and requires_alternative:
-                if factual_signal is None:
+                if factual_source is None:
                     factual_inputs = batch["factual"]
-                    factual_signal = self._extract_one_side(factual_inputs, side="factual")
+                    factual_source, factual_target = self._extract_one_side(factual_inputs, side="factual")
                     del factual_inputs
-                    factual_signal = factual_signal.to(dtype=self.dtype, device=self.device)
+                    factual_source = factual_source.to(dtype=self.dtype, device=self.device)
+                    factual_target = factual_target.to(dtype=self.dtype, device=self.device)
                     if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
                         os.makedirs(self.cache_dir, exist_ok=True)
-                        torch.save(factual_signal, cache_file_factual)
-                alternative_signal = factual_signal
-            elif alternative_signal is None and requires_alternative:
+                        torch.save(
+                            self._pack_cached_side(factual_source, factual_target, mixed=mixed),
+                            cache_file_factual,
+                        )
+                alternative_source = factual_source
+                alternative_target = factual_target
+            elif alternative_source is None and requires_alternative:
                 alternative_inputs = batch['alternative']
-                alternative_signal = self._extract_one_side(alternative_inputs, side="alternative")
+                alternative_source, alternative_target = self._extract_one_side(
+                    alternative_inputs, side="alternative"
+                )
                 del alternative_inputs
-                alternative_signal = alternative_signal.to(dtype=self.dtype, device=self.device)
+                alternative_source = alternative_source.to(dtype=self.dtype, device=self.device)
+                alternative_target = alternative_target.to(dtype=self.dtype, device=self.device)
                 if self.use_cached_signals and self.cache_dir is not None and cache_file_alternative:
                     os.makedirs(self.cache_dir, exist_ok=True)
-                    torch.save(alternative_signal, cache_file_alternative)
+                    torch.save(
+                        self._pack_cached_side(alternative_source, alternative_target, mixed=mixed),
+                        cache_file_alternative,
+                    )
             if timing_enabled:
                 self._sync_cuda_for_timing()
                 t_alternative = time.perf_counter()
 
             if source == 'factual':
-                source_tensor = factual_signal
+                source_tensor = factual_source
             elif source == 'alternative':
-                source_tensor = alternative_signal
+                source_tensor = alternative_source
             elif source == 'diff':
-                source_tensor = factual_signal - alternative_signal
+                source_tensor = factual_source - alternative_source
             elif source is None:
                 source_tensor = None  # e.g. supervised_decoder: only target needed
             else:
                 raise ValueError(f'Unknown source: {source}')
 
             if self.target == 'factual':
-                target_tensor = factual_signal
+                target_tensor = factual_target
             elif self.target == 'alternative':
-                target_tensor = alternative_signal
+                target_tensor = alternative_target
             elif self.target == 'diff':
-                target_tensor = source_tensor.clone() if source == 'diff' else (factual_signal - alternative_signal)
+                if source == 'diff' and not mixed:
+                    target_tensor = source_tensor.clone()
+                else:
+                    target_tensor = factual_target - alternative_target
             elif self.target is None:
                 target_tensor = None
             else:
                 raise ValueError(f'Unknown target: {self.target}')
 
-            del factual_signal
-            del alternative_signal
+            del factual_source
+            del factual_target
+            del alternative_source
+            del alternative_target
 
             output = {'source': source_tensor, 'target': target_tensor}
             for key in batch:
@@ -529,6 +591,7 @@ class GradientTrainingDataset(SignalTrainingDatasetBase):
         *,
         source: str = 'factual',
         target: str = 'diff',
+        expand_encoder_eval_poles: bool = False,
         cache_dir: Optional[str] = None,
         use_cached_gradients: bool = True,
         cache_key_fields: Optional[List[str]] = None,
@@ -552,6 +615,7 @@ class GradientTrainingDataset(SignalTrainingDatasetBase):
             GradientSignalExtractor(gradient_creator, signal=gradient_signal),
             source=source,
             target=target,
+            expand_encoder_eval_poles=expand_encoder_eval_poles,
             cache_dir=cache_dir,
             use_cached_signals=use_cached_gradients,
             cache_key_fields=cache_key_fields,

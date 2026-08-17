@@ -155,6 +155,27 @@ def test_signal_scope_semantic_shortcuts_roundtrip():
     assert SignalScope.from_dict(word_embedding.to_dict()) == word_embedding
 
 
+def test_signal_scope_from_signal_space_uses_saved_activation_sites():
+    signal_space = {
+        "kind": "activation",
+        "mapping": [
+            {"name": "transformer.wte", "shape": [768], "repr": "all"},
+            {"name": "transformer.h.0", "shape": [768], "repr": "all"},
+        ],
+    }
+    scope = SignalScope.from_signal_space(signal_space)
+    assert scope.activation_sites == ("transformer.wte", "transformer.h.0")
+
+
+def test_signal_scope_from_signal_space_strips_activation_prefix():
+    signal_space = {
+        "kind": "activation",
+        "mapping": [{"name": "activation:transformer.h.1", "shape": [768], "repr": "all"}],
+    }
+    scope = SignalScope.from_signal_space(signal_space)
+    assert scope.activation_sites == ("transformer.h.1",)
+
+
 def test_signal_scope_rejects_mixed_raw_and_semantic_activation_scopes():
     with pytest.raises(ValueError, match="either activation_sites or a semantic"):
         SignalScope.from_values(
@@ -473,8 +494,56 @@ def test_activation_signal_extractor_supports_prediction_selector():
     )
 
     assert torch.equal(batch.factual, torch.tensor([10.5, 11.5, 12.5]))
+    assert batch.factual_target is None
     assert batch.alternative is None
     assert batch.diff is None
+
+
+def test_activation_signal_keeps_target_token_selector():
+    signal = Signal.activation(
+        token_selector="pre_prediction",
+        target_token_selector="prediction",
+    )
+    assert signal.options == {
+        "token_selector": "pre_prediction",
+        "target_token_selector": "prediction",
+    }
+    same = Signal.activation(token_selector="prediction", target_token_selector="prediction")
+    assert same.options == {"token_selector": "prediction"}
+
+
+def test_activation_signal_extractor_mixed_site_one_forward_two_gathers():
+    class CountingActivationModel(TinyActivationModel):
+        def __init__(self):
+            super().__init__()
+            self.n_forward = 0
+
+        def forward(self, input_ids, attention_mask=None):
+            self.n_forward += 1
+            return super().forward(input_ids, attention_mask=attention_mask)
+
+    model = CountingActivationModel()
+    extractor = ActivationSignalExtractor(
+        model,
+        signal=Signal.activation(
+            token_selector="pre_prediction",
+            target_token_selector="prediction",
+        ),
+        scope=SignalScope.from_values(activation_sites=["emb"]),
+    )
+    batch = extractor(
+        factual_inputs={
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "prediction_mask": torch.tensor([[False, True, False], [False, True, False]]),
+        },
+        alternative_inputs=None,
+        requires_alternative=False,
+    )
+    assert model.n_forward == 1
+    # pre_prediction = index 0; prediction = index 1; batch-mean over 2 rows
+    assert torch.equal(batch.factual, torch.tensor([7.5, 8.5, 9.5]))
+    assert torch.equal(batch.factual_target, torch.tensor([10.5, 11.5, 12.5]))
+    assert batch.alternative_target is None
 
 
 def test_activation_signal_extractor_can_infer_static_input_dim_for_known_sites():
@@ -577,7 +646,7 @@ def test_activation_signal_extractor_prefers_configured_gradiend_width_for_valid
         )
 
     message = str(exc_info.value)
-    assert "configured GRADIEND input_dim" in message
+    assert "configured encoder input_dim" in message
     assert "expected 7" in message
     assert "width 3" in message
     assert "checkpoint does not match" in message

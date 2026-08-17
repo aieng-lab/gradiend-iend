@@ -279,6 +279,7 @@ class TestTextGradientTrainingDataset:
                 "alternative_id": ["3PL"],
                 "label": [1.0],
                 "feature_class_id": ["3SG->3PL"],
+                "feature_pole": ["pos"],
             }),
             tokenizer=tokenizer,
             batch_size=1,
@@ -329,6 +330,60 @@ class TestTextGradientTrainingDataset:
         assert extractor.factual_inputs["prediction_mask"].sum().item() == 1
         assert extractor.alternative_inputs["prediction_mask"].sum().item() == 1
         assert row["source"].abs().sum().item() > 0
+
+    def test_signal_dataset_mixed_site_uses_target_gather_for_diff(self):
+        class OnePairRow:
+            batch_size = 1
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, _idx):
+                return {
+                    "factual": torch.tensor([0.0]),
+                    "alternative": torch.tensor([0.0]),
+                    "label": 1.0,
+                }
+
+        class MixedSiteExtractor:
+            signal = Signal.activation(
+                token_selector="pre_prediction",
+                target_token_selector="prediction",
+            )
+
+            def __call__(
+                self,
+                factual_inputs=None,
+                alternative_inputs=None,
+                *,
+                requires_factual=True,
+                requires_alternative=True,
+            ):
+                factual = torch.tensor([1.0, 0.0]) if requires_factual else None
+                alternative = torch.tensor([1.0, 0.0]) if requires_alternative else None
+                factual_target = torch.tensor([10.0, 0.0]) if requires_factual else None
+                alternative_target = torch.tensor([4.0, 0.0]) if requires_alternative else None
+                return SignalBatch.from_factual_alternative(
+                    factual,
+                    alternative,
+                    factual_target=factual_target,
+                    alternative_target=alternative_target,
+                    signal_id="activation",
+                )
+
+        dataset = SignalTrainingDatasetBase(
+            OnePairRow(),
+            MixedSiteExtractor(),
+            source="alternative",
+            target="diff",
+            signal=Signal.activation(
+                token_selector="pre_prediction",
+                target_token_selector="prediction",
+            ),
+        )
+        row = dataset[0]
+        assert torch.equal(row["source"], torch.tensor([1.0, 0.0]))
+        assert torch.equal(row["target"], torch.tensor([6.0, 0.0]))
 
     def test_text_activation_dataset_fills_wordpiece_continuation_by_token_id(self):
         """WordPiece targets like ##ver must be inserted by id, not string-replaced."""
@@ -422,6 +477,48 @@ class TestTextGradientTrainingDataset:
         assert item["prediction_mask"].sum().item() == 2
         pred_ids = item["input_ids"][item["prediction_mask"]].tolist()
         assert pred_ids == [tokenizer.vocab["John"], tokenizer.vocab["Smith"]]
+
+    def test_filled_prediction_rejects_placeholder_mismatch_with_actionable_error(self):
+        from gradiend.trainer.text.prediction.dataset import _filled_prediction_from_template
+
+        tokenizer = MockTokenizer()
+        with pytest.raises(ValueError, match="mask_placeholder='\\[MASK\\]'"):
+            _filled_prediction_from_template(
+                tokenizer,
+                template="The person [PRONOUN] runs",
+                target="he",
+                max_length=16,
+            )
+
+    def test_text_training_dataset_rejects_missing_placeholder_for_clm_next_token(self):
+        with pytest.raises(ValueError, match="TextPredictionConfig.mask_placeholder"):
+            TextTrainingDataset(
+                data=pd.DataFrame({
+                    "masked": ["The person [PRONOUN] runs"],
+                    "factual": ["he"],
+                    "alternative": ["she"],
+                    "factual_class": ["M"],
+                    "alternative_class": ["F"],
+                    "factual_id": ["M"],
+                    "alternative_id": ["F"],
+                    "label": [1.0],
+                    "feature_class_id": ["M->F"],
+                    "feature_pole": ["pos"],
+                }),
+                tokenizer=MockTokenizer(),
+                batch_size=1,
+                is_decoder_only_model=True,
+                prediction_objective="clm_next_token",
+                mask_placeholder="[MASK]",
+            )
+
+    def test_resolve_mask_placeholder_prefers_non_default_config(self):
+        from gradiend.trainer.text.prediction.dataset import resolve_mask_placeholder
+        from gradiend.trainer.text.prediction.trainer import TextPredictionConfig
+
+        config = TextPredictionConfig(mask_placeholder="[PRONOUN]")
+        args = TrainingArguments()  # default "[MASK]"
+        assert resolve_mask_placeholder(config=config, training_args=args) == "[PRONOUN]"
 
     def test_filled_prediction_from_template_fills_every_mask_slot(self):
         from gradiend.trainer.text.prediction.dataset import _filled_prediction_from_template

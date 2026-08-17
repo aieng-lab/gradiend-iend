@@ -38,6 +38,7 @@ from gradiend.trainer.text.prediction.dataset import (
     TextActivationTrainingDataset,
     TextTrainingDataset,
     create_masked_pair_from_text,
+    resolve_mask_placeholder,
 )
 from pathlib import Path
 from gradiend.trainer.core.unified_data import (
@@ -242,6 +243,13 @@ class TextPredictionConfig(TrainerConfig):
 
     # Column names (merged format)
     masked_col: str = "masked"
+    mask_placeholder: str = "[MASK]"
+    """Dataset-level prediction-slot marker inside ``masked_col`` templates.
+
+    Independent of ``tokenizer.mask_token``. For name-filled gender data that keeps
+    ``[PRONOUN]`` in the masked column, set ``mask_placeholder=\"[PRONOUN]\"``.
+    ``TrainingArguments.mask_placeholder`` may override when this stays at the default.
+    """
     label_col: str = "label"
     label_class_col: str = "label_class"
     split_col: Optional[str] = "split"
@@ -292,8 +300,8 @@ class TextPredictionConfig(TrainerConfig):
     decoder_eval_export_row_wise_csv: bool = False
     # If True and row-wise decoder eval is used (decoder_eval_targets="label" or default with overlap),
     # export full per-row scores to experiment_dir/decoder_row_wise_scores.csv (masked, factual, alternative,
-    # factual_id, alternative_id, P_factual, P_alternative, etc.). For evaluate_decoder grids with static
-    # target-token scoring, export per-sample raw CSVs beside the grid cache instead. Default False.
+    # factual_id, alternative_id, P_factual, P_alternative, etc.). Decoder *grids* skip that per-step
+    # write and instead emit one aggregated raw CSV beside the grid cache (raw_output_path). Default False.
 
     decoder_eval_ignore_tokens: Optional[List[str]] = None
     # Tokens to ignore in LMS evaluation
@@ -396,29 +404,58 @@ class TextPredictionTrainer(Trainer):
         return TextPredictionModelWithGradiend
 
     def get_target_feature_class_ids(self):
-        """Dataset ``feature_class_id`` values for the ± training poles.
+        """Balance / pole keys for the ± training poles (excludes neutral).
 
-        ``create_training_data`` assigns ``0`` / ``1`` to the bipolar pair transitions and
-        to one-pole factual→CF / reverse edges; identity/neutral ids start at ``2``.
-        These ints are what pre-prune stratifies on — not semantic class names.
+        Text-prediction rows use ``feature_pole`` in ``{"pos", "neg", "neutral"}``.
+        This returns ``["pos", "neg"]`` for bipolar pairs and one-pole (factual→CF /
+        reverse). Semantic class *names* belong in :meth:`get_target_feature_classes`.
 
-        For decoder / metric class *names* (one-pole: + class plus CFs), use
-        :meth:`get_target_feature_classes` / :meth:`_decoder_eval_class_names`.
+        Deprecated int ``feature_class_id`` (0/1/2) is still written as a mirror of
+        ``feature_pole`` for older readers; prefer ``feature_pole``.
         """
         if self._is_one_pole_config() or self.pair is not None:
-            return [0, 1]
+            return ["pos", "neg"]
         return None
 
     def get_target_feature_classes(self):
-        """Semantic class names for decoder/metrics (not dataset ``feature_class_id`` ints).
+        """Semantic class names for decoder/metrics (not ``feature_pole`` keys).
 
         One-pole expands to the + class plus resolved counterfactual names so decoder
         token sets / per-class strengthen grids cover the CF vocabulary. Bipolar pairs
-        map ``[0, 1]`` via :meth:`map_target_feature_class_ids`.
+        return the configured pair names.
         """
         if self._is_one_pole_config():
             return self._decoder_eval_class_names()
+        pair = self.pair
+        if pair is not None:
+            return [str(pair[0]), str(pair[1])]
         return super().get_target_feature_classes()
+
+    @staticmethod
+    def _feature_pole_from_label(label: Any) -> str:
+        """Map encoding label to named feature pole for batch balance."""
+        try:
+            value = int(label)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return "pos"
+        if value < 0:
+            return "neg"
+        return "neutral"
+
+    @classmethod
+    def _deprecated_feature_class_id_from_pole(cls, pole: str) -> int:
+        """Deprecated int mirror of ``feature_pole`` (pos→0, neg→1, neutral→2)."""
+        return {"pos": 0, "neg": 1, "neutral": 2}.get(str(pole), 2)
+
+    @classmethod
+    def _attach_feature_pole_fields(cls, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Set ``feature_pole`` and deprecated int ``feature_class_id`` from ``label``."""
+        pole = cls._feature_pole_from_label(entry.get("label", 0))
+        entry["feature_pole"] = pole
+        entry["feature_class_id"] = cls._deprecated_feature_class_id_from_pole(pole)
+        return entry
 
     @staticmethod
     def _training_args_with_text_activation_defaults(args: Optional[TrainingArguments]) -> Optional[TrainingArguments]:
@@ -2399,9 +2436,14 @@ class TextPredictionTrainer(Trainer):
             tokenizer: Any,
             *,
             is_decoder_only_model: bool,
-            neutral_feature_class_id: int,
             mask_placeholder: str,
+            neutral_feature_class_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        """Build neutral identity training rows (feature_pole=neutral).
+
+        ``neutral_feature_class_id`` is deprecated; pole fields are derived from label=0.
+        """
+        del neutral_feature_class_id  # deprecated; kept for call-site compatibility
         rows: List[Dict[str, Any]] = []
         if neutral_df is None or neutral_df.empty:
             return rows
@@ -2444,18 +2486,19 @@ class TextPredictionTrainer(Trainer):
                     masked_text = masked_text.replace("[MASK]", mask_placeholder)
             if not masked_text or neutral_token is None:
                 continue
-            entry: Dict[str, Any] = {
-                UNIFIED_MASKED: masked_text,
-                UNIFIED_FACTUAL: neutral_token,
-                UNIFIED_ALTERNATIVE: neutral_token,
-                "factual_id": "neutral",
-                "alternative_id": "neutral",
-                "label": 0,
-                "feature_class_id": neutral_feature_class_id,
-                "is_identity_transition": True,
-                "neutral_variant": "neutral_identity",
-                "transition_type": "neutral_identity",
-            }
+            entry: Dict[str, Any] = self._attach_feature_pole_fields(
+                {
+                    UNIFIED_MASKED: masked_text,
+                    UNIFIED_FACTUAL: neutral_token,
+                    UNIFIED_ALTERNATIVE: neutral_token,
+                    "factual_id": "neutral",
+                    "alternative_id": "neutral",
+                    "label": 0,
+                    "is_identity_transition": True,
+                    "neutral_variant": "neutral_identity",
+                    "transition_type": "neutral_identity",
+                }
+            )
             if split_col is not None and pd.notna(neutral_row.get(split_col)):
                 entry[UNIFIED_SPLIT] = neutral_row[split_col]
             rows.append(entry)
@@ -2471,7 +2514,7 @@ class TextPredictionTrainer(Trainer):
             include_other_classes: bool = False,
             use_all_transitions: bool = False,
             transition_selection: Optional[List[Union[TransitionSpec, Tuple[str, str]]]] = None,
-            balance_column: Optional[str] = "feature_class_id",
+            balance_column: Optional[str] = "feature_pole",
             **kwargs,
     ) -> Any:
         """
@@ -2480,9 +2523,12 @@ class TextPredictionTrainer(Trainer):
         Accepts model_with_gradiend or tokenizer as first argument.
 
         When max_size is None, uses train_max_size from training_args if set.
-        For text prediction, max_size caps samples per feature_class_id (downsampling).
-        Note: Balancing happens automatically via dataset scheduler cycling; this parameter
+        For text prediction, max_size caps samples per ``feature_pole`` / balance group
+        (downsampling). Balancing happens via dataset scheduler cycling; this parameter
         primarily reduces total dataset size.
+
+        Rows include ``feature_pole`` in ``{"pos", "neg", "neutral"}`` (default
+        balance_column). Deprecated int ``feature_class_id`` (0/1/2) mirrors that pole.
 
         Args:
             model_or_tokenizer: Model-with-GRADIEND or tokenizer used to build
@@ -2623,28 +2669,22 @@ class TextPredictionTrainer(Trainer):
                 )
 
         training_pairs = []
-        feature_class_id_map = {
-            (class_pair[0], class_pair[1]): 0,
-            (class_pair[1], class_pair[0]): 1,
-        }
-        # One-pole multi-CF: all factual→CF edges share the + pole id; reverse share −.
-        if fac_cfg and resolved_cf:
-            for f in fac_cfg:
-                for c in resolved_cf:
-                    feature_class_id_map[(str(f), str(c))] = 0
-                    feature_class_id_map[(str(c), str(f))] = 1
-        next_fcid = 2
-        add_identity = bool(getattr(training_args, "add_identity_for_other_classes", False))
-        add_neutral_identity = bool(getattr(training_args, "add_neutral_identity_transitions", True))
-        mask_placeholder = getattr(training_args, "mask_placeholder", "[MASK]") if training_args is not None else "[MASK]"
-
-        def _feature_class_id(src: str, tgt: str) -> int:
-            nonlocal next_fcid
-            key = (str(src), str(tgt))
-            if key not in feature_class_id_map:
-                feature_class_id_map[key] = next_fcid
-                next_fcid += 1
-            return feature_class_id_map[key]
+        add_identity = bool(
+            getattr(training_args, "add_identity_for_other_classes", False)
+            if training_args is not None
+            else False
+        )
+        # Default True only when TrainingArguments is present (package default).
+        # Without args, skip neutrals — there is no configured neutral pool.
+        add_neutral_identity = bool(
+            getattr(training_args, "add_neutral_identity_transitions", True)
+            if training_args is not None
+            else False
+        )
+        mask_placeholder = resolve_mask_placeholder(
+            config=self.config,
+            training_args=training_args,
+        )
 
         fac_set = {str(c) for c in fac_cfg} if fac_cfg else set()
         cf_set = {str(c) for c in resolved_cf} if resolved_cf else set()
@@ -2661,16 +2701,17 @@ class TextPredictionTrainer(Trainer):
                     label = 0
             else:
                 label = 1 if src == class_pair[0] else (-1 if src == class_pair[1] else 0)
-            pair_entry = {
-                "masked": row[UNIFIED_MASKED],
-                "factual": row[UNIFIED_FACTUAL],
-                "alternative": row[UNIFIED_ALTERNATIVE],
-                "factual_id": src,
-                "alternative_id": tgt,
-                "label": label,
-                "feature_class_id": _feature_class_id(src, tgt),
-                "is_identity_transition": False,
-            }
+            pair_entry = self._attach_feature_pole_fields(
+                {
+                    "masked": row[UNIFIED_MASKED],
+                    "factual": row[UNIFIED_FACTUAL],
+                    "alternative": row[UNIFIED_ALTERNATIVE],
+                    "factual_id": src,
+                    "alternative_id": tgt,
+                    "label": label,
+                    "is_identity_transition": False,
+                }
+            )
             if UNIFIED_SPLIT in row.index and pd.notna(row[UNIFIED_SPLIT]):
                 pair_entry[UNIFIED_SPLIT] = row[UNIFIED_SPLIT]
             training_pairs.append(pair_entry)
@@ -2684,17 +2725,18 @@ class TextPredictionTrainer(Trainer):
                 neutral_data = split_data[split_data[UNIFIED_FACTUAL_CLASS].isin(neutral_classes)].copy()
                 for _, row in neutral_data.iterrows():
                     c = row[UNIFIED_FACTUAL_CLASS]
-                    identity_entry = {
-                        UNIFIED_MASKED: row[UNIFIED_MASKED],
-                        UNIFIED_FACTUAL: row[UNIFIED_FACTUAL],
-                        UNIFIED_ALTERNATIVE: row[UNIFIED_FACTUAL],
-                        "factual_id": c,
-                        "alternative_id": c,
-                        "label": 0,
-                        "feature_class_id": _feature_class_id(c, c),
-                        "is_identity_transition": True,
-                        "transition_type": "identity",
-                    }
+                    identity_entry = self._attach_feature_pole_fields(
+                        {
+                            UNIFIED_MASKED: row[UNIFIED_MASKED],
+                            UNIFIED_FACTUAL: row[UNIFIED_FACTUAL],
+                            UNIFIED_ALTERNATIVE: row[UNIFIED_FACTUAL],
+                            "factual_id": c,
+                            "alternative_id": c,
+                            "label": 0,
+                            "is_identity_transition": True,
+                            "transition_type": "identity",
+                        }
+                    )
                     if UNIFIED_SPLIT in row.index and pd.notna(row[UNIFIED_SPLIT]):
                         identity_entry[UNIFIED_SPLIT] = row[UNIFIED_SPLIT]
                     training_pairs.append(identity_entry)
@@ -2718,29 +2760,30 @@ class TextPredictionTrainer(Trainer):
                         if factual_col is None:
                             continue
                         for _, row in subset.iterrows():
-                            training_pairs.append({
-                                "masked": row[masked_col_cfg],
-                                "factual": row[factual_col],
-                                "alternative": row[factual_col],
-                                "factual_id": c,
-                                "alternative_id": c,
-                                "label": 0,
-                                "feature_class_id": _feature_class_id(c, c),
-                                "is_identity_transition": True,
-                                "transition_type": "identity",
-                            })
+                            training_pairs.append(
+                                self._attach_feature_pole_fields(
+                                    {
+                                        "masked": row[masked_col_cfg],
+                                        "factual": row[factual_col],
+                                        "alternative": row[factual_col],
+                                        "factual_id": c,
+                                        "alternative_id": c,
+                                        "label": 0,
+                                        "is_identity_transition": True,
+                                        "transition_type": "identity",
+                                    }
+                                )
+                            )
         elif add_identity and not self.all_classes:
             logger.warning(
                 "add_identity_for_other_classes is True but classes are not defined; skipping identity augmentation.")
 
         if add_neutral_identity:
             neutral_df = self._resolve_shared_neutral_dataframe(split=split, required=True)
-            neutral_feature_class_id = _feature_class_id("neutral", "neutral")
             neutral_identity_rows = self._neutral_identity_rows(
                 neutral_df,
                 tokenizer,
                 is_decoder_only_model=bool(is_decoder_only_model),
-                neutral_feature_class_id=neutral_feature_class_id,
                 mask_placeholder=mask_placeholder,
             )
             if not neutral_identity_rows:
@@ -2754,7 +2797,7 @@ class TextPredictionTrainer(Trainer):
 
         # Apply max_size if specified: cap per logical balancing group.
         # For encoder eval this may be factual_id / alternative_id (depending on source),
-        # while diff-style training naturally uses feature_class_id transitions.
+        # while training balance defaults to feature_pole (pos/neg/neutral).
         # The dataset's balance_column (set below) cycles through groups, ensuring equal
         # representation via oversampling. This downsampling reduces total dataset size but is
         # not strictly necessary for balancing (the scheduler handles that). It's kept for
@@ -2766,7 +2809,7 @@ class TextPredictionTrainer(Trainer):
         group_cap_col = (
             balance_column
             if balance_column is not None and balance_column in training_df.columns
-            else "feature_class_id"
+            else "feature_pole"
         )
         if max_size is not None and len(training_df) > max_size:
             training_df = _sample_up_to_per_group(training_df, group_cap_col, max_size, seed)
@@ -2995,6 +3038,7 @@ class TextPredictionTrainer(Trainer):
             max_size_neutral: Optional[int] = None,
             eval_batch_size: Optional[int] = None,
             return_decoder_per_row_df: bool = False,
+            export_row_wise_csv: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
         Evaluate a model for decoder evaluation using generic feature score + LMS.
@@ -3019,6 +3063,10 @@ class TextPredictionTrainer(Trainer):
                 returned dict with one row per evaluated prediction sample. This is
                 intentionally kept out of the JSON cache; callers that grid-search
                 many candidates should persist it as a separate raw-results artifact.
+            export_row_wise_csv: If True, write ``experiment_dir/decoder_row_wise_scores.csv``.
+                If None (default), follow ``config.decoder_eval_export_row_wise_csv`` **unless**
+                ``return_decoder_per_row_df=True`` (decoder grid collection) — then skip the
+                per-step overwrite so the grid can aggregate once into ``raw_output_path``.
 
         Returns:
             Dict with 'feature_score' and 'lms' keys
@@ -3099,10 +3147,14 @@ class TextPredictionTrainer(Trainer):
         # Do NOT group by alternative_id for panels — same key names, different semantics.
         dataset_class_col = label_dataset_col
 
-        export_row_wise_csv = use_row_wise and getattr(
-            self.config, "decoder_eval_export_row_wise_csv", False
-        )
-        return_per_row_df = export_row_wise_csv or return_decoder_per_row_df
+        cfg_export = bool(getattr(self.config, "decoder_eval_export_row_wise_csv", False))
+        if export_row_wise_csv is None:
+            # Decoder grid passes return_decoder_per_row_df=True for every (ff, lr);
+            # do not rewrite experiment_dir/decoder_row_wise_scores.csv each step.
+            do_export = bool(use_row_wise and cfg_export and not return_decoder_per_row_df)
+        else:
+            do_export = bool(use_row_wise and export_row_wise_csv)
+        return_per_row_df = do_export or return_decoder_per_row_df
         eval_out = objective.score_probability_shift(
             model,
             tokenizer,
@@ -3118,7 +3170,7 @@ class TextPredictionTrainer(Trainer):
         if return_per_row_df and isinstance(eval_out, tuple) and len(eval_out) == 2 and hasattr(eval_out[1], "columns"):
             probs_by_dataset, per_row_df = eval_out
             csv_path = resolve_decoder_row_wise_csv_path(self.experiment_dir)
-            if export_row_wise_csv and csv_path and not per_row_df.empty:
+            if do_export and csv_path and not per_row_df.empty:
                 os.makedirs(os.path.dirname(csv_path), exist_ok=True)
                 per_row_df.to_csv(csv_path, index=False)
                 logger.info("Saved row-wise decoder eval scores to %s", csv_path)
@@ -3152,11 +3204,20 @@ class TextPredictionTrainer(Trainer):
                     probs_factual[class_name] = float(probs_by_dataset[class_name][class_name])
             probs = counterfactual_probs if counterfactual_probs else next(iter(probs_by_dataset.values()))
         else:
-            probs = next(iter(probs_by_dataset.values())) if probs_by_dataset else {}
+            # Same-panel strengthen (one-pole): selection uses P(class) on that class's dataset.
+            # Mirror pair-mode contract: expose under probs[class], not *_factual suffixes.
+            selection_classes = list(class_names_for_metrics)
+            restrict = self._decoder_eval_class_names() or self.target_classes
+            if restrict:
+                restrict_set = frozenset(str(c) for c in restrict)
+                selection_classes = [c for c in selection_classes if c in restrict_set]
             if probs_by_dataset:
-                for class_name in class_names_for_metrics:
+                for class_name in selection_classes:
                     if class_name in probs_by_dataset and class_name in probs_by_dataset[class_name]:
                         probs_factual[class_name] = float(probs_by_dataset[class_name][class_name])
+            probs = dict(probs_factual) if probs_factual else (
+                next(iter(probs_by_dataset.values())) if probs_by_dataset else {}
+            )
 
         # Compute LMS
         ignore_tokens = self.config.decoder_eval_ignore_tokens
@@ -3585,7 +3646,10 @@ class TextPredictionTrainer(Trainer):
         objective_name = self._prediction_objective(getattr(model_with_gradiend, "base_model", tokenizer)).name
         neutral_objective_name = self._neutral_encoder_prediction_objective(objective_name)
         rhs_window = getattr(getattr(self, "_training_args", None), "decoder_sequence_cloze_rhs_window", -1)
-        mask_placeholder = getattr(getattr(self, "_training_args", None), "mask_placeholder", "[MASK]")
+        mask_placeholder = resolve_mask_placeholder(
+            config=self.config,
+            training_args=getattr(self, "_training_args", None),
+        )
         logger.debug(f"Tokenizer: is_decoder_only_model={is_decoder_only_model}, mask_token={mask_token}")
 
         # Collect training data entries and re-mask non-target tokens
@@ -3631,15 +3695,18 @@ class TextPredictionTrainer(Trainer):
                 continue
 
             # Build pair for TextTrainingDataset; encoding is done once when iterating gradient_data
-            neutral_training_masked_pairs.append({
-                UNIFIED_MASKED: masked_text,
-                UNIFIED_FACTUAL: original_token,
-                UNIFIED_ALTERNATIVE: original_token,
-                "factual_id": "neutral",
-                "alternative_id": "neutral",
-                "label": 0,
-                "feature_class_id": 0,
-            })
+            neutral_training_masked_pairs.append(
+                self._attach_feature_pole_fields(
+                    {
+                        UNIFIED_MASKED: masked_text,
+                        UNIFIED_FACTUAL: original_token,
+                        UNIFIED_ALTERNATIVE: original_token,
+                        "factual_id": "neutral",
+                        "alternative_id": "neutral",
+                        "label": 0,
+                    }
+                )
+            )
 
         rows: List[Dict[str, Any]] = []
         component_rows: List[Dict[str, Any]] = []
@@ -3657,7 +3724,7 @@ class TextPredictionTrainer(Trainer):
                 prediction_objective=neutral_objective_name,
                 rhs_window=rhs_window,
                 target_key="label",
-                balance_column="feature_class_id",
+                balance_column="feature_pole",
                 mask_placeholder=mask_placeholder,
                 max_length=max_length,
             )
@@ -3785,15 +3852,18 @@ class TextPredictionTrainer(Trainer):
                     neutral_token,
                 )
                 continue
-            neutral_pairs.append({
-                UNIFIED_MASKED: masked_text,
-                UNIFIED_FACTUAL: neutral_token,  # Use actual token (not empty) for neutral
-                UNIFIED_ALTERNATIVE: neutral_token,  # Same token for both (makes diff=0 but factual non-zero)
-                "factual_id": "neutral",
-                "alternative_id": "neutral",
-                "label": 0,
-                "feature_class_id": 0,
-            })
+            neutral_pairs.append(
+                self._attach_feature_pole_fields(
+                    {
+                        UNIFIED_MASKED: masked_text,
+                        UNIFIED_FACTUAL: neutral_token,  # Use actual token (not empty) for neutral
+                        UNIFIED_ALTERNATIVE: neutral_token,  # Same token for both (makes diff=0 but factual non-zero)
+                        "factual_id": "neutral",
+                        "alternative_id": "neutral",
+                        "label": 0,
+                    }
+                )
+            )
             neutral_dataset_count += 1
 
         logger.debug(f"Created {neutral_dataset_count} neutral pairs from {len(neutral_data_df)} rows")
@@ -3816,7 +3886,7 @@ class TextPredictionTrainer(Trainer):
             prediction_objective=neutral_objective_name,
             rhs_window=rhs_window,
             target_key="label",
-            balance_column="feature_class_id",
+            balance_column="feature_pole",
             max_length=max_length,
         )
 
@@ -4375,7 +4445,7 @@ class TextPredictionTrainer(Trainer):
             )
 
         training_config = model_with_gradiend.gradiend.kwargs.get('training', {}).get('training_args', {})
-        source_type = training_config.get('source', 'factual')
+        source_type = encoder_kwargs.get("source") or training_config.get('source', 'factual')
 
         # create_eval_data only accepts split, source, max_size, include_other_classes, etc.
         # Do not pass column-override or other encoder-only kwargs (text_col, masked_col, ...).

@@ -312,33 +312,45 @@ def _build_one_pole_both_text_training_data(*, batch_size: int, n_feature: int =
     return trainer, training_data
 
 
-def test_one_pole_feature_class_ids_match_dataset_for_pre_prune():
-    """Regression: one-pole IDs are dataset ints; names stay on get_target_feature_classes.
-
-    Pre-prune stratifies on ``feature_class_id`` column values. Returning string class
-    names from ``get_target_feature_class_ids`` made stratification find zero classes.
-    """
-    from gradiend.trainer.core.pruning import _stratified_indices
+def test_one_pole_feature_pole_and_name_based_pre_prune():
+    """One-pole emits named feature_pole; pre-prune stratifies on factual_id names."""
+    from gradiend.trainer.core.pruning import (
+        PrePruneConfig,
+        _resolve_pre_prune_stratification,
+        _stratified_indices,
+    )
 
     trainer, training_data = _build_one_pole_both_text_training_data(batch_size=1)
-    ids = trainer.get_target_feature_class_ids()
-    assert ids == [0, 1]
+    assert trainer.get_target_feature_class_ids() == ["pos", "neg"]
 
     df = training_data.data
-    present = set(int(v) for v in df["feature_class_id"].unique())
-    assert set(ids).issubset(present)
+    assert "feature_pole" in df.columns
+    poles = set(df["feature_pole"].astype(str).unique())
+    assert poles <= {"pos", "neg", "neutral"}
+    # One-pole factual filter keeps + rows; source=both synthesizes the − pole at batch time.
+    assert "pos" in poles
+    assert "neutral" in poles
+    # Deprecated int mirror of feature_pole.
+    assert set(int(v) for v in df["feature_class_id"].unique()) <= {0, 1, 2}
 
     names = trainer.get_target_feature_classes()
     assert names is not None
     assert names[0] == "asian"
     assert set(names) >= {"asian", "black", "white"}
 
-    # Same filter pre_prune uses: target ids ∩ dataset keys must be non-empty.
+    key, targets = _resolve_pre_prune_stratification(
+        training_data,
+        PrePruneConfig(n_samples=4, topk=0.1),
+        trainer,
+    )
+    assert key == "factual_id"
+    # After one-pole factual filter, only + class rows remain in the training frame.
+    assert targets == ["asian"]
     indices = _stratified_indices(
         training_data,
         n_samples=4,
-        feature_class_key="feature_class_id",
-        target_feature_class_ids=ids,
+        feature_class_key=key,
+        target_feature_class_ids=targets,
         seed=0,
     )
     assert len(indices) == 4
@@ -391,21 +403,23 @@ def test_both_e2e_real_text_dataset_with_neutrals_exposes_both_feature_poles(bat
 
     df = training_data.data
     assert (df["neutral_variant"] == "neutral_identity").any()
-    feature_fcids = sorted(
+    assert "feature_pole" in df.columns
+    feature_poles = sorted(
         {
-            int(v)
-            for v in df.loc[df["factual_id"] != "neutral", "feature_class_id"].unique()
+            str(v)
+            for v in df.loc[df["factual_id"] != "neutral", "feature_pole"].unique()
         }
     )
-    neutral_fcids = sorted(
+    neutral_poles = sorted(
         {
-            int(v)
-            for v in df.loc[df["factual_id"] == "neutral", "feature_class_id"].unique()
+            str(v)
+            for v in df.loc[df["factual_id"] == "neutral", "feature_pole"].unique()
         }
     )
-    assert feature_fcids, "expected feature training rows"
-    assert neutral_fcids, "expected neutral identity rows"
-    assert set(feature_fcids).isdisjoint(set(neutral_fcids))
+    assert feature_poles, "expected feature training rows"
+    assert neutral_poles == ["neutral"], "expected neutral identity rows"
+    assert set(feature_poles).isdisjoint(set(neutral_poles))
+    assert set(feature_poles) <= {"pos", "neg"}
 
     signal_dataset = SignalTrainingDatasetBase(
         training_data,
@@ -690,11 +704,11 @@ def test_both_encoder_only_expands_each_example_to_both_poles():
     assert all(c["requires_alternative"] is False for c in extractor.calls)
 
 
-@pytest.mark.parametrize("source", ["factual", "alternative", "diff", "both"])
-def test_encoder_eval_expands_one_pole_for_all_sources(source):
-    """Encoder-only eval expands both poles for any source (not only source='both')."""
+@pytest.mark.parametrize("source", ["factual", "alternative", "diff"])
+def test_encoder_eval_does_not_expand_two_pole_by_default(source):
+    """Normal two-pole encoder eval encodes source only (no fac/alt expand)."""
     dataset = SignalTrainingDatasetBase(
-        _FixedPairRows(n=1),
+        _FixedPairRows(n=2),
         _RecordingExtractor(),
         source=source,
         target=None,
@@ -702,6 +716,26 @@ def test_encoder_eval_expands_one_pole_for_all_sources(source):
         device=torch.device("cpu"),
     )
     assert len(dataset) == 2
+    assert dataset.expand_encoder_eval_poles is False
+
+
+@pytest.mark.parametrize("source", ["factual", "alternative", "diff", "both"])
+def test_encoder_eval_expands_one_pole_when_flag_set(source):
+    """One-pole encoder eval expands both poles when expand_encoder_eval_poles=True."""
+    dataset = SignalTrainingDatasetBase(
+        _FixedPairRows(n=1),
+        _RecordingExtractor(),
+        source=source,
+        target=None,
+        expand_encoder_eval_poles=True,
+        signal=Signal.gradient(),
+        device=torch.device("cpu"),
+    )
+    if source == "both":
+        # source='both' visits both poles via its own mapping (len==2 for n=1).
+        assert len(dataset) == 2
+    else:
+        assert len(dataset) == 2
     labels = [int(dataset[i]["label"]) for i in range(2)]
     assert set(labels) == {1, -1}
 
@@ -713,6 +747,7 @@ def test_factual_encoder_eval_expand_enables_correlation_from_one_pole_row():
         _RecordingExtractor(),
         source="factual",
         target=None,
+        expand_encoder_eval_poles=True,
         signal=Signal.gradient(),
         device=torch.device("cpu"),
     )

@@ -193,6 +193,49 @@ class TrainerForStrengthenWeakenTestGrid:
         return result
 
 
+class TrainerForSamePanelStrengthenTest(TrainerForStrengthenWeakenTest):
+    """One-pole IO: strengthen on own factual panel (decoder_eval_prob_on_other_class=False)."""
+
+    def __init__(self):
+        super().__init__()
+        self.target_classes = ["IO", "SUBJECT"]
+        self._model.feature_class_encoding_direction = {"IO": 1.0, "SUBJECT": -1.0}
+        self.config = MagicMock()
+        self.config.decoder_eval_prob_on_other_class = False
+        self._training_args.decoder_eval_prob_on_other_class = False
+
+    def _get_decoder_eval_dataframe(self, tokenizer, **kwargs):
+        training_like_df = pd.DataFrame([
+            {"masked": "[MASK] a", "label_class": "IO", "label": "Alice"},
+            {"masked": "[MASK] b", "label_class": "SUBJECT", "label": "Bob"},
+        ])
+        neutral_df = pd.DataFrame([{"text": "neutral"}])
+        return training_like_df, neutral_df
+
+    def _resolve_decoder_eval_targets(self, training_like_df=None):
+        return (None, True)
+
+    def evaluate_base_model(self, base_model, tokenizer, *, training_like_df=None, **kwargs):
+        if training_like_df is not None and hasattr(training_like_df, "columns"):
+            col = "label_class" if "label_class" in training_like_df.columns else "factual_id"
+            if col in training_like_df.columns:
+                dataset_classes = sorted(training_like_df[col].dropna().astype(str).unique().tolist())
+            else:
+                dataset_classes = []
+        else:
+            dataset_classes = []
+        self._evaluate_base_model_calls.append({"dataset_classes": dataset_classes})
+
+        # Same-panel strengthen: scalar lives in probs_factual[IO]; probs may be stale/legacy.
+        probs = {"neutral": 0.01}
+        probs_factual = {"IO": 0.85, "neutral": 0.99}
+        return {
+            "lms": {"lms": 0.99},
+            "probs": probs,
+            "probs_factual": probs_factual,
+        }
+
+
 class TestDecoderStrengthenWeakenDataset:
     """Ensure correct probability on correct dataset for strengthen and weaken."""
 
@@ -301,3 +344,23 @@ class TestDecoderStrengthenWeakenDataset:
         # We return factual 3SG: base 0.1 (weaken 0.9), modified 0.05 (weaken 0.95) → selector picks 0.95
         assert "3SG_weaken" in result
         assert result["3SG_weaken"]["value"] == pytest.approx(0.95, abs=1e-5)
+
+    def test_same_panel_strengthen_uses_target_dataset(self):
+        """One-pole strengthen must score on IO rows, not SUBJECT (other class)."""
+        evaluator = DecoderEvaluator()
+        trainer = TrainerForSamePanelStrengthenTest()
+        result = evaluator.evaluate_decoder(
+            trainer,
+            target_class="IO",
+            increase_target_probabilities=True,
+            feature_factors=[-1.0],
+            lrs=[1e-2],
+            plot=False,
+        )
+        for call in trainer._evaluate_base_model_calls:
+            assert call["dataset_classes"] == ["IO"], (
+                "Same-panel strengthen IO must use IO dataset rows, not SUBJECT."
+            )
+        assert "IO" in result
+        assert result["IO"]["value"] == 0.85
+        assert "IO_weaken" not in result

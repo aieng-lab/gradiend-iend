@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from gradiend.util.metrics import accuracy_score
+from gradiend.util.metrics import accuracy_score, roc_auc_score
 
 from gradiend.util import json_loads
 from gradiend.util.encoder_splits import order_split_names
@@ -52,6 +52,117 @@ def get_correlation(
 	if np.isnan(corr):
 		return 0.0
 	return float(corr)
+
+
+def get_roc_auc_one_vs_rest(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+) -> float:
+	"""One-vs-rest ROC-AUC: positive = ``label > threshold``, else negative.
+
+	Default threshold ``0.5`` so only clearly positive labels (e.g. ``+1``) count
+	as the + pole; CF (``-1``), identity (``0``), and dataset neutrals are
+	negatives. Returns 0.5 when undefined.
+	"""
+	if len(df) < 2:
+		return 0.5
+	labels = np.asarray(df[label_col], dtype=float)
+	scores = np.asarray(df[encoded_col], dtype=float)
+	finite = np.isfinite(labels) & np.isfinite(scores)
+	if int(finite.sum()) < 2:
+		return 0.5
+	y = (labels[finite] > float(positive_label_threshold)).astype(int)
+	if y.min() == y.max():
+		return 0.5
+	return float(roc_auc_score(y.tolist(), scores[finite].tolist()))
+
+
+def _roc_auc_masked(
+	labels: np.ndarray,
+	scores: np.ndarray,
+	*,
+	positive_mask: np.ndarray,
+	negative_mask: np.ndarray,
+) -> Optional[float]:
+	"""Binary AUROC on an explicit positive/negative mask pair; None if undefined."""
+	keep = (positive_mask | negative_mask) & np.isfinite(labels) & np.isfinite(scores)
+	if int(keep.sum()) < 2:
+		return None
+	y = positive_mask[keep].astype(int)
+	if y.min() == y.max():
+		return None
+	return float(roc_auc_score(y.tolist(), scores[keep].tolist()))
+
+
+def get_roc_auc_neutral(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+	neutral_abs_threshold: float = 0.5,
+) -> Optional[float]:
+	"""``auc_n``: target (``label > +thr``) vs neutrals (``|label| <= thr``)."""
+	if len(df) < 2:
+		return None
+	labels = np.asarray(df[label_col], dtype=float)
+	scores = np.asarray(df[encoded_col], dtype=float)
+	pos = labels > float(positive_label_threshold)
+	neu = np.abs(labels) <= float(neutral_abs_threshold)
+	return _roc_auc_masked(labels, scores, positive_mask=pos, negative_mask=neu)
+
+
+def get_roc_auc_other(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+	negative_label_threshold: float = -0.5,
+) -> Optional[float]:
+	"""``auc_o``: target (``label > +thr``) vs rivals (``label < -thr``)."""
+	if len(df) < 2:
+		return None
+	labels = np.asarray(df[label_col], dtype=float)
+	scores = np.asarray(df[encoded_col], dtype=float)
+	pos = labels > float(positive_label_threshold)
+	neg = labels < float(negative_label_threshold)
+	return _roc_auc_masked(labels, scores, positive_mask=pos, negative_mask=neg)
+
+
+def get_roc_auc_min_n_o(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+) -> Dict[str, Optional[float]]:
+	"""``min(auc_n, auc_o)`` plus components for one-pole checkpoint selection.
+
+	Missing side is omitted from the min (so pair data without neutrals can still
+	use ``auc_o`` alone). Returns ``min_auc_n_o=0.5`` when neither is defined.
+	"""
+	auc_n = get_roc_auc_neutral(
+		df,
+		encoded_col=encoded_col,
+		label_col=label_col,
+		positive_label_threshold=positive_label_threshold,
+	)
+	auc_o = get_roc_auc_other(
+		df,
+		encoded_col=encoded_col,
+		label_col=label_col,
+		positive_label_threshold=positive_label_threshold,
+	)
+	parts = [v for v in (auc_n, auc_o) if isinstance(v, (int, float))]
+	return {
+		"roc_auc_neutral": float(auc_n) if auc_n is not None else None,
+		"roc_auc_other": float(auc_o) if auc_o is not None else None,
+		"min_auc_n_o": float(min(parts)) if parts else 0.5,
+	}
 
 
 def _should_use_metrics_cache(csv_path: str, json_path: str) -> bool:
@@ -359,6 +470,8 @@ def _compute_metrics_from_df(
 
 		if len(df_all) > 0:
 			pearson_all = get_correlation(df_all)
+			roc_auc_all = get_roc_auc_one_vs_rest(df_all)
+			min_parts_all = get_roc_auc_min_n_o(df_all)
 			df_all_labels = df_all["label"].astype(float).tolist()
 			df_all_preds = df_all["encoded"].astype(float).tolist()
 			actual_all = [_classify_value(v) for v in df_all_labels]
@@ -366,10 +479,18 @@ def _compute_metrics_from_df(
 			acc_all = accuracy_score(actual_all, pred_all)
 		else:
 			pearson_all = 0.0
+			roc_auc_all = 0.5
+			min_parts_all = {
+				"roc_auc_neutral": None,
+				"roc_auc_other": None,
+				"min_auc_n_o": 0.5,
+			}
 			acc_all = 0.0
 
 		if len(df_training) > 0:
 			pearson_training = get_correlation(df_training)
+			roc_auc_training = get_roc_auc_one_vs_rest(df_training)
+			min_parts_training = get_roc_auc_min_n_o(df_training)
 			df_training_labels = df_training["label"].astype(float).tolist()
 			df_training_preds = df_training["encoded"].astype(float).tolist()
 			actual_training = [_classify_value(v) for v in df_training_labels]
@@ -377,10 +498,18 @@ def _compute_metrics_from_df(
 			acc_training = accuracy_score(actual_training, pred_training)
 		else:
 			pearson_training = 0.0
+			roc_auc_training = 0.5
+			min_parts_training = {
+				"roc_auc_neutral": None,
+				"roc_auc_other": None,
+				"min_auc_n_o": 0.5,
+			}
 			acc_training = 0.0
 
 		if len(target_only_df) > 0:
 			pearson_target_only = get_correlation(target_only_df)
+			roc_auc_target_only = get_roc_auc_one_vs_rest(target_only_df)
+			min_parts_target = get_roc_auc_min_n_o(target_only_df)
 			labels_target_only = target_only_df["label"].astype(float).tolist()
 			preds_target_only = target_only_df["encoded"].astype(float).tolist()
 			actual_target_only = [_classify_binary(v) for v in labels_target_only]
@@ -388,19 +517,37 @@ def _compute_metrics_from_df(
 			acc_target_only = accuracy_score(actual_target_only, pred_target_only)
 		else:
 			pearson_target_only = 0.0
+			roc_auc_target_only = 0.5
+			min_parts_target = {
+				"roc_auc_neutral": None,
+				"roc_auc_other": None,
+				"min_auc_n_o": 0.5,
+			}
 			acc_target_only = 0.0
 
 		all_dimension_scores[dim] = {
 			"all_data": {
 				"correlation": float(pearson_all),
+				"roc_auc": float(roc_auc_all),
+				"roc_auc_neutral": min_parts_all.get("roc_auc_neutral"),
+				"roc_auc_other": min_parts_all.get("roc_auc_other"),
+				"min_auc_n_o": float(min_parts_all.get("min_auc_n_o", 0.5)),
 				"accuracy": float(acc_all),
 			},
 			"training_only": {
 				"correlation": float(pearson_training),
+				"roc_auc": float(roc_auc_training),
+				"roc_auc_neutral": min_parts_training.get("roc_auc_neutral"),
+				"roc_auc_other": min_parts_training.get("roc_auc_other"),
+				"min_auc_n_o": float(min_parts_training.get("min_auc_n_o", 0.5)),
 				"accuracy": float(acc_training),
 			},
 			"target_classes_only": {
 				"correlation": float(pearson_target_only),
+				"roc_auc": float(roc_auc_target_only),
+				"roc_auc_neutral": min_parts_target.get("roc_auc_neutral"),
+				"roc_auc_other": min_parts_target.get("roc_auc_other"),
+				"min_auc_n_o": float(min_parts_target.get("min_auc_n_o", 0.5)),
 				"accuracy": float(acc_target_only),
 			},
 		}
@@ -494,6 +641,14 @@ def _compute_metrics_from_df(
 
 	# Top-level correlation = training_only (for callbacks, best-checkpoint selection)
 	corr_training = all_dimension_scores[0]["training_only"]["correlation"]
+	# One-vs-rest AUROC on all_data so dataset neutrals (label 0) count as negatives —
+	# matches one-pole "only the + pole should fire" (label > 0.5) checkpoint selection.
+	roc_auc_all = all_dimension_scores[0]["all_data"]["roc_auc"]
+	# Split AUCs on all_data: auc_n = target vs neutral, auc_o = target vs rival.
+	# min_auc_n_o is the one-pole selection metric that cannot be carried by neutrals alone.
+	auc_n_all = all_dimension_scores[0]["all_data"].get("roc_auc_neutral")
+	auc_o_all = all_dimension_scores[0]["all_data"].get("roc_auc_other")
+	min_auc_all = all_dimension_scores[0]["all_data"].get("min_auc_n_o", 0.5)
 
 	result: Dict[str, Any] = {
 		"n_samples": n_samples,
@@ -507,6 +662,10 @@ def _compute_metrics_from_df(
 			"neutral_boundary": neutral_boundary,
 		},
 		"correlation": corr_training,
+		"roc_auc": float(roc_auc_all),
+		"roc_auc_neutral": float(auc_n_all) if isinstance(auc_n_all, (int, float)) else None,
+		"roc_auc_other": float(auc_o_all) if isinstance(auc_o_all, (int, float)) else None,
+		"min_auc_n_o": float(min_auc_all) if isinstance(min_auc_all, (int, float)) else 0.5,
 		"mean_by_class": mean_by_class,
 		"min_by_class": min_by_class,
 		"max_by_class": max_by_class,
@@ -791,5 +950,9 @@ __all__ = [
 	"get_component_metrics_from_dataframe",
 	"get_encoder_metrics_from_dataframe",
 	"get_correlation",
+	"get_roc_auc_one_vs_rest",
+	"get_roc_auc_neutral",
+	"get_roc_auc_other",
+	"get_roc_auc_min_n_o",
 	"invalidate_encoder_metrics_cache",
 ]
