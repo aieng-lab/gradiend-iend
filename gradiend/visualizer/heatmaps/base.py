@@ -34,8 +34,17 @@ def filter_comparison_heatmap_plot_kwargs(kwargs: Optional[Dict[str, Any]]) -> D
     return {k: v for k, v in kwargs.items() if k not in _MATRIX_COMPUTE_KWARGS}
 
 
-def _encoding_measure_is_signed(measure: Optional[str]) -> bool:
+_DISPERSION_CELL_STAT_FIELDS = frozenset({"std", "range_half_width"})
+
+
+def _encoding_measure_is_signed(
+    measure: Optional[str],
+    *,
+    cell_stat_field: Optional[str] = None,
+) -> bool:
     """Whether encoded-value heatmaps use a diverging (signed) color scale."""
+    if cell_stat_field in _DISPERSION_CELL_STAT_FIELDS:
+        return False
     if not measure:
         return False
     name = str(measure)
@@ -50,10 +59,15 @@ def _encoding_measure_is_signed(measure: Optional[str]) -> bool:
     return False
 
 
-def _default_colormap_for_measure(measure: Optional[str], cmap: str) -> str:
+def _default_colormap_for_measure(
+    measure: Optional[str],
+    cmap: str,
+    *,
+    cell_stat_field: Optional[str] = None,
+) -> str:
     if cmap != "viridis":
         return cmap
-    if _encoding_measure_is_signed(measure):
+    if _encoding_measure_is_signed(measure, cell_stat_field=cell_stat_field):
         return "coolwarm"
     return cmap
 
@@ -329,7 +343,7 @@ def plot_comparison_heatmap(
     measure_name = str(comparison_data.get("measure") or "")
     value_name = comparison_data.get("value")
     cell_stat_field = _comparison_cell_stat_field(comparison_data)
-    is_dispersion_stat_matrix = cell_stat_field in {"std", "range_half_width"}
+    is_dispersion_stat_matrix = cell_stat_field in _DISPERSION_CELL_STAT_FIELDS
     base_measure = _base_measure_name(measure_name, cell_stat_field)
 
     if percentages:
@@ -424,10 +438,17 @@ def plot_comparison_heatmap(
     row_normalized_by_diagonal = bool(comparison_data.get("row_normalized_by_diagonal"))
     normalized_cross_encoding = row_normalized_by_diagonal and str(measure).startswith("cross_encoding_")
     cross_encoding_difference = measure == "cross_encoding_positive_minus_negative"
-    signed_encoding = _encoding_measure_is_signed(measure)
+    signed_encoding = _encoding_measure_is_signed(
+        measure,
+        cell_stat_field=cell_stat_field,
+    )
     signed_measures = {"cosine_signed", "spearman_signed", "cross_encoding_positive_minus_negative"}
     bounded_unit_measures = {"cosine", "cosine_signed", "spearman", "spearman_signed", "mass_overlap", "cross_encoding_positive_mean", "cross_encoding_negative_mean", "cross_encoding_positive_minus_negative"}
-    cmap = _default_colormap_for_measure(measure, cmap)
+    cmap = _default_colormap_for_measure(
+        measure,
+        cmap,
+        cell_stat_field=cell_stat_field,
+    )
     color_norm = None
     if color_center is not None:
         color_norm = resolve_encoding_color_norm(
@@ -455,7 +476,7 @@ def plot_comparison_heatmap(
             cbar_label = color_norm.legend_label
     if vmin is None:
         if is_dispersion_stat_matrix:
-            vmin = float(np.nanmin(mat_arr))
+            vmin = 0.0
         elif cross_encoding_difference or signed_encoding:
             vmin, _ = _symmetric_value_limits(mat_arr)
         elif measure in signed_measures:
@@ -515,6 +536,18 @@ def plot_comparison_heatmap(
     cbar_kws = {"shrink": 0.75 if cbar_shrink is None else float(cbar_shrink)}
     if cbar_pad is not None:
         cbar_kws["pad"] = cbar_pad
+    if is_dispersion_stat_matrix and color_norm is None and scale == "linear":
+        from matplotlib.ticker import MaxNLocator
+
+        lower = float(vmin)
+        upper = float(vmax)
+        interior_ticks = MaxNLocator(nbins=5).tick_values(lower, upper)
+        interior_ticks = interior_ticks[
+            (interior_ticks >= lower) & (interior_ticks <= upper)
+        ]
+        cbar_kws["ticks"] = np.unique(
+            np.concatenate(([lower], interior_ticks, [upper]))
+        )
     # Do not pass cbar_label through cbar_kws: "%" is a TeX comment when usetex is on.
 
     def _draw_heatmap_with_plain_seaborn_text():

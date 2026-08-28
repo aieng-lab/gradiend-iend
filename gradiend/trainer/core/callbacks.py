@@ -30,6 +30,7 @@ from gradiend.trainer.core.component_seed import (
 )
 from gradiend.trainer.core.stats import (
     _mean_by_class_for_step,
+    _positive_target_class_mean,
     _target_class_mean_stats,
     metric_checkpoint_rank,
 )
@@ -57,6 +58,8 @@ def _normalize_selection_metric(raw: Any) -> str:
         return "min_auc_n_o"
     if name in {"correlation", "corr"}:
         return "correlation"
+    if name in {"e", "encoding_e", "encoding-e", "encodinge"}:
+        return "encoding_e"
     if name == "loss":
         return "loss"
     return name
@@ -65,7 +68,10 @@ def _normalize_selection_metric(raw: Any) -> str:
 def _selection_metric_from_config(config: Any, *, use_loss_for_best: bool = False) -> str:
     if use_loss_for_best:
         return "loss"
-    return _normalize_selection_metric(_config_get(config, "convergent_metric", "correlation"))
+    explicit = _config_get(config, "selection_metric", None)
+    if explicit is None:
+        explicit = _config_get(config, "convergent_metric", "correlation")
+    return _normalize_selection_metric(explicit)
 
 
 def _current_step_correlation(
@@ -110,6 +116,10 @@ def _current_step_selection_score(
         if isinstance(eval_result, dict) and eval_result.get("min_auc_n_o") is not None:
             return float(eval_result["min_auc_n_o"])
         return _hist_float_at_step(training_stats.get("min_auc_n_o"), step)
+    if name == "encoding_e":
+        if isinstance(eval_result, dict) and eval_result.get("encoding_e") is not None:
+            return float(eval_result["encoding_e"])
+        return _hist_float_at_step(training_stats.get("encoding_e"), step)
     if name == "loss":
         return None
     return _current_step_correlation(
@@ -415,14 +425,28 @@ class NormalizationCallback(TrainingCallback):
             return
 
         if model.gradiend.latent_dim == 1 and 'mean_by_class' in eval_result:
-            # For normalization, if the correlation is strongly negative, invert the encoding.
+            # Correlation is sign-symmetric and keeps its historical correlation-based
+            # normalization. AUC is self-orienting, so explicitly orient the learned
+            # encoding: the semantic positive target (numeric label +1) must have mean > 0.
             try:
+                selection_metric = _selection_metric_from_config(config)
+                is_auc_metric = selection_metric in {"roc_auc", "min_auc_n_o", "encoding_e"}
+                positive_target_mean = _positive_target_class_mean(eval_result.get('mean_by_class'))
                 corr_raw = eval_result.get('correlation')
-                if corr_raw is None:
+                if corr_raw is None and not is_auc_metric:
                     return  # Empty eval data; no correlation to normalize
-                corr = float(corr_raw)
-                if corr < -0.6:
-                    logger.info(f'Inverting encoding since correlation is {corr} < -0.5')
+                corr = float(corr_raw) if isinstance(corr_raw, (int, float)) else None
+                should_invert = (
+                    isinstance(positive_target_mean, (int, float)) and positive_target_mean < 0.0
+                ) if is_auc_metric else (corr is not None and corr < -0.6)
+                if should_invert:
+                    if is_auc_metric:
+                        logger.info(
+                            "Inverting AUC-scored encoding since label +1 mean is %.4f < 0",
+                            positive_target_mean,
+                        )
+                    else:
+                        logger.info(f'Inverting encoding since correlation is {corr} < -0.5')
                     # CONTRACT: update_direction=False — flip encoder/decoder weights only.
                     # feature_class_encoding_direction is semantic (+1/-1 per class) and must
                     # NOT be negated here. Decoder eval derives ff from that metadata by source.
@@ -431,13 +455,14 @@ class NormalizationCallback(TrainingCallback):
                     # After inversion, flip the sign of the recorded correlation so that
                     # logs, checkpoints, and subsequent callbacks see the normalized
                     # (positive) orientation for this step.
-                    new_corr = -corr
-                    eval_result['correlation'] = new_corr
-                    training_stats['correlation'] = new_corr
+                    new_corr = -corr if corr is not None else None
+                    if new_corr is not None:
+                        eval_result['correlation'] = new_corr
+                        training_stats['correlation'] = new_corr
 
                     # Update per-step history if present
                     scores_hist = training_stats.get('scores')
-                    if isinstance(scores_hist, dict):
+                    if isinstance(scores_hist, dict) and new_corr is not None:
                         scores_hist[step] = new_corr
 
                     # Flip mean encodings per class and per feature class to match the new orientation
@@ -521,11 +546,17 @@ class CheckpointCallback(TrainingCallback):
     Behavior:
 
     - Saves the best model based on ``convergent_metric``
+
       (``correlation`` / ``roc_auc`` / ``min_auc_n_o``) or loss when ``use_loss_for_best=True``
+
     - For correlation: ``|correlation|`` by default; ``prefer_convergent_checkpoint`` can
+
       prefer threshold-satisfying steps
-    - For roc_auc: raw one-vs-rest AUROC (higher better); bipolar mean gating only if
-      ``convergent_mean_by_class_threshold`` is set
+
+    - For roc_auc: raw one-vs-rest AUROC (higher better); label ``+1`` must have
+
+      positive mean encoding; bipolar magnitude gating remains optional
+
     - For min_auc_n_o: ``min(auc_n, auc_o)`` so neutrals alone cannot carry selection
     - When use_loss_for_best=True (e.g. supervised_decoder), best = lowest loss
     - Saves periodic checkpoints every checkpoint_interval steps (if checkpoints enabled)
@@ -570,6 +601,7 @@ class CheckpointCallback(TrainingCallback):
             eval_result=kwargs.get("eval_result"),
             step=step,
             epoch=kwargs.get("epoch"),
+            selection_metric=_selection_metric_from_config(config),
         )
         if updated_components:
             path = save_component_best_states(self.output, self.component_best_states)
@@ -584,11 +616,32 @@ class CheckpointCallback(TrainingCallback):
         if component_split and self.component_best_states and not self.use_loss_for_best:
             merge_summary = summary_from_component_best_states(self.component_best_states)
             merge_rank = merge_rank_from_summary(merge_summary)
-            is_better = self._best_merge_rank is None or merge_rank > self._best_merge_rank
+            component_selection_metric = _selection_metric_from_config(config)
+            # Component-local states are monotonic under their configured
+            # selection metric. Any update therefore creates the new best E
+            # merge even when its aggregate correlation is lower.
+            is_better = (
+                bool(updated_components)
+                if component_selection_metric != "correlation"
+                else self._best_merge_rank is None or merge_rank > self._best_merge_rank
+            )
             score_for_log = (
                 None
                 if merge_summary is None
-                else merge_summary.get("correlation_mean")
+                else (
+                    sum(
+                        float(state.get("encoding_e"))
+                        for state in self.component_best_states.values()
+                        if isinstance(state.get("encoding_e"), (int, float))
+                    ) / len(self.component_best_states)
+                    if component_selection_metric == "encoding_e"
+                    and self.component_best_states
+                    and all(
+                        isinstance(state.get("encoding_e"), (int, float))
+                        for state in self.component_best_states.values()
+                    )
+                    else merge_summary.get("correlation_mean")
+                )
             )
             if is_better and merge_summary is not None:
                 was_first = self._best_merge_rank is None
@@ -627,6 +680,7 @@ class CheckpointCallback(TrainingCallback):
                             "global_step": step,
                             "epoch": self.best_epoch,
                             "selection": "component_best_merge",
+                            "selection_metric": f"component_{component_selection_metric}",
                             "component_best_steps": merge_summary.get("component_best_steps"),
                             "n_converged": merge_summary.get("n_converged"),
                             "n_components": merge_summary.get("n_components"),
@@ -722,7 +776,7 @@ class CheckpointCallback(TrainingCallback):
                         best_ckpt['roc_auc'] = None
                         best_ckpt['min_auc_n_o'] = None
                         best_ckpt['loss'] = self.best_score
-                    elif selection_metric in {"roc_auc", "min_auc_n_o"}:
+                    elif selection_metric in {"roc_auc", "min_auc_n_o", "encoding_e"}:
                         best_ckpt[selection_metric] = self.best_score
                         best_ckpt['correlation'] = _current_step_correlation(
                             step=step,
@@ -737,6 +791,9 @@ class CheckpointCallback(TrainingCallback):
                                 best_ckpt['min_auc_n_o'] = ev.get("min_auc_n_o")
                             best_ckpt['roc_auc_neutral'] = ev.get("roc_auc_neutral")
                             best_ckpt['roc_auc_other'] = ev.get("roc_auc_other")
+                            best_ckpt['auc_rival'] = ev.get("auc_rival")
+                            best_ckpt['class_exclusivity'] = ev.get("class_exclusivity")
+                            best_ckpt['neutral_specificity'] = ev.get("neutral_specificity")
                     else:
                         best_ckpt['correlation'] = self.best_score
                         if isinstance(kwargs.get("eval_result"), dict):
@@ -785,10 +842,13 @@ class CheckpointCallback(TrainingCallback):
             best_score_checkpoint['correlation'] = None
             best_score_checkpoint['roc_auc'] = None
             best_score_checkpoint['min_auc_n_o'] = None
-        elif selection_metric in {"roc_auc", "min_auc_n_o"}:
+        elif selection_metric in {"roc_auc", "min_auc_n_o", "encoding_e"}:
             best_score_checkpoint[selection_metric] = self.best_score
             best_score_checkpoint['correlation'] = training_stats.get("correlation")
-            for key in ("roc_auc", "min_auc_n_o", "roc_auc_neutral", "roc_auc_other"):
+            for key in (
+                "roc_auc", "min_auc_n_o", "roc_auc_neutral", "roc_auc_other",
+                "auc_rival", "class_exclusivity", "neutral_specificity", "encoding_e",
+            ):
                 if key == selection_metric:
                     continue
                 hist = training_stats.get(key)
@@ -974,6 +1034,22 @@ class LoggingCallback(TrainingCallback):
                             detail.append(f"auc_n={float(auc_n):.4f}")
                         if isinstance(auc_o, (int, float)):
                             detail.append(f"auc_o={float(auc_o):.4f}")
+                        if detail:
+                            parts.append("(" + " ".join(detail) + ")")
+                elif selection_metric == "encoding_e":
+                    e_str = "N/A" if selection_score is None else f"{selection_score:.4f}"
+                    parts.append(f"E: {e_str}")
+                    if isinstance(eval_result, dict):
+                        detail = []
+                        for key, label in (
+                            ("roc_auc_neutral", "auc_n"),
+                            ("roc_auc_other", "auc_rival"),
+                            ("class_exclusivity", "excl"),
+                            ("neutral_specificity", "spec"),
+                        ):
+                            value = eval_result.get(key)
+                            if isinstance(value, (int, float)):
+                                detail.append(f"{label}={float(value):.4f}")
                         if detail:
                             parts.append("(" + " ".join(detail) + ")")
                 component_fragment = ""

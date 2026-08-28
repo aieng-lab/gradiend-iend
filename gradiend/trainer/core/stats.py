@@ -145,6 +145,22 @@ def _nonzero_target_class_abs_means(mean_by_class: Dict[Any, float]) -> List[flo
     return abs_means
 
 
+def _positive_target_class_mean(mean_by_class: Any) -> Optional[float]:
+    """Return the encoded mean for the semantic positive target class (label ``+1``)."""
+    if not isinstance(mean_by_class, dict):
+        return None
+    for label, mean_value in mean_by_class.items():
+        if not isinstance(mean_value, (int, float)):
+            continue
+        try:
+            numeric_label = float(label)
+        except (TypeError, ValueError):
+            continue
+        if numeric_label == 1.0:
+            return float(mean_value)
+    return None
+
+
 def _target_class_mean_stats(
     mean_by_class: Any,
     mean_threshold: Any = None,
@@ -217,18 +233,30 @@ def metric_checkpoint_rank(
     """Rank for best-checkpoint selection (higher is better).
 
     ``metric``:
+
       - ``correlation``: compare ``|score|`` (bipolar)
       - ``roc_auc`` / ``auroc``: compare raw ``score`` (one-vs-rest; higher better)
       - ``min_auc_n_o`` / ``min_auc``: compare raw ``min(auc_n, auc_o)`` (higher better)
+      - ``encoding_e`` / ``E``: compare the fair validation bottleneck (higher better)
     """
     name = str(metric or "correlation").strip().lower()
     if name in {"auroc", "auc", "roc-auc"}:
         name = "roc_auc"
     if name in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
         name = "min_auc_n_o"
+    if name in {"e", "encoding_e", "encoding-e", "encodinge"}:
+        name = "encoding_e"
     raw = float(score) if isinstance(score, (int, float)) else None
-    if name in {"roc_auc", "min_auc_n_o"}:
-        rank_score = raw if raw is not None else float("-inf")
+    is_auc_metric = name in {"roc_auc", "min_auc_n_o", "encoding_e"}
+    positive_target_mean = _positive_target_class_mean(mean_by_class) if is_auc_metric else None
+    positive_target_ok = (
+        isinstance(positive_target_mean, (int, float)) and positive_target_mean > 0.0
+    ) if is_auc_metric else True
+    if is_auc_metric:
+        # AUC is self-orienting, but the learned encoding has a semantic orientation:
+        # label +1 must encode positively.  An invalid/missing orientation must never
+        # beat an eligible checkpoint merely because its AUC is higher.
+        rank_score = raw if raw is not None and positive_target_ok else float("-inf")
         score_ok = score_threshold is None or (raw is not None and raw >= float(score_threshold))
     else:
         rank_score = abs(raw) if raw is not None else float("-inf")
@@ -236,7 +264,7 @@ def metric_checkpoint_rank(
     means_ok, _product, min_abs = _target_class_mean_stats(mean_by_class, mean_threshold)
     # AUROC-family metrics do not require opposite-sign bipolar means unless a mean
     # threshold is explicitly set (prefer_convergent + mean_threshold).
-    if name in {"roc_auc", "min_auc_n_o"} and mean_threshold is None:
+    if is_auc_metric and mean_threshold is None:
         means_ok = True
         min_abs = None
     converged = bool(
@@ -245,6 +273,7 @@ def metric_checkpoint_rank(
         and step > 0
         and raw is not None
         and score_ok
+        and positive_target_ok
         and means_ok
     )
     try:
@@ -317,6 +346,16 @@ def _best_step_target_class_mean_product(
         return None
     _means_ok, product, _min_abs = _target_class_mean_stats(mean_by_class, mean_threshold=None)
     return product
+
+
+def _best_step_positive_target_class_mean(
+    training_stats: Dict[str, Any],
+    best_score_checkpoint: Dict[str, Any],
+) -> Optional[float]:
+    """Return the label-``+1`` mean encoded value at the best checkpoint."""
+    return _positive_target_class_mean(
+        _best_step_mean_by_class(training_stats, best_score_checkpoint)
+    )
 
 
 def summarize_topk_stability(

@@ -277,6 +277,20 @@ def is_decoder_only_model(model_or_tokenizer):
     if is_seq2seq_model(model_or_tokenizer):
         return False
     obj = model_or_tokenizer
+    # Some causal-LM tokenizers expose a mask token even though their model is
+    # decoder-only.  Gemma 3 is one such family, so the historical
+    # ``mask_token is not None => encoder MLM`` shortcut gives a false
+    # negative before the model itself has been loaded.  Prefer an explicit
+    # causal-family identity when it is available on the tokenizer.
+    identity = " ".join(
+        str(value or "")
+        for value in (
+            getattr(getattr(obj, "__class__", None), "__name__", ""),
+            getattr(obj, "name_or_path", ""),
+        )
+    ).lower()
+    if "gemma" in identity:
+        return True
     if hasattr(obj, "mask_token"):
         return getattr(obj, "mask_token", None) is None
     if hasattr(obj, "mask_token_id"):

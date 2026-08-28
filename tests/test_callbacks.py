@@ -231,6 +231,55 @@ class TestNormalizationCallback:
         model.invert_encoding.assert_not_called()
         assert eval_result["correlation"] == pytest.approx(-0.55)
 
+    def test_auc_normalization_orients_label_plus_one_mean_positive(self):
+        callback = NormalizationCallback()
+        model = MagicMock()
+        model.gradiend.latent_dim = 1
+        model.invert_encoding = MagicMock()
+        eval_result = {
+            "correlation": 0.7,
+            "mean_by_class": {-1.0: -0.8, 0.0: 0.2, 1.0: -0.4},
+        }
+        training_stats = {
+            "scores": {100: 0.7},
+            "mean_by_class": {100: dict(eval_result["mean_by_class"])},
+        }
+
+        callback.on_step_end(
+            step=100,
+            loss=0.5,
+            model=model,
+            config={"convergent_metric": "min_auc_n_o"},
+            training_stats=training_stats,
+            eval_result=eval_result,
+        )
+
+        model.invert_encoding.assert_called_once_with(update_direction=False)
+        assert eval_result["mean_by_class"][1.0] == pytest.approx(0.4)
+        assert training_stats["mean_by_class"][100][1.0] == pytest.approx(0.4)
+
+    def test_auc_normalization_does_not_use_negative_correlation_for_orientation(self):
+        callback = NormalizationCallback()
+        model = MagicMock()
+        model.gradiend.latent_dim = 1
+        model.invert_encoding = MagicMock()
+        eval_result = {
+            "correlation": -0.9,
+            "mean_by_class": {-1.0: -0.4, 1.0: 0.6},
+        }
+
+        callback.on_step_end(
+            step=100,
+            loss=0.5,
+            model=model,
+            config={"convergent_metric": "roc_auc"},
+            training_stats={},
+            eval_result=eval_result,
+        )
+
+        model.invert_encoding.assert_not_called()
+        assert eval_result["mean_by_class"][1.0] == pytest.approx(0.6)
+
 
 class TestCheckpointCallback:
     """Test CheckpointCallback."""

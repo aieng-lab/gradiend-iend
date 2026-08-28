@@ -347,6 +347,9 @@ class Visualizer:
         figsize: Optional[Tuple[float, float]] = None,
         highlight_non_convergence: Optional[bool] = None,
         return_fig_ax: bool = False,
+        split: Optional[Any] = None,
+        training_like_df: Optional[Any] = None,
+        neutral_df: Optional[Any] = None,
         **kwargs: Any,
     ) -> str:
         """Plot decoder probability shifts for this trainer.
@@ -362,6 +365,28 @@ class Visualizer:
             figsize: Figure size in inches.
             highlight_non_convergence: Append a non-convergence marker when requested.
             return_fig_ax: Return ``(fig, axes)`` instead of the output path.
+            split: Decoder-eval split the caller's ``decoder_results`` (if any)
+                was actually evaluated against. Forwarded to
+                ``analyze_decoder_for_plotting`` below, which otherwise
+                defaults to ``"test"``. Explicit parameter (not folded into
+                ``**kwargs``) so it cannot be silently dropped by a future
+                change here -- see ``training_like_df`` below for why that
+                matters.
+            training_like_df: Optional caller-supplied evaluation frame, paired
+                with ``neutral_df``. Reused as-is by ``analyze_decoder_for_
+                plotting`` instead of being re-derived from the trainer's own
+                internal (narrower, one-pole-scoped) data. This and ``split``
+                are explicit parameters rather than generic ``**kwargs``
+                entries deliberately: an earlier version accepted them only
+                via ``**kwargs`` and silently failed to forward them to
+                ``analyze_decoder_for_plotting``, which produced a live
+                production bug (`probs_by_dataset[X][Y] is absent`) -- a
+                value hidden in a loosely-typed kwargs bag is invisible to
+                both the type checker and a future maintainer skimming this
+                signature. An explicit parameter cannot be dropped without a
+                visible signature change.
+            neutral_df: Optional caller-supplied neutral frame, paired with
+                ``training_like_df`` (see above).
             **kwargs: Forwarded to ``gradiend.visualizer.probability_shifts.plot_probability_shifts``.
         """
         if decoder_results is None:
@@ -372,6 +397,9 @@ class Visualizer:
             class_ids=class_ids,
             use_cache=use_cache,
             intervention_kwargs=(decoder_results or {}).get("intervention_kwargs"),
+            split=split,
+            training_like_df=training_like_df,
+            neutral_df=neutral_df,
         )
 
         return _plot_probability_shifts(

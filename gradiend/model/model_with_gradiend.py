@@ -233,6 +233,10 @@ def _check_convergence_warning(model_path: str) -> None:
                                 mean_threshold=convergence_info.get(
                                     "convergent_mean_by_class_threshold"
                                 ),
+                                selection_metric=(
+                                    (training_data.get("training_args") or {}).get("selection_metric")
+                                    or convergence_metric
+                                ),
                             )
                             component_payload = component_run if isinstance(component_run, dict) else None
                         component_fragment = strip_component_prefix(
@@ -1032,10 +1036,13 @@ class ModelWithGradiend(nn.Module, ABC):
         Signal-specific behavior:
 
         - Gradient-space GRADIEND checkpoints are converted to an ordinary
+
           weight-rewritten base model, equivalent to
           :meth:`rewrite_base_model` with the same ``learning_rate``,
           ``feature_factor``, and ``part``.
+
         - Activation-space ACTIEND checkpoints are converted to an ordinary
+
           base model copy with fixed PyTorch forward hooks.  The hooks add the
           decoded activation-space update at the activation sites recorded in
           the GRADIEND mapping.  The returned model owns a copy of the steering
@@ -1856,7 +1863,7 @@ class ModelWithGradiend(nn.Module, ABC):
                 DeprecationWarning,
                 stacklevel=2,
             )
-        selected_params = scope_params(signal_space.scope)
+        selected_params = scope_params(signal_space.scope, base_model=base_model)
         if selected_params is None:
             selected_params = tuple(legacy_params) if legacy_params is not None else None
         elif legacy_params is not None and tuple(legacy_params) != tuple(selected_params):
@@ -2132,7 +2139,16 @@ class ModelWithGradiend(nn.Module, ABC):
     def _move_batch_to_device(self, batch, device):
         if torch.is_tensor(batch):
             return batch.to(device, non_blocking=True)
-        if isinstance(batch, dict):
+        if isinstance(batch, Mapping):
+            # Deliberately ``Mapping``, not ``dict``: a tokenizer's own output
+            # (``transformers.BatchEncoding``) is a ``UserDict`` subclass, so
+            # ``isinstance(batch, dict)`` is False for it -- with that check,
+            # this branch silently never ran for a raw tokenizer batch, and
+            # every tensor inside stayed on whatever device the tokenizer put
+            # it on (always CPU) regardless of the model's device. Returns a
+            # plain dict rather than trying to reconstruct the original
+            # mapping type, since callers here only ever unpack it via
+            # ``**batch`` or ``batch[...]``.
             return {k: self._move_batch_to_device(v, device) for k, v in batch.items()}
         if isinstance(batch, (list, tuple)):
             return type(batch)(self._move_batch_to_device(v, device) for v in batch)

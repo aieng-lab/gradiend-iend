@@ -79,7 +79,20 @@ def _numeric(value: Any) -> Optional[float]:
     return float(value) if isinstance(value, (int, float)) else None
 
 
-def _candidate_rank(candidate: Dict[str, Any]) -> tuple[int, float, float, int]:
+def _selection_score(candidate: Dict[str, Any], selection_metric: str) -> Optional[float]:
+	name = str(selection_metric or "correlation").strip().lower()
+	if name in {"e", "encoding-e", "encodinge"}:
+		name = "encoding_e"
+	value = _numeric(candidate.get(name))
+	if value is None and isinstance(candidate.get("metrics"), dict):
+		value = _numeric(candidate["metrics"].get(name))
+	return abs(value) if name == "correlation" and value is not None else value
+
+
+def _candidate_rank(
+    candidate: Dict[str, Any],
+    selection_metric: str = "correlation",
+) -> tuple[int, float, float, int]:
     corr = _numeric(candidate.get("correlation"))
     min_abs = _numeric(candidate.get("min_target_class_abs_mean"))
     step = candidate.get("global_step")
@@ -89,7 +102,9 @@ def _candidate_rank(candidate: Dict[str, Any]) -> tuple[int, float, float, int]:
         step_int = -1
     return (
         1 if bool(candidate.get("converged")) else 0,
-        abs(corr) if corr is not None else float("-inf"),
+        _selection_score(candidate, selection_metric)
+        if _selection_score(candidate, selection_metric) is not None
+        else float("-inf"),
         min_abs if min_abs is not None else float("-inf"),
         step_int,
     )
@@ -102,6 +117,7 @@ def _component_candidate_from_metrics(
     step: int,
     threshold: Optional[float],
     mean_threshold: Optional[float],
+    selection_metric: str = "correlation",
 ) -> Dict[str, Any]:
     corr = _numeric(metrics.get("correlation"))
     means_ok, target_mean_product, min_abs = _target_mean_converged(
@@ -123,7 +139,7 @@ def _component_candidate_from_metrics(
         "target_mean_product": target_mean_product,
         "min_target_class_abs_mean": min_abs,
         "best_component_global_step": step,
-        "selection_metric": "component_correlation",
+        "selection_metric": f"component_{selection_metric}",
     }
     return {
         "component_index": metrics.get("component_index"),
@@ -131,6 +147,7 @@ def _component_candidate_from_metrics(
         "component_label": metrics.get("component_label"),
         "global_step": step,
         "correlation": corr,
+        "encoding_e": _numeric(metrics.get("encoding_e")),
         "target_mean_product": target_mean_product,
         "min_target_class_abs_mean": min_abs,
         "converged": converged,
@@ -184,6 +201,7 @@ def update_component_best_states(
     eval_result: Optional[Dict[str, Any]],
     step: int,
     epoch: Optional[int] = None,
+    selection_metric: str = "correlation",
 ) -> List[str]:
     """
     Update in-memory component-best states from one evaluation result.
@@ -227,13 +245,14 @@ def update_component_best_states(
             "min_target_class_abs_mean": min_abs,
             "target_mean_product": convergence.get("target_mean_product"),
             "converged": bool(convergence.get("converged")),
-            "selection_metric": "component_correlation",
+            "selection_metric": f"component_{selection_metric}",
+            "encoding_e": _numeric(metrics.get("encoding_e")),
             "metrics": copy.deepcopy(metrics),
             "convergence": copy.deepcopy(convergence),
             "state": extract_gradiend_component_state(model, component_key),
         }
         current = best_states.get(component_key)
-        if current is None or _candidate_rank(candidate) > _candidate_rank(current):
+        if current is None or _candidate_rank(candidate, selection_metric) > _candidate_rank(current, selection_metric):
             best_states[component_key] = candidate
             updated.append(component_key)
     return updated
@@ -694,6 +713,7 @@ def component_run_from_training_stats(
     *,
     threshold: Optional[float],
     mean_threshold: Optional[float],
+    selection_metric: str = "correlation",
 ) -> Optional[Dict[str, Any]]:
     """Extract per-component best-step convergence details from ``training.json`` data.
 
@@ -727,9 +747,10 @@ def component_run_from_training_stats(
                 step=step,
                 threshold=threshold,
                 mean_threshold=mean_threshold,
+                selection_metric=selection_metric,
             )
             current = best_candidates.get(component_key)
-            if current is None or _candidate_rank(candidate) > _candidate_rank(current):
+            if current is None or _candidate_rank(candidate, selection_metric) > _candidate_rank(current, selection_metric):
                 best_candidates[component_key] = candidate
 
     if not best_candidates:
@@ -763,6 +784,7 @@ def summarize_component_seed_runs(
     runs: Sequence[Dict[str, Any]],
     *,
     min_convergent_seeds: Optional[int],
+    selection_metric: str = "correlation",
 ) -> Optional[Dict[str, Any]]:
     """Summarize which components have enough convergent seeds and select source runs."""
     component_ids: Dict[str, Dict[str, Any]] = {}
@@ -791,6 +813,9 @@ def summarize_component_seed_runs(
                     "seed": run.get("seed"),
                     "output_dir": run.get("output_dir"),
                     "correlation": info.get("correlation"),
+                    "encoding_e": (
+                        metrics.get("encoding_e") if isinstance(metrics, dict) else None
+                    ),
                     "min_target_class_abs_mean": info.get("min_target_class_abs_mean"),
                     "global_step": info.get("best_component_global_step") or info.get("global_step"),
                     "best_component_global_step": info.get("best_component_global_step") or info.get("global_step"),
@@ -820,7 +845,9 @@ def summarize_component_seed_runs(
             selected = max(
                 candidates,
                 key=lambda item: (
-                    abs(float(item["correlation"])) if isinstance(item.get("correlation"), (int, float)) else float("-inf"),
+                    _selection_score(item, selection_metric)
+                    if _selection_score(item, selection_metric) is not None
+                    else float("-inf"),
                     float(item["min_target_class_abs_mean"])
                     if isinstance(item.get("min_target_class_abs_mean"), (int, float))
                     else float("-inf"),
@@ -843,6 +870,7 @@ def summarize_component_seed_runs(
         "missing_component_ids": missing_components,
         "converged": converged,
         "selected_components": selected_components if converged else {},
+        "selection_metric": selection_metric,
     }
 
 

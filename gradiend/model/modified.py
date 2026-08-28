@@ -415,6 +415,56 @@ def _apply_steering_with_mask(
     return out
 
 
+def _apply_clamp_with_mask(
+    activation: torch.Tensor,
+    direction: torch.Tensor,
+    target_activation: float,
+    *,
+    encoder_weight: torch.Tensor,
+    encoder_bias: Optional[torch.Tensor],
+    mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Force a single SAE feature's own activation to ``target_activation``.
+
+    Computes the feature's real current activation ``f = relu(x @ w + b)``
+    (Templeton et al. 2024 activation clamping) and adds the correction
+    ``(target - f) * direction`` — equivalent to decoding after overriding
+    just that one feature, without a full SAE encode/decode round-trip.
+    Unlike ``_apply_steering_with_mask``'s fixed additive shift, the
+    correction is position-dependent: where the feature is already near the
+    target it barely moves; where it is far, the correction is large.
+    """
+    direction = direction.to(device=activation.device, dtype=activation.dtype).flatten()
+    if activation.shape[-1] != direction.numel():
+        raise ValueError(
+            f"ACTIEND clamp direction width {direction.numel()} does not match activation last "
+            f"dimension {activation.shape[-1]}"
+        )
+    encoded = _encoder_score(
+        activation,
+        encoder_weight=encoder_weight,
+        encoder_bias=encoder_bias,
+        encoder_activation="relu",
+    )
+    if encoded.shape[-1] != 1:
+        raise ValueError(
+            f"ACTIEND clamp mode requires a single-feature encoder score, got width {encoded.shape[-1]}"
+        )
+    delta = float(target_activation) - encoded.squeeze(-1)
+    view_shape = (1,) * (activation.dim() - 1) + (direction.numel(),)
+    correction = delta.unsqueeze(-1) * direction.reshape(view_shape)
+    if mask is None:
+        return activation + correction
+    if mask.shape != activation.shape[:2]:
+        raise ValueError(
+            f"ACTIEND token selector mask shape {tuple(mask.shape)} does not match activation prefix "
+            f"{tuple(activation.shape[:2])}"
+        )
+    out = activation.clone()
+    out[mask] = out[mask] + correction[mask]
+    return out
+
+
 def _add_steering(
     activation: torch.Tensor,
     vector: torch.Tensor,
@@ -472,6 +522,8 @@ def _register_activation_steering_hooks(
         module = _resolve_module(model, module_name)
 
         def make_hook(steering_vector: torch.Tensor, app: Mapping[str, Any]):
+            mode = str(app.get("mode") or "add").lower()
+
             def hook(_module: nn.Module, _args: Any, output: Any) -> Any:
                 activation = _first_tensor(output)
                 mask = _selector_mask_from_application(
@@ -480,7 +532,22 @@ def _register_activation_steering_hooks(
                     tensors=tensors,
                     context=context,
                 )
-                steered = _apply_steering_with_mask(activation, steering_vector, mask)
+                if mode == "clamp":
+                    encoder_weight = tensors[app["clamp_encoder_weight_key"]]
+                    encoder_bias_key = app.get("clamp_encoder_bias_key")
+                    encoder_bias = tensors[encoder_bias_key] if encoder_bias_key is not None else None
+                    steered = _apply_clamp_with_mask(
+                        activation,
+                        steering_vector,
+                        float(app["target_activation"]),
+                        encoder_weight=encoder_weight,
+                        encoder_bias=encoder_bias,
+                        mask=mask,
+                    )
+                elif mode == "add":
+                    steered = _apply_steering_with_mask(activation, steering_vector, mask)
+                else:
+                    raise ValueError(f"Unsupported activation steering mode {mode!r}")
                 return _replace_first_tensor(output, steered)
 
             return hook

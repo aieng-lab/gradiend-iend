@@ -321,7 +321,11 @@ class TestClassMergeMapSuiteIntegration:
             alternative_class_col="alternative_class",
             pair_definitions=pair_definitions,
             model="bert-base-uncased",
-            args=TrainingArguments(do_eval=False, output_dir="tmp_test_suite_merge"),
+            args=TrainingArguments(
+                do_eval=False,
+                output_dir="tmp_test_suite_merge",
+                add_neutral_identity_transitions=False,
+            ),
         )
         trainer = suite.get_trainer("pronoun_number_singular_plural")
         tokenizer = MockTokenizer()

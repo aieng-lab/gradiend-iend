@@ -434,7 +434,7 @@ def _run(
         decoder_eval_targets="label",
         # One-pole data: only an IO factual panel; score P(IO)/P(SUBJECT) there.
         decoder_eval_prob_on_other_class=False,
-        img_format="png",
+        img_format="pdf",
         args=args,
     )
     print(f"\n=== Training source='both' on {POS_CLASS}-only factual IOI data ===")

@@ -111,6 +111,36 @@ for the view sign applied before anchor aggregation.
 
 ---
 
+## Null controls (planned)
+
+Cross-encoding currently reports observed matrices and, for multi-seed runs,
+seed-level dispersion. It does **not** yet test whether an observed association
+is larger than expected when feature classes have no meaningful relationship.
+Until null controls are implemented, off-diagonal patterns should therefore be
+treated as hypotheses rather than confirmatory findings.
+
+Planned null-control analyses, in implementation priority order, are:
+
+1. **Label permutation:** shuffle probe feature labels while preserving class
+   counts, recompute the matrix repeatedly, and compare each observed cell with
+   its permutation distribution. This is the preferred first implementation.
+2. **Sign/alignment permutation:** randomly flip pairwise GRADIEND orientations
+   before anchor aggregation to test whether row structure depends on the
+   intended sign frame.
+3. **Random feature pairs:** construct size-matched artificial contrasts to
+   measure cross-encoding structure for semantically meaningless splits.
+4. **Matched lexical controls:** compare semantic or social features with
+   random target-token sets matched for frequency, token length, and sample
+   count.
+
+This should be implemented as a first-class comparison analysis, not as a
+heatmap-only option. A null-control result should retain the observed matrix and
+report the null mean and standard deviation, empirical p-values or z-scores,
+multiple-comparison correction, permutation count, random seed, and any
+matching or stratification rules. No such API is implemented yet.
+
+---
+
 ## API map
 
 | Step | Function |

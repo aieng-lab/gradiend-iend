@@ -200,8 +200,10 @@ class Signal:
         keep same-site source and target.
 
         ``scale`` (optional):
+
           - ``None`` / omitted: raw activations (historical default)
           - ``"running_rms"``: divide each site (or the concat) by a running RMS
+
             estimated online from extracted activations. Only O(n_sites) floats
             of state — never buffers activations. Use for CAA/SAE-comparable
             activation magnitude before the ACTIEND autoencoder.

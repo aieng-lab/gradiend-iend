@@ -406,6 +406,7 @@ class TestTextGradientTrainingDataset:
                 "alternative_id": ["neutral"],
                 "label": [0.0],
                 "feature_class_id": ["neutral"],
+                "feature_pole": ["neutral"],
             }),
             tokenizer=tokenizer,
             batch_size=1,
@@ -705,7 +706,8 @@ class TestTextTrainingDataset:
             "factual_id": [1, 2],
             "alternative_id": [3, 4],
             "label": ["positive", "negative"],
-            "feature_class_id": [1, 2]
+            "feature_class_id": [1, 2],
+            "feature_pole": ["pos", "neg"],
         })
         
         tokenizer = MockTokenizer()
@@ -765,7 +767,8 @@ class TestTextTrainingDataset:
             "factual_id": list(range(100)),
             "alternative_id": list(range(100, 200)),
             "label": ["positive"] * 100,
-            "feature_class_id": [1] * 100
+            "feature_class_id": [1] * 100,
+            "feature_pole": ["pos"] * 100,
         })
         
         tokenizer = MockTokenizer()
@@ -802,7 +805,8 @@ class TestTextTrainingDataset:
             "factual_id": list(range(100)),
             "alternative_id": list(range(100, 200)),
             "label": ["positive"] * 100,
-            "feature_class_id": [1] * 100
+            "feature_class_id": [1] * 100,
+            "feature_pole": ["pos"] * 100,
         })
         
         tokenizer = MockTokenizer()
@@ -829,7 +833,8 @@ class TestTextTrainingDataset:
             "factual_class": ["class1"] * 20,
             "alternative_class": ["class2"] * 20,
             "label": ["positive"] * 10 + ["negative"] * 10,  # Need different labels for batching
-            "feature_class_id": [1] * 20
+            "feature_class_id": [1] * 20,
+            "feature_pole": ["pos"] * 10 + ["neg"] * 10,
         })
         
         tokenizer = MockTokenizer()
@@ -892,7 +897,8 @@ class TestTextTrainingDataset:
             "factual_id": [1],
             "alternative_id": [2],
             "label": ["positive"],
-            "feature_class_id": [1]
+            "feature_class_id": [1],
+            "feature_pole": ["pos"],
         })
         
         tokenizer = MockTokenizer()
@@ -921,7 +927,8 @@ class TestTextTrainingDataset:
             "factual_id": [1],
             "alternative_id": [2],
             "label": ["positive"],
-            "feature_class_id": [1]
+            "feature_class_id": [1],
+            "feature_pole": ["pos"],
         })
         
         tokenizer = MockTokenizer()
@@ -963,6 +970,7 @@ class TestTextTrainingDataset:
                 "alternative_id": [2],
                 "label": ["positive"],
                 "feature_class_id": [1],
+                "feature_pole": ["pos"],
             }),
             tokenizer=MockTokenizer(),
             batch_size=1,
@@ -986,6 +994,7 @@ class TestTextTrainingDataset:
                 "alternative_id": [2],
                 "label": ["positive"],
                 "feature_class_id": [1],
+                "feature_pole": ["pos"],
             }),
             tokenizer=MockTokenizer(),
             batch_size=1,
@@ -1014,6 +1023,7 @@ class TestTextTrainingDataset:
                 "alternative_id": [2],
                 "label": ["positive"],
                 "feature_class_id": [1],
+                "feature_pole": ["pos"],
             }),
             tokenizer=tokenizer,
             batch_size=1,
@@ -1038,6 +1048,7 @@ class TestTextTrainingDataset:
                 "alternative_id": [2],
                 "label": ["positive"],
                 "feature_class_id": [1],
+                "feature_pole": ["pos"],
             }),
             tokenizer=MockTokenizer(),
             batch_size=1,
@@ -1061,6 +1072,7 @@ class TestTextTrainingDataset:
                 "alternative_id": [2],
                 "label": ["positive"],
                 "feature_class_id": [1],
+                "feature_pole": ["pos"],
             }),
             tokenizer=MockTokenizer(),
             batch_size=1,
@@ -1087,6 +1099,7 @@ class TestTextTrainingDataset:
                 "alternative_id": [2],
                 "label": ["positive"],
                 "feature_class_id": [1],
+                "feature_pole": ["pos"],
             }),
             tokenizer=MockTokenizer(),
             batch_size=1,
@@ -1109,6 +1122,7 @@ class TestTextTrainingDataset:
                 "alternative_id": [2],
                 "label": ["positive"],
                 "feature_class_id": [1],
+                "feature_pole": ["pos"],
             }),
             tokenizer=MockTokenizer(),
             batch_size=1,
@@ -1133,7 +1147,8 @@ class TestTextTrainingDataset:
             "factual_id": [1],
             "alternative_id": [2],
             "label": ["positive"],
-            "feature_class_id": [42]
+            "feature_class_id": [42],
+            "feature_pole": ["pos"],
         })
         
         tokenizer = MockTokenizer()
@@ -1162,12 +1177,13 @@ class TestTextTrainingDataset:
             "factual_id": [1],
             "alternative_id": [2],
             "label": ["positive"],
-            "feature_class_id": [1]
+            "feature_class_id": [1],
+            "feature_pole": ["pos"],
         })
-        
+
         tokenizer = MockTokenizer()
         tokenizer.mask_token = "[MASK]"
-        
+
         dataset = TextTrainingDataset(
             data=data,
             tokenizer=tokenizer,
@@ -1192,12 +1208,13 @@ class TestTextTrainingDataset:
             "factual_id": list(range(10)),
             "alternative_id": list(range(10, 20)),
             "label": ["positive"] * 10,
-            "feature_class_id": [1] * 10
+            "feature_class_id": [1] * 10,
+            "feature_pole": ["pos"] * 10,
         })
-        
+
         tokenizer = MockTokenizer()
         tokenizer.mask_token = "[MASK]"
-        
+
         dataset = TextTrainingDataset(
             data=data,
             tokenizer=tokenizer,
@@ -1228,7 +1245,8 @@ class TestTextDatasetDataLoadingVariations:
             "factual_id": list(range(100)),
             "alternative_id": list(range(100, 200)),
             "label": ["positive"] * 50 + ["negative"] * 50,
-            "feature_class_id": [1] * 50 + [2] * 50
+            "feature_class_id": [1] * 50 + [2] * 50,
+            "feature_pole": ["pos"] * 50 + ["neg"] * 50,
         })
         
         tokenizer = MockTokenizer()
@@ -1263,7 +1281,8 @@ class TestTextDatasetDataLoadingVariations:
             "factual_id": [0],
             "alternative_id": [0],
             "label": ["neutral_data"],  # Identity/neutral_data class
-            "feature_class_id": [0]  # Identity class ID
+            "feature_class_id": [0],  # Identity class ID
+            "feature_pole": ["neutral"],
         })
         
         tokenizer = MockTokenizer()

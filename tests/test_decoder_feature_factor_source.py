@@ -230,3 +230,57 @@ def test_strengthen_missing_feature_factor_error_lists_grid_ffs():
             feature_factor_from_id=lambda cid: cid["feature_factor"] if isinstance(cid, dict) else cid[0],
             lr_from_id=lambda cid: cid["learning_rate"] if isinstance(cid, dict) else cid[1],
         )
+
+
+def test_explicit_feature_factors_bypasses_class_to_ff_requirement():
+    """Opposite-polarity random-control counterpart of the test above: same
+    single-sided grid (only ff=-1.0 present, class_to_ff wants +1.0 for 'F'),
+    but the caller explicitly requested feature_factors=[-1.0] on purpose
+    (e.g. run_encoder_causal_for_class's opposite-polarity re-query). This
+    must NOT raise -- the caller's manual parameter is what evaluate_decoder
+    should honor, not class_to_ff's auto-derived expectation. Fixed 2026-08-22
+    after this exact crash on a real run (pronoun_number's
+    actiend:plural-singular:plural opposite-polarity control).
+    """
+    results = {
+        "base": {"id": "base", "lms": {"lms": 1.0}, "probs": {}},
+        (-1.0, 0.01): {
+            "id": {"feature_factor": -1.0, "learning_rate": 0.01},
+            "lms": {"lms": 1.0},
+            "probs": {"M": 0.7, "F": 0.3},
+        },
+    }
+    summary = compute_metric_summaries(
+        results,
+        metrics=["F"],
+        selector=LMSThresholdPolicy(ratio=0.0),
+        class_to_ff={"M": -1.0, "F": 1.0},
+        feature_factor_from_id=lambda cid: cid["feature_factor"] if isinstance(cid, dict) else cid[0],
+        lr_from_id=lambda cid: cid["learning_rate"] if isinstance(cid, dict) else cid[1],
+        explicit_feature_factors=True,
+    )
+    assert summary["F"]["feature_factor"] == -1.0
+
+
+def test_auto_derived_single_sided_grid_still_raises_even_with_flag_unset():
+    """Sanity: explicit_feature_factors defaults to False, so an ordinary
+    (non-opt-in) caller keeps today's strict behavior -- only a caller that
+    positively asserts it chose feature_factors itself gets the relaxed path.
+    """
+    results = {
+        "base": {"id": "base", "lms": {"lms": 1.0}, "probs": {}},
+        (-1.0, 0.01): {
+            "id": {"feature_factor": -1.0, "learning_rate": 0.01},
+            "lms": {"lms": 1.0},
+            "probs": {"M": 0.7, "F": 0.3},
+        },
+    }
+    with pytest.raises(ValueError, match=r"strengthen class 'F'"):
+        compute_metric_summaries(
+            results,
+            metrics=["F"],
+            selector=LMSThresholdPolicy(ratio=0.0),
+            class_to_ff={"M": -1.0, "F": 1.0},
+            feature_factor_from_id=lambda cid: cid["feature_factor"] if isinstance(cid, dict) else cid[0],
+            lr_from_id=lambda cid: cid["learning_rate"] if isinstance(cid, dict) else cid[1],
+        )

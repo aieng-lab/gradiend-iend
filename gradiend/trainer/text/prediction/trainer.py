@@ -1003,7 +1003,18 @@ class TextPredictionTrainer(Trainer):
         self.data = None
         self.class_datasets = None
         self._combined_data: Optional[pd.DataFrame] = None
-        self._all_classes: Optional[List[str]] = None
+        # An explicitly configured all_classes is already known at construction
+        # time (mirrors _target_classes above) and must not wait on lazy data
+        # loading to become visible: callers that only reload a checkpoint for
+        # eval (e.g. decoder eval on a skip-existing trainer) never call
+        # _ensure_data()/_prepare_data(), so a lazily-populated _all_classes
+        # would silently stay unset and the all_classes property would fall
+        # back to target_classes. When config.all_classes is None, leave this
+        # None so the existing lazy data-inference paths (_set_all_classes
+        # calls below) still populate it as before.
+        self._all_classes: Optional[List[str]] = (
+            list(config.all_classes) if config.all_classes is not None else None
+        )
         self._data_loaded = False
         self._data_materialized_all_class_transitions = False
         self._combined_data_template: Optional[pd.DataFrame] = None
@@ -1646,7 +1657,6 @@ class TextPredictionTrainer(Trainer):
                     f"config.data must be a DataFrame, dict, local path, or HuggingFace dataset id; "
                     f"got {type(config.data).__name__}"
                 )
-        self._apply_one_pole_factual_filter()
         self._check_data_non_empty()
         self._resolve_split_col_strategy()
         if is_heldout_split_mode(config.split_col):
@@ -1683,39 +1693,6 @@ class TextPredictionTrainer(Trainer):
                     self.config.decoder_eval_targets = inferred
             except Exception as e:
                 logger.warning(f"Could not auto-infer decoder_eval_targets: {e}")
-
-    def _apply_one_pole_factual_filter(self) -> None:
-        """Keep only unified rows whose factual_class is the one-pole + class.
-
-        One-pole: sole ``target_classes`` entry when ``counterfactual_classes`` is set.
-        """
-        classes = self._one_pole_positive_classes()
-        if not classes:
-            return
-        if self._combined_data is None:
-            return
-        keep = {str(c) for c in classes}
-        combined = self._combined_data
-        if UNIFIED_FACTUAL_CLASS not in combined.columns:
-            raise RuntimeError(
-                "one-pole factual filter requires unified combined_data with "
-                f"{UNIFIED_FACTUAL_CLASS!r} column"
-            )
-        filtered = combined[combined[UNIFIED_FACTUAL_CLASS].astype(str).isin(keep)].copy()
-        if filtered.empty:
-            present = sorted(combined[UNIFIED_FACTUAL_CLASS].dropna().astype(str).unique().tolist())
-            raise RuntimeError(
-                f"one-pole factual filter={sorted(keep)} matched no rows "
-                f"(present factual classes: {present})"
-            )
-        n_before, n_after = len(combined), len(filtered)
-        self._combined_data = filtered
-        logger.info(
-            "one-pole factual filter %s: %d -> %d rows",
-            sorted(keep),
-            n_before,
-            n_after,
-        )
 
     def _one_pole_positive_class(self) -> Optional[str]:
         """Return the + class for one-pole mode, else None.
@@ -1998,6 +1975,9 @@ class TextPredictionTrainer(Trainer):
         dpi: Optional[int] = None,
         highlight_non_convergence: Optional[bool] = None,
         return_fig_ax: bool = False,
+        split: Optional[Any] = None,
+        training_like_df: Optional[Any] = None,
+        neutral_df: Optional[Any] = None,
         **kwargs: Any,
     ) -> str:
         """Plot text-prediction decoder probability shifts.
@@ -2016,6 +1996,19 @@ class TextPredictionTrainer(Trainer):
             dpi: Optional output DPI. Defaults to trainer config when available.
             highlight_non_convergence: Override non-convergence markers.
             return_fig_ax: If True, return Matplotlib ``(fig, ax)``.
+            split: Decoder-eval split ``decoder_results`` was actually
+                evaluated against (defaults to ``"test"`` deep in the plot-
+                refresh step if omitted). Pass this whenever you called
+                ``evaluate_decoder(..., split=...)`` with a non-default
+                split, or the plot-refresh step will silently re-score
+                against a different population than your headline result.
+            training_like_df: Optional evaluation frame to reuse for the
+                plot-refresh step, paired with ``neutral_df`` -- pass the
+                SAME frame you gave ``evaluate_decoder(...)`` if you supplied
+                one, or this step re-derives its own (narrower,
+                trainer-internal) frame instead.
+            neutral_df: Optional neutral frame to reuse, paired with
+                ``training_like_df``.
             **kwargs: Additional keyword arguments forwarded to the evaluator.
         """
         if img_format is None:
@@ -2035,6 +2028,9 @@ class TextPredictionTrainer(Trainer):
             dpi=dpi,
             highlight_non_convergence=highlight_non_convergence,
             return_fig_ax=return_fig_ax,
+            split=split,
+            training_like_df=training_like_df,
+            neutral_df=neutral_df,
             **kwargs,
         )
     plot_probability_shifts.__doc__ = (
@@ -2472,6 +2468,24 @@ class TextPredictionTrainer(Trainer):
                 neutral_token = str(neutral_row[token_col])
             else:
                 raw_text = str(neutral_row[text_col]) if text_col is not None and pd.notna(neutral_row.get(text_col)) else ""
+                # We already know the real resolved placeholder here (unlike
+                # create_masked_pair_from_text, which only sees the tokenizer's
+                # native mask_token — None for decoder-only models like gpt2).
+                # If raw_text already contains it, this row is a pre-built
+                # masked pair missing its label/token column, not raw text to
+                # re-mask — re-masking it would silently corrupt the pair
+                # (a random split point can land inside the placeholder's own
+                # sub-tokens). Fail loud with the fix instead of guessing.
+                if mask_placeholder and mask_placeholder in raw_text:
+                    raise ValueError(
+                        f"neutral_data row already contains the mask "
+                        f"placeholder {mask_placeholder!r} in its {text_col!r} "
+                        f"column, but no matching label/factual/token column "
+                        f"was found to use it as a pre-built masked pair. "
+                        f"Add a 'label' (or 'factual'/'token') column with the "
+                        f"intended target word for this row instead of relying "
+                        f"on re-masking already-masked text."
+                    )
                 pair = create_masked_pair_from_text(
                     raw_text,
                     tokenizer,
@@ -2628,18 +2642,23 @@ class TextPredictionTrainer(Trainer):
                 transition_id(src, tgt) for src, tgt in transition_edges
             } | train_transitions
             pair_data = split_data[split_data[UNIFIED_TRANSITION].isin(selected_transition_ids)].copy()
-        elif include_other_classes and self.all_classes is not None and len(self.all_classes) > 2:
+        elif include_other_classes:
             pair_data = split_data.copy()
         elif fac_cfg and resolved_cf:
-            # One-pole multi-CF: keep factual→each CF (and reverse edges if present).
+            # One-pole multi-CF: training has factual data only for the configured
+            # positive class. Keep the full unified frame for decoder evaluation,
+            # but do not admit rival-class factual rows into training -- doing so
+            # silently turns the one-pole objective into a two-pole objective.
             fac_set = {str(c) for c in fac_cfg}
             cf_set = {str(c) for c in resolved_cf}
             allowed = {
                 transition_id(f, c) for f in fac_set for c in cf_set
-            } | {
-                transition_id(c, f) for f in fac_set for c in cf_set
             }
-            pair_data = split_data[split_data[UNIFIED_TRANSITION].isin(allowed)].copy()
+            pair_data = split_data[
+                split_data[UNIFIED_FACTUAL_CLASS].astype(str).isin(fac_set)
+                & split_data[UNIFIED_ALTERNATIVE_CLASS].astype(str).isin(cf_set)
+                & split_data[UNIFIED_TRANSITION].isin(allowed)
+            ].copy()
         else:
             pair_data = split_data[split_data[UNIFIED_TRANSITION].isin(train_transitions)].copy()
 
@@ -3114,6 +3133,12 @@ class TextPredictionTrainer(Trainer):
 
         # Resolve targets and whether to use row-wise evaluation (P(factual) vs P(alternative) per row).
         targets, use_row_wise = self._resolve_decoder_eval_targets(training_like_df)
+        logger.info(
+            "evaluate_base_model: resolved decoder_eval targets (pre-restrict): "
+            "use_row_wise=%s target_keys=%s",
+            use_row_wise,
+            sorted(targets.keys()) if targets else targets,
+        )
 
         if not use_row_wise and not targets:
             run_id_part = f" (run_id={self.run_id})" if self.run_id is not None else ""
@@ -3126,7 +3151,17 @@ class TextPredictionTrainer(Trainer):
         if not use_row_wise and getattr(self.config, "decoder_eval_restrict_to_target_classes", True) and self.target_classes is not None:
             restrict_classes = self._decoder_eval_class_names() or self.target_classes
             target_classes_set = frozenset(str(c) for c in restrict_classes)
+            pre_restrict_keys = sorted(targets.keys())
             targets = {k: v for k, v in targets.items() if k in target_classes_set}
+            logger.info(
+                "evaluate_base_model: decoder_eval_restrict_to_target_classes -- "
+                "target_classes=%s decoder_eval_class_names/restrict_classes=%s "
+                "targets before=%s after=%s",
+                self.target_classes,
+                sorted(target_classes_set),
+                pre_restrict_keys,
+                sorted(targets.keys()),
+            )
             if not targets:
                 raise ValueError(
                     f"decoder_eval_restrict_to_target_classes=True but no decoder_eval_targets for "
@@ -3146,6 +3181,20 @@ class TextPredictionTrainer(Trainer):
         # probs_by_dataset keys = factual label_class (panel title matches row filter).
         # Do NOT group by alternative_id for panels — same key names, different semantics.
         dataset_class_col = label_dataset_col
+
+        logger.info(
+            "evaluate_base_model: scoring training_like_df rows=%d dataset_class_col=%r "
+            "class_counts=%s use_row_wise=%s final_target_keys=%s",
+            len(training_like_df),
+            dataset_class_col,
+            (
+                training_like_df[dataset_class_col].astype(str).value_counts().to_dict()
+                if dataset_class_col and dataset_class_col in training_like_df.columns
+                else None
+            ),
+            use_row_wise,
+            sorted(targets.keys()) if targets else targets,
+        )
 
         cfg_export = bool(getattr(self.config, "decoder_eval_export_row_wise_csv", False))
         if export_row_wise_csv is None:
@@ -3287,6 +3336,9 @@ class TextPredictionTrainer(Trainer):
         class_ids: Optional[List[str]] = None,
         use_cache: Optional[bool] = None,
         intervention_kwargs: Optional[Mapping[str, Any]] = None,
+        split: Optional[Any] = None,
+        training_like_df: Optional[Any] = None,
+        neutral_df: Optional[Any] = None,
         **kwargs: Any
     ) -> Dict[str, Any]:
         """
@@ -3304,7 +3356,29 @@ class TextPredictionTrainer(Trainer):
                 refreshing plot panels (token_selector, activation_gate, etc.). When omitted,
                 uses ``decoder_results["intervention_kwargs"]`` if present, otherwise the
                 historical decoder-eval default (``encoder_direction``).
-            **kwargs: Decoder evaluation options such as ``split``,
+            split: Decoder-eval split to use when (re-)deriving training_like_df/
+                neutral_df. Defaults to ``"test"`` when omitted -- callers that
+                evaluated their decoder grid against a specific split (e.g.
+                ``"validation"``) MUST pass it here too, or this step silently
+                re-derives against a different split's data.
+            training_like_df: Optional caller-supplied evaluation frame. Reused
+                as-is (together with ``neutral_df``) instead of being
+                re-derived from the trainer's own internal data when BOTH are
+                given -- callers that already evaluated a decoder grid
+                against an explicit (study-supplied) frame must pass the SAME
+                frame here, or this step silently substitutes the trainer's
+                own internal one-pole-scoped view (missing rival classes) for
+                the plot refresh. This is exactly the same class of bug
+                fixed in decoder.py's dataset-narrowing removal -- see
+                CLAUDE.md in the study repo. Promoted from ``**kwargs`` to an
+                explicit parameter deliberately: a value buried in a generic
+                kwargs bag is silently dropped if an intermediate layer
+                doesn't know to forward it by name (exactly what happened
+                here before this fix) -- an explicit parameter makes that
+                impossible without a visible signature change at every layer.
+            neutral_df: Optional caller-supplied neutral frame, paired with
+                ``training_like_df`` (see above).
+            **kwargs: Other decoder evaluation options such as
                 ``max_size_training_like``, ``max_size_neutral``, ``max_size``,
                 and ``eval_batch_size``. Omitted size options default to
                 ``TrainingArguments``.
@@ -3318,7 +3392,9 @@ class TextPredictionTrainer(Trainer):
         )
         from gradiend.evaluator.decoder_eval_utils import parse_grid_candidate_id
 
-        split = kwargs.get("split", "test")
+        resolved_split = split if split is not None else "test"
+        cached_training_like_df = training_like_df
+        cached_neutral_df = neutral_df
         max_size = kwargs.get("max_size")
         max_size_training_like = kwargs.get("max_size_training_like")
         max_size_neutral = kwargs.get("max_size_neutral")
@@ -3336,7 +3412,20 @@ class TextPredictionTrainer(Trainer):
         eval_batch_size = self._default_from_training_args(eval_batch_size, "eval_batch_size")
 
         if decoder_results is None:
-            decoder_results = self.evaluate_decoder(use_cache=use_cache, **kwargs)
+            # evaluate_decoder's own `split` parameter defaults to "test",
+            # not None -- None is a distinct value downstream (e.g. the
+            # decoder cache key treats split=None as "none", not "test").
+            # Only pass split when the caller actually gave one, so an
+            # omitted split here still resolves to evaluate_decoder's own
+            # default instead of silently becoming "no split" / a
+            # different cache bucket.
+            decoder_results = self.evaluate_decoder(
+                use_cache=use_cache,
+                training_like_df=training_like_df,
+                neutral_df=neutral_df,
+                **({"split": split} if split is not None else {}),
+                **kwargs,
+            )
         
         grid = decoder_results.get("grid", {})
         _reserved = {"grid", "plot_path", "plot_paths", "intervention_kwargs"}
@@ -3364,15 +3453,21 @@ class TextPredictionTrainer(Trainer):
         base_model = model_with_gradiend.base_model
         tokenizer = model_with_gradiend.tokenizer
         
-        # Get training_like_df for evaluation
-        training_like_df, neutral_df = self._get_decoder_eval_dataframe(
-            tokenizer,
-            split=split,
-            max_size_training_like=max_size_training_like,
-            max_size_neutral=max_size_neutral,
-            cached_training_like_df=None,
-            cached_neutral_df=None,
-        )
+        # Get training_like_df for evaluation. Reuse a caller-supplied frame
+        # as-is when both are given -- do not silently substitute the
+        # trainer's own internal (narrower, one-pole-scoped) view for a
+        # frame the caller explicitly evaluated the decoder grid against.
+        if cached_training_like_df is not None and cached_neutral_df is not None:
+            training_like_df, neutral_df = cached_training_like_df, cached_neutral_df
+        else:
+            training_like_df, neutral_df = self._get_decoder_eval_dataframe(
+                tokenizer,
+                split=resolved_split,
+                max_size_training_like=max_size_training_like,
+                max_size_neutral=max_size_neutral,
+                cached_training_like_df=cached_training_like_df,
+                cached_neutral_df=cached_neutral_df,
+            )
         
         # Resolve targets and row-wise mode (plotting uses same evaluation path; row-wise needs no static targets).
         targets, use_row_wise = self._resolve_decoder_eval_targets(training_like_df)
@@ -4181,6 +4276,11 @@ class TextPredictionTrainer(Trainer):
                 split=split,
                 batch_size=1,
                 max_size=max_size_training_like,
+                # One-pole training is target-factual only, but decoder
+                # evaluation must score that learned feature on every factual
+                # class. Keep the populations separate explicitly instead of
+                # broadening the training frame.
+                include_other_classes=self._is_one_pole_config(),
             )
 
             # Extract DataFrame from dataset

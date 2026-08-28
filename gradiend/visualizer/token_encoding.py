@@ -386,8 +386,11 @@ def compute_token_encodings(
     Compute one encoded value per visible token.
 
     - ACTIEND (``uses_activations``): encode the activation vector at each token
+
       position (one forward pass).
+
     - GRADIEND: mask each token, create gradients for that leave-one-out example,
+
       and encode the resulting gradient signal.
     """
     tokenizer = getattr(model_with_gradiend, "tokenizer", None)

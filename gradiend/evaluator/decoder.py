@@ -169,6 +169,96 @@ def _write_decoder_raw_rows(raw_output_path: Optional[str], frames: Sequence[pd.
     return raw_output_path
 
 
+def _cell_lms(entry: Optional[Mapping[str, Any]]) -> Optional[float]:
+    """Read a grid cell's scalar LMS value (``entry["lms"]["lms"]``, per default_extract_candidates)."""
+    if not isinstance(entry, Mapping):
+        return None
+    lms = entry.get("lms")
+    if isinstance(lms, Mapping):
+        val = lms.get("lms")
+        return float(val) if isinstance(val, (int, float)) else None
+    if isinstance(lms, (int, float)):
+        return float(lms)
+    return None
+
+
+def _bisect_refine_lms_boundary(
+    *,
+    relevant_results: Dict[Any, Dict[str, Any]],
+    pairs: List[Tuple[float, float]],
+    lrs: List[float],
+    classes_to_eval: Sequence[str],
+    class_to_ff: Mapping[str, float],
+    selector: Any,
+    refine_points: int,
+    evaluate_pair: Callable[[float, float], Dict[str, Any]],
+) -> None:
+    """Binary-search each class's LMS-gate boundary, mutating ``relevant_results``/``pairs``/``lrs`` in place.
+
+    For each class's polarity (``class_to_ff[cls]``), scans the already-evaluated
+    learning rates (ascending) for the first adjacent pair where ``lms`` crosses
+    ``selector.ratio * base_lms`` — the boundary :class:`LMSThresholdPolicy`-style
+    selectors actually optimize around (restrict to lms-passing candidates, then
+    argmax metric — so under the usual "metric increases, lms decreases with
+    |lr|" pattern, the selected point already sits on this boundary). Bisects
+    that interval by geometric midpoint for up to ``refine_points`` steps,
+    evaluating each new point via ``evaluate_pair`` and narrowing toward
+    whichever side is still on the passing side.
+
+    No-ops (per class, or entirely) when: ``selector`` has no ``ratio``
+    attribute (nothing to define the boundary against — not every
+    ``SelectionPolicy`` has one); base lms is missing; a class's grid has no
+    visible pass→fail transition among adjacent points (already uniform,
+    nothing to refine); or a class's polarity was already covered by an
+    earlier class in ``classes_to_eval`` sharing the same ``feature_factor``.
+    """
+    ratio = getattr(selector, "ratio", None)
+    if ratio is None:
+        return
+    base_lms = _cell_lms(relevant_results.get("base"))
+    if base_lms is None:
+        return
+    cutoff = float(ratio) * base_lms
+
+    seen_ff: set = set()
+    for cls in classes_to_eval:
+        ff = class_to_ff.get(cls)
+        if ff is None or ff in seen_ff:
+            continue
+        seen_ff.add(ff)
+
+        same_ff_lrs = sorted({lr for (f, lr) in pairs if f == ff})
+        if len(same_ff_lrs) < 2:
+            continue
+        lms_by_lr = {lr: _cell_lms(relevant_results.get((ff, lr))) for lr in same_ff_lrs}
+
+        lo = hi = None
+        for a, b in zip(same_ff_lrs, same_ff_lrs[1:]):
+            la, lb = lms_by_lr.get(a), lms_by_lr.get(b)
+            if la is None or lb is None:
+                continue
+            if la >= cutoff > lb:
+                lo, hi = a, b
+                break
+        if lo is None:
+            continue
+
+        for _ in range(refine_points):
+            mid = (lo * hi) ** 0.5 if lo > 0 and hi > 0 else (lo + hi) / 2.0
+            if mid <= lo or mid >= hi or (ff, mid) in relevant_results:
+                break
+            result = evaluate_pair(ff, mid)
+            pairs.append((ff, mid))
+            lrs.append(mid)
+            mid_lms = _cell_lms(result)
+            if mid_lms is None:
+                break
+            if mid_lms >= cutoff:
+                lo = mid
+            else:
+                hi = mid
+
+
 def _decoder_split_cache_key(split: Any) -> str:
     if split is None:
         return "none"
@@ -248,11 +338,26 @@ def _plot_all_target_classes(
     plot_keys_override: Optional[List[str]] = None,
     plot_kwargs: Optional[Dict[str, Any]] = None,
     intervention_kwargs: Optional[Mapping[str, Any]] = None,
+    training_like_df: Optional[Any] = None,
+    neutral_df: Optional[Any] = None,
+    split: Optional[Any] = None,
 ) -> List[str]:
     """Plot probability shifts once per target class for the given direction. Returns list of saved plot paths.
     When show is None and plot was requested, defaults to True so the plot is displayed.
     When plot_keys_override is set (e.g. when user passed target_class), only those keys are plotted,
-    so we do not plot for internal result keys (e.g. 3PL when strengthening 3SG)."""
+    so we do not plot for internal result keys (e.g. 3PL when strengthening 3SG).
+
+    ``training_like_df``/``neutral_df``/``split`` are forwarded to
+    ``trainer.plot_probability_shifts`` -> ``analyze_decoder_for_plotting``
+    so the plot-refresh pass reuses the SAME frame the decoder grid was
+    actually evaluated against, instead of silently re-deriving a
+    (potentially narrower, one-pole-scoped) frame from the trainer's own
+    internal data. Confirmed production bug when this wasn't threaded
+    through: a bisection-refined grid cell's plot-refresh call re-derived
+    training_like_df with split defaulting to "test" and no caller frame
+    reused, replacing every rival class's panel with the trainer's own
+    internal one-pole view -- see CLAUDE.md in the study repo.
+    """
     if plot_keys_override is not None:
         plot_keys = [k for k in plot_keys_override if k in summary]
     elif increase_target_probabilities:
@@ -289,10 +394,23 @@ def _plot_all_target_classes(
         call_kwargs = dict(base_plot_kwargs)
         if output_path is not None:
             call_kwargs["output"] = output_path
+        # training_like_df/neutral_df/split are explicit parameters all the
+        # way down this call chain (trainer.plot_probability_shifts ->
+        # evaluator.plot_probability_shifts -> visualizer.plot_probability_
+        # shifts -> analyze_decoder_for_plotting), each treating an explicit
+        # None the same as "not supplied" -- so passing them unconditionally
+        # here is safe and requires no "only if not None" dance. This used
+        # to be a **kwargs bag with a hand-picked subset silently forwarded
+        # at one layer (visualizer.py) and not others, which is exactly what
+        # let this same data go missing in production -- see CLAUDE.md in
+        # the study repo.
         path = trainer.plot_probability_shifts(
             decoder_results=decoder_results,
             target_class=target_class,
             increase_target_probabilities=increase_target_probabilities,
+            training_like_df=training_like_df,
+            neutral_df=neutral_df,
+            split=split,
             **call_kwargs,
         )
         if path:
@@ -324,14 +442,19 @@ def derive_default_feature_factor(
     CONTRACT (do not change without explicit design review):
 
     - Gradient-space GRADIEND uses the historical weight-rewrite convention:
+
       factual/diff sources use ``-feature_class_encoding_direction[class_name]``;
       alternative sources use ``+feature_class_encoding_direction[class_name]``.
+
     - Activation-space ACTIEND uses direct activation-displacement semantics,
+
       so its feature factor is the negated GRADIEND weight-rewrite feature
       factor. For the usual ``target="diff"`` steering setup, that means
       factual/diff sources use ``+feature_class_encoding_direction[class_name]``
       and alternative sources use ``-feature_class_encoding_direction[class_name]``.
+
     - Rewrite/hook orientation is **only** this ``feature_factor`` ×
+
       decoder(latent); never flip LR. ``SignalScope`` chooses activation sites
       and does not participate in the sign convention.
 
@@ -671,6 +794,7 @@ def compute_metric_summaries(
     lr_from_id: Callable[[CandidateId], float] = lambda cid: cid[1],
     empty_default_id: str = "base",
     class_to_ff: Optional[Mapping[str, float]] = None,
+    explicit_feature_factors: bool = False,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Summarize multiple metrics in one pass.
@@ -698,6 +822,14 @@ def compute_metric_summaries(
         class_to_ff: Optional mapping from class id to its strengthening feature
             factor. Used to restrict strengthen and weaken summaries to candidates
             with the correct rewrite orientation per class.
+        explicit_feature_factors: True when the caller passed an explicit
+            ``feature_factors=`` to ``evaluate_decoder`` rather than letting it
+            derive a default sweep from ``class_to_ff``. When True,
+            ``class_to_ff`` is not used to filter candidates for a metric --
+            the caller already chose exactly which feature_factor(s) to
+            evaluate (e.g. an opposite-polarity random control), and this
+            function must respect that instead of silently re-deriving its
+            own expectation and rejecting a grid the caller built on purpose.
 
     Returns:
       {metric: {"value", "feature_factor", "learning_rate", "id", "strengthen"}}
@@ -729,6 +861,30 @@ def compute_metric_summaries(
     def _candidates_for_metric(metric: str) -> List[Candidate]:
         if not class_to_ff:
             return list(candidates)
+        if explicit_feature_factors:
+            # class_to_ff's job is disambiguating which subset of a grid the
+            # package *itself* derived a default sweep for counts as
+            # "strengthen"/"weaken" for this metric. When the caller instead
+            # passed an explicit feature_factors=[...] (e.g. an
+            # opposite-polarity random-control re-query deliberately
+            # evaluating a class's *non-canonical* direction on purpose),
+            # that derivation never happened -- the grid already is exactly
+            # what was explicitly requested, and second-guessing it against
+            # class_to_ff[metric] would silently override the caller's own
+            # manual parameter instead of respecting it. See gradiend-sae's
+            # CLAUDE.md ("opposite-polarity causal control failed") for the
+            # concrete crash this caused: pronoun_number's
+            # actiend:plural-singular:plural random control passed
+            # feature_factors=[opp_ff], and this function's old unconditional
+            # class_to_ff[metric] filter found zero matching candidates and
+            # raised -- even though the caller had explicitly asked for
+            # exactly that ff and needed no disambiguation at all.
+            #
+            # This is deliberately narrower than "grid has only one ff
+            # present": an *auto-derived* single-sided grid (class_to_ff
+            # never consulted by the caller) still must raise -- see
+            # test_strengthen_missing_feature_factor_error_lists_grid_ffs.
+            return list(candidates)
         if metric.endswith("_weaken"):
             base = metric[:-7]
             strengthen_ff = class_to_ff.get(base)
@@ -754,6 +910,14 @@ def compute_metric_summaries(
     summary: Dict[str, Dict[str, Any]] = {}
     for metric in normalized_metrics:
         filtered = _candidates_for_metric(metric)
+        logger.debug(
+            "compute_metric_summaries: metric=%r class_to_ff=%s candidate_ffs=%s "
+            "filtered_ffs=%s",
+            metric,
+            class_to_ff,
+            sorted({float(feature_factor_from_id(c.id)) for c in candidates}),
+            sorted({float(feature_factor_from_id(c.id)) for c in filtered}),
+        )
         chosen = selector.select(metric, filtered, ctx) if filtered else None
         if chosen is None:
             chosen = _fallback_when_none(filtered) if filtered else None
@@ -761,6 +925,16 @@ def compute_metric_summaries(
             if not metric.endswith("_weaken") and class_to_ff and metric in class_to_ff:
                 available_ffs = sorted(
                     {float(feature_factor_from_id(c.id)) for c in candidates}
+                )
+                logger.error(
+                    "compute_metric_summaries: no candidate for strengthen metric=%r -- "
+                    "class_to_ff=%s (required ff=%s), grid candidate ffs=%s, "
+                    "filtered (post _candidates_for_metric) ffs=%s",
+                    metric,
+                    class_to_ff,
+                    class_to_ff[metric],
+                    available_ffs,
+                    sorted({float(feature_factor_from_id(c.id)) for c in filtered}),
                 )
                 raise ValueError(
                     "No decoder grid candidates for strengthen class %r "
@@ -840,6 +1014,7 @@ class DecoderEvaluator:
         plot: bool = False,
         show: Optional[bool] = None,
         plot_kwargs: Optional[Dict[str, Any]] = None,
+        refine_points: int = 0,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation and return summary + grid for one direction (strengthen or weaken).
@@ -906,6 +1081,22 @@ class DecoderEvaluator:
             plot_kwargs: Optional dict of options forwarded to plot_probability_shifts when plot=True.
                 E.g. plot_kwargs=dict(figsize=(5, 3), show=False). The evaluate_decoder ``show`` argument
                 overrides plot_kwargs[\"show\"] when set.
+            refine_points: If > 0, after the requested ``lrs`` grid is evaluated, binary-search up to
+                this many additional points per (strengthen) target class to sharpen the LMS-gate
+                boundary the grid found only coarsely. For each class, finds the adjacent pair of
+                evaluated learning rates where ``lms`` crosses ``ratio * base_lms`` (the boundary
+                ``selector`` — normally :class:`LMSThresholdPolicy` — actually optimizes around), then
+                bisects that interval by geometric midpoint, evaluating and narrowing toward the
+                boundary each step. Assumes ``lms`` is monotonically non-increasing in ``|lr|`` (more
+                aggressive steering degrades fluency) and the target metric is monotonically
+                non-decreasing in ``|lr|`` within the passing region — true for typical strengthen
+                sweeps. Skips classes whose grid has no visible pass/fail transition among adjacent
+                points (nothing to bisect) and any class evaluated under a ``selector`` without a
+                ``ratio`` attribute (nothing to define the boundary against). No-op when
+                ``increase_target_probabilities=False`` (weaken mode) or ``target_class`` is unset.
+                New points are merged into ``grid``/the returned summary exactly like the coarse grid
+                (and into the on-disk cache) — this is not a second cache-invalidating call, the
+                extra points are computed in the same pass.
 
         Returns:
             Flat dict with:
@@ -983,7 +1174,6 @@ class DecoderEvaluator:
         else:
             classes_to_eval = target_classes or []
 
-        tcs = set(target_classes or [])
         # Strengthen summaries must only request classes actually evaluated.
         # ``get_target_feature_classes()`` expands one-pole to claim+CFs for token
         # vocab; those CF names are datasets / weaken rivals, not strengthen metrics.
@@ -1040,6 +1230,15 @@ class DecoderEvaluator:
                 cls: derive_feature_factor_for_class(trainer, raw_model, cls)
                 for cls in target_classes
             }
+
+        # Captured before feature_factors is possibly overwritten by the
+        # derivation below -- distinguishes "caller explicitly chose these
+        # feature_factors" (e.g. an opposite-polarity random-control
+        # re-query, deliberately requesting a class's non-canonical
+        # direction) from "this evaluator derived its own default sweep from
+        # class_to_ff". Forwarded into compute_metric_summaries so it can
+        # tell those two cases apart instead of always trusting class_to_ff.
+        explicit_feature_factors = feature_factors is not None
 
         if feature_factors is None:
             if increase_target_probabilities and classes_to_eval and class_to_ff:
@@ -1169,21 +1368,30 @@ class DecoderEvaluator:
                         lr_from_id=summary_lr_from_id,
                         empty_default_id=summary_empty_default_id,
                         class_to_ff=class_to_ff,
+                        explicit_feature_factors=explicit_feature_factors,
                     )
                     if not plot:
                         out_cached = {**summary, "grid": relevant_results}
                         if raw_output_path:
                             out_cached["raw_output_path"] = raw_output_path
                         return out_cached
-                    # plot=True: get full df and run fill-in + plot
-                    training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
-                        tokenizer,
-                        max_size_training_like=max_size_training_like,
-                        max_size_neutral=max_size_neutral,
-                        split=split,
-                        cached_training_like_df=None,
-                        cached_neutral_df=None,
-                    )
+                    # plot=True: get full df and run fill-in + plot. Reuse the
+                    # caller's own training_like_df/neutral_df (still their
+                    # original values here -- untouched since function entry)
+                    # instead of unconditionally re-deriving from the
+                    # trainer's internal state, which silently substitutes a
+                    # different (often narrower) population. Same bug and
+                    # fix as the other _get_decoder_eval_dataframe call site
+                    # below -- see CLAUDE.md in the study repo.
+                    if training_like_df is None or neutral_df is None:
+                        training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
+                            tokenizer,
+                            max_size_training_like=max_size_training_like,
+                            max_size_neutral=max_size_neutral,
+                            split=split,
+                            cached_training_like_df=training_like_df,
+                            cached_neutral_df=neutral_df,
+                        )
                     full_training_like_df = training_like_df
                     dataset_class_col = "label_class" if "label_class" in getattr(training_like_df, "columns", []) else "factual_id"
                     if full_training_like_df is not None and dataset_class_col in getattr(full_training_like_df, "columns", []):
@@ -1232,6 +1440,9 @@ class DecoderEvaluator:
                                 plot_keys_override=plot_keys_override,
                                 plot_kwargs=plot_kwargs,
                                 intervention_kwargs=resolved_intervention_kwargs,
+                                training_like_df=full_training_like_df,
+                                neutral_df=neutral_df,
+                                split=split,
                             )
                         except ImportError as e:
                             logger.warning("Skipping decoder probability-shift plots: %s", e)
@@ -1272,33 +1483,39 @@ class DecoderEvaluator:
                 cached_neutral_df=neutral_df,
             )
 
-        # Restrict to datasets required for the requested direction (efficiency).
-        # Strengthen + prob_on_other_class: P(target) on the other class's dataset.
-        # Strengthen + same-panel (one-pole): P(target) on target's own dataset.
-        # Weaken: maximize (1 - P(class) on class's data) → need class's data.
+        # `full_training_like_df`/`dataset_class_col` are read later for
+        # plotting (both the every-class-shown plot branches below) even
+        # though `training_like_df` itself is used unfiltered for scoring --
+        # see the removed dataset-narrowing note below.
         full_training_like_df = training_like_df
         dataset_class_col = "label_class" if "label_class" in getattr(training_like_df, "columns", []) else "factual_id"
-        if summary_metrics is not None or target_class is not None:
-            # Score P(claim) on rival datasets when needed, but do not treat CF
-            # names as summary metrics. For one-pole, rivals come from the full
-            # expanded class set; for bipolar, from the other claim class(es).
-            if increase_target_probabilities and prob_on_other_class:
-                required_datasets = set(tcs) if tcs else set(classes_to_eval)
-            else:
-                required_datasets = set(classes_to_eval)
-        elif increase_target_probabilities:
-            if prob_on_other_class:
-                required_datasets = {d for c in classes_to_eval for d in (tcs - {c})}
-            else:
-                required_datasets = set(classes_to_eval)
-        else:
-            required_datasets = set(classes_to_eval)
-        if dataset_class_col in getattr(training_like_df, "columns", []) and required_datasets:
-            training_like_df_selection = full_training_like_df[
-                full_training_like_df[dataset_class_col].astype(str).isin(required_datasets)
-            ]
-            if len(training_like_df_selection) > 0:
-                training_like_df = training_like_df_selection
+        # NOTE: this used to additionally pre-filter `training_like_df` down
+        # to a `required_datasets` subset computed from
+        # (target_class/classes_to_eval, tcs, increase_target_probabilities,
+        # prob_on_other_class) as a scoring-efficiency optimization ("only
+        # score the dataset rows this specific direction needs"). Removed:
+        # every real call site's `classes_to_eval` is either (a) a trainer's
+        # full claim set (`evaluate_decoder_for_classes` in the study, or a
+        # bare `target_class=` covering every pole a pair trainer has) --
+        # which already made the old formula recover full coverage, so
+        # narrowing was a no-op there -- or (b) a singleton (every direct
+        # `target_class="X"` call in this package's own examples, and every
+        # opposite-polarity random-control re-query in causal_study.py) --
+        # where the old formula unconditionally dropped that one class's own
+        # dataset panel. That silent drop is exactly what caused
+        # "probs_by_dataset['M']['F'] is absent"-style crashes in production
+        # (confirmed on gender_en/pronoun_number/religion_one_pole): the
+        # dropped class's own panel is needed by this same call's same-panel
+        # weaken-selection (probs_by_dataset[class][class] in trainer.py) and
+        # by cross-panel callers this purely-local, single-call vantage point
+        # cannot predict. Since no current caller relies on the narrowing for
+        # actual performance (it was a no-op whenever safe, and unsafe
+        # whenever it did anything), keeping a "fixed" version of it around
+        # only preserves complexity with no benefit -- removed outright
+        # rather than patched. If a genuine large-multi-class-frame
+        # performance need arises later, it should be reintroduced as an
+        # explicit, opt-in parameter with its own contract, not a silent
+        # default a caller has no way to see or override.
 
         _LARGE_DATASET = 10000
         if max_size_training_like is None and len(training_like_df) > _LARGE_DATASET:
@@ -1340,16 +1557,18 @@ class DecoderEvaluator:
             all_results["base"] = base_results
             relevant_results["base"] = base_results
 
-        for feature_factor, lr in gradiend_tqdm(
-            pairs,
-            desc=f"Evaluate GRADIEND {run_id or ''}",
-            total=len(pairs),
-            position=0,
-        ):
+        def _evaluate_pair(feature_factor: float, lr: float) -> Dict[str, Any]:
             id_key = (feature_factor, lr)
-            if id_key in relevant_results and use_cache:
-                continue
-
+            logger.info(
+                "_evaluate_pair: ff=%r lr=%r id(training_like_df)=%s len(training_like_df)=%s "
+                "id(neutral_df)=%s len(neutral_df)=%s",
+                feature_factor,
+                lr,
+                id(training_like_df),
+                len(training_like_df) if training_like_df is not None else None,
+                id(neutral_df),
+                len(neutral_df) if neutral_df is not None else None,
+            )
             with _decoder_grid_model_context(
                 model_with_gradiend,
                 base_model=base_model,
@@ -1382,6 +1601,42 @@ class DecoderEvaluator:
                 modified_results["id"] = {"feature_factor": feature_factor, "learning_rate": lr}
             all_results[id_key] = modified_results
             relevant_results[id_key] = modified_results
+            return modified_results
+
+        for feature_factor, lr in gradiend_tqdm(
+            pairs,
+            desc=f"Evaluate GRADIEND {run_id or ''}",
+            total=len(pairs),
+            position=0,
+        ):
+            id_key = (feature_factor, lr)
+            if id_key in relevant_results and use_cache:
+                continue
+            _evaluate_pair(feature_factor, lr)
+
+        if refine_points > 0 and increase_target_probabilities and classes_to_eval and class_to_ff:
+            logger.info(
+                "evaluate_decoder: entering _bisect_refine_lms_boundary refine_points=%r "
+                "classes_to_eval=%r class_to_ff=%r id(training_like_df)=%s len(training_like_df)=%s "
+                "id(neutral_df)=%s len(neutral_df)=%s",
+                refine_points,
+                list(classes_to_eval),
+                dict(class_to_ff),
+                id(training_like_df),
+                len(training_like_df) if training_like_df is not None else None,
+                id(neutral_df),
+                len(neutral_df) if neutral_df is not None else None,
+            )
+            _bisect_refine_lms_boundary(
+                relevant_results=relevant_results,
+                pairs=pairs,
+                lrs=lrs,
+                classes_to_eval=classes_to_eval,
+                class_to_ff=class_to_ff,
+                selector=selector,
+                refine_points=refine_points,
+                evaluate_pair=_evaluate_pair,
+            )
 
         summary = self.compute_metric_summaries(
             trainer,
@@ -1393,6 +1648,7 @@ class DecoderEvaluator:
             lr_from_id=summary_lr_from_id,
             empty_default_id=summary_empty_default_id,
             class_to_ff=class_to_ff,
+            explicit_feature_factors=explicit_feature_factors,
         )
 
         plot_paths: List[str] = []
@@ -1441,6 +1697,9 @@ class DecoderEvaluator:
                         plot_keys_override=plot_keys_override,
                         plot_kwargs=plot_kwargs,
                         intervention_kwargs=resolved_intervention_kwargs,
+                        training_like_df=full_training_like_df,
+                        neutral_df=neutral_df,
+                        split=split,
                     )
                 except ImportError as e:
                     logger.warning("Skipping decoder probability-shift plots: %s", e)
@@ -1490,6 +1749,7 @@ class DecoderEvaluator:
             lr_from_id: Callable[[CandidateId], float] = lambda cid: cid[1],
             empty_default_id: str = "base",
             class_to_ff: Optional[Mapping[str, float]] = None,
+            explicit_feature_factors: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Build a per-metric (i.e., target classes) summary for a decoder grid evaluation.
@@ -1519,6 +1779,10 @@ class DecoderEvaluator:
                 that strengthens it. Used for strengthen and ``*_weaken`` metrics
                 so each summary only considers candidates with the correct
                 rewrite orientation for that class.
+            explicit_feature_factors: True when the grid's feature_factors were
+                explicitly requested by the caller of ``evaluate_decoder``
+                (not derived by this evaluator from ``class_to_ff``). See the
+                module-level ``compute_metric_summaries``'s docstring.
 
         Returns:
             A dict keyed by metric name with values containing selected metric
@@ -1534,4 +1798,5 @@ class DecoderEvaluator:
             lr_from_id=lr_from_id,
             empty_default_id=empty_default_id,
             class_to_ff=class_to_ff,
+            explicit_feature_factors=explicit_feature_factors,
         )

@@ -106,6 +106,24 @@ _ANALYZE_SEED_STABILITY_MIN_ONE_WARNING = (
 )
 
 
+def _selection_metric_needs_rivals(metric: Any) -> bool:
+    """Whether periodic validation must encode one-pole rival factual rows."""
+    name = str(metric or "correlation").strip().lower()
+    return name in {
+        "e", "encoding_e", "encoding-e", "encodinge",
+        "roc_auc", "auroc", "auc", "roc-auc",
+        "min_auc_n_o", "min_auc", "auc_min", "roc_auc_min",
+        "min_auc_no", "min(auc_n,auc_o)",
+    }
+
+
+def _selection_eval_source(*, one_pole: bool, training_source: Any, metric: Any) -> Any:
+    """Use the minimal source population needed by the active selector."""
+    if one_pole and not _selection_metric_needs_rivals(metric):
+        return "factual"
+    return training_source
+
+
 def set_seed(seed: int) -> None:
     """
     Set all RNG seeds and env vars for reproducible runs. Call at the very start of your
@@ -1220,6 +1238,30 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             include_other = self._default_from_training_args(
                 None, "include_other_classes", fallback=False
             )
+            # Expand one-pole validation only when the active selector needs
+            # rivals. Correlation selection stays pair-local and avoids the
+            # repeated rival encodings; final encoder reporting can still ask
+            # for include_other_classes=True once after training.
+            selection_name = str(
+                getattr(config, "selection_metric", None)
+                or getattr(config, "convergent_metric", None)
+                or "correlation"
+            ).strip().lower()
+            selection_needs_rivals = _selection_metric_needs_rivals(selection_name)
+            if self._is_one_pole_config():
+                # source=both already supplies target and configured rival
+                # poles for E. Do not add reverse/full-class factual contexts
+                # to periodic selection evaluation; those belong to the one-off
+                # final report.
+                include_other = False
+            # Correlation selection for one-pole is target-vs-neutral. Do not
+            # encode the counterfactual source pole merely because optimization
+            # itself uses source=both.
+            eval_source = _selection_eval_source(
+                one_pole=self._is_one_pole_config(),
+                training_source=config.source,
+                metric=selection_name,
+            )
             # Use dedicated train-time encoder eval cap when set, otherwise fall back to encoder_eval_max_size
             train_eval_max_size = getattr(config, "encoder_eval_train_max_size", None)
             if train_eval_max_size is None:
@@ -1227,7 +1269,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             eval_dataset = self.create_eval_data(
                 model_with_gradiend,
                 split=self.resolve_split_for_role("eval"),
-                source=config.source,
+                source=eval_source,
                 max_size=train_eval_max_size,
                 include_other_classes=include_other,
             )
@@ -1247,6 +1289,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 return self.evaluator.evaluate_encoder(
                     eval_data=eval_dataset,
                     use_cache=False,
+                    compute_rival_metrics=selection_needs_rivals,
                 )
             config.evaluate_fn = _default_evaluate
             installed_default_evaluate = True
@@ -1464,11 +1507,18 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 val = bsc.get("loss")
                 if isinstance(val, (int, float)):
                     return -float(val)
-            val = bsc.get("correlation")
+            selection_name = str(
+                getattr(args, "selection_metric", None)
+                or getattr(args, "convergent_metric", None)
+                or "correlation"
+            ).strip().lower()
+            if selection_name in {"e", "encoding-e", "encodinge"}:
+                selection_name = "encoding_e"
+            val = bsc.get(selection_name)
             if isinstance(val, (int, float)):
                 return float(val)
             ts = stats.get("training_stats") or {}
-            val = ts.get("correlation")
+            val = ts.get(selection_name)
             return float(val) if isinstance(val, (int, float)) else None
 
         def _numeric_or_none(value: Any) -> Optional[float]:
@@ -1616,6 +1666,11 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         )
 
                 convergent_metric = (args.convergent_metric or ("loss" if args.supervised_decoder else "correlation")).lower()
+                selection_metric = str(
+                    getattr(args, "selection_metric", None) or convergent_metric
+                ).strip().lower()
+                if selection_metric in {"e", "encoding-e", "encodinge"}:
+                    selection_metric = "encoding_e"
                 threshold = args.convergent_score_threshold
                 min_convergent = args.min_convergent_seeds
                 convergent_count = 0
@@ -1792,16 +1847,18 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     # Optionally skip expensive full validation eval:
                     # - never needed for loss-based convergence (convergent_metric == "loss")
                     # - can be skipped when training_score (score) is clearly below threshold
-                    # - skip when we already have a convergent seed (no need to recompute encoder analysis)
+                    # Every seed that remains eligible is evaluated on the same
+                    # validation population; otherwise best-seed selection would
+                    # compare full-eval scores for early seeds with smaller
+                    # training-callback scores for later seeds.
                     run_full_eval = convergent_metric != "loss"
                     if (
                         run_full_eval
+                        and selection_metric == convergent_metric
                         and threshold is not None
                         and isinstance(score, (int, float))
                         and score < threshold
                     ):
-                        run_full_eval = False
-                    if run_full_eval and seed_value != seeds[0] and convergent_count >= 1:
                         run_full_eval = False
                     try:
                         self._model_arg = out_path
@@ -1811,6 +1868,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                 split=self.resolve_split_for_role("eval"),
                                 max_size=seed_selection_eval_max_size,
                                 use_cache=False,
+                                source=(
+                                    _selection_eval_source(
+                                        one_pole=self._is_one_pole_config(),
+                                        training_source=None,
+                                        metric=selection_metric,
+                                    )
+                                ),
+                                include_other_classes=False,
                             )
                             if isinstance(eval_result, dict):
                                 eval_corr = eval_result.get("correlation")
@@ -1830,7 +1895,18 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         prev_model_instance = None
                         _clear_seed_gpu_state()
 
-                    selection_score = eval_corr if eval_corr is not None else score
+                    eval_selection_score = (
+                        eval_result.get(selection_metric)
+                        if isinstance(eval_result, dict)
+                        else None
+                    )
+                    if not isinstance(eval_selection_score, (int, float)):
+                        eval_selection_score = eval_corr if selection_metric == "correlation" else None
+                    selection_score = (
+                        float(eval_selection_score)
+                        if isinstance(eval_selection_score, (int, float))
+                        else score
+                    )
 
                     metric_val = None
                     bsc = {}
@@ -1838,6 +1914,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         stats,
                         threshold=threshold,
                         mean_threshold=args.convergent_mean_by_class_threshold,
+                        selection_metric=selection_metric,
                     ) if convergent_metric != "loss" else None
                     component_summary = (
                         component_run.get("summary")
@@ -1852,6 +1929,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                 metric_val = (stats.get("training_stats") or {}).get("loss")
                         elif isinstance(component_summary, dict):
                             metric_val = component_summary.get("correlation_mean")
+                        elif convergent_metric in {"roc_auc", "min_auc_n_o"}:
+                            # best_score_checkpoint[selection_metric] is the scalar best-step
+                            # value for AUC-based metrics (callbacks.py sets it directly as
+                            # self.best_score) — bsc["correlation"] here is an unrelated,
+                            # non-best-step snapshot and must not be used for this comparison.
+                            metric_val = bsc.get(convergent_metric)
+                            if metric_val is None:
+                                metric_val = (stats.get("training_stats") or {}).get(convergent_metric)
                         else:
                             metric_val = bsc.get("correlation")
                             if metric_val is None:
@@ -1863,6 +1948,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     mean_ok = True
                     target_mean_product = None
                     min_target_class_abs_mean = None
+                    positive_target_class_mean = None
+                    positive_target_class_mean_ok = True
+                    auc_positive_target_required = convergent_metric in {"roc_auc", "min_auc_n_o"}
                     if isinstance(metric_val, (int, float)):
                         if convergent_metric == "loss":
                             if best_step_ok and metric_val <= threshold:
@@ -1881,14 +1969,30 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                             if converged:
                                 convergent_count += 1
                         else:
-                            target_mean_product = trainer_stats._best_step_target_class_mean_product(
-                                (stats or {}).get("training_stats") or {},
-                                (stats or {}).get("best_score_checkpoint") or {},
-                            )
+                            stats_history = (stats or {}).get("training_stats") or {}
+                            stats_best_checkpoint = (stats or {}).get("best_score_checkpoint") or {}
+                            if auc_positive_target_required:
+                                positive_target_class_mean = trainer_stats._best_step_positive_target_class_mean(
+                                    stats_history,
+                                    stats_best_checkpoint,
+                                )
+                                positive_target_class_mean_ok = (
+                                    isinstance(positive_target_class_mean, (int, float))
+                                    and positive_target_class_mean > 0.0
+                                )
+                            else:
+                                target_mean_product = trainer_stats._best_step_target_class_mean_product(
+                                    stats_history,
+                                    stats_best_checkpoint,
+                                )
                             if args.convergent_mean_by_class_threshold is not None:
+                                target_mean_product = trainer_stats._best_step_target_class_mean_product(
+                                    stats_history,
+                                    stats_best_checkpoint,
+                                )
                                 min_target_class_abs_mean = trainer_stats._best_step_min_target_class_abs_mean(
-                                    (stats or {}).get("training_stats") or {},
-                                    (stats or {}).get("best_score_checkpoint") or {},
+                                    stats_history,
+                                    stats_best_checkpoint,
                                 )
                             mean_ok = (
                                 args.convergent_mean_by_class_threshold is None
@@ -1897,8 +2001,19 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                     and min_target_class_abs_mean >= args.convergent_mean_by_class_threshold
                                 )
                             )
-                            sign_ok = isinstance(target_mean_product, (int, float)) and target_mean_product < 0
-                            if best_step_ok and metric_val >= threshold and mean_ok and sign_ok:
+                            sign_ok = (
+                                isinstance(target_mean_product, (int, float)) and target_mean_product < 0
+                            ) if (
+                                not auc_positive_target_required
+                                or args.convergent_mean_by_class_threshold is not None
+                            ) else True
+                            if (
+                                best_step_ok
+                                and metric_val >= threshold
+                                and positive_target_class_mean_ok
+                                and mean_ok
+                                and sign_ok
+                            ):
                                 convergent_count += 1
                                 converged = True
 
@@ -1910,6 +2025,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                             "used_cache": used_cache,
                             "training_score": score,
                             "eval_correlation": eval_corr,
+                            "selection_metric": selection_metric,
                             "selection_score": selection_score,
                             "convergence_metric": convergent_metric,
                             "convergence_metric_value": metric_val,
@@ -1917,6 +2033,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                             "threshold": threshold,
                             "convergent_mean_by_class_threshold": args.convergent_mean_by_class_threshold,
                             "convergent_min_target_class_abs_mean": min_target_class_abs_mean,
+                            "auc_positive_target_mean_required": auc_positive_target_required,
+                            "convergent_positive_target_class_mean": positive_target_class_mean,
+                            "convergent_positive_target_class_mean_ok": positive_target_class_mean_ok,
                             "converged": converged,
                             "split_cycle_index": split_cycle_index,
                             "split_cycle_length": split_cycle_length,
@@ -1925,6 +2044,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     if component_run is not None:
                         seed_report[-1]["component_summary"] = component_run.get("summary")
                         seed_report[-1]["component_convergence"] = component_run.get("convergence_by_component")
+                        seed_report[-1]["component_metrics"] = component_run.get("metrics_by_component")
                     if (
                         split_cycle_queue is not None
                         and split_cycle_index is not None
@@ -1935,6 +2055,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                 summarize_component_seed_runs(
                                     seed_report,
                                     min_convergent_seeds=min_convergent,
+                                    selection_metric=selection_metric,
                                 )
                                 or {"min_convergent_runs_per_component": convergent_count}
                             ).get("min_convergent_runs_per_component", convergent_count) < min_convergent
@@ -1953,6 +2074,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                 reason += f" (best checkpoint global_step={bsc.get('global_step')}; requires > 0)"
                             elif metric_val < threshold:
                                 reason += f" (below threshold {threshold:.4f})"
+                            elif auc_positive_target_required and not positive_target_class_mean_ok:
+                                if isinstance(positive_target_class_mean, (int, float)):
+                                    reason += (
+                                        " (label +1 mean encoding="
+                                        f"{positive_target_class_mean:.4f}; requires > 0)"
+                                    )
+                                else:
+                                    reason += " (label +1 mean encoding unavailable; requires > 0)"
                             elif not sign_ok:
                                 if isinstance(target_mean_product, (int, float)):
                                     reason += f" (target-class mean sign criterion not met; product={target_mean_product:.4f})"
@@ -1991,6 +2120,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     component_seed_summary = summarize_component_seed_runs(
                         seed_report,
                         min_convergent_seeds=min_convergent,
+                        selection_metric=selection_metric,
                     ) if convergent_metric != "loss" and min_convergent is not None else None
                     component_stop = bool(
                         component_seed_summary is not None
@@ -2002,6 +2132,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                             component_seed_summary = summarize_component_seed_runs(
                                 seed_report,
                                 min_convergent_seeds=min_convergent,
+                                selection_metric=selection_metric,
                             ) if convergent_metric != "loss" else None
                         if (
                             component_seed_summary is not None
@@ -2062,6 +2193,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 component_seed_summary = summarize_component_seed_runs(
                     seed_report,
                     min_convergent_seeds=min_convergent,
+                    selection_metric=selection_metric,
                 ) if convergent_metric != "loss" and min_convergent is not None else None
                 if component_seed_summary is not None:
                     convergent_count = int(component_seed_summary.get("min_convergent_runs_per_component") or 0)
@@ -2107,8 +2239,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
 
                 report = {
                     "convergence_metric": convergent_metric,
+                    "selection_metric": selection_metric,
                     "threshold": threshold,
                     "convergent_mean_by_class_threshold": args.convergent_mean_by_class_threshold,
+                    "auc_positive_target_mean_required": convergent_metric in {"roc_auc", "min_auc_n_o"},
                     "min_convergent_seeds": min_convergent,
                     "max_seeds": args.max_seeds,
                     "seeds_tried": [r.get("seed") for r in seed_report],
@@ -2411,6 +2545,17 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     "convergent_mean_by_class_threshold": args.convergent_mean_by_class_threshold,
                     "convergent_min_target_class_abs_mean": (
                         best_run.get("convergent_min_target_class_abs_mean") if isinstance(best_run, dict) else None
+                    ),
+                    "auc_positive_target_mean_required": convergent_metric in {"roc_auc", "min_auc_n_o"},
+                    "convergent_positive_target_class_mean": (
+                        best_run.get("convergent_positive_target_class_mean")
+                        if isinstance(best_run, dict)
+                        else None
+                    ),
+                    "convergent_positive_target_class_mean_ok": (
+                        best_run.get("convergent_positive_target_class_mean_ok")
+                        if isinstance(best_run, dict)
+                        else True
                     ),
                 }
                 if component_seed_summary is not None:
@@ -2846,6 +2991,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         plot_kwargs: Optional[Dict[str, Any]] = None,
         decoder_lms_mode: Optional[str] = None,
         device: Optional[Any] = None,
+        refine_points: int = 0,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation for one direction (strengthen or weaken).
@@ -2922,6 +3068,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 :meth:`cpu`) or released via :meth:`unload_model`, call :meth:`cuda` /
                 :meth:`get_model` yourself or pass an explicit device; a warning is logged
                 when evaluation runs on CPU while CUDA is available.
+            refine_points: If > 0, binary-search up to this many additional points per target class
+                to sharpen the LMS-gate boundary the ``lrs`` grid found only coarsely. See
+                ``Evaluator.evaluate_decoder``'s ``refine_points`` docstring for the algorithm and
+                its assumptions/skip conditions.
 
         Returns:
             Dict with flattened decoder summaries. For strengthen, keys like dec["3SG"]; for weaken,
@@ -3014,6 +3164,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         show=show,
                         plot_kwargs=plot_kwargs,
                         model_with_gradiend=eval_model,
+                        refine_points=refine_points,
                     )
                     runtime_monitor.mark("trainer:evaluate_decoder:done")
                     return result

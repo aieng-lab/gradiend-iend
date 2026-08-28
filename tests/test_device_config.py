@@ -164,3 +164,76 @@ def test_place_inputs_follows_actual_base_model_device():
 
     placed = model._place_inputs_for_base_forward({"input_ids": torch.tensor([1, 2, 3])})
     assert placed["input_ids"].device.type == "cpu"
+
+
+def test_place_inputs_moves_a_batchencoding_not_just_a_plain_dict():
+    """A raw tokenizer batch must actually be moved, not silently passed through.
+
+    Real bug, hit live on a GPU cluster run (2026-08-27): create_inputs()
+    tokenizes with ``tokenizer(text, return_tensors="pt")``, whose return type
+    is ``transformers.BatchEncoding`` -- a ``UserDict`` subclass, NOT a
+    ``dict`` subclass (``isinstance(BatchEncoding(...), dict)`` is False).
+    ``_move_batch_to_device``'s old ``isinstance(batch, dict)`` check silently
+    fell through to its final ``return batch`` (unchanged) branch for every
+    such input, so create_inputs's own call to
+    ``_place_inputs_for_base_forward`` never moved anything -- input_ids
+    stayed on whatever device the tokenizer put it on (always CPU) regardless
+    of the model's device, crashing the very first real forward pass with
+    "Expected all tensors to be on the same device" even though every
+    device-introspection check on the model itself reported the correct GPU.
+    A plain dict never hit this (the test above already covers that case);
+    only a real BatchEncoding does.
+    """
+    from transformers.tokenization_utils_base import BatchEncoding
+
+    class FakeEmb(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(10, 4))
+
+    class Base(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embeddings = FakeEmb()
+
+        def get_input_embeddings(self):
+            return self.embeddings
+
+        def forward(self, **kwargs):
+            return kwargs
+
+    class Gradiend:
+        encoder = None
+        device_encoder = torch.device("cpu")
+        param_map = []
+
+        def to(self, *_, **__):
+            return self
+
+    class ConcreteModelWithGradiend(ModelWithGradiend):
+        def _save_model(self, save_directory, **kwargs):
+            pass
+
+        @classmethod
+        def _load_model(cls, load_directory, **kwargs):
+            return None
+
+        def create_gradients(self, factual, counterfactual=None, **kwargs):
+            return {}
+
+        def _ensure_gradiend_param_map_spec(self):
+            pass
+
+        def _sync_base_requires_grad_to_param_map(self):
+            pass
+
+    model = ConcreteModelWithGradiend(Base(), Gradiend(), base_model_device=torch.device("cpu"))
+
+    item = BatchEncoding({"input_ids": torch.tensor([1, 2, 3])})
+    placed = model._place_inputs_for_base_forward(item)
+
+    # The old buggy code returned the *exact same object*, unmoved, unwrapped
+    # -- the tell-tale sign _move_batch_to_device's Mapping branch never ran.
+    assert placed is not item
+    assert isinstance(placed, dict)
+    assert torch.equal(placed["input_ids"], item["input_ids"])

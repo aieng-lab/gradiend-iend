@@ -34,6 +34,7 @@ from gradiend.trainer.core.stats import (
     load_training_stats,
     _best_checkpoint_step_is_after_initial,
     _best_step_min_target_class_abs_mean,
+    _best_step_positive_target_class_mean,
     _best_step_target_class_mean_product,
 )
 from gradiend.util.component_logging import (
@@ -44,6 +45,78 @@ from gradiend.util.component_logging import (
 )
 
 logger = get_logger(__name__)
+
+
+def build_optimizer_parameter_groups(
+    gradiend: Any,
+    train_params: Sequence[Any],
+    *,
+    learning_rate: float,
+    learning_rate_decoder: Optional[float] = None,
+    supervised_encoder: bool = False,
+) -> List[Any]:
+    """Return optimizer parameters, optionally splitting the decoder into its own group.
+
+    ``learning_rate_decoder=None`` (the default) reproduces the historical
+    single-group behaviour exactly: the caller's ``train_params`` list is
+    returned unchanged, so the optimizer sees the identical object it always
+    did.  Only when an explicit decoder learning rate is supplied is a second
+    parameter group created.
+
+    The motivation is that Adam-family updates are scale-free -- the per-step
+    per-coordinate displacement is bounded by roughly ``lr`` regardless of the
+    gradient's magnitude -- so under one shared learning rate the decoder's
+    total reachable displacement is capped at about ``lr * steps * sqrt(dim)``.
+    When the decoder's optimum has a much larger norm than the encoder's, that
+    cap can be orders of magnitude smaller than the distance it must travel,
+    and the decoder cannot converge no matter how correct its gradient is.
+    Giving the decoder its own learning rate removes that constraint without
+    touching encoder optimization.
+
+    Parameters are split by identity against ``gradiend.decoder``. Component
+    decoders share tensors with the full model's decoder, so this does not
+    double-count them.
+    """
+    params = list(train_params)
+    if learning_rate_decoder is None:
+        return params
+    decoder = getattr(gradiend, "decoder", None)
+    if decoder is None:
+        raise ValueError(
+            "learning_rate_decoder was set but the GRADIEND model has no built "
+            "decoder; ensure the model is built before optimizer construction"
+        )
+    if supervised_encoder:
+        # No decoder parameter is being trained at all, so a decoder learning
+        # rate cannot take effect.  Fail loudly rather than silently ignoring a
+        # deliberately-set hyperparameter.
+        raise ValueError(
+            "learning_rate_decoder is set but supervised_encoder=True trains "
+            "encoder parameters only; the decoder learning rate would have no "
+            "effect. Unset one of the two."
+        )
+    decoder_ids = {id(parameter) for parameter in decoder.parameters()}
+    decoder_params = [p for p in params if id(p) in decoder_ids]
+    other_params = [p for p in params if id(p) not in decoder_ids]
+    if not decoder_params:
+        raise ValueError(
+            "learning_rate_decoder is set but no decoder parameter is being "
+            "optimized; check supervised_encoder / trainable parameter selection"
+        )
+    groups: List[Any] = []
+    if other_params:
+        groups.append({"params": other_params, "lr": float(learning_rate)})
+    groups.append({"params": decoder_params, "lr": float(learning_rate_decoder)})
+    logger.info(
+        "Decoupled decoder learning rate: %d non-decoder parameter tensors at "
+        "lr=%g, %d decoder parameter tensors at lr=%g (ratio %.3gx).",
+        len(other_params),
+        float(learning_rate),
+        len(decoder_params),
+        float(learning_rate_decoder),
+        float(learning_rate_decoder) / float(learning_rate) if learning_rate else float("inf"),
+    )
+    return groups
 
 
 def format_training_start_message(model_with_gradiend: Any, training_args: TrainingArguments) -> str:
@@ -302,19 +375,44 @@ def train(
         logger.info("Supervised decoder: optimizing decoder parameters only.")
     else:
         train_params = list(model_with_gradiend.gradiend.parameters())
-    if training_args.optim.lower() == 'adamw':
+    optimizer_params = build_optimizer_parameter_groups(
+        model_with_gradiend.gradiend,
+        train_params,
+        learning_rate=training_args.learning_rate,
+        learning_rate_decoder=training_args.learning_rate_decoder,
+        supervised_encoder=bool(training_args.supervised_encoder),
+    )
+    optim_name = training_args.optim.lower()
+    if optim_name == 'adamw':
         optimizer = torch.optim.AdamW(
-            train_params,
+            optimizer_params,
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
             eps=training_args.adam_epsilon
         )
-    else:
+    elif optim_name == 'adam':
         optimizer = torch.optim.Adam(
-            train_params,
+            optimizer_params,
             lr=training_args.learning_rate,
             weight_decay=training_args.weight_decay,
             eps=training_args.adam_epsilon
+        )
+    elif optim_name == 'sgd':
+        # Per-parameter-group learning rates set by
+        # build_optimizer_parameter_groups are honored here exactly as they are
+        # for the Adam branches; SGD only changes the update rule.
+        optimizer = torch.optim.SGD(
+            optimizer_params,
+            lr=training_args.learning_rate,
+            momentum=training_args.sgd_momentum,
+            weight_decay=training_args.weight_decay,
+        )
+    else:
+        # Previously any unrecognized value silently fell through to Adam, so a
+        # typo produced a different optimizer than requested with no warning.
+        raise ValueError(
+            f"Unsupported optim={training_args.optim!r}; "
+            "expected one of 'adamw', 'adam', 'sgd'"
         )
 
     # Initial evaluation before training starts (at step 0)
@@ -608,6 +706,8 @@ def train(
                 selection_metric = "roc_auc"
             if selection_metric in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
                 selection_metric = "min_auc_n_o"
+            if selection_metric in {"e", "encoding_e", "encoding-e", "encodinge"}:
+                selection_metric = "encoding_e"
             if selection_metric == "loss" or getattr(cb, "use_loss_for_best", False):
                 best_score_checkpoint = {
                     "correlation": None,
@@ -619,17 +719,22 @@ def train(
                     "selection_metric": "loss",
                 }
                 logger.info(f"Training completed (loss selection). Best loss: {cb.best_score:.6f}")
-            elif selection_metric in {"roc_auc", "min_auc_n_o"}:
+            elif selection_metric in {"roc_auc", "min_auc_n_o", "encoding_e"}:
                 best_score_checkpoint = {
                     "correlation": training_stats.get("correlation"),
                     "roc_auc": training_stats.get("roc_auc"),
                     "min_auc_n_o": training_stats.get("min_auc_n_o"),
+                    "encoding_e": training_stats.get("encoding_e"),
                     "global_step": cb.best_step,
                     "epoch": cb.best_epoch,
                     "selection_metric": selection_metric,
                 }
                 best_score_checkpoint[selection_metric] = cb.best_score
-                label = "AUROC" if selection_metric == "roc_auc" else "min(auc_n,auc_o)"
+                label = {
+                    "roc_auc": "AUROC",
+                    "min_auc_n_o": "min(auc_n,auc_o)",
+                    "encoding_e": "encoding E",
+                }[selection_metric]
                 if cb.best_score is None:
                     logger.info(f"Training completed. No encoder {label} score was recorded.")
                 else:
@@ -668,6 +773,9 @@ def train(
     converged = True
     convergent_count = None
     min_target_class_abs_mean = None
+    positive_target_class_mean = None
+    positive_target_class_mean_ok = True
+    auc_positive_target_required = convergent_metric in {"roc_auc", "min_auc_n_o"}
     best_component_summary = None
     best_components = None
     if threshold is not None and min_convergent_seeds is not None and min_convergent_seeds > 0:
@@ -682,6 +790,7 @@ def train(
             },
             threshold=threshold,
             mean_threshold=training_args.convergent_mean_by_class_threshold,
+            selection_metric=training_args.selection_metric or convergent_metric,
         )
         if isinstance(component_run, dict) and isinstance(component_run.get("summary"), dict):
             best_component_summary = component_run["summary"]
@@ -709,6 +818,13 @@ def train(
             if isinstance(metric_val, dict):
                 step = best_score_checkpoint.get("global_step")
                 metric_val = metric_val.get(step, metric_val.get(str(step))) if step is not None else None
+            positive_target_class_mean = _best_step_positive_target_class_mean(
+                training_stats, best_score_checkpoint
+            )
+            positive_target_class_mean_ok = (
+                isinstance(positive_target_class_mean, (int, float))
+                and positive_target_class_mean > 0.0
+            )
             # Optional bipolar mean gate only when explicitly configured.
             mean_ok = True
             if training_args.convergent_mean_by_class_threshold is not None:
@@ -725,6 +841,7 @@ def train(
                 best_step_ok
                 and metric_val is not None
                 and float(metric_val) >= threshold
+                and positive_target_class_mean_ok
                 and mean_ok
                 and sign_ok
             )
@@ -791,6 +908,26 @@ def train(
                     min_convergent_seeds,
                 )
             elif (
+                auc_positive_target_required
+                and metric_val is not None
+                and metric_val >= threshold
+                and not positive_target_class_mean_ok
+            ):
+                if isinstance(positive_target_class_mean, (int, float)):
+                    detail = f"was {positive_target_class_mean:.4f} (required: > 0)"
+                else:
+                    detail = "was unavailable (required: > 0)"
+                logger.warning(
+                    "Training completed but model did not converge: "
+                    "%s=%.4f met the threshold %.4f, but the label +1 mean encoding %s "
+                    "(required: %s convergent seeds).",
+                    convergent_metric,
+                    metric_val,
+                    threshold,
+                    detail,
+                    min_convergent_seeds,
+                )
+            elif (
                 convergent_metric != "loss"
                 and metric_val is not None
                 and abs(metric_val) >= threshold
@@ -852,6 +989,9 @@ def train(
             "threshold": threshold,
             "convergent_mean_by_class_threshold": training_args.convergent_mean_by_class_threshold,
             "convergent_min_target_class_abs_mean": min_target_class_abs_mean,
+            "auc_positive_target_mean_required": auc_positive_target_required,
+            "convergent_positive_target_class_mean": positive_target_class_mean,
+            "convergent_positive_target_class_mean_ok": positive_target_class_mean_ok,
         }
         if best_component_summary is not None:
             convergence_info["convergence_unit"] = "component"

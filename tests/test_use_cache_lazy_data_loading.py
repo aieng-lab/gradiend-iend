@@ -49,6 +49,24 @@ def _prediction_data():
     }
 
 
+def _neutral_data():
+    """Shared neutral pool: add_neutral_identity_transitions defaults True whenever
+    TrainingArguments is present, and now hard-requires TextPredictionConfig.neutral_data
+    (see TextPredictionTrainer._resolve_shared_neutral_dataframe).
+
+    Pre-masked rows (masked + label) so _neutral_identity_rows uses them
+    directly instead of remasking raw text via tokenizer.tokenize(), which
+    _DummyPredictionTokenizer (used across this file) does not implement.
+    """
+    return pd.DataFrame(
+        {
+            "masked": ["[MASK] went home", "[MASK] is home", "[MASK] stayed home"],
+            "label": ["someone", "someone", "someone"],
+            "split": ["train", "validation", "test"],
+        }
+    )
+
+
 def _classification_data():
     return pd.DataFrame(
         [
@@ -73,6 +91,7 @@ def _make_prediction_trainer(experiment_dir: str) -> TextPredictionTrainer:
         target_classes=["3SG", "3PL"],
         args=args,
         use_class_names_as_columns=True,
+        neutral_data=_neutral_data(),
     )
 
 

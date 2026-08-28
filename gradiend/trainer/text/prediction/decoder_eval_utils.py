@@ -270,21 +270,29 @@ def _clm_first_continuation_token_ids(
     target: str,
     vocab_norm_map: Optional[Dict[str, List[str]]] = None,
 ) -> List[int]:
-    """Resolve the first CLM continuation token for ``target`` in this row context."""
+    """Resolve CLM continuation token ids for ``target`` in this row context.
+
+    Always include the contextual first continuation token. Also SUM (via the
+    caller gathering ``p[ids].sum()``) every single-token vocab piece whose
+    surface matches ``target`` after stripping leading space markers and
+    casefolding (``he`` / ``He`` / ``Ġhe`` / …). Do not take MAX over variants.
+    """
     if target is None or (isinstance(target, float) and np.isnan(target)):
         return []
     continuation = f"{gap}{str(target).lstrip()}"
+    ids: List[int] = []
     prefix_ids = _tokenizer_input_ids(tokenizer, prefix_context)
     if prefix_ids:
         full_ids = _tokenizer_input_ids(tokenizer, prefix_context + continuation)
         if full_ids[: len(prefix_ids)] == prefix_ids and len(full_ids) > len(prefix_ids):
-            return [int(full_ids[len(prefix_ids)])]
-    continuation_ids = _tokenizer_input_ids(tokenizer, continuation)
-    if continuation_ids:
-        return [int(continuation_ids[0])]
+            ids.append(int(full_ids[len(prefix_ids)]))
+    if not ids:
+        continuation_ids = _tokenizer_input_ids(tokenizer, continuation)
+        if continuation_ids:
+            ids.append(int(continuation_ids[0]))
     if vocab_norm_map is not None:
-        return _single_token_candidate_ids(tokenizer, target, vocab_norm_map)
-    return []
+        ids.extend(_single_token_candidate_ids(tokenizer, target, vocab_norm_map))
+    return _unique_token_ids(ids)
 
 
 def _clm_first_continuation_token_ids_for_targets(
@@ -854,6 +862,31 @@ def compute_probability_shift_score_clm(
                             score_kind="target_token_probability",
                         )
                     )
+
+    logger.info(
+        "compute_probability_shift_score_clm: eval_kind=%r dataset_class_col=%r "
+        "expected metrics (targets.keys())=%s groups actually populated=%s "
+        "metrics populated per group=%s",
+        eval_kind,
+        dataset_class_col,
+        sorted(targets.keys()),
+        sorted(str(k) for k in probs_by_dataset.keys()),
+        {str(g): sorted(m.keys()) for g, m in probs_by_dataset.items()},
+    )
+    missing_cells = {
+        str(g): sorted(set(targets.keys()) - set(m.keys()))
+        for g, m in probs_by_dataset.items()
+        if set(targets.keys()) - set(m.keys())
+    }
+    if missing_cells:
+        logger.warning(
+            "compute_probability_shift_score_clm: some (group, metric) cells never "
+            "got populated despite being in targets -- missing_cells(group -> metrics)=%s. "
+            "This means every row in that group failed to produce a non-empty token id "
+            "list for that metric (see _clm_first_continuation_token_ids_for_targets), "
+            "not a missing-group problem.",
+            missing_cells,
+        )
 
     # Compute means per dataset class
     probs_by_dataset_means = {}

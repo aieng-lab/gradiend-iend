@@ -179,7 +179,7 @@ excluded by the model-loading logic.
 | **max_seeds** | `3` | Maximum number of seeds to try. |
 | **min_convergent_seeds** | `1` | Stop once this many seeds have converged. `None` runs all `max_seeds`. |
 | **convergent_metric** | `None` | `"correlation"` or `"loss"`. `None` defaults to `"correlation"` unless `supervised_decoder=True`. |
-| **convergent_score_threshold** | `None` | Score threshold for convergence. `None` becomes `0.5` for correlation; required for loss. |
+| **convergent_score_threshold** | `None` | Score threshold for convergence. `None` becomes `0.5` for correlation, `0.9` for roc_auc / min_auc_n_o; required for loss. |
 | **convergent_mean_by_class_threshold** | `None` | Additional convergence threshold: every non-zero target class must have \|mean encoded\| ≥ this value at the best step. For correlation mode, `None` becomes `0.5`. |
 | **prefer_convergent_checkpoint** | `False` | If `True`, best-checkpoint selection prefers steps that meet convergence criteria over a higher-\|correlation\| step that fails them. Default keeps max \|correlation\|; convergence is still checked at that best step. |
 | **split_resplit_per_seed** | `False` | For trainer-assigned splits (`split_col="heldout"` or `None`), redraw them per training seed. |
