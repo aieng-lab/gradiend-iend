@@ -150,6 +150,9 @@ def plot_probability_shifts(
     figsize: Optional[Tuple[float, float]] = None,
     highlight_non_convergence: Optional[bool] = None,
     return_fig_ax: bool = False,
+    split: Optional[Any] = None,
+    training_like_df: Optional[Any] = None,
+    neutral_df: Optional[Any] = None,
     **kwargs: Any
 ) -> Any:
     """
@@ -178,6 +181,17 @@ def plot_probability_shifts(
         highlight_non_convergence: Accepted for API compatibility.
         return_fig_ax: If True, return ``(fig, axes)`` and leave the figure open for
             caller-side customization.
+        split: Decoder-eval split to evaluate/re-derive against when
+            ``decoder_results``/``plotting_data`` aren't already supplied
+            (defaults to ``"test"`` several layers down if omitted). Has no
+            effect when both are already given.
+        training_like_df: Optional evaluation frame to reuse (paired with
+            ``neutral_df``) when ``plotting_data`` isn't already supplied --
+            pass the same frame you evaluated the decoder against, or this
+            function derives its own (narrower, trainer-internal) one. Has
+            no effect when ``plotting_data`` is already given.
+        neutral_df: Optional neutral frame to reuse, paired with
+            ``training_like_df``.
         **kwargs: Additional plotting options. Supported keys include:
             ``title``/``suptitle`` for a figure-level title, ``img_format``, ``dpi``,
             and ``use_cache``.
@@ -187,17 +201,35 @@ def plot_probability_shifts(
         returns ``(fig, axes)``.
     """
     plt = _require_matplotlib()
-    
-    # Get decoder_results and plotting_data
+
+    # Get decoder_results and plotting_data. split/training_like_df/
+    # neutral_df are explicit parameters (not folded into **kwargs)
+    # specifically so a caller invoking this function directly (bypassing
+    # the trainer's own plot_probability_shifts wrapper, which already
+    # threads these through) can't have them silently dropped -- see
+    # CLAUDE.md in the study repo for the production bug this exact
+    # mistake caused when it happened at a different layer.
     if decoder_results is None and trainer is not None:
-        decoder_results = trainer.evaluate_decoder(use_cache=kwargs.get("use_cache"))
-    
+        # evaluate_decoder's own `split` defaults to "test", not None --
+        # None is a distinct value downstream (e.g. the decoder cache key
+        # treats split=None as "none", not "test"). Only pass split when
+        # this function's own caller actually gave one.
+        decoder_results = trainer.evaluate_decoder(
+            use_cache=kwargs.get("use_cache"),
+            training_like_df=training_like_df,
+            neutral_df=neutral_df,
+            **({"split": split} if split is not None else {}),
+        )
+
     if plotting_data is None and trainer is not None:
         plotting_data = trainer.analyze_decoder_for_plotting(
             decoder_results=decoder_results,
             class_ids=class_ids,
             use_cache=kwargs.get("use_cache"),
             intervention_kwargs=(decoder_results or {}).get("intervention_kwargs"),
+            split=split,
+            training_like_df=training_like_df,
+            neutral_df=neutral_df,
         )
     
     if decoder_results is None or plotting_data is None:

@@ -116,6 +116,27 @@ class TrainingArguments:
     learning_rate: float = 1e-5
     """Peak learning rate."""
 
+    learning_rate_decoder: Optional[float] = None
+    """Optional separate learning rate for the GRADIEND/ACTIEND decoder.
+
+    ``None`` (default) keeps the historical behaviour exactly: encoder and
+    decoder share ``learning_rate`` in a single optimizer parameter group.
+
+    Set a value to give the decoder its own group. Adam-family updates are
+    scale-free, so per-step displacement is bounded by roughly ``lr`` per
+    coordinate regardless of gradient magnitude; the decoder can therefore move
+    at most about ``lr * steps * sqrt(output_dim)`` in total. When the decoder's
+    optimum has a far larger norm than the encoder's -- as it does for ACTIEND,
+    whose reconstruction target is a raw activation difference -- that cap can be
+    orders of magnitude below the distance it must travel, so the decoder cannot
+    converge under an encoder-tuned learning rate however correct its gradient
+    direction is. Raising only the decoder's rate lifts that constraint without
+    perturbing encoder optimization.
+
+    Incompatible with ``supervised_encoder=True``, which trains no decoder
+    parameter; that combination raises instead of silently doing nothing.
+    """
+
     num_train_epochs: int = 3
     """Number of training epochs."""
 
@@ -129,7 +150,20 @@ class TrainingArguments:
     """Epsilon for Adam/AdamW."""
 
     optim: str = "adamw"
-    """Optimizer: 'adamw' or 'adam'."""
+    """Optimizer: 'adamw', 'adam', or 'sgd'.
+
+    'sgd' exists to test whether a decoder-reachability shortfall is specific to
+    Adam-family updates. Adam's per-coordinate step is scale-free (bounded by
+    approximately ``learning_rate`` regardless of gradient magnitude), so total
+    displacement over training is bounded by ``lr * steps * sqrt(dim)``. Plain
+    SGD has no such bound -- its displacement scales with the gradients
+    themselves -- so the two optimizers make different predictions about whether
+    a large-norm decoder optimum is reachable within a fixed budget.
+    """
+
+    sgd_momentum: float = 0.0
+    """Momentum for ``optim='sgd'``. Defaults to 0.0, i.e. plain gradient
+    descent, which is the case the reachability analysis actually covers."""
 
     criterion: Optional[Union[nn.Module, Any]] = field(default=None, repr=False)
     """Loss function; None = MSELoss()."""
@@ -328,15 +362,24 @@ class TrainingArguments:
     """Stop once this many seeds have converged. None = run max_seeds. 0 is invalid."""
 
     convergent_metric: Optional[str] = None
-    """Metric for convergence + best-checkpoint selection: "correlation", "roc_auc"/"auroc",
+    """Metric used to decide convergence: "correlation", "roc_auc"/"auroc",
     "min_auc_n_o"/"min_auc", or "loss".
 
     Defaults to correlation unless supervised_decoder (then loss). Use ``min_auc_n_o`` for
     one-pole runs (``min(auc_n, auc_o)`` so neutrals alone cannot carry selection). Legacy
     ``roc_auc`` is pooled one-vs-rest (rivals ∪ neutrals as negatives)."""
 
+    selection_metric: Optional[str] = None
+    """Metric used for best-checkpoint and best-seed selection.
+
+    ``None`` preserves the historical behavior by using ``convergent_metric``.
+    Set ``"encoding_e"``/``"E"`` to select by the same validation bottleneck
+    as the gradiend-sae SAE/CAA study while leaving convergence semantics
+    unchanged. For one-pole data this includes ``auc_rival`` and class
+    exclusivity whenever rival factual rows exist."""
+
     convergent_score_threshold: Optional[float] = None
-    """Threshold for convergence. Defaults: 0.5 (correlation), 0.7 (roc_auc / min_auc_n_o); required for loss."""
+    """Threshold for convergence. Defaults: 0.5 (correlation), 0.9 (roc_auc / min_auc_n_o); required for loss."""
 
     convergent_mean_by_class_threshold: Optional[float] = None
     """Optional additional convergence criterion: minimum absolute mean encoded value per target class.
@@ -436,6 +479,40 @@ class TrainingArguments:
         self.signal = signal
         self.signals = signals
         self.signal_scope = coerce_signal_scope(self.signal_scope)
+        if (
+            self.signal_scope is not None
+            and self.signal is not None
+            and self.signal.kind == "gradient"
+            and self.signal_scope.activation_sites is not None
+        ):
+            # signal_scope.activation_selector (SignalScope.layers()/.layer()/
+            # .embeddings()/.word_embedding()) IS now resolved for a gradient
+            # signal too -- gradient_params_from_selector() in
+            # gradiend/signal_space.py translates it into weight-parameter
+            # wildcards via the same architecture-agnostic ModelTopology the
+            # activation-signal path already used, at model-construction time
+            # (scope_params(scope, base_model=...) in
+            # ModelWithGradiend._create_gradiend). See that function's
+            # docstring: fixed 2026-08-20 after gradiend-sae found
+            # SignalScope.layers() attached to Signal.gradient() silently
+            # training with no scope restriction at all.
+            #
+            # Raw activation_sites=... (an explicit include-list of exact/
+            # wildcard *module* paths, not the semantic shortcuts above) is
+            # NOT resolved for a gradient signal -- there is no generic,
+            # correct way to turn an arbitrary caller-supplied module-name
+            # pattern into the right parameter-name wildcard without risking
+            # a silently-wrong match (e.g. a pattern that already ends in a
+            # wildcard). Fail loudly here instead.
+            raise ValueError(
+                "signal_scope.activation_sites has no effect on a gradient signal "
+                "(Signal.gradient()) -- it is only resolved for Signal.activation(). "
+                "SignalScope.layers()/.layer()/.embeddings()/.word_embedding() (the "
+                "activation_selector shortcuts) DO work for gradient signals; only a "
+                "raw activation_sites=[...] include-list does not. For a gradient "
+                "signal's weight-parameter scope, use SignalScope.from_values(params=[...]) "
+                "(or .default()/.full() for the built-in mode presets) instead."
+            )
         self.gradiend_split = coerce_gradiend_split(self.gradiend_split)
         if self.params is not None:
             warnings.warn(
@@ -466,6 +543,25 @@ class TrainingArguments:
         if self.output_dir is not None and not isinstance(self.output_dir, str):
             raise TypeError(f"output_dir must be str or None, got {type(self.output_dir).__name__}")
         normalize_use_cache(self.use_cache)
+        if self.learning_rate_decoder is not None:
+            if isinstance(self.learning_rate_decoder, bool) or not isinstance(
+                self.learning_rate_decoder, (int, float)
+            ):
+                raise TypeError(
+                    "learning_rate_decoder must be a number or None, got "
+                    f"{type(self.learning_rate_decoder).__name__}"
+                )
+            if not self.learning_rate_decoder > 0:
+                raise ValueError(
+                    f"learning_rate_decoder must be positive, got {self.learning_rate_decoder}"
+                )
+            if self.supervised_encoder:
+                raise ValueError(
+                    "learning_rate_decoder is incompatible with supervised_encoder=True: "
+                    "no decoder parameter is trained, so the decoder learning rate "
+                    "would have no effect."
+                )
+            self.learning_rate_decoder = float(self.learning_rate_decoder)
         if not isinstance(self.reuse_pre_prune, bool):
             raise TypeError(f"reuse_pre_prune must be bool, got {type(self.reuse_pre_prune).__name__}")
         if not isinstance(self.fail_on_non_convergence, bool):
@@ -664,11 +760,28 @@ class TrainingArguments:
         if metric == "correlation" and self.convergent_mean_by_class_threshold is None:
             self.convergent_mean_by_class_threshold = 0.5
         if metric in {"roc_auc", "min_auc_n_o"} and self.convergent_score_threshold is None:
-            self.convergent_score_threshold = 0.7
+            self.convergent_score_threshold = 0.9
         # roc_auc / min_auc_n_o: do not auto-enable bipolar mean threshold
         # (identity/neutral at ≤0 is fine).
         if metric == "loss" and self.convergent_score_threshold is None:
             raise ValueError("convergent_score_threshold is required when convergent_metric='loss'.")
+
+        if self.selection_metric is not None:
+            selection = str(self.selection_metric).strip().lower()
+            if selection in {"e", "encoding_e", "encoding-e", "encodinge"}:
+                selection = "encoding_e"
+            elif selection in {"auroc", "auc", "roc-auc"}:
+                selection = "roc_auc"
+            elif selection in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
+                selection = "min_auc_n_o"
+            elif selection == "corr":
+                selection = "correlation"
+            if selection not in {"correlation", "loss", "roc_auc", "min_auc_n_o", "encoding_e"}:
+                raise ValueError(
+                    "selection_metric must be 'correlation', 'roc_auc', 'min_auc_n_o', "
+                    f"'encoding_e'/'E', or 'loss', got {selection!r}"
+                )
+            self.selection_metric = selection
 
     def to_dict(self) -> dict:
         """Dict for serialization (excludes callables and nn.Module). Canonical keys only."""

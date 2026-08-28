@@ -17,6 +17,7 @@ from gradiend.trainer.core.signals import Signal, SignalBatch, SignalSet
 from gradiend.trainer.core.stats import (
     _best_checkpoint_step_is_after_initial,
     _best_step_min_target_class_abs_mean,
+    _best_step_positive_target_class_mean,
     _best_step_target_class_mean_product,
     correlation_checkpoint_rank,
     load_training_stats,
@@ -864,6 +865,24 @@ class TestConvergenceCriteria:
         product = _best_step_target_class_mean_product(training_stats, best_score_checkpoint)
 
         assert product == pytest.approx(0.36)
+
+    def test_positive_target_class_mean_uses_numeric_label_plus_one(self):
+        training_stats = {
+            "mean_by_class": {
+                "50": {
+                    "-1.0": 0.4,
+                    "0.0": -0.1,
+                    "1.0": 0.9,
+                }
+            }
+        }
+
+        value = _best_step_positive_target_class_mean(
+            training_stats,
+            {"global_step": 50},
+        )
+
+        assert value == pytest.approx(0.9)
 
     def test_target_class_mean_product_is_none_without_exactly_two_targets(self):
         training_stats = {

@@ -218,7 +218,42 @@ class TestTrainingArguments:
             args = TrainingArguments(params=["encoder.*"])
 
         assert args.signal_scope == SignalScope.from_values(params=["encoder.*"])
-    
+
+    def test_gradient_signal_accepts_layers_scope_but_rejects_raw_activation_sites(self):
+        """SignalScope's semantic shortcuts (.layers()/.layer()/.embeddings()/
+        .word_embedding(), i.e. activation_selector) are scope metadata
+        independent of signal kind -- for a gradient signal they now resolve
+        into weight-parameter wildcards via gradient_params_from_selector()
+        (gradiend/signal_space.py), using the same ModelTopology the
+        activation-signal path already used. This was originally a silent
+        no-op instead (a GRADIEND run configured with SignalScope.layers()
+        trained against the package's plain default scope, embeddings
+        included, with no error anywhere -- caught 2026-08-20 via
+        gradiend-sae); construction-time resolvability can't be checked here
+        since no model is loaded yet, but it must not be rejected up front.
+
+        Raw activation_sites=[...] (an explicit module-path include-list, not
+        one of the semantic shortcuts) is a different case: there is no
+        generic, safe way to turn an arbitrary caller-supplied module pattern
+        into the right parameter-name wildcard, so it is still rejected.
+        """
+        # No longer raises -- resolved later, at model-construction time.
+        TrainingArguments(signal=Signal.gradient(), signal_scope=SignalScope.layers())
+        TrainingArguments(signal=Signal.gradient(), signal_scope=SignalScope.layer(2))
+        TrainingArguments(signal=Signal.gradient(), signal_scope=SignalScope.embeddings())
+
+        with pytest.raises(ValueError, match="activation_sites"):
+            TrainingArguments(
+                signal=Signal.gradient(),
+                signal_scope=SignalScope.from_values(activation_sites=["encoder.layer.*"]),
+            )
+
+        # Sanity: the pre-existing legitimate combinations still construct fine.
+        TrainingArguments(
+            signal=Signal.gradient(), signal_scope=SignalScope.from_values(params=["encoder.*"])
+        )
+        TrainingArguments(signal=Signal.activation(), signal_scope=SignalScope.layers())
+
     def test_training_arguments_override(self):
         """Test parameter override behavior."""
         args = TrainingArguments(

@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 import os
 
 import pandas as pd
@@ -48,6 +49,9 @@ class TinyTokenizer:
 
 
 class TinyCausalModel(torch.nn.Module):
+    # a real causal LM carries a config; decoder-only detection reads it, not the class name
+    config = SimpleNamespace(model_type="gpt2", architectures=["GPT2LMHeadModel"])
+
     @property
     def device(self):
         return torch.device("cpu")
@@ -144,6 +148,8 @@ class SpaceAwareTokenizer:
 
 
 class SpaceSensitiveCausalModel(torch.nn.Module):
+    config = SimpleNamespace(model_type="gpt2", architectures=["GPT2LMHeadModel"])
+
     @property
     def device(self):
         return torch.device("cpu")

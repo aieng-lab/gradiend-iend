@@ -515,9 +515,11 @@ class TestDecoderEvaluator:
 
     @staticmethod
     def _default_decoder_lrs():
+        # Mirrors DecoderEvaluator.evaluate_decoder's default lrs grid
+        # (gradiend/evaluator/decoder.py), extended down to 1e-05.
         return [
             m * 10 ** e
-            for e in range(2, -4, -1)
+            for e in range(2, -6, -1)
             for m in [5, 2, 1]
             if m * 10 ** e <= 100
         ]
@@ -1024,6 +1026,117 @@ class TestDecoderEvaluator:
 
         factors = default_decoder_feature_factors(trainer, model_with_gradiend=trainer._model)
         assert factors == [-1.0, 1.0]  # -direction["positive"], -direction["negative"] from model
+
+    def test_bisect_refine_lms_boundary_narrows_toward_true_crossing(self):
+        """Binary search should land far closer to the LMS-gate crossing than the coarse grid did."""
+        from gradiend.evaluator.decoder import LMSThresholdPolicy, _bisect_refine_lms_boundary
+
+        # Simulated ground truth: lms falls linearly with lr, crossing the
+        # ratio*base_lms=0.9 cutoff exactly at lr=2.0. Coarse grid only has
+        # lr=1 (passing) and lr=10 (failing) — a 9x gap either side of it.
+        def simulated_lms(lr: float) -> float:
+            return max(0.0, 1.0 - 0.05 * lr)
+
+        relevant_results = {
+            "base": {"lms": {"lms": 1.0}},
+            (1.0, 1.0): {"lms": {"lms": simulated_lms(1.0)}},
+            (1.0, 10.0): {"lms": {"lms": simulated_lms(10.0)}},
+        }
+        pairs = [(1.0, 1.0), (1.0, 10.0)]
+        lrs = [1.0, 10.0]
+        calls = []
+
+        def evaluate_pair(ff, lr):
+            calls.append((ff, lr))
+            entry = {"lms": {"lms": simulated_lms(lr)}}
+            relevant_results[(ff, lr)] = entry
+            return entry
+
+        _bisect_refine_lms_boundary(
+            relevant_results=relevant_results,
+            pairs=pairs,
+            lrs=lrs,
+            classes_to_eval=["positive"],
+            class_to_ff={"positive": 1.0},
+            selector=LMSThresholdPolicy(ratio=0.9),
+            refine_points=10,
+            evaluate_pair=evaluate_pair,
+        )
+
+        assert len(calls) == 10
+        assert len(pairs) == 12 and len(lrs) == 12
+        # Every bisection point lands strictly inside the original coarse bracket.
+        assert all(1.0 < lr < 10.0 for _ff, lr in calls)
+        # Converges within 0.01 of the true crossing (lr=2.0) — the nearest
+        # point a flat 10-point log-spaced grid over [1, 10] would offer is
+        # ~2.51, off by 0.5: bisection is >50x tighter here.
+        passing_lrs = [lr for (_ff, lr) in calls if simulated_lms(lr) >= 0.9]
+        failing_lrs = [lr for (_ff, lr) in calls if simulated_lms(lr) < 0.9]
+        assert max(passing_lrs) == pytest.approx(2.0, abs=0.01)
+        assert min(failing_lrs) == pytest.approx(2.0, abs=0.01)
+
+    def test_bisect_refine_lms_boundary_skips_when_no_transition(self):
+        """No adjacent pass/fail pair on the coarse grid -> nothing to bisect."""
+        from gradiend.evaluator.decoder import LMSThresholdPolicy, _bisect_refine_lms_boundary
+
+        relevant_results = {
+            "base": {"lms": {"lms": 1.0}},
+            (1.0, 1.0): {"lms": {"lms": 0.95}},
+            (1.0, 2.0): {"lms": {"lms": 0.93}},
+        }
+        pairs = [(1.0, 1.0), (1.0, 2.0)]
+        lrs = [1.0, 2.0]
+        calls = []
+
+        _bisect_refine_lms_boundary(
+            relevant_results=relevant_results,
+            pairs=pairs,
+            lrs=lrs,
+            classes_to_eval=["positive"],
+            class_to_ff={"positive": 1.0},
+            selector=LMSThresholdPolicy(ratio=0.9),
+            refine_points=10,
+            evaluate_pair=lambda ff, lr: calls.append((ff, lr)),
+        )
+
+        assert calls == []
+        assert pairs == [(1.0, 1.0), (1.0, 2.0)]
+
+    def test_evaluate_decoder_refine_points_is_opt_in_and_extends_grid(self):
+        """refine_points=0 (default) leaves grid untouched; >0 adds bisected cells."""
+        from gradiend.evaluator.decoder import LMSThresholdPolicy
+
+        evaluator = DecoderEvaluator()
+        trainer = MockTrainer()
+        trainer._model = MockModelWithGradiend(mapping_kind="activation", source="factual", target="diff")
+
+        def evaluate_base_model(base_model, tokenizer, **kwargs):
+            cache_folder = kwargs.get("cache_folder", "")
+            if cache_folder.startswith("base_split_"):
+                return {"lms": {"lms": 1.0}, "positive": 0.7, "negative": 0.3}
+            lr = float(cache_folder.rsplit("_", 1)[-1])
+            # "positive" strictly increases with lr, so the argmax-among-passing
+            # selector prefers the largest still-passing lr it was offered —
+            # exactly what bisection should get closer to than the coarse grid.
+            return {
+                "lms": {"lms": max(0.0, 1.0 - 0.05 * lr)},
+                "positive": 0.5 + 0.1 * lr,
+                "negative": 0.3,
+            }
+
+        trainer.evaluate_base_model = evaluate_base_model
+        selector = LMSThresholdPolicy(ratio=0.9)
+
+        baseline = evaluator.evaluate_decoder(
+            trainer, target_class="positive", lrs=[1.0, 10.0], refine_points=0, selector=selector,
+        )
+        refined = evaluator.evaluate_decoder(
+            trainer, target_class="positive", lrs=[1.0, 10.0], refine_points=10, selector=selector,
+        )
+
+        assert self._grid_pairs(baseline) == {(1.0, 1.0), (1.0, 10.0)}
+        assert len(self._grid_pairs(refined)) == 12
+        assert refined["positive"]["learning_rate"] != baseline["positive"]["learning_rate"]
 
 
 def test_plot_all_target_classes_forwards_plot_kwargs():

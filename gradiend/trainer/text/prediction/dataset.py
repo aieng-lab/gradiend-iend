@@ -316,6 +316,7 @@ def _left_truncate_template_keeping_mask(
         return template
     # RHS after the mask does not affect causal hidden states at the mask span.
     clipped = template[: last + len(mask_placeholder)]
+    encoded = None
     try:
         encoded = tokenizer(
             clipped,
@@ -323,7 +324,13 @@ def _left_truncate_template_keeping_mask(
             truncation=False,
             return_offsets_mapping=True,
         )
-    except TypeError:
+    except (TypeError, NotImplementedError):
+        encoded = None
+
+    # Some tokenizers (slow/non-fast tokenizers, or tokenizer stubs in tests)
+    # silently ignore ``return_offsets_mapping`` instead of raising, so the
+    # exception handler above alone is not enough to catch every case.
+    if encoded is None or "offset_mapping" not in encoded:
         ids = tokenizer(clipped, add_special_tokens=True, truncation=False)["input_ids"]
         if len(ids) <= int(max_length):
             return clipped
@@ -481,6 +488,7 @@ def _filled_prediction_from_template(
     track of the exact span that was filled.
 
     Steps:
+
       1. Tokenize the template with the dataset mask still present; locate each slot.
       2. Resolve ``target`` to vocab id(s).
       3. Splice those id(s) over each mask slot (templates may contain several).
@@ -626,6 +634,30 @@ def create_masked_pair_from_text(
     Returns:
         Tuple of (masked_text, target_token), or None if no valid pair could be created.
     """
+    # Guard against silent corruption: if `text` already contains a mask
+    # placeholder (caller passed an already-masked string, e.g. neutral_data
+    # built with `masked`==`text`, with no companion label/token column to
+    # take the pre-built-pair fast path), tokenizing and re-splitting it here
+    # can land a random split point *inside* the placeholder's own BPE
+    # sub-tokens (e.g. "[MASK]" -> "[", "MAS", "K", "]" for gpt2), producing
+    # nonsense pairs like ("...is [MAS[MASK]", "K") with no error anywhere.
+    # Fail loud instead of training on that.
+    placeholder_candidates = {"[MASK]"}
+    if mask_token:
+        placeholder_candidates.add(str(mask_token))
+    for placeholder in placeholder_candidates:
+        if placeholder and placeholder in text:
+            raise ValueError(
+                f"create_masked_pair_from_text: `text` already contains "
+                f"{placeholder!r} — this function expects raw, unmasked text "
+                f"and derives its own mask position/target from it. Passing "
+                f"pre-masked text here silently corrupts the pair (a random "
+                f"split point can land inside the placeholder's own "
+                f"sub-tokens). If you already have a masked/target pair, "
+                f"provide a label/factual/token column on the DataFrame so "
+                f"the caller uses it directly instead of calling this "
+                f"function."
+            )
     excluded_tokens = excluded_tokens or []
     tokens = tokenizer.tokenize(text)
     if not tokens:

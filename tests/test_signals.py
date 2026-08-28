@@ -17,7 +17,13 @@ from gradiend.trainer.core.signals import (
     normalize_signal_arguments,
     require_single_gradient_signal,
 )
-from gradiend.signal_space import default_activation_sites, resolve_activation_modules
+from gradiend.model_topology import infer_model_topology
+from gradiend.signal_space import (
+    default_activation_sites,
+    gradient_params_from_selector,
+    resolve_activation_modules,
+    scope_params,
+)
 
 
 def test_gradient_signal_has_no_scope_options():
@@ -378,6 +384,101 @@ class LlamaishActivationModel(nn.Module):
         self.config = type("Config", (), {"model_type": "llama", "architectures": ["LlamaForCausalLM"]})()
         self.model = LlamaishCore(hidden_size)
         self.lm_head = nn.Linear(hidden_size, 17)
+
+
+class Gemma3ishLayer(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(hidden_size)
+        # Gemma2/3's extra double-norm sandwich -- irrelevant to topology
+        # (still just more submodules under this layer's own dotted path),
+        # included so the fixture isn't structurally identical to Llama's.
+        self.pre_feedforward_layernorm = nn.LayerNorm(hidden_size)
+        self.post_feedforward_layernorm = nn.LayerNorm(hidden_size)
+
+    def forward(self, hidden_states):
+        return self.input_layernorm(hidden_states)
+
+
+class Gemma3ishCore(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(23, hidden_size)
+        self.layers = nn.ModuleList([Gemma3ishLayer(hidden_size), Gemma3ishLayer(hidden_size)])
+        self.norm = nn.LayerNorm(hidden_size)
+
+
+class Gemma3ishActivationModel(nn.Module):
+    """Gemma-3-shaped (text-only base model, no vision tower): model.{embed_tokens,layers.*,norm}."""
+
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.config = type("Config", (), {"model_type": "gemma3", "architectures": ["Gemma3ForCausalLM"]})()
+        self.model = Gemma3ishCore(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, 23)
+
+
+class Qwen3ishMoeLayer(nn.Module):
+    """Qwen3-MoE-shaped layer: sparse expert MLP nested well below the layer's
+    own dotted path -- included to confirm the ``.*`` wildcard still sweeps
+    arbitrarily deep nested experts, not just one level of children."""
+
+    def __init__(self, hidden_size=6, n_experts=4):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(hidden_size)
+        self.experts = nn.ModuleList([nn.Linear(hidden_size, hidden_size) for _ in range(n_experts)])
+        self.gate = nn.Linear(hidden_size, n_experts)
+
+    def forward(self, hidden_states):
+        return self.input_layernorm(hidden_states)
+
+
+class Qwen3ishCore(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(29, hidden_size)
+        self.layers = nn.ModuleList([Qwen3ishMoeLayer(hidden_size), Qwen3ishMoeLayer(hidden_size)])
+        self.norm = nn.LayerNorm(hidden_size)
+
+
+class Qwen3ishMoeActivationModel(nn.Module):
+    """Qwen3.5-MoE-shaped: model.{embed_tokens,layers.*,norm}, each layer's MLP
+    replaced by a sparse expert block nested under the layer's own path."""
+
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.config = type(
+            "Config", (), {"model_type": "qwen3_5_moe", "architectures": ["Qwen3MoeForCausalLM"]}
+        )()
+        self.model = Qwen3ishCore(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, 29)
+
+
+class GPTNeoXishLayer(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(hidden_size)
+
+    def forward(self, hidden_states):
+        return self.input_layernorm(hidden_states)
+
+
+class GPTNeoXishCore(nn.Module):
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.embed_in = nn.Embedding(19, hidden_size)
+        self.layers = nn.ModuleList([GPTNeoXishLayer(hidden_size), GPTNeoXishLayer(hidden_size)])
+        self.final_layer_norm = nn.LayerNorm(hidden_size)
+
+
+class GPTNeoXishActivationModel(nn.Module):
+    """Pythia/GPT-NeoX-shaped: gpt_neox.{embed_in,layers.*,final_layer_norm} + top-level embed_out head."""
+
+    def __init__(self, hidden_size=6):
+        super().__init__()
+        self.config = type("Config", (), {"model_type": "gpt_neox", "architectures": ["GPTNeoXForCausalLM"]})()
+        self.gpt_neox = GPTNeoXishCore(hidden_size)
+        self.embed_out = nn.Linear(hidden_size, 19)
 
 
 class DistilbertishBlock(nn.Module):
@@ -796,6 +897,158 @@ def test_semantic_embedding_scopes_resolve_distinct_sites():
 
     assert tuple(name for name, _module in embeddings) == ("embeddings",)
     assert tuple(name for name, _module in word_embedding) == ("embeddings.word_embeddings",)
+
+
+def test_gradient_scope_layers_resolves_to_weight_parameter_wildcards():
+    """The gradient-signal counterpart of
+    test_semantic_layer_scope_resolves_through_supported_topology: the same
+    semantic scope (SignalScope.layers()/.layer()) must resolve for a
+    gradient signal too, via gradient_params_from_selector()/scope_params(...,
+    base_model=...) -- not just the activation-signal path. Fixed 2026-08-20;
+    before this, these selectors were silently ignored for a gradient signal
+    (scope_params() returned None regardless of what activation_selector held).
+    """
+    model = GPT2ishActivationModel(hidden_size=5)
+    params = {name for name, _ in model.named_parameters()}
+
+    all_layers = gradient_params_from_selector(model, ("layers", None))
+    assert all_layers == ("transformer.h.0.*", "transformer.h.1.*")
+
+    layer_one = gradient_params_from_selector(model, ("layers", (1,)))
+    assert layer_one == ("transformer.h.1.*",)
+
+    # Sanity: these wildcards actually match the intended weights and nothing
+    # from embeddings/head -- fnmatch-style matching lives in
+    # gradiend/model/core/backbone.py::_filter_params_by_include, exercised
+    # here directly against real parameter names for confidence.
+    from fnmatch import fnmatch
+
+    matched = {name for name in params if any(fnmatch(name, pat) for pat in all_layers)}
+    assert matched == {
+        "transformer.h.0.ln_1.weight",
+        "transformer.h.0.ln_1.bias",
+        "transformer.h.1.ln_1.weight",
+        "transformer.h.1.ln_1.bias",
+    }
+    assert not any(fnmatch(name, pat) for name in ("transformer.wte.weight", "lm_head.weight") for pat in all_layers)
+
+    # scope_params() is the actual entry point ModelWithGradiend._create_gradiend
+    # calls; verify it delegates correctly given a base_model.
+    assert scope_params(SignalScope.layers(), base_model=model) == all_layers
+    assert scope_params(SignalScope.layer(1), base_model=model) == layer_one
+    # Without a base_model (old callers that only care about explicit params=),
+    # behavior is unchanged: a selector-only scope resolves to None.
+    assert scope_params(SignalScope.layers()) is None
+    # An explicit params= include-list always wins over activation_selector,
+    # base_model or not.
+    explicit = SignalScope.from_values(params=["transformer.wte.*"])
+    assert scope_params(explicit, base_model=model) == ("transformer.wte.*",)
+
+
+def test_gradient_scope_embeddings_resolve_to_weight_parameter_wildcards():
+    model = GPT2ishActivationModel(hidden_size=5)
+
+    embeddings = gradient_params_from_selector(model, ("word_embedding",))
+    assert embeddings == ("transformer.wte.*",)
+    assert scope_params(SignalScope.word_embedding(), base_model=model) == embeddings
+
+
+def test_gradient_scope_semantic_selector_requires_supported_topology():
+    with pytest.raises(ValueError, match="SignalScope.from_values"):
+        gradient_params_from_selector(TinyActivationModel(), ("layers", None))
+
+
+def test_semantic_layer_scope_resolves_for_gpt_neox_activation_signal():
+    """Activation-signal-path coverage for gpt_neox specifically -- this
+    family had no test anywhere in the package before (unlike bert/distilbert/
+    llama/opt/gpt2), despite gpt_neox being pythia-70m-deduped, one of only
+    two production models the gradiend-sae study actually trains on. Mirrors
+    test_semantic_layer_scope_resolves_through_supported_topology.
+    """
+    model = GPTNeoXishActivationModel(hidden_size=6)
+
+    all_layers = resolve_activation_modules(model, (), scope=SignalScope.layers())
+    layer_one = resolve_activation_modules(model, (), scope=SignalScope.layer(1))
+
+    assert tuple(name for name, _module in all_layers) == (
+        "gpt_neox.layers.0",
+        "gpt_neox.layers.1",
+    )
+    assert tuple(name for name, _module in layer_one) == ("gpt_neox.layers.1",)
+
+
+def test_gradient_scope_layers_resolves_for_gpt_neox():
+    """Gradient-signal-path counterpart of the above, and of
+    test_gradient_scope_layers_resolves_to_weight_parameter_wildcards (gpt2)
+    -- confirms gradient_params_from_selector()/scope_params(..., base_model=...)
+    genuinely generalizes across architectures rather than only having been
+    verified against gpt2.
+    """
+    model = GPTNeoXishActivationModel(hidden_size=6)
+    params = {name for name, _ in model.named_parameters()}
+
+    all_layers = gradient_params_from_selector(model, ("layers", None))
+    assert all_layers == ("gpt_neox.layers.0.*", "gpt_neox.layers.1.*")
+    assert scope_params(SignalScope.layers(), base_model=model) == all_layers
+
+    from fnmatch import fnmatch
+
+    matched = {name for name in params if any(fnmatch(name, pat) for pat in all_layers)}
+    assert matched == {
+        "gpt_neox.layers.0.input_layernorm.weight",
+        "gpt_neox.layers.0.input_layernorm.bias",
+        "gpt_neox.layers.1.input_layernorm.weight",
+        "gpt_neox.layers.1.input_layernorm.bias",
+    }
+    # Neither the embedding, the final layer norm, nor the head leak in --
+    # final_layer_norm is topologically homeless (like gpt2's ln_f) for the
+    # same reason: it isn't part of ModelTopology.layers/embeddings/
+    # prediction_heads for gpt_neox either.
+    excluded = ("gpt_neox.embed_in.weight", "gpt_neox.final_layer_norm.weight", "embed_out.weight")
+    assert not any(fnmatch(name, pat) for name in excluded for pat in all_layers)
+
+    word_embedding = gradient_params_from_selector(model, ("word_embedding",))
+    assert word_embedding == ("gpt_neox.embed_in.*",)
+
+
+def test_gemma3_and_qwen3_moe_resolve_via_the_llama_family_adapter():
+    """gemma3/qwen3_5_moe aren't Llama, but they're Llama-*shaped* (model.layers
+    ModuleList + model.embed_tokens) -- the study's own configs/models/*.yaml
+    reference these exact arches (gemma-3-270m, qwen3.5-*) for other purposes,
+    so this closes the gap where those model_type strings weren't in
+    ModelTopology's llama-like family set at all (added 2026-08-21: "gemma3",
+    "gemma3_text", "qwen3_5", "qwen3_moe", "qwen3_5_moe" -- see
+    _LLAMA_TYPES). Covers both the pre-existing activation-signal path and
+    the gradient-signal path fixed earlier in this session.
+    """
+    from fnmatch import fnmatch
+
+    for model, prefix, n_layers in (
+        (Gemma3ishActivationModel(hidden_size=6), "model", 2),
+        (Qwen3ishMoeActivationModel(hidden_size=6), "model", 2),
+    ):
+        topology = infer_model_topology(model)
+        assert topology is not None, f"{model.config.model_type} did not resolve to a topology"
+        assert topology.layers == tuple(f"{prefix}.layers.{i}" for i in range(n_layers))
+        assert topology.word_embedding == f"{prefix}.embed_tokens"
+
+        # Activation-signal path (pre-existing mechanism, now covered for these arches).
+        resolved = resolve_activation_modules(model, (), scope=SignalScope.layers())
+        assert tuple(name for name, _module in resolved) == topology.layers
+
+        # Gradient-signal path (this session's fix).
+        params = {name for name, _ in model.named_parameters()}
+        patterns = gradient_params_from_selector(model, ("layers", None))
+        assert patterns == tuple(f"{p}.*" for p in topology.layers)
+        matched = {name for name in params if any(fnmatch(name, pat) for pat in patterns)}
+        # Every matched parameter must live under one of the layer paths --
+        # in particular this proves the MoE model's deeply-nested expert
+        # weights (model.layers.{i}.experts.{j}.*) are swept correctly, not
+        # just the layer's top-level children.
+        assert matched and all(any(name.startswith(f"{p}.") for p in topology.layers) for name in matched)
+        assert not any(name.startswith(f"{prefix}.embed_tokens") for name in matched)
+        assert not any(name.startswith(f"{prefix}.norm") for name in matched)
+        assert not any(name.startswith("lm_head") for name in matched)
 
 
 def test_semantic_scope_requires_supported_topology():

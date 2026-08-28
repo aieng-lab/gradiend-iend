@@ -327,6 +327,129 @@ class TestTrainerDataAsDataFrame:
         assert by_source.loc["negative", "feature_pole"] == "neg"
         assert by_source.loc["negative", "feature_class_id"] == 1  # deprecated mirror
 
+    def test_one_pole_keeps_full_factual_coverage_for_decoder_evaluation(self):
+        """Training selects its transitions without destructively narrowing eval data.
+
+        Decoder plots score the selected feature on every factual class.  A
+        one-pole trainer trains only target-factual→counterfactual transitions, but
+        its unified frame must still retain reverse-CF factual rows so those
+        probability panels can be evaluated.
+        """
+        df = pd.DataFrame(
+            [
+                {"masked": "[MASK] chapel", "split": "train", "label_class": "christian", "label": "christian", "alternative_class": "muslim", "alternative": "muslim"},
+                {"masked": "[MASK] mosque", "split": "train", "label_class": "muslim", "label": "muslim", "alternative_class": "christian", "alternative": "christian"},
+                {"masked": "[MASK] synagogue", "split": "train", "label_class": "jewish", "label": "jewish", "alternative_class": "christian", "alternative": "christian"},
+            ]
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=TextPredictionConfig(
+                data=df,
+                target_classes=["christian"],
+                all_classes=["christian", "muslim", "jewish"],
+                counterfactual_classes="all",
+            ),
+            training_args=TrainingArguments(add_neutral_identity_transitions=False),
+        )
+
+        trainer._ensure_data()
+        assert set(trainer.combined_data[UNIFIED_FACTUAL_CLASS]) == {
+            "christian", "muslim", "jewish"
+        }
+
+        training_data = trainer.create_training_data(_DummyPredictionTokenizer(), split="train")
+        assert set(training_data.data["factual_id"]) == {"christian"}
+        assert set(training_data.data["alternative_id"]) == {"muslim"}
+        assert set(training_data.data["label"]) == {1}
+
+        decoder_df, _ = trainer._get_decoder_eval_dataframe(
+            _DummyPredictionTokenizer(), split="train"
+        )
+        assert set(decoder_df["factual_id"]) == {"christian", "muslim", "jewish"}
+
+    def test_binary_one_pole_decoder_evaluation_keeps_both_factual_classes(self):
+        """``include_other_classes`` also applies to binary one-pole data."""
+        df = pd.DataFrame(
+            [
+                {
+                    "masked": "The nurse said [MASK] arrived.",
+                    "split": "test",
+                    "label_class": "F",
+                    "label": "she",
+                    "alternative_class": "M",
+                    "alternative": "he",
+                },
+                {
+                    "masked": "The doctor said [MASK] arrived.",
+                    "split": "test",
+                    "label_class": "M",
+                    "label": "he",
+                    "alternative_class": "F",
+                    "alternative": "she",
+                },
+            ]
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=TextPredictionConfig(
+                data=df,
+                target_classes=["F"],
+                all_classes=["F", "M"],
+                counterfactual_classes="all",
+            ),
+            training_args=TrainingArguments(add_neutral_identity_transitions=False),
+        )
+
+        decoder_df, _ = trainer._get_decoder_eval_dataframe(
+            _DummyPredictionTokenizer(), split="test"
+        )
+
+        assert set(decoder_df["factual_id"]) == {"F", "M"}
+
+
+class TestAllClassesFromConfigAtConstruction:
+    """config.all_classes must be visible on the trainer before any data loading.
+
+    A checkpoint-reload trainer built purely for eval (e.g. decoder eval on a
+    skip-existing one-pole trainer) calls trainer.get_model(load_directory=...)
+    and never calls _ensure_data()/create_training_data()/.train() -- so
+    _all_classes must not depend on that lazy data-loading path running first,
+    or an explicitly configured all_classes silently reverts to target_classes
+    (just the trainer's own pole for one-pole configs), and CF-class resolution
+    for e.g. counterfactual_classes="all" finds nothing to resolve against.
+    """
+
+    def test_all_classes_visible_immediately_without_ensure_data(self):
+        config = TextPredictionConfig(
+            data=_merged_with_alternative_df(),
+            label_col="label",
+            label_class_col="label_class",
+            alternative_col="alternative",
+            alternative_class_col="alternative_class",
+            target_classes=["3SG"],
+            all_classes=["3SG", "3PL"],
+            counterfactual_classes="all",
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        # No _ensure_data()/create_training_data()/get_model() call here --
+        # mirrors a reload-only trainer built for eval on an existing checkpoint.
+        assert set(trainer.all_classes) == {"3SG", "3PL"}
+        assert set(trainer.get_target_feature_classes()) == {"3SG", "3PL"}
+
+    def test_all_classes_still_lazily_inferred_when_not_configured(self):
+        """Unset all_classes keeps the existing data-inference behavior."""
+        class_dfs = _per_class_dict()
+        config = TextPredictionConfig(
+            data=class_dfs,
+            target_classes=["3SG", "3PL"],
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        assert trainer._all_classes is None
+        trainer._ensure_data()
+        assert set(trainer._all_classes) == {"3SG", "3PL"}
+
 
 class TestTrainerDataAsDict:
     """data=dict (per-class) builds merged then unified."""

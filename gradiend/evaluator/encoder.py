@@ -134,6 +134,7 @@ class EncoderEvaluator:
         split: Optional[str] = None,
         max_size: Optional[int] = None,
         trust_encoder_df_cache: bool = False,
+        compute_rival_metrics: bool = True,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
@@ -264,7 +265,12 @@ class EncoderEvaluator:
             if encoder_df.empty:
                 return {"n_samples": 0, "correlation": None}
             metrics_kw = _encoder_metrics_kwargs_from_trainer(trainer, encoder_df)
-            result = get_encoder_metrics_from_dataframe(encoder_df, component_df=component_df, **metrics_kw)
+            result = get_encoder_metrics_from_dataframe(
+                encoder_df,
+                component_df=component_df,
+                compute_rival_metrics=compute_rival_metrics,
+                **metrics_kw,
+            )
         else:
             if eval_data is None:
                 eval_data = trainer.create_eval_data(
@@ -296,7 +302,12 @@ class EncoderEvaluator:
             df = _rows_to_encoder_df(training_rows)
             component_df = _rows_to_encoder_df(component_training_rows) if component_training_rows else None
             metrics_kw = _encoder_metrics_kwargs_from_trainer(trainer, df)
-            result = get_encoder_metrics_from_dataframe(df, component_df=component_df, **metrics_kw)
+            result = get_encoder_metrics_from_dataframe(
+                df,
+                component_df=component_df,
+                compute_rival_metrics=compute_rival_metrics,
+                **metrics_kw,
+            )
             result["training_rows"] = training_rows
             if component_training_rows:
                 result["component_training_rows"] = component_training_rows

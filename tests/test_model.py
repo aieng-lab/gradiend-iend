@@ -1249,6 +1249,92 @@ class TestModelWithGradiend:
         torch.testing.assert_close(loaded(input_ids=inputs), expected)
         assert "encoder_weight_0" in loaded._gradiend_modified_tensors
 
+    def test_activation_clamp_mode_forces_feature_to_target(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        model = apply_activation_steering(
+            TinyActivationBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {
+                        "axis": "last_dim",
+                        "token_selector": "all",
+                        "mode": "clamp",
+                        "target_activation": 5.0,
+                        "clamp_encoder_weight_key": "clamp_enc_w",
+                        "clamp_encoder_bias_key": "clamp_enc_b",
+                    },
+                }
+            ],
+            tensors={
+                # Direction and encoder both read off feature 0, so the
+                # clamp correction lands entirely on that axis and the
+                # post-hook encoder readout should equal the target exactly.
+                "steering_0": torch.tensor([1.0, 0.0]),
+                "clamp_enc_w": torch.tensor([[1.0, 0.0]]),
+                "clamp_enc_b": torch.tensor([0.0]),
+            },
+        )
+        inputs = torch.tensor([[[3.0, 4.0]]])
+        out = model(input_ids=inputs)
+        torch.testing.assert_close(out, torch.tensor([[[5.0, 4.0]]]))
+
+    def test_activation_clamp_mode_respects_prediction_token_selector(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyPredictionBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Embedding(200, 2)
+                with torch.no_grad():
+                    self.emb.weight.zero_()
+                    self.emb.weight[10] = torch.tensor([3.0, 4.0])
+
+            def forward(self, input_ids=None, attention_mask=None):
+                return self.emb(input_ids)
+
+        model = apply_activation_steering(
+            TinyPredictionBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {
+                        "axis": "last_dim",
+                        "token_selector": "prediction",
+                        "mask_token_id": 103,
+                        "mode": "clamp",
+                        "target_activation": 5.0,
+                        "clamp_encoder_weight_key": "clamp_enc_w",
+                        "clamp_encoder_bias_key": "clamp_enc_b",
+                    },
+                }
+            ],
+            tensors={
+                "steering_0": torch.tensor([1.0, 0.0]),
+                "clamp_enc_w": torch.tensor([[1.0, 0.0]]),
+                "clamp_enc_b": torch.tensor([0.0]),
+            },
+        )
+        masked_ids = torch.tensor([[101, 103, 10]])
+        out = model(input_ids=masked_ids)
+        # Position 1 (mask token) reads embedding row 0 -> feature score 0,
+        # clamped to 5.0; position 2 (outside the selector) is untouched.
+        torch.testing.assert_close(out[:, 1, :], torch.tensor([[5.0, 0.0]]))
+        torch.testing.assert_close(out[:, 2, :], torch.tensor([[3.0, 4.0]]))
+
     def test_activation_encoder_direction_selector_is_not_symmetric(self):
         from gradiend.model.modified import apply_activation_steering
 

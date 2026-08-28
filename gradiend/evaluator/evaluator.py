@@ -144,6 +144,7 @@ class Evaluator:
         plot: bool = False,
         show: Optional[bool] = None,
         plot_kwargs: Optional[Dict[str, Any]] = None,
+        refine_points: int = 0,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation and return summary + grid for one direction (strengthen or weaken).
@@ -193,6 +194,9 @@ class Evaluator:
             plot: If True, after selection run any missing dataset evaluations for plotting, update cache, then plot.
             show: If True, display the plot; if False, only save. When None and plot=True, defaults to True.
             plot_kwargs: Optional dict of options forwarded to plot_probability_shifts when plot=True.
+            refine_points: If > 0, forwarded to the underlying ``DecoderEvaluator`` to
+                binary-search the LMS-gate boundary after the coarse ``lrs`` sweep
+                (see ``DecoderEvaluator.evaluate_decoder``'s own docstring).
 
         Returns:
             Flat dict: for strengthen, keys like result['3SG']; for weaken, keys like result['3SG_weaken'].
@@ -232,6 +236,7 @@ class Evaluator:
             plot=plot,
             show=show if show is not None else plot,
             plot_kwargs=plot_kwargs,
+            refine_points=refine_points,
         )
         if selector is not None:
             kwargs["selector"] = selector
@@ -586,6 +591,9 @@ class Evaluator:
         figsize: Optional[Tuple[float, float]] = None,
         highlight_non_convergence: Optional[bool] = None,
         return_fig_ax: bool = False,
+        split: Optional[Any] = None,
+        training_like_df: Optional[Any] = None,
+        neutral_df: Optional[Any] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -604,6 +612,19 @@ class Evaluator:
             figsize: Optional Matplotlib figure size.
             highlight_non_convergence: Override non-convergence markers in title.
             return_fig_ax: If True, return Matplotlib ``(fig, ax)``.
+            split: Decoder-eval split ``decoder_results`` was actually
+                evaluated against. Pass this whenever it isn't ``"test"`` --
+                otherwise the plot-refresh step re-derives against the wrong
+                split's data. Explicit parameter (not ``**kwargs``) so it
+                can't be silently dropped by an intermediate layer -- see
+                ``gradiend.visualizer.visualizer.plot_probability_shifts``
+                for the production bug this class of mistake caused.
+            training_like_df: Optional caller-supplied evaluation frame,
+                paired with ``neutral_df``, reused as-is for the plot-refresh
+                step instead of being re-derived from the trainer's internal
+                (narrower) data.
+            neutral_df: Optional caller-supplied neutral frame, paired with
+                ``training_like_df``.
             **kwargs: Additional keyword arguments forwarded to the visualizer.
 
         Returns:
@@ -621,6 +642,9 @@ class Evaluator:
             figsize=figsize,
             highlight_non_convergence=highlight_non_convergence,
             return_fig_ax=return_fig_ax,
+            split=split,
+            training_like_df=training_like_df,
+            neutral_df=neutral_df,
             **kwargs,
         )
     plot_probability_shifts.__doc__ = (

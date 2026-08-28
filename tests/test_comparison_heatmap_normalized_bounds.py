@@ -95,6 +95,34 @@ def test_anchor_aligned_encoding_uses_signed_bounds_and_coolwarm():
         plt.close("all")
 
 
+def test_anchor_aligned_seed_std_uses_zero_to_max_sequential_scale():
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("seaborn")
+    import matplotlib.pyplot as plt
+
+    try:
+        plot_comparison_heatmap(
+            {
+                "measure": "anchor_aligned_encoding_factual_seed_std",
+                "model_ids": ["A", "B"],
+                "column_ids": ["A", "B"],
+                "matrix": [[0.02, 0.08], [0.04, 0.06]],
+            },
+            percentages=True,
+            show=False,
+            return_data=True,
+        )
+        mesh = plt.gcf().axes[0].collections[0]
+        assert mesh.norm.vmin == pytest.approx(0.0)
+        assert mesh.norm.vmax == pytest.approx(8.0)
+        assert mesh.cmap.name == "viridis"
+        cbar_ticks = plt.gcf().axes[1].get_yticks()
+        assert cbar_ticks.min() == pytest.approx(0.0)
+        assert cbar_ticks.max() == pytest.approx(8.0)
+    finally:
+        plt.close("all")
+
+
 def test_plot_comparison_heatmap_sets_axis_labels():
     pytest.importorskip("matplotlib")
     pytest.importorskip("seaborn")

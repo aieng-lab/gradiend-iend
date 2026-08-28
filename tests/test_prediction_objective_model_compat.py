@@ -1,5 +1,6 @@
 """Tests that explicit prediction_objective values match the base model architecture."""
 
+from types import SimpleNamespace
 import pytest
 
 from gradiend.trainer.core.arguments import TrainingArguments
@@ -50,6 +51,18 @@ class _GptTokenizerStub:
         return type("GPT2Tokenizer", (), {"__name__": "GPT2Tokenizer"})
 
 
+class _GemmaTokenizerWithMaskStub:
+    """Gemma 3 remains a causal LM despite exposing a tokenizer mask token."""
+
+    name_or_path = "google/gemma-3-270m"
+    mask_token = "<mask>"
+    mask_token_id = 9
+
+    @property
+    def __class__(self):
+        return type("GemmaTokenizerFast", (), {"__name__": "GemmaTokenizerFast"})
+
+
 def test_format_seq2seq_objective_hint_lists_all_three():
     hint = format_seq2seq_objective_hint()
     assert "seq2seq_decoder" in hint
@@ -94,6 +107,21 @@ def test_clm_next_token_rejects_t5():
             "clm_next_token",
             _T5TokenizerStub(),
         )
+
+
+def test_clm_next_token_accepts_gemma_tokenizer_with_mask_token(monkeypatch):
+    # The model config (not the tokenizer's unused mask token) says Gemma 3 is causal.
+    import gradiend.model.utils as model_utils
+
+    gemma_config = SimpleNamespace(
+        model_type="gemma3", architectures=["Gemma3ForConditionalGeneration"], text_config=None
+    )
+    monkeypatch.setattr(model_utils, "_is_hf_tokenizer", lambda obj: True)
+    monkeypatch.setattr(model_utils, "_config_for_name", lambda name: gemma_config)
+    validate_prediction_objective_for_model(
+        "clm_next_token",
+        _GemmaTokenizerWithMaskStub(),
+    )
 
 
 def test_resolve_prediction_objective_validates_with_tokenizer():

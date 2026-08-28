@@ -47,9 +47,12 @@ def _release_test_memory():
 
 
 def pytest_configure(config):
-    repo_basetemp = Path(__file__).resolve().parents[1] / ".pytest_tmp_local"
-    repo_basetemp.mkdir(parents=True, exist_ok=True)
-    config.option.basetemp = str(repo_basetemp)
+    # Keep the repository-local default, but honor an explicit pytest
+    # ``--basetemp`` so constrained runners can select a writable location.
+    if config.option.basetemp is None:
+        repo_basetemp = Path(__file__).resolve().parents[1] / ".pytest_tmp_local"
+        repo_basetemp.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = str(repo_basetemp)
 
     if os.environ.get("GRADIEND_PROFILE_TEST_MEMORY") != "1":
         return

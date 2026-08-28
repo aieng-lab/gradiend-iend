@@ -211,19 +211,34 @@ def scope_mode(scope: Any) -> str:
     return str(getattr(scope, "mode", None) or "default")
 
 
-def scope_params(scope: Any) -> Optional[Tuple[str, ...]]:
-    """Return parameter patterns carried by a SignalScope-like object."""
+def scope_params(scope: Any, *, base_model: Optional[nn.Module] = None) -> Optional[Tuple[str, ...]]:
+    """Return parameter patterns carried by a SignalScope-like object.
+
+    ``scope.params`` (an explicit include-list) always wins when present. When
+    it is absent but the scope carries a semantic ``activation_selector``
+    (``SignalScope.layers()``/``.layer()``/``.embeddings()``/``.word_embedding()``)
+    and ``base_model`` is given, resolves it into weight-parameter wildcards
+    via ``gradient_params_from_selector`` -- see that function's docstring for
+    why this matters (a gradient signal used to silently ignore that field
+    entirely). ``base_model=None`` (the default, for callers that only need
+    ``scope.params`` and have no model handy) preserves the old behavior of
+    returning ``None`` when only a selector is set.
+    """
     if scope is None:
         return None
     if isinstance(scope, Mapping):
         raw = scope.get("params")
     else:
         raw = getattr(scope, "params", None)
-    if raw is None:
-        return None
-    if isinstance(raw, str):
-        return (raw,)
-    return tuple(str(item) for item in raw)
+    if raw is not None:
+        if isinstance(raw, str):
+            return (raw,)
+        return tuple(str(item) for item in raw)
+    if base_model is not None:
+        selector = activation_selector_from_scope(scope)
+        if selector is not None:
+            return gradient_params_from_selector(base_model, selector)
+    return None
 
 
 def _prefer_text_backbone_if_multimodal(module: nn.Module) -> nn.Module:
@@ -447,6 +462,41 @@ def _activation_sites_from_selector(base_model: nn.Module, selector: Tuple[Any, 
             raise ValueError(f"{topology.model_type} topology has no word embedding activation site")
         return (topology.word_embedding,)
     raise ValueError(f"Unknown activation selector: {kind!r}")
+
+
+def gradient_params_from_selector(base_model: nn.Module, selector: Tuple[Any, ...]) -> Tuple[str, ...]:
+    """Translate a semantic ``SignalScope`` selector (``.layers()``/``.layer()``/
+    ``.embeddings()``/``.word_embedding()``) into weight-parameter wildcard
+    patterns for a gradient signal, via the same architecture-agnostic
+    ``ModelTopology`` the activation-signal path already uses.
+
+    ``SignalScope``'s semantic shortcuts are documented as scope metadata
+    independent of signal kind, but only the activation-signal path
+    (``resolve_activation_modules``, via ``_activation_sites_from_selector``)
+    actually resolved them -- ``scope_params``/``scope_mode`` (what a gradient
+    signal's weight-parameter scope is built from, see
+    ``gradiend/model/core/backbone.py::build_gradiend_from_base_model``) never
+    consulted ``activation_selector`` at all, so attaching e.g.
+    ``SignalScope.layers()`` to ``Signal.gradient()`` silently resolved to no
+    scope restriction whatsoever. Fixed by resolving the same selector into
+    module paths via ``_activation_sites_from_selector`` (identical topology,
+    identical error messages for out-of-range layers / unsupported
+    architectures) and appending ``.*`` so each path becomes a parameter-name
+    wildcard matching every weight under that module -- module dotted-paths
+    match nothing on their own in ``named_parameters()``, only their leaf
+    parameters do.
+
+    Note this is deliberately narrower than "backbone minus embeddings": for
+    gpt2, ``topology.layers`` covers only ``transformer.h.*`` (the residual
+    blocks), not the final ``transformer.ln_f`` layer norm applied after the
+    last block -- that's consistent with ``.layers()``'s own documented
+    "transformer-layer outputs" semantics, but callers wanting backbone-minus-
+    embeddings specifically (as opposed to residual-blocks-only) should keep
+    using an explicit ``SignalScope.from_values(params=[...])`` include-list
+    instead.
+    """
+    sites = _activation_sites_from_selector(base_model, selector)
+    return tuple(f"{site}.*" for site in sites)
 
 
 def resolve_activation_modules(

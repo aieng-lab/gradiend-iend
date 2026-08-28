@@ -60,10 +60,13 @@ class GradiendSplit:
         Examples:
 
         - For ``Signal.gradient()``, the resolved tensor entries are selected base
+
           model parameter tensors. ``by_tensor()`` therefore trains one virtual
           component per included parameter tensor, not one component per scalar
           weight.
+
         - For ``Signal.activation(...)``, the resolved tensor entries are selected
+
           activation sources/sites after token selection and flattening metadata have
           been applied. ``by_tensor()`` therefore trains one virtual component per
           included activation tensor/site, not one component per upstream parameter

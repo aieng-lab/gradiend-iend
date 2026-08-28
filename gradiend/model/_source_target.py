@@ -8,21 +8,25 @@ Training vs decoder evaluation
   (``factual``, ``alternative``, ``diff``, or ``both``).
 
 * ``source="both"`` alternates the encoder pole **per training batch** (factual on even
+
   batch indices, alternative on odd). Internally each batch is compiled to the
   existing ``factual`` + ``diff`` path by optionally swapping factual/alternative
   (and inverting the label) so target is always ``input − opposite``.
 
 * **Encoder evaluation** (``target=None``) encodes the configured training
+
   ``source`` only (``factual`` / ``alternative`` / ``diff``). It does **not**
   expand each row to both poles on normal two-pole data.
 
 * **One-pole exception:** when ``expand_encoder_eval_poles=True``, encoder eval
+
   expands each base example to both poles so labels ``+1`` and ``-1`` remain
   available for correlation (a single factual class would otherwise be unipolar).
 
 * **``source="both"``:** encoder eval still visits both poles (that *is* the source).
 
 * **Decoder rewrite/intervention** uses ``model.source`` and ``model.target``
+
   (persisted in ``gradiend_context.json``) to
 
   pick the default ``feature_factor`` sign per class. It is set once before training

@@ -98,7 +98,10 @@ def test_activation_intervention_sweep_labels_application_modes_in_plot_rows():
 
     assert "steering | prediction slot | always" in labels
     assert "steering | all tokens | always" in labels
-    assert "encoder-gated | prediction slot | near target +-0.2" in labels
+    # encoder_range "near target +-0.2" is intentionally omitted from the grid:
+    # for |feature_factor|=1 it is identical to "direction gt 0.8" on encodings
+    # in [-1, 1] (see the comment in _strategy_grid).
+    assert "encoder-gated | prediction slot | near target +-0.2" not in labels
     assert "encoder-gated | all tokens | direction gt 0.8" in labels
     assert all(row["application_mode"] in {"steering", "encoder_gated"} for row in rows)
     assert {row["token_selector"] for row in rows} == {"prediction", "all"}
@@ -109,10 +112,10 @@ def test_activation_intervention_sweep_labels_application_modes_in_plot_rows():
         "steering | prediction slot | always",
         "encoder-gated | all tokens | direction gt 0.5",
         "encoder-gated | all tokens | direction gt 0.8",
-        "encoder-gated | all tokens | near target +-0.2",
         "encoder-gated | all tokens | abs gt 0.8",
+        "encoder-gated | prediction slot | direction gt 0.5",
     ]
-    assert rows[6]["label"] == "encoder-gated | prediction slot | direction gt 0.5"
+    assert rows[6]["label"] == "encoder-gated | prediction slot | direction gt 0.8"
 
 
 def test_activation_intervention_heatmap_nests_single_site_under_parent():
@@ -217,10 +220,14 @@ def test_activation_examples_enable_neutral_identity_training():
     sweep_source = SWEEP_EXAMPLE_PATH.read_text(encoding="utf-8")
     gender_source = GENDER_EXAMPLE_PATH.read_text(encoding="utf-8")
 
-    assert "neutral_data=neutral_path" in train_source
-    assert "eval_neutral_data=neutral_path" not in train_source
+    # Both examples load neutral data via load_english_pronoun_neutral_data()
+    # into a `neutral_data` variable (not a raw ensure_english_pronoun_data()
+    # path tuple) and pass it straight through as neutral_data= so identity
+    # transitions are enabled at train time, not just eval time.
+    assert "neutral_data=neutral_data" in train_source
+    assert "eval_neutral_data=neutral_data" not in train_source
     assert "add_neutral_identity_transitions=True" in train_source
-    assert "neutral_data=neutral_path" in sweep_source
+    assert "neutral_data=neutral_data" in sweep_source
     assert "add_neutral_identity_transitions=True" in sweep_source
     assert "neutral_data=neutral_df" in gender_source
 
@@ -240,8 +247,12 @@ def test_activation_intervention_sweep_reports_selector_coverage():
     assert "selector_neutral_scope_coverage" in source
     assert "selector_target_minus_neutral" in source
     assert "selector_scope_target_minus_neutral" in source
-    assert "actiend_selector_neutral_coverage_heatmap.png" in source
-    assert "actiend_selector_neutral_scope_coverage_heatmap.png" in source
+    # Coverage / specificity metrics don't depend on LR, so they're merged into
+    # one heatmap (_plot_selector_metrics_heatmap) instead of one PNG per
+    # metric -- covers the same selector_neutral_coverage /
+    # selector_neutral_scope_coverage columns as separate files used to.
+    assert "actiend_selector_metrics_heatmap.png" in source
+    assert "_plot_selector_metrics_heatmap" in source
     assert "probability_specificity_score" in source
     assert "actiend_probability_specificity_heatmap.png" in source
     assert "actiend_specificity_summary.md" in source

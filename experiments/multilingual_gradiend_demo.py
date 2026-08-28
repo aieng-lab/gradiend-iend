@@ -23,6 +23,8 @@ At the end, plots in the experiment directory root:
   (GRADIEND × directed input transition, pre-anchor)
 - cross_encoding_oriented_factual_heatmap.pdf
   (dense oriented cross-encoding; columns = factual feature class $s(x)$)
+- cross_encoding_oriented_default_std_heatmap.pdf
+  (seed standard deviation for the source-aligned default matrix)
 - topk_overlap_venn_three_train_english_pronouns.pdf (when enough pronoun runs exist)
 
 Usage:
@@ -1934,7 +1936,11 @@ def plot_cross_encoding(
         build_demo_trainer_label_mapping,
         build_demo_transition_label_mapping,
         demo_encoding_heatmap_normalized_style_kwargs,
+        demo_encoding_std_heatmap_style_kwargs,
         demo_encoding_heatmap_style_kwargs,
+    )
+    from gradiend.visualizer.heatmaps.encoding import (
+        resolve_oriented_cross_encoding_alignment,
     )
 
     eval_rows = None
@@ -2107,11 +2113,24 @@ def plot_cross_encoding(
             row_label_mapping=trainer_labels,
             column_label_mapping=transition_labels,
             title="GRADIEND × input transition (pre-anchor, seed std)",
-            **style,
+            **demo_encoding_std_heatmap_style_kwargs(style),
         )
 
     feature_labels = build_demo_feature_label_mapping(feature_order)
-
+    default_alignment, _ = resolve_oriented_cross_encoding_alignment(
+        trainers_by_id,
+        "auto",
+    )
+    oriented_common_plot_kwargs = {
+        "order": feature_order,
+        "pretty_groups": feature_pretty_groups,
+        "row_label_mapping": feature_labels,
+        "column_label_mapping": feature_labels,
+        "title": False,
+        "show": True,
+        "xlabel": "Probe feature",
+        "ylabel": "Orienting feature",
+    }
 
     normalized_style = demo_encoding_heatmap_normalized_style_kwargs(
         group_label_fontsize=25,
@@ -2138,13 +2157,8 @@ def plot_cross_encoding(
             split="test",
             max_size=config.args.encoder_eval_max_size,
             aggregate="mean",
-            order=feature_order,
-            pretty_groups=feature_pretty_groups,
-            row_label_mapping=feature_labels,
-            column_label_mapping=feature_labels,
             output_path=cross_encoding_output,
-            title=False,
-            show=True,
+            **oriented_common_plot_kwargs,
             **style,
         )
         print(f"Oriented cross-encoding heatmap saved to {cross_encoding_output}")
@@ -2171,21 +2185,25 @@ def plot_cross_encoding(
                     config.args.experiment_dir,
                     f"cross_encoding_oriented_{s}_std_heatmap.pdf",
                 )
-                std_style = dict(style)
-                std_style["cbar_label"] = "Encoding std"
+                std_style = demo_encoding_std_heatmap_style_kwargs(style)
                 plot_comparison_heatmap(
                     oriented_std,
-                    order=feature_order,
-                    pretty_groups=feature_pretty_groups,
-                    row_label_mapping=feature_labels,
-                    column_label_mapping=feature_labels,
                     output_path=std_output,
-                    title=False,
-                    show=True,
                     models=trainers_by_id,
+                    **oriented_common_plot_kwargs,
                     **filter_comparison_heatmap_plot_kwargs(std_style),
                 )
                 print(f"Oriented cross-encoding std heatmap saved to {std_output}")
+                if s == default_alignment:
+                    default_std_output = os.path.join(
+                        config.args.experiment_dir,
+                        "cross_encoding_oriented_default_std_heatmap.pdf",
+                    )
+                    shutil.copyfile(std_output, default_std_output)
+                    print(
+                        "Default source-aligned cross-encoding std heatmap "
+                        f"({default_alignment}) saved to {default_std_output}"
+                    )
         normalized_output = os.path.join(
             config.args.experiment_dir,
             f"cross_encoding_oriented_{s}_row_normalized_heatmap.pdf",
@@ -2200,13 +2218,8 @@ def plot_cross_encoding(
             max_size=config.args.encoder_eval_max_size,
             aggregate="mean",
             normalize=True,
-            order=feature_order,
-            pretty_groups=feature_pretty_groups,
-            row_label_mapping=feature_labels,
-            column_label_mapping=feature_labels,
             output_path=normalized_output,
-            title=False,
-            show=True,
+            **oriented_common_plot_kwargs,
             **normalized_style,
         )
         print(f"Row-normalized oriented cross-encoding heatmap saved to {normalized_output}")
@@ -2223,15 +2236,8 @@ def plot_cross_encoding(
         split="test",
         max_size=config.args.encoder_eval_max_size,
         aggregate="mean",
-        order=feature_order,
-        pretty_groups=feature_pretty_groups,
-        row_label_mapping=feature_labels,
-        column_label_mapping=feature_labels,
         output_path=default_output,
-        title=False,
-        show=True,
-        xlabel="Probe feature",
-        ylabel="Orienting feature",
+        **oriented_common_plot_kwargs,
         **style,
     )
     print(f"Default oriented cross-encoding heatmap saved to {default_output}")
@@ -2250,15 +2256,8 @@ def plot_cross_encoding(
         max_size=config.args.encoder_eval_max_size,
         aggregate="mean",
         normalize=True,
-        order=feature_order,
-        pretty_groups=feature_pretty_groups,
-        row_label_mapping=feature_labels,
-        column_label_mapping=feature_labels,
         output_path=default_normalized_output,
-        title=False,
-        show=True,
-        xlabel="Probe feature",
-        ylabel="Orienting feature",
+        **oriented_common_plot_kwargs,
         **normalized_style,
     )
     print(
