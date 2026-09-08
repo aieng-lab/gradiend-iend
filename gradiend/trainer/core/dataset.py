@@ -157,6 +157,7 @@ class SignalTrainingDatasetBase:
         timing_label: str = "signal",
         signal: Any = None,
         signals: Any = None,
+        combine_diff_in_place: bool = False,
     ):
         assert source in source_target_keywords, f'Invalid source {source}, must be one of {source_target_keywords}'
         assert target in source_target_keywords, f'Invalid target {target}, must be one of {source_target_keywords}'
@@ -172,6 +173,7 @@ class SignalTrainingDatasetBase:
         device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         self.training_data = training_data
+        self.combine_diff_in_place = bool(combine_diff_in_place)
         self.batch_size = getattr(training_data, 'batch_size', None) or 1
         if not callable(signal_extractor):
             raise TypeError(f"signal_extractor must be callable, got {type(signal_extractor).__name__}")
@@ -537,6 +539,12 @@ class SignalTrainingDatasetBase:
             elif self.target == 'diff':
                 if source == 'diff' and not mixed:
                     target_tensor = source_tensor.clone()
+                elif self.combine_diff_in_place:
+                    # Memory-constrained streaming consumers (notably CGA)
+                    # relinquish the factual target after this operation.  Reuse
+                    # its storage instead of allocating a third full-width
+                    # gradient for ``factual - alternative``.
+                    target_tensor = factual_target.sub_(alternative_target)
                 else:
                     target_tensor = factual_target - alternative_target
             elif self.target is None:
@@ -603,6 +611,7 @@ class GradientTrainingDataset(SignalTrainingDatasetBase):
         timing_label: str = "gradient",
         signal: Any = None,
         signals: Any = None,
+        combine_diff_in_place: bool = False,
     ):
         gradient_signal = require_single_gradient_signal(
             signal=signal,
@@ -626,6 +635,7 @@ class GradientTrainingDataset(SignalTrainingDatasetBase):
             timing_steps=timing_steps,
             timing_label=timing_label,
             signal=gradient_signal,
+            combine_diff_in_place=combine_diff_in_place,
         )
         self.use_cached_gradients = self.use_cached_signals
 

@@ -70,10 +70,12 @@ The data is generated with `gradiend.examples.create_english_pronoun_data`.
 Generation streams the full English Wikipedia split, uses non-overlapping
 two-sentence windows, keeps windows between 20 and 200 characters, requires at
 least five words of left context before the target pronoun, and collects up to
-10,000 examples per pronoun class.
+10,000 unique examples per pronoun class. Exact repeated prediction examples
+are removed before splitting, and masked prompts with conflicting targets are
+excluded. Publication fails if a masked prompt occurs in more than one split.
 
-The resulting data contains 50,000 rows: 10,000 rows per class, split into
-80% train, 10% validation, and 10% test per class.
+Rows are split into approximately 80% train, 10% validation, and 10% test per
+class. Exact counts for the published revision are in `dataset_summary.json`.
 
 ## Bias, Risks, and Limitations
 

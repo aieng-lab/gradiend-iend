@@ -456,7 +456,9 @@ def draw_convergence_axes(
         ax.set_title(escape_matplotlib_usetex_text(title))
         ax_idx += 1
 
-    if use_external_legend and axes:
+    # ``axes`` is a NumPy array for multi-panel plots. Testing the array itself
+    # for truth is ambiguous once it contains more than one axis.
+    if use_external_legend and len(axes) > 0:
         legend_axes = []
         i = 0
         if plot_mean_by_class and series_by_class:

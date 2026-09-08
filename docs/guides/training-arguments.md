@@ -51,12 +51,47 @@ to the opposite pole.
 | **gradient_timing_steps** | `0` | If `> 0`, log gradient-row timing every N rows. |
 | **train_max_size** | `None` | Cap training samples per feature class. `None` uses all data. |
 | **learning_rate** | `1e-5` | Peak learning rate. |
+| **learning_rate_decoder** | `"auto"` | Decoder learning rate. `"auto"` starts at `learning_rate` and calibrates a model-local decoder rate at the first `eval_steps` boundary; a positive float creates a decoder parameter group at that rate; `None` shares `learning_rate` exactly as in historical runs. |
 | **num_train_epochs** | `3` | Number of epochs. Ignored when `max_steps > 0`. |
 | **max_steps** | `-1` | Total training steps when `> 0`; overrides `num_train_epochs`. |
 | **weight_decay** | `1e-2` | Weight decay for the optimizer. |
 | **adam_epsilon** | `1e-8` | Epsilon for Adam/AdamW. |
 | **optim** | `"adamw"` | Optimizer: `"adamw"` or `"adam"`. |
 | **criterion** | `None` | Loss function. `None` becomes `torch.nn.MSELoss()`. Advanced use only. |
+
+### Automatic decoder learning rate
+
+By default, `TrainingArguments` uses `learning_rate_decoder="auto"`, because an
+encoder-tuned rate may leave the much larger decoder unable to reach its local
+optimum in the remaining update budget. The decoder uses the shared
+`learning_rate` during the warm-up. At the first `eval_steps` boundary, GRADIEND
+estimates the decoder's distance to its current linear least-squares optimum
+and selects
+
+`max(learning_rate, distance / (remaining_steps * sqrt(decoder_parameter_count)))`.
+
+This calibration does not run an additional forward, backward, or evaluation
+pass. Each ordinary training step contributes its already-computed latent
+encoding to a small Hessian EMA, and calibration reduces Adam's existing
+decoder first moment to latent-sized Gram matrices. Persistent extra state is
+on CPU and contains `components * (latent_dim + decoder_bias)^2` float64 values;
+it does not scale with the decoder output width. There is no additional
+decoder-sized tensor or persistent GPU allocation beyond Adam's normal state.
+
+The current implementation requires Adam or AdamW, MSE loss, and an identity
+(linear) decoder. The auto decoder group uses `weight_decay=0` because applying
+AdamW shrinkage at the newly selected rate would invalidate the unregularized
+least-squares reachability estimate; encoder weight decay is unchanged. If the
+latent Hessian is rank-deficient at the first boundary, training keeps the
+shared rate and retries at later boundaries. The status, estimated distance,
+chosen rate, ranks, and condition numbers are written to
+`training.json` under `training_stats.decoder_lr_auto`.
+
+Set `learning_rate_decoder=None` to recover the historical single optimizer
+group. Automatic calibration changes the optimization protocol, has the
+constraints above, and estimates a local
+decoder optimum while the encoder is still moving; it should be compared with
+the historical shared-rate baseline before becoming a study default.
 
 ---
 
@@ -151,6 +186,7 @@ Supported objectives are `auto`, `mlm_mask_token`, `clm_next_token`,
 | **params** | `None` | Optional list of parameter names or wildcard patterns included in the GRADIEND parameter map. `None` includes all backbone parameters. |
 | **activation_encoder** | `None` | Encoder activation, e.g. `"tanh"`, `"gelu"`, or `"relu"`. `None` uses the model default. |
 | **activation_decoder** | `None` | Decoder activation, e.g. `"id"` or `"tanh"`. `None` uses the model default. |
+| **bias_encoder** | `True` | Whether the encoder linear layer has a bias. `None` also uses the enabled model default. |
 | **bias_decoder** | `None` | Whether the decoder linear layer has a bias. `None` uses the model default. |
 | **latent_dim** | `None` | GRADIEND latent dimension. `None` uses the model default, normally one feature dimension. |
 | **init_fan_in_floor** | `10000` | Lower bound for the fan-in used to initialize fresh encoder weights and matching decoder rows. Small activation-space ACTIEND components can have far fewer dimensions than classic parameter-space GRADIEND inputs; the floor keeps their initial random scale conservative and has been empirically helpful for ACTIEND convergence. Large GRADIEND parameter spaces are above the floor, so their initialization is unchanged. Set `None` to use raw component/input fan-in. |

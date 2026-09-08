@@ -62,6 +62,8 @@ def english_pronoun_generation_config() -> Dict[str, Any]:
         "min_left_context_words": MIN_LEFT_CONTEXT_WORDS,
         "max_size_per_class": MAX_SIZE_PER_CLASS,
         "balance": "try",
+        "deduplicate": True,
+        "drop_ambiguous_masked": True,
         "neutral_max_size": NEUTRAL_MAX_SIZE,
         "neutral_excluded_words": NEUTRAL_EXCLUDE_ENGLISH_PRONOUNS,
     }
@@ -201,6 +203,8 @@ def ensure_english_pronoun_data(
             max_size_per_class=MAX_SIZE_PER_CLASS,
             format="per_class",
             balance="try",
+            deduplicate=True,
+            drop_ambiguous_masked=True,
             min_rows_per_class_for_split=MIN_ROWS_PER_CLASS_FOR_SPLIT,
             raise_on_incomplete_classes=True,
         )

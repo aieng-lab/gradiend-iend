@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple, Union
 
@@ -36,8 +36,13 @@ from gradiend.util.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Panel keys in probability-shift plots: factual label_class / factual_id only.
-PROBS_BY_DATASET_GROUPING = "label_class"
+# Decoder selection uses the requested grid directly. Callers may explicitly
+# request boundary refinement, but it is not part of the default protocol.
+DEFAULT_DECODER_REFINE_POINTS = 0
+
+
+class DecoderPlotDataError(RuntimeError):
+    """Plotting cannot proceed from stored results; never a cache-recompute signal."""
 
 
 @contextmanager
@@ -193,25 +198,7 @@ def _bisect_refine_lms_boundary(
     refine_points: int,
     evaluate_pair: Callable[[float, float], Dict[str, Any]],
 ) -> None:
-    """Binary-search each class's LMS-gate boundary, mutating ``relevant_results``/``pairs``/``lrs`` in place.
-
-    For each class's polarity (``class_to_ff[cls]``), scans the already-evaluated
-    learning rates (ascending) for the first adjacent pair where ``lms`` crosses
-    ``selector.ratio * base_lms`` — the boundary :class:`LMSThresholdPolicy`-style
-    selectors actually optimize around (restrict to lms-passing candidates, then
-    argmax metric — so under the usual "metric increases, lms decreases with
-    |lr|" pattern, the selected point already sits on this boundary). Bisects
-    that interval by geometric midpoint for up to ``refine_points`` steps,
-    evaluating each new point via ``evaluate_pair`` and narrowing toward
-    whichever side is still on the passing side.
-
-    No-ops (per class, or entirely) when: ``selector`` has no ``ratio``
-    attribute (nothing to define the boundary against — not every
-    ``SelectionPolicy`` has one); base lms is missing; a class's grid has no
-    visible pass→fail transition among adjacent points (already uniform,
-    nothing to refine); or a class's polarity was already covered by an
-    earlier class in ``classes_to_eval`` sharing the same ``feature_factor``.
-    """
+    """Binary-search each class's LMS-gate boundary in place."""
     ratio = getattr(selector, "ratio", None)
     if ratio is None:
         return
@@ -226,23 +213,18 @@ def _bisect_refine_lms_boundary(
         if ff is None or ff in seen_ff:
             continue
         seen_ff.add(ff)
-
         same_ff_lrs = sorted({lr for (f, lr) in pairs if f == ff})
         if len(same_ff_lrs) < 2:
             continue
         lms_by_lr = {lr: _cell_lms(relevant_results.get((ff, lr))) for lr in same_ff_lrs}
-
         lo = hi = None
         for a, b in zip(same_ff_lrs, same_ff_lrs[1:]):
             la, lb = lms_by_lr.get(a), lms_by_lr.get(b)
-            if la is None or lb is None:
-                continue
-            if la >= cutoff > lb:
+            if la is not None and lb is not None and la >= cutoff > lb:
                 lo, hi = a, b
                 break
         if lo is None:
             continue
-
         for _ in range(refine_points):
             mid = (lo * hi) ** 0.5 if lo > 0 and hi > 0 else (lo + hi) / 2.0
             if mid <= lo or mid >= hi or (ff, mid) in relevant_results:
@@ -269,63 +251,6 @@ def _decoder_split_cache_key(split: Any) -> str:
     return str(split)
 
 
-def _refresh_probs_by_dataset_for_plotting(
-    trainer: Any,
-    *,
-    model_with_gradiend: Any,
-    base_model: Any,
-    tokenizer: Any,
-    relevant_results: Dict[Any, Dict[str, Any]],
-    training_like_df: Any,
-    neutral_df: Any,
-    part: str,
-    intervention_kwargs: Optional[Mapping[str, Any]] = None,
-    max_size_training_like: Optional[int] = None,
-    max_size_neutral: Optional[int] = None,
-    eval_batch_size: Optional[int] = None,
-) -> None:
-    """Replace probs_by_dataset on every grid entry using full factual-grouped evaluation.
-
-    Decoder selection may evaluate a row subset; legacy caches may have grouped by
-    alternative_id while using the same key names. Never merge — always replace for plots.
-    """
-    for id_key, entry in list(relevant_results.items()):
-        if id_key == "base":
-            rewritten = nullcontext(base_model)
-        else:
-            parsed = parse_grid_candidate_id(id_key, entry)
-            if parsed is None:
-                continue
-            ff, lr = parsed
-            rewritten = _decoder_grid_model_context(
-                model_with_gradiend,
-                base_model=base_model,
-                learning_rate=lr,
-                feature_factor=ff,
-                part=part,
-                intervention_kwargs=intervention_kwargs,
-            )
-
-        with rewritten as eval_model:
-            result = trainer.evaluate_base_model(
-                eval_model,
-                tokenizer,
-                use_cache=False,
-                training_like_df=training_like_df,
-                neutral_df=neutral_df,
-                max_size_training_like=max_size_training_like,
-                max_size_neutral=max_size_neutral,
-                eval_batch_size=eval_batch_size,
-                # Plot refresh only needs probs_by_dataset; never rewrite
-                # experiment_dir/decoder_row_wise_scores.csv per grid cell.
-                export_row_wise_csv=False,
-            )
-
-        if isinstance(result, dict) and result.get("probs_by_dataset"):
-            entry["probs_by_dataset"] = result["probs_by_dataset"]
-            entry["_probs_by_dataset_grouping"] = PROBS_BY_DATASET_GROUPING
-
-
 def _plot_all_target_classes(
     trainer: Any,
     summary: Dict[str, Any],
@@ -347,16 +272,9 @@ def _plot_all_target_classes(
     When plot_keys_override is set (e.g. when user passed target_class), only those keys are plotted,
     so we do not plot for internal result keys (e.g. 3PL when strengthening 3SG).
 
-    ``training_like_df``/``neutral_df``/``split`` are forwarded to
-    ``trainer.plot_probability_shifts`` -> ``analyze_decoder_for_plotting``
-    so the plot-refresh pass reuses the SAME frame the decoder grid was
-    actually evaluated against, instead of silently re-deriving a
-    (potentially narrower, one-pole-scoped) frame from the trainer's own
-    internal data. Confirmed production bug when this wasn't threaded
-    through: a bisection-refined grid cell's plot-refresh call re-derived
-    training_like_df with split defaulting to "test" and no caller frame
-    reused, replacing every rival class's panel with the trainer's own
-    internal one-pole view -- see CLAUDE.md in the study repo.
+    Plotting consumes the probabilities already stored in
+    ``relevant_results``. The dataframe arguments remain forwarded for API
+    compatibility, but an existing grid is never re-evaluated for plotting.
     """
     if plot_keys_override is not None:
         plot_keys = [k for k in plot_keys_override if k in summary]
@@ -737,6 +655,7 @@ def _decoder_cache_selection_context(
     increase_target_probabilities: bool,
     metrics_for_summary: Sequence[str],
     classes_to_eval: Sequence[str],
+    refine_points: int,
 ) -> Dict[str, Any]:
     """Fingerprint for decoder-grid cache invalidation when selection contract changes."""
     return {
@@ -744,6 +663,7 @@ def _decoder_cache_selection_context(
         "increase_target_probabilities": bool(increase_target_probabilities),
         "metrics_for_summary": sorted(str(m) for m in metrics_for_summary),
         "classes_to_eval": sorted(str(c) for c in classes_to_eval),
+        "refine_points": int(refine_points),
     }
 
 
@@ -753,8 +673,48 @@ def _decoder_cache_selection_matches(
 ) -> bool:
     cached = payload.get("selection_context")
     if not isinstance(cached, dict):
-        return True
-    return all(cached.get(key) == value for key, value in expected.items())
+        return int(expected.get("refine_points", 0)) == 0
+
+    for key, value in expected.items():
+        if key == "refine_points" and key not in cached:
+            # Older package versions did not fingerprint refinement. Accept
+            # such a cache for a refined request only when it visibly contains
+            # evaluated LRs outside its recorded coarse grid. Missing plotting
+            # metadata is handled separately and never invalidates a grid.
+            if int(value) == 0:
+                continue
+            requested_lrs = {
+                float(lr) for lr in (payload.get("lrs") or [])
+                if isinstance(lr, (int, float))
+            }
+            cached_results = convert_results_to_dict(payload.get("results", []))
+            has_refined_lr = False
+            for candidate_key, entry in cached_results.items():
+                if candidate_key == "base" or not isinstance(entry, Mapping):
+                    continue
+                parsed = parse_grid_candidate_id(candidate_key, entry)
+                if parsed is not None and float(parsed[1]) not in requested_lrs:
+                    has_refined_lr = True
+                    break
+            if not has_refined_lr:
+                return False
+            continue
+        if key == "refine_points":
+            # A cache refined to N points is a strict superset of a coarser
+            # (fewer- or zero-refine-point) request's grid -- it was built by
+            # evaluating the full coarse grid first and only adding points on
+            # top. Only invalidate when the cache has *less* refinement than
+            # requested, never merely a different amount.
+            try:
+                if int(cached.get(key, 0)) < int(value):
+                    return False
+            except (TypeError, ValueError):
+                if cached.get(key) != value:
+                    return False
+            continue
+        if cached.get(key) != value:
+            return False
+    return True
 
 
 def _decoder_cache_payload(
@@ -827,7 +787,7 @@ def compute_metric_summaries(
             derive a default sweep from ``class_to_ff``. When True,
             ``class_to_ff`` is not used to filter candidates for a metric --
             the caller already chose exactly which feature_factor(s) to
-            evaluate (e.g. an opposite-polarity random control), and this
+            evaluate (e.g. a non-canonical-direction diagnostic), and this
             function must respect that instead of silently re-deriving its
             own expectation and rejecting a grid the caller built on purpose.
 
@@ -865,17 +825,14 @@ def compute_metric_summaries(
             # class_to_ff's job is disambiguating which subset of a grid the
             # package *itself* derived a default sweep for counts as
             # "strengthen"/"weaken" for this metric. When the caller instead
-            # passed an explicit feature_factors=[...] (e.g. an
-            # opposite-polarity random-control re-query deliberately
-            # evaluating a class's *non-canonical* direction on purpose),
+            # passed explicit feature_factors=[...] to evaluate a class's
+            # *non-canonical* direction on purpose,
             # that derivation never happened -- the grid already is exactly
             # what was explicitly requested, and second-guessing it against
             # class_to_ff[metric] would silently override the caller's own
-            # manual parameter instead of respecting it. See gradiend-sae's
-            # CLAUDE.md ("opposite-polarity causal control failed") for the
-            # concrete crash this caused: pronoun_number's
-            # actiend:plural-singular:plural random control passed
-            # feature_factors=[opp_ff], and this function's old unconditional
+            # manual parameter instead of respecting it. A prior study used
+            # this for an opposite-polarity diagnostic (not a random vector),
+            # and this function's old unconditional
             # class_to_ff[metric] filter found zero matching candidates and
             # raised -- even though the caller had explicitly asked for
             # exactly that ff and needed no disambiguation at all.
@@ -962,6 +919,20 @@ def compute_metric_summaries(
             "strengthen": not metric.endswith("_weaken"),
             "lms": float(chosen.lms),
             "base_lms": float(ctx.base_lms),
+            # Rendering metadata, recorded by evaluation. The plotter must not
+            # reconstruct either field from class ordering or trainer state.
+            "selection_metric_class": (
+                metric[:-7] if metric.endswith("_weaken") else metric
+            ),
+            "selection_dataset_class": (
+                metric[:-7]
+                if metric.endswith("_weaken")
+                else (
+                    (results.get("base", {}).get("_selection_dataset_by_metric") or {}).get(metric)
+                    if isinstance(results.get("base", {}), Mapping)
+                    else None
+                )
+            ),
         }
 
     return summary
@@ -1014,7 +985,7 @@ class DecoderEvaluator:
         plot: bool = False,
         show: Optional[bool] = None,
         plot_kwargs: Optional[Dict[str, Any]] = None,
-        refine_points: int = 0,
+        refine_points: int = DEFAULT_DECODER_REFINE_POINTS,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation and return summary + grid for one direction (strengthen or weaken).
@@ -1074,14 +1045,17 @@ class DecoderEvaluator:
             increase_target_probabilities: If True (default), compute **strengthen** summaries only (keys e.g. "3SG", "3PL").
                 If False, compute **weaken** summaries only (keys e.g. "3SG_weaken", "3PL_weaken"). Only the
                 dataset–feature-factor combinations required for the chosen direction are evaluated.
-            plot: If True, after selection run any missing dataset evaluations needed for plotting,
-                update cache incrementally, then call the trainer's plot_probability_shifts.
+            plot: If True, render the probabilities already produced by the
+                decoder grid. Plotting never initiates decoder evaluation;
+                missing plot curves raise an explicit error.
             show: If True, display the plot (e.g. plt.show()). If False, only save to file. When None
                 and plot=True, defaults to True (same as evaluate_encoder: plot implies show).
             plot_kwargs: Optional dict of options forwarded to plot_probability_shifts when plot=True.
                 E.g. plot_kwargs=dict(figsize=(5, 3), show=False). The evaluate_decoder ``show`` argument
                 overrides plot_kwargs[\"show\"] when set.
-            refine_points: If > 0, after the requested ``lrs`` grid is evaluated, binary-search up to
+            refine_points: Optional number of LMS-boundary bisection points per target class.
+                Defaults to 0, so selection uses the requested ``lrs`` grid directly. When positive,
+                binary-search up to
                 this many additional points per (strengthen) target class to sharpen the LMS-gate
                 boundary the grid found only coarsely. For each class, finds the adjacent pair of
                 evaluated learning rates where ``lms`` crosses ``ratio * base_lms`` (the boundary
@@ -1097,6 +1071,7 @@ class DecoderEvaluator:
                 New points are merged into ``grid``/the returned summary exactly like the coarse grid
                 (and into the on-disk cache) — this is not a second cache-invalidating call, the
                 extra points are computed in the same pass.
+                Pass 0 only to request an explicit coarse-grid ablation.
 
         Returns:
             Flat dict with:
@@ -1114,6 +1089,12 @@ class DecoderEvaluator:
               - When plot=True, also 'plot_paths' and 'plot_path'.
         """
         logger.info(f"Starting decoder evaluation with part={part}")
+        if not isinstance(refine_points, int) or isinstance(refine_points, bool):
+            raise TypeError(
+                f"refine_points must be an int, got {type(refine_points).__name__}"
+            )
+        if refine_points < 0:
+            raise ValueError(f"refine_points must be >= 0, got {refine_points}")
         use_cache = trainer._resolve_artifact_use_cache(use_cache, fallback=False)
         if max_size_training_like is None:
             max_size_training_like = max_size
@@ -1221,6 +1202,7 @@ class DecoderEvaluator:
             increase_target_probabilities=increase_target_probabilities,
             metrics_for_summary=metrics_for_summary,
             classes_to_eval=classes_to_eval,
+            refine_points=refine_points,
         )
 
         # Per-class strengthen ff (see gradiend.model._source_target module docstring).
@@ -1233,8 +1215,7 @@ class DecoderEvaluator:
 
         # Captured before feature_factors is possibly overwritten by the
         # derivation below -- distinguishes "caller explicitly chose these
-        # feature_factors" (e.g. an opposite-polarity random-control
-        # re-query, deliberately requesting a class's non-canonical
+        # feature_factors" (e.g. deliberately requesting a class's non-canonical
         # direction) from "this evaluator derived its own default sweep from
         # class_to_ff". Forwarded into compute_metric_summaries so it can
         # tell those two cases apart instead of always trusting class_to_ff.
@@ -1271,6 +1252,12 @@ class DecoderEvaluator:
                 for m in [5, 2, 1]
                 if m * 10 ** e <= 100
             ]
+        else:
+            lrs = list(lrs)
+        # Refinement appends evaluated points to ``lrs`` in place.  Keep the
+        # caller's requested coarse grid separate so cache identity remains
+        # stable across a refined write and its subsequent read.
+        requested_lrs = list(lrs)
 
         experiment_dir = trainer.experiment_dir
         cache_file = resolve_decoder_grid_cache_path(experiment_dir, explicit_path=output_path)
@@ -1321,12 +1308,14 @@ class DecoderEvaluator:
                 )
                 structural_cache_matches = cache_matches
                 if cache_matches and raw_output_path and not os.path.isfile(raw_output_path):
-                    logger.info(
-                        "Decoder grid cache matches at %s, but raw per-sample CSV is missing at %s; recomputing.",
+                    logger.warning(
+                        "Decoder grid cache matches at %s, but optional raw per-sample CSV is missing at %s. "
+                        "Using the cached numerical grid without regenerating the export; missing derived "
+                        "artifacts never trigger decoder inference implicitly.",
                         cache_file,
                         raw_output_path,
                     )
-                    cache_matches = False
+                    raw_output_path = None
                 if cache_matches and not _decoder_cache_selection_matches(payload, selection_context):
                     logger.info(
                         "Decoder cache selection context mismatch at %s; recomputing.",
@@ -1370,45 +1359,10 @@ class DecoderEvaluator:
                         class_to_ff=class_to_ff,
                         explicit_feature_factors=explicit_feature_factors,
                     )
-                    if not plot:
-                        out_cached = {**summary, "grid": relevant_results}
-                        if raw_output_path:
-                            out_cached["raw_output_path"] = raw_output_path
-                        return out_cached
-                    # plot=True: get full df and run fill-in + plot. Reuse the
-                    # caller's own training_like_df/neutral_df (still their
-                    # original values here -- untouched since function entry)
-                    # instead of unconditionally re-deriving from the
-                    # trainer's internal state, which silently substitutes a
-                    # different (often narrower) population. Same bug and
-                    # fix as the other _get_decoder_eval_dataframe call site
-                    # below -- see CLAUDE.md in the study repo.
-                    if training_like_df is None or neutral_df is None:
-                        training_like_df, neutral_df = trainer._get_decoder_eval_dataframe(
-                            tokenizer,
-                            max_size_training_like=max_size_training_like,
-                            max_size_neutral=max_size_neutral,
-                            split=split,
-                            cached_training_like_df=training_like_df,
-                            cached_neutral_df=neutral_df,
-                        )
-                    full_training_like_df = training_like_df
-                    dataset_class_col = "label_class" if "label_class" in getattr(training_like_df, "columns", []) else "factual_id"
-                    if full_training_like_df is not None and dataset_class_col in getattr(full_training_like_df, "columns", []):
-                        _refresh_probs_by_dataset_for_plotting(
-                            trainer,
-                            model_with_gradiend=model_with_gradiend,
-                            base_model=base_model,
-                            tokenizer=tokenizer,
-                            relevant_results=relevant_results,
-                            training_like_df=full_training_like_df,
-                            neutral_df=neutral_df,
-                            part=part,
-                            intervention_kwargs=resolved_intervention_kwargs,
-                            max_size_training_like=max_size_training_like,
-                            max_size_neutral=max_size_neutral,
-                            eval_batch_size=eval_batch_size,
-                        )
+                    # Plotting a cache hit is deliberately read-only.  The
+                    # grid already contains the probabilities produced by
+                    # decoder evaluation. Never run model inference merely
+                    # because ``plot=True``.
                     if cache_file:
                         try:
                             payload_update = _decoder_cache_payload(
@@ -1417,7 +1371,7 @@ class DecoderEvaluator:
                                 max_size_training_like=max_size_training_like,
                                 max_size_neutral=max_size_neutral,
                                 feature_factors=feature_factors,
-                                lrs=lrs,
+                                lrs=requested_lrs,
                                 intervention_cache_fingerprint=intervention_cache_fingerprint,
                                 results=convert_results_to_list(relevant_results),
                                 selection_context=selection_context,
@@ -1426,6 +1380,11 @@ class DecoderEvaluator:
                                 json.dump(payload_update, f, indent=2)
                         except Exception as e:
                             logger.warning("Error writing decoder cache %s: %s", cache_file, e)
+                    if not plot:
+                        out_cached = {**summary, "grid": relevant_results}
+                        if raw_output_path:
+                            out_cached["raw_output_path"] = raw_output_path
+                        return out_cached
                     plot_paths: List[str] = []
                     if hasattr(trainer, "plot_probability_shifts"):
                         try:
@@ -1440,12 +1399,17 @@ class DecoderEvaluator:
                                 plot_keys_override=plot_keys_override,
                                 plot_kwargs=plot_kwargs,
                                 intervention_kwargs=resolved_intervention_kwargs,
-                                training_like_df=full_training_like_df,
+                                training_like_df=training_like_df,
                                 neutral_df=neutral_df,
                                 split=split,
                             )
                         except ImportError as e:
                             logger.warning("Skipping decoder probability-shift plots: %s", e)
+                        except Exception as e:
+                            raise DecoderPlotDataError(
+                                "Could not plot the cached decoder grid. Plotting errors do not "
+                                "invalidate the grid and will not trigger decoder evaluation."
+                            ) from e
                     out = {
                         **summary,
                         "grid": relevant_results,
@@ -1459,6 +1423,8 @@ class DecoderEvaluator:
                     return out
                 elif not structural_cache_matches:
                     logger.info("Decoder cache mismatch (part/split/size/feature_factors/lrs); recomputing.")
+            except DecoderPlotDataError:
+                raise
             except Exception as e:
                 logger.warning("Error loading cached decoder results: %s", e)
 
@@ -1500,7 +1466,7 @@ class DecoderEvaluator:
         # which already made the old formula recover full coverage, so
         # narrowing was a no-op there -- or (b) a singleton (every direct
         # `target_class="X"` call in this package's own examples, and every
-        # opposite-polarity random-control re-query in causal_study.py) --
+        # explicit singleton non-canonical-direction diagnostic) --
         # where the old formula unconditionally dropped that one class's own
         # dataset panel. That silent drop is exactly what caused
         # "probs_by_dataset['M']['F'] is absent"-style crashes in production
@@ -1614,14 +1580,22 @@ class DecoderEvaluator:
                 continue
             _evaluate_pair(feature_factor, lr)
 
-        if refine_points > 0 and increase_target_probabilities and classes_to_eval and class_to_ff:
+        refinement_classes = list(classes_to_eval)
+        if increase_target_probabilities:
+            pass
+        elif target_classes:
+            # Weakening class C is scored by ``C_weaken`` while steering with
+            # each rival class's semantic feature factor.
+            rivals = [c for c in target_classes if c not in set(classes_to_eval)]
+            if rivals:
+                refinement_classes = rivals
+        if refine_points > 0 and refinement_classes and class_to_ff:
             logger.info(
                 "evaluate_decoder: entering _bisect_refine_lms_boundary refine_points=%r "
-                "classes_to_eval=%r class_to_ff=%r id(training_like_df)=%s len(training_like_df)=%s "
+                "classes_to_eval=%r id(training_like_df)=%s len(training_like_df)=%s "
                 "id(neutral_df)=%s len(neutral_df)=%s",
                 refine_points,
-                list(classes_to_eval),
-                dict(class_to_ff),
+                list(refinement_classes),
                 id(training_like_df),
                 len(training_like_df) if training_like_df is not None else None,
                 id(neutral_df),
@@ -1631,7 +1605,7 @@ class DecoderEvaluator:
                 relevant_results=relevant_results,
                 pairs=pairs,
                 lrs=lrs,
-                classes_to_eval=classes_to_eval,
+                classes_to_eval=refinement_classes,
                 class_to_ff=class_to_ff,
                 selector=selector,
                 refine_points=refine_points,
@@ -1652,21 +1626,10 @@ class DecoderEvaluator:
         )
 
         plot_paths: List[str] = []
-        if plot and full_training_like_df is not None and dataset_class_col in getattr(full_training_like_df, "columns", []):
-            _refresh_probs_by_dataset_for_plotting(
-                trainer,
-                model_with_gradiend=model_with_gradiend,
-                base_model=base_model,
-                tokenizer=tokenizer,
-                relevant_results=relevant_results,
-                training_like_df=full_training_like_df,
-                neutral_df=neutral_df,
-                part=part,
-                intervention_kwargs=resolved_intervention_kwargs,
-                max_size_training_like=max_size_training_like,
-                max_size_neutral=max_size_neutral,
-                eval_batch_size=eval_batch_size,
-            )
+        if plot:
+            # Fresh decoder evaluation already computed probs_by_dataset for
+            # every grid cell.  Plotting consumes those results directly and
+            # must never initiate a second inference pass.
             if cache_file:
                 try:
                     payload = _decoder_cache_payload(
@@ -1675,7 +1638,7 @@ class DecoderEvaluator:
                         max_size_training_like=max_size_training_like,
                         max_size_neutral=max_size_neutral,
                         feature_factors=feature_factors,
-                        lrs=lrs,
+                        lrs=requested_lrs,
                         intervention_cache_fingerprint=intervention_cache_fingerprint,
                         results=convert_results_to_list(relevant_results),
                         selection_context=selection_context,
@@ -1712,7 +1675,7 @@ class DecoderEvaluator:
                     max_size_training_like=max_size_training_like,
                     max_size_neutral=max_size_neutral,
                     feature_factors=feature_factors,
-                    lrs=lrs,
+                    lrs=requested_lrs,
                     intervention_cache_fingerprint=intervention_cache_fingerprint,
                     results=convert_results_to_list(relevant_results),
                     selection_context=selection_context,

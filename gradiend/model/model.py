@@ -331,7 +331,7 @@ class GradiendModel(nn.Module):
         latent_dim: int,
         activation_encoder: str = "tanh",
         activation_decoder: str = "id",
-        bias_encoder: bool = False,
+        bias_encoder: bool = True,
         bias_decoder: bool = True,
         torch_dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
@@ -357,7 +357,7 @@ class GradiendModel(nn.Module):
             activation_encoder: Encoder activation name (case-insensitive).
             activation_decoder: Decoder activation name. If falsy, uses encoder activation
                 but with decoder-appropriate defaults via get_activation.
-            bias_encoder: Whether the encoder linear layer uses a bias term.
+            bias_encoder: Whether the encoder linear layer uses a bias term. Enabled by default.
             bias_decoder: Whether the decoder linear layer uses a bias term.
             torch_dtype: dtype used for model parameters.
             device: Optional default device for both encoder and decoder when specific

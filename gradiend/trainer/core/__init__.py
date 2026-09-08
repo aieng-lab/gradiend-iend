@@ -22,6 +22,7 @@ from .signals import (
     ActivationSignalExtractor,
 )
 from .dataset import SignalTrainingDatasetBase
+from .decoder_lr import AutoDecoderLearningRate, AUTO_DECODER_LR
 
 __all__ = [
     'train',
@@ -43,4 +44,6 @@ __all__ = [
     'GradientSignalExtractor',
     'ActivationSignalExtractor',
     'SignalTrainingDatasetBase',
+    'AutoDecoderLearningRate',
+    'AUTO_DECODER_LR',
 ]

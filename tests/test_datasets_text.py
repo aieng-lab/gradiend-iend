@@ -521,7 +521,7 @@ class TestTextGradientTrainingDataset:
         args = TrainingArguments()  # default "[MASK]"
         assert resolve_mask_placeholder(config=config, training_args=args) == "[PRONOUN]"
 
-    def test_filled_prediction_from_template_fills_every_mask_slot(self):
+    def test_filled_prediction_from_template_fills_the_first_mask_slot(self):
         from gradiend.trainer.text.prediction.dataset import _filled_prediction_from_template
 
         tokenizer = MockTokenizer()
@@ -549,9 +549,14 @@ class TestTextGradientTrainingDataset:
             max_length=32,
         )
         ids = item["input_ids"].tolist()
-        assert ids.count(tokenizer.vocab["she"]) == 2
+        # Superseded 2026-08-29: templates are now truncated after the FIRST
+        # placeholder, so only one slot survives. Anchoring on the last left
+        # earlier placeholders in the prefix as literal "[MASK]" text that the
+        # model attended to as context; a single prediction site with a clean
+        # prefix is the intended behaviour.
+        assert ids.count(tokenizer.vocab["she"]) == 1
         assert tokenizer.mask_token_id not in ids
-        assert item["prediction_mask"].sum().item() == 2
+        assert item["prediction_mask"].sum().item() == 1
 
     def test_filled_prediction_from_template_without_tokenizer_mask_token(self):
         """Dataset mask placeholder must work when the tokenizer has no MLM mask special."""

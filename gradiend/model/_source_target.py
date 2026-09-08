@@ -201,7 +201,13 @@ def resolve_model_signal_kind(model: Any, trainer: Any = None, *, default: str =
     gradiend = getattr(model, "gradiend", None) if model is not None else None
     mapping_kind = getattr(gradiend, "mapping_kind", None)
     if mapping_kind is not None:
-        return "activation" if str(mapping_kind).strip().lower() == "activation" else "gradient"
+        # activation_gradient (dL/dh) is an activation-space signal for intervention
+        # sign semantics -- steered in activation space, not weight-rewritten.
+        return (
+            "activation"
+            if str(mapping_kind).strip().lower() in ("activation", "activation_gradient")
+            else "gradient"
+        )
 
     if trainer is not None:
         args = getattr(trainer, "_training_args", None) or getattr(trainer, "training_args", None)

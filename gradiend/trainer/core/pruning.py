@@ -446,11 +446,29 @@ def _stratified_indices(
     if target_feature_class_ids is not None:
         # Only stratify over classes that actually have data in the dataset
         class_ids = [cid for cid in target_feature_class_ids if cid in by_fc]
+        if not class_ids and by_fc:
+            # One-pole training requests the task's full class list but its
+            # frame carries only the trained pole's ids, so nothing matches.
+            # Stratification here exists solely to draw a representative
+            # gradient sample -- the classes actually present serve that just as
+            # well. Raising instead forced callers to disable pre-pruning
+            # entirely, which on a multi-billion-parameter model means building
+            # the encoder at full width (26 GiB at 8B) instead of pruned width.
+            logger.warning(
+                "pre_prune: none of the requested feature classes %s are present "
+                "in the dataset (found %s); stratifying over the classes present.",
+                list(target_feature_class_ids),
+                sorted(by_fc, key=repr),
+            )
+            class_ids = list(by_fc.keys())
     else:
         class_ids = list(by_fc.keys())
 
     if len(class_ids) == 0:
-        raise ValueError("No feature classes found for stratification.")
+        raise ValueError(
+            "No feature classes found for stratification: the dataset yielded no "
+            f"{feature_class_key!r} values at all, so no sample can be drawn."
+        )
 
     n_classes = len(class_ids)
     per_class = n_samples // n_classes

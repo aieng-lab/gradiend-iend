@@ -134,7 +134,12 @@ def test_derive_default_feature_factor_rejects_activation_non_diff_targets(targe
 def test_strengthen_summary_filters_to_class_feature_factor():
     """With both ff in grid, strengthen 3SG must not pick the other class's ff."""
     results = {
-        "base": {"id": "base", "lms": {"lms": 1.0}, "probs": {}},
+        "base": {
+            "id": "base",
+            "lms": {"lms": 1.0},
+            "probs": {},
+            "_selection_dataset_by_metric": {"3SG": "3PL", "3PL": "3SG"},
+        },
         (-1.0, 0.01): {
             "id": {"feature_factor": -1.0, "learning_rate": 0.01},
             "lms": {"lms": 1.0},
@@ -157,6 +162,8 @@ def test_strengthen_summary_filters_to_class_feature_factor():
     )
     assert summary["3SG"]["feature_factor"] == 1.0
     assert summary["3SG"]["value"] == 0.2
+    assert summary["3SG"]["selection_metric_class"] == "3SG"
+    assert summary["3SG"]["selection_dataset_class"] == "3PL"
 
 
 def test_lms_threshold_policy_fallback_handles_dict_candidate_ids():

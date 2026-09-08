@@ -30,6 +30,45 @@ TRAINING_CARD = Path("hf_datasets/en-pronouns/README.md")
 NEUTRAL_CARD = Path("hf_datasets/en-pronoun-neutral/README.md")
 
 
+def validate_training_frame(df: pd.DataFrame) -> None:
+    """Fail closed when generated prediction examples are not publication-ready."""
+    required = {"masked", "split", "label_class", "label", "feature_class_id"}
+    missing = sorted(required.difference(df.columns))
+    if missing:
+        raise ValueError(f"training.csv is missing required columns: {missing}")
+    if df[list(required)].isna().any().any():
+        raise ValueError("training.csv contains missing values in required columns")
+    duplicate = df.duplicated(["masked", "label_class", "label"], keep=False)
+    if duplicate.any():
+        raise ValueError(
+            "training.csv contains duplicate prediction examples: "
+            f"{int(duplicate.sum())} rows; regenerate with the current gradiend API"
+        )
+    prompt_split_counts = df.groupby("masked", sort=False)["split"].nunique()
+    leaking = prompt_split_counts[prompt_split_counts > 1]
+    if not leaking.empty:
+        raise ValueError(
+            "training.csv has masked prompts shared across data splits: "
+            f"{len(leaking)} prompts"
+        )
+    target_pairs = (
+        df["label_class"].astype(str) + "\u241f" + df["label"].astype(str)
+    )
+    target_counts = target_pairs.groupby(df["masked"].astype(str), sort=False).nunique()
+    ambiguous = target_counts[target_counts > 1]
+    if not ambiguous.empty:
+        raise ValueError(
+            "training.csv has masked prompts with conflicting class/label targets: "
+            f"{len(ambiguous)} prompts"
+        )
+    expected_splits = {"train", "validation", "test"}
+    actual_splits = set(df["split"].astype(str))
+    if actual_splits != expected_splits:
+        raise ValueError(
+            f"training.csv splits must be {sorted(expected_splits)}; got {sorted(actual_splits)}"
+        )
+
+
 def _clean_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path)
@@ -46,23 +85,21 @@ def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def stage_training_dataset(source_dir: Path, stage_dir: Path) -> Path:
+def stage_training_dataset(source_dir: Path, stage_dir: Path, *, include_readme: bool = True) -> Path:
     training_csv = source_dir / "training.csv"
     if not training_csv.is_file():
         raise FileNotFoundError(f"Missing generated training data: {training_csv}")
-    if not TRAINING_CARD.is_file():
+    if include_readme and not TRAINING_CARD.is_file():
         raise FileNotFoundError(f"Missing dataset card template: {TRAINING_CARD}")
 
     repo_dir = stage_dir / "en-pronouns"
     _clean_dir(repo_dir)
-    shutil.copy2(TRAINING_CARD, repo_dir / "README.md")
+    if include_readme:
+        shutil.copy2(TRAINING_CARD, repo_dir / "README.md")
     _copy_common_metadata(source_dir, repo_dir)
 
     df = pd.read_csv(training_csv)
-    required = {"masked", "split", "label_class", "label", "feature_class_id"}
-    missing = sorted(required.difference(df.columns))
-    if missing:
-        raise ValueError(f"training.csv is missing required columns: {missing}")
+    validate_training_frame(df)
 
     summary = {
         "rows": int(len(df)),
@@ -75,6 +112,18 @@ def stage_training_dataset(source_dir: Path, stage_dir: Path) -> Path:
             str(key): int(value)
             for key, value in df["split"].value_counts().sort_index().items()
         },
+        "rows_by_class_and_split": {
+            str(class_id): {
+                str(split): int(value)
+                for split, value in group["split"].value_counts().sort_index().items()
+            }
+            for class_id, group in df.groupby("label_class", sort=True)
+        },
+        "quality_checks": {
+            "duplicate_prediction_examples": 0,
+            "masked_prompts_crossing_splits": 0,
+            "ambiguous_masked_targets": 0,
+        },
     }
     _write_json(repo_dir / "dataset_summary.json", summary)
 
@@ -84,21 +133,29 @@ def stage_training_dataset(source_dir: Path, stage_dir: Path) -> Path:
     return repo_dir
 
 
-def stage_neutral_dataset(source_dir: Path, stage_dir: Path) -> Path:
+def stage_neutral_dataset(source_dir: Path, stage_dir: Path, *, include_readme: bool = True) -> Path:
     neutral_csv = source_dir / "neutral.csv"
     if not neutral_csv.is_file():
         raise FileNotFoundError(f"Missing generated neutral data: {neutral_csv}")
-    if not NEUTRAL_CARD.is_file():
+    if include_readme and not NEUTRAL_CARD.is_file():
         raise FileNotFoundError(f"Missing dataset card template: {NEUTRAL_CARD}")
 
     repo_dir = stage_dir / "en-pronoun-neutral"
     _clean_dir(repo_dir)
-    shutil.copy2(NEUTRAL_CARD, repo_dir / "README.md")
+    if include_readme:
+        shutil.copy2(NEUTRAL_CARD, repo_dir / "README.md")
     _copy_common_metadata(source_dir, repo_dir)
 
     df = pd.read_csv(neutral_csv)
     if list(df.columns) != ["text"]:
         raise ValueError(f"neutral.csv must have exactly one column ['text']; got {list(df.columns)}")
+    if df["text"].isna().any() or df["text"].astype(str).str.strip().eq("").any():
+        raise ValueError("neutral.csv contains missing or empty text")
+    duplicate_neutral = df["text"].duplicated(keep=False)
+    if duplicate_neutral.any():
+        raise ValueError(
+            f"neutral.csv contains {int(duplicate_neutral.sum())} duplicate rows; regenerate it"
+        )
 
     _write_json(
         repo_dir / "dataset_summary.json",
@@ -145,6 +202,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--private", action="store_true", help="Create repos as private.")
     parser.add_argument("--dry-run", action="store_true", help="Only stage files; do not upload.")
     parser.add_argument(
+        "--skip-readme",
+        action="store_true",
+        help="Do not stage or upload dataset-card README files; existing Hub cards stay unchanged.",
+    )
+    parser.add_argument(
+        "--training-only",
+        action="store_true",
+        help="Stage/upload only a corrected labeled training dataset; leave the neutral repository untouched.",
+    )
+    parser.add_argument(
         "--commit-message",
         default="Upload English pronoun datasets",
         help="Commit message for both dataset uploads.",
@@ -157,13 +224,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stage_root = args.stage_dir.resolve()
     stage_root.mkdir(parents=True, exist_ok=True)
 
-    training_dir = stage_training_dataset(args.source_dir, stage_root)
-    neutral_dir = stage_neutral_dataset(args.source_dir, stage_root)
+    training_dir = stage_training_dataset(
+        args.source_dir, stage_root, include_readme=not args.skip_readme
+    )
+    neutral_dir = None
+    if not args.training_only:
+        neutral_dir = stage_neutral_dataset(
+            args.source_dir, stage_root, include_readme=not args.skip_readme
+        )
 
     print(f"Staged training dataset: {training_dir}")
     print(f"Staged neutral dataset:  {neutral_dir}")
     print(f"Training repo id: {args.training_repo_id}")
-    print(f"Neutral repo id:  {args.neutral_repo_id}")
+    if neutral_dir is not None:
+        print(f"Neutral repo id:  {args.neutral_repo_id}")
 
     if args.dry_run:
         print("Dry run complete; no upload performed.")
@@ -176,13 +250,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         token=args.token,
         commit_message=args.commit_message,
     )
-    upload_dataset_folder(
-        repo_id=args.neutral_repo_id,
-        folder=neutral_dir,
-        private=args.private,
-        token=args.token,
-        commit_message=args.commit_message,
-    )
+    if neutral_dir is not None:
+        upload_dataset_folder(
+            repo_id=args.neutral_repo_id,
+            folder=neutral_dir,
+            private=args.private,
+            token=args.token,
+            commit_message=args.commit_message,
+        )
     print("Upload complete.")
     return 0
 

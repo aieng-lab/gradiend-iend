@@ -36,7 +36,10 @@ from gradiend.comparison.seed_policy import (
     comparison_seed_metadata,
     unwrap_trainer,
 )
-from gradiend.model.utils import is_seq2seq_model
+from gradiend.model.utils import (
+    is_decoder_only_model as _is_decoder_only,
+    is_seq2seq_model,
+)
 from gradiend.trainer.core.cache_policy import coerce_artifact_use_cache
 from gradiend.trainer.core.unified_schema import normalize_transition_id, transition_id
 from gradiend.trainer.text.prediction.dataset import TextTrainingDataset
@@ -370,7 +373,7 @@ def _gradient_dataset_for_unified_df(
     else:
         objective_name = "mlm"
     is_seq2seq = is_seq2seq_model(tokenizer)
-    is_decoder_only_model = False if is_seq2seq else tokenizer.mask_token_id is None
+    is_decoder_only_model = False if is_seq2seq else _is_decoder_only(tokenizer)
     if objective_name == "clm_sequence_cloze":
         is_decoder_only_model = True
     elif objective_name == "seq2seq_decoder_sequence_cloze":

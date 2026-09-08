@@ -1,6 +1,8 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pandas as pd
+import pytest
 
 from gradiend import TextPredictionTrainer, TrainingArguments
 from gradiend.trainer.core.arguments import TrainingArguments as CoreTrainingArguments
@@ -239,102 +241,48 @@ def test_prediction_evaluate_decoder_uses_requested_split(monkeypatch):
     assert result["splits"] == ["validation"]
 
 
-def test_prediction_decoder_plotting_analysis_uses_training_argument_caps(monkeypatch):
+def test_analyze_decoder_for_plotting_with_existing_grid_is_inference_free():
+    """Existing plot data is consumed as-is; plotting never loads or runs a model."""
     trainer = _make_prediction_trainer("prediction-cache-exp")
-    trainer._training_args.decoder_eval_max_size_training_like = 7
-    trainer._training_args.decoder_eval_max_size_neutral = 11
-    trainer._training_args.eval_batch_size = 3
-    trainer.get_model = lambda: SimpleNamespace(
-        base_model=SimpleNamespace(),
-        tokenizer=_DummyPredictionTokenizer(),
+    trainer.get_model = Mock(side_effect=AssertionError("plotting loaded a model"))
+    trainer.evaluate_base_model = Mock(
+        side_effect=AssertionError("plotting ran decoder evaluation")
     )
+    existing_panels = {"3SG": {"3SG": 0.5}}
 
-    captured = {}
-
-    def _fake_get_decoder_eval_dataframe(tokenizer, **kwargs):
-        captured["data_kwargs"] = kwargs
-        return (
-            pd.DataFrame({"masked": ["[MASK] went home"], "label_class": ["3SG"]}),
-            pd.DataFrame({"text": ["neutral"]}),
-        )
-
-    def _fake_evaluate_base_model(model, tokenizer, **kwargs):
-        captured["base_kwargs"] = kwargs
-        return {"probs_by_dataset": {"3SG": {"3SG": 0.8}}}
-
-    trainer._get_decoder_eval_dataframe = _fake_get_decoder_eval_dataframe
-    trainer._resolve_decoder_eval_targets = lambda training_like_df=None: ({"3SG": ["he"]}, False)
-    trainer.evaluate_base_model = _fake_evaluate_base_model
-
-    trainer.analyze_decoder_for_plotting(
-        decoder_results={"grid": {"base": {}}},
-        class_ids=["3SG"],
-        use_cache=True,
-    )
-
-    assert captured["data_kwargs"]["split"] == "test"
-    assert captured["data_kwargs"]["max_size_training_like"] == 7
-    assert captured["data_kwargs"]["max_size_neutral"] == 11
-    assert captured["base_kwargs"]["max_size_training_like"] == 7
-    assert captured["base_kwargs"]["max_size_neutral"] == 11
-    assert captured["base_kwargs"]["eval_batch_size"] == 3
-
-
-def test_analyze_decoder_for_plotting_forwards_intervention_kwargs():
-    """Plot refresh must reuse the grid's token_selector / activation_gate, not hardcode encoder_direction."""
-    from contextlib import contextmanager
-
-    trainer = _make_prediction_trainer("prediction-cache-exp")
-    trainer._training_args.decoder_eval_max_size_training_like = 4
-    trainer._training_args.decoder_eval_max_size_neutral = 4
-    trainer._training_args.eval_batch_size = 2
-
-    captured = {}
-
-    @contextmanager
-    def _fake_intervene(**kwargs):
-        captured["intervene"] = kwargs
-        yield SimpleNamespace()
-
-    model = SimpleNamespace(
-        base_model=SimpleNamespace(),
-        tokenizer=_DummyPredictionTokenizer(),
-        intervene=_fake_intervene,
-    )
-    trainer.get_model = lambda: model
-    trainer._get_decoder_eval_dataframe = lambda tokenizer, **kwargs: (
-        pd.DataFrame({"masked": ["[MASK] went home"], "label_class": ["3SG"]}),
-        pd.DataFrame({"text": ["neutral"]}),
-    )
-    trainer._resolve_decoder_eval_targets = lambda training_like_df=None: ({"3SG": ["he"]}, False)
-    trainer.evaluate_base_model = lambda *args, **kwargs: {
-        "probs_by_dataset": {"3SG": {"3SG": 0.8}},
-        "_probs_by_dataset_grouping": "label_class",
-    }
-
-    trainer.analyze_decoder_for_plotting(
+    result = trainer.analyze_decoder_for_plotting(
         decoder_results={
             "grid": {
-                "base": {},
+                "base": {"probs_by_dataset": {"3SG": {"3SG": 0.8}}},
                 (1.0, 10.0): {
                     "id": {"feature_factor": 1.0, "learning_rate": 10.0},
-                    "probs_by_dataset": {"3SG": {"3SG": 0.5}},
+                    "probs_by_dataset": existing_panels,
                 },
-            },
-            "intervention_kwargs": {
-                "token_selector": "all",
-                "activation_gate": None,
-                "threshold": 0.5,
             },
         },
         class_ids=["3SG"],
-        use_cache=False,
     )
 
-    assert captured["intervene"]["token_selector"] == "all"
-    assert captured["intervene"]["value"] == 10.0
-    assert captured["intervene"]["feature_factor"] == 1.0
-    assert "activation_gate" not in captured["intervene"] or captured["intervene"].get("activation_gate") is None
+    assert result["plotting_data"][(1.0, 10.0)]["probs_by_dataset"] is existing_panels
+    trainer.get_model.assert_not_called()
+    trainer.evaluate_base_model.assert_not_called()
+
+
+def test_analyze_decoder_for_plotting_refuses_missing_panels_without_evaluation():
+    from gradiend.evaluator.decoder import DecoderPlotDataError
+
+    trainer = _make_prediction_trainer("prediction-cache-exp")
+    trainer.evaluate_base_model = Mock(
+        side_effect=AssertionError("plotting ran decoder evaluation")
+    )
+
+    with pytest.raises(DecoderPlotDataError, match="read-only"):
+        trainer.analyze_decoder_for_plotting(
+            decoder_results={"grid": {"base": {}}},
+            class_ids=["3SG"],
+        )
+
+    trainer.evaluate_base_model.assert_not_called()
 
 
 def test_classification_cached_train_defers_data_loading(monkeypatch):

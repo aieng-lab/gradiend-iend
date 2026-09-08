@@ -15,6 +15,10 @@ from torch.utils.data import DataLoader
 
 from gradiend.util.logging import get_logger
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.decoder_lr import (
+    AutoDecoderLearningRate,
+    is_auto_decoder_lr,
+)
 from gradiend.trainer.core.signals import require_single_signal
 from gradiend.trainer.core.callbacks import (
     TrainingCallback,
@@ -47,12 +51,77 @@ from gradiend.util.component_logging import (
 logger = get_logger(__name__)
 
 
+def split_encoder_decoder_parameters(
+    gradiend: Any,
+    train_params: Sequence[Any],
+) -> tuple[List[Any], List[Any]]:
+    """Split trainable parameters into (decoder, non-decoder) by identity.
+
+    Shared with ``build_optimizer_parameter_groups`` so a diagnostic can never
+    disagree with the optimizer about which tensors are the decoder's. Component
+    decoders share tensors with the full model's decoder, so identity matching
+    does not double-count them.
+    """
+    params = list(train_params)
+    decoder = getattr(gradiend, "decoder", None)
+    if decoder is None:
+        return [], params
+    decoder_ids = {id(parameter) for parameter in decoder.parameters()}
+    decoder_params = [p for p in params if id(p) in decoder_ids]
+    other_params = [p for p in params if id(p) not in decoder_ids]
+    return decoder_params, other_params
+
+
+def component_gradient_norms(
+    gradiend: Any,
+    train_params: Sequence[Any],
+) -> dict:
+    """Gradient L2 norms for the decoder and for everything else.
+
+    Both optimizers tested converge the encoder and neither converges the
+    decoder on the same objective, which rules out an optimizer-side
+    explanation and points at the objective's own conditioning: if the loss is
+    far less sensitive to decoder scale than to encoder direction, the decoder's
+    gradient is correspondingly smaller and no learning rate shared with the
+    encoder can close the distance.
+
+    Must be called while gradients are live -- after ``backward()`` and before
+    the next ``zero_grad()``. Parameters with no gradient are skipped rather
+    than counted as zero, so a norm of 0.0 means "all gradients were zero", not
+    "nothing had a gradient"; ``*_n`` reports how many tensors contributed.
+    """
+    import torch as _torch
+
+    decoder_params, other_params = split_encoder_decoder_parameters(
+        gradiend, train_params
+    )
+
+    def _norm(parameters):
+        squares = [
+            float(_torch.linalg.vector_norm(p.grad.detach()).item()) ** 2
+            for p in parameters
+            if getattr(p, "grad", None) is not None
+        ]
+        return (float(sum(squares) ** 0.5), len(squares))
+
+    decoder_norm, decoder_n = _norm(decoder_params)
+    other_norm, other_n = _norm(other_params)
+    ratio = (decoder_norm / other_norm) if other_norm > 0.0 else float("nan")
+    return {
+        "decoder": decoder_norm,
+        "encoder": other_norm,
+        "decoder_over_encoder": ratio,
+        "decoder_n": decoder_n,
+        "encoder_n": other_n,
+    }
+
+
 def build_optimizer_parameter_groups(
     gradiend: Any,
     train_params: Sequence[Any],
     *,
     learning_rate: float,
-    learning_rate_decoder: Optional[float] = None,
+    learning_rate_decoder: Any = None,
     supervised_encoder: bool = False,
 ) -> List[Any]:
     """Return optimizer parameters, optionally splitting the decoder into its own group.
@@ -95,26 +164,36 @@ def build_optimizer_parameter_groups(
             "encoder parameters only; the decoder learning rate would have no "
             "effect. Unset one of the two."
         )
-    decoder_ids = {id(parameter) for parameter in decoder.parameters()}
-    decoder_params = [p for p in params if id(p) in decoder_ids]
-    other_params = [p for p in params if id(p) not in decoder_ids]
+    decoder_params, other_params = split_encoder_decoder_parameters(gradiend, params)
     if not decoder_params:
         raise ValueError(
             "learning_rate_decoder is set but no decoder parameter is being "
             "optimized; check supervised_encoder / trainable parameter selection"
         )
+    decoder_lr = (
+        float(learning_rate)
+        if is_auto_decoder_lr(learning_rate_decoder)
+        else float(learning_rate_decoder)
+    )
     groups: List[Any] = []
     if other_params:
         groups.append({"params": other_params, "lr": float(learning_rate)})
-    groups.append({"params": decoder_params, "lr": float(learning_rate_decoder)})
+    decoder_group = {"params": decoder_params, "lr": decoder_lr}
+    if is_auto_decoder_lr(learning_rate_decoder):
+        # The estimator targets the unregularized linear least-squares optimum.
+        # Letting AdamW inherit the global weight decay would multiply that
+        # shrinkage by the newly selected decoder LR and invalidate the
+        # reachability calculation. Encoder regularization is left untouched.
+        decoder_group["weight_decay"] = 0.0
+    groups.append(decoder_group)
     logger.info(
         "Decoupled decoder learning rate: %d non-decoder parameter tensors at "
         "lr=%g, %d decoder parameter tensors at lr=%g (ratio %.3gx).",
         len(other_params),
         float(learning_rate),
         len(decoder_params),
-        float(learning_rate_decoder),
-        float(learning_rate_decoder) / float(learning_rate) if learning_rate else float("inf"),
+        decoder_lr,
+        decoder_lr / float(learning_rate) if learning_rate else float("inf"),
     )
     return groups
 
@@ -324,6 +403,11 @@ def train(
         'mean_by_feature_class': {},  # step -> dict of feature_class (e.g. masc_nom) -> mean encoded value
         'encoder_norms': {},
         'decoder_norms': {},
+        # Gradient (not weight) norms per step. Weight norms say where the
+        # parameters are; these say how hard the objective is pushing them.
+        'encoder_grad_norms': {},
+        'decoder_grad_norms': {},
+        'decoder_over_encoder_grad_ratio': {},
     }
 
     time_stats = {
@@ -414,6 +498,37 @@ def train(
             f"Unsupported optim={training_args.optim!r}; "
             "expected one of 'adamw', 'adam', 'sgd'"
         )
+
+    auto_decoder_lr = None
+    if is_auto_decoder_lr(training_args.learning_rate_decoder):
+        epoch_limited_steps = int(training_args.num_train_epochs) * len(data)
+        planned_training_steps = (
+            min(int(training_args.max_steps), epoch_limited_steps)
+            if training_args.max_steps > 0
+            else epoch_limited_steps
+        )
+        if planned_training_steps <= int(training_args.eval_steps):
+            raise ValueError(
+                "learning_rate_decoder='auto' needs at least one optimizer step "
+                "after its first calibration boundary: planned training steps "
+                f"({planned_training_steps}) must exceed eval_steps "
+                f"({training_args.eval_steps})"
+            )
+        auto_decoder_lr = AutoDecoderLearningRate(
+            gradiend=model_with_gradiend.gradiend,
+            optimizer=optimizer,
+            initial_lr=float(training_args.learning_rate),
+            # Supervised-decoder training calls the shared decoder directly on
+            # labels, even when the model exposes component views; its loss is
+            # therefore the full objective rather than a component aggregate.
+            aggregation=(
+                "full"
+                if training_args.supervised_decoder
+                else getattr(training_args, "gradiend_split_loss", "mean")
+            ),
+            criterion=training_args.criterion,
+        )
+        training_stats['decoder_lr_auto'] = auto_decoder_lr.summary()
 
     # Initial evaluation before training starts (at step 0)
     if training_args.do_eval and training_args.evaluate_fn is not None:
@@ -559,6 +674,25 @@ def train(
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            if auto_decoder_lr is not None and auto_decoder_lr.selected_lr is None:
+                auto_encoded = labels if training_args.supervised_decoder else encoded_value
+                auto_decoder_lr.observe(auto_encoded)
+            # Read gradients here: they are live between backward() and the next
+            # zero_grad(), and step() does not modify them.
+            try:
+                _grad_norms = component_gradient_norms(
+                    model_with_gradiend.gradiend, train_params
+                )
+            except Exception as _grad_exc:  # noqa: BLE001 - never stop training
+                # Log once rather than swallowing silently: an always-failing
+                # diagnostic leaves the key present but empty, which reads as
+                # "no data" instead of "broken".
+                if not globals().get("_GRAD_NORM_WARNED"):
+                    globals()["_GRAD_NORM_WARNED"] = True
+                    logger.warning(
+                        "gradient-norm diagnostic disabled after error: %r", _grad_exc
+                    )
+                _grad_norms = None
             optimizer.step()
             if runtime_monitor is not None:
                 runtime_monitor.mark("training:step:done", step=global_step + 1, epoch=epoch + 1)
@@ -578,6 +712,12 @@ def train(
             training_stats['global_step'] = global_step
             training_stats['encoder_norms'][global_step] = model_with_gradiend.gradiend.encoder_norm
             training_stats['decoder_norms'][global_step] = model_with_gradiend.gradiend.decoder_norm
+            if _grad_norms is not None:
+                training_stats['encoder_grad_norms'][global_step] = _grad_norms['encoder']
+                training_stats['decoder_grad_norms'][global_step] = _grad_norms['decoder']
+                training_stats['decoder_over_encoder_grad_ratio'][global_step] = (
+                    _grad_norms['decoder_over_encoder']
+                )
             
             # Call callbacks in order; eval_result flows from EvaluationCallback to later callbacks
             config_dict = training_args.to_dict()
@@ -612,6 +752,26 @@ def train(
                 if out is not None:
                     eval_result = out
                     step_kwargs['eval_result'] = eval_result
+            if (
+                auto_decoder_lr is not None
+                and auto_decoder_lr.selected_lr is None
+                and global_step % training_args.eval_steps == 0
+            ):
+                auto_result = auto_decoder_lr.estimate(
+                    step=global_step,
+                    total_steps=planned_training_steps,
+                )
+                training_stats['decoder_lr_auto'] = auto_result
+                if auto_result.get("status") == "calibrated":
+                    logger.info(
+                        "Automatic decoder LR calibrated at step %d: %g -> %g "
+                        "(distance=%g, remaining_steps=%d).",
+                        global_step,
+                        float(auto_result["initial_lr"]),
+                        float(auto_result["selected_lr"]),
+                        float(auto_result["decoder_distance_to_local_optimum"]),
+                        int(auto_result["remaining_steps"]),
+                    )
             time_stats['eval'] += time.time() - step_start
             if max_iter is not None and global_step >= max_iter:
                 break

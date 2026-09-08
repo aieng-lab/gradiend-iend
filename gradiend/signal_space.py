@@ -526,8 +526,16 @@ def resolve_activation_modules(
     return tuple(selected.items())
 
 
-def resolve_activation_signal_space(base_model: nn.Module, signal: Any, scope: Any) -> ResolvedSignalSpace:
-    """Resolve the flattened GRADIEND input space for an activation signal."""
+def resolve_activation_signal_space(
+    base_model: nn.Module, signal: Any, scope: Any, *, kind: str = "activation"
+) -> ResolvedSignalSpace:
+    """Resolve the flattened GRADIEND input space for an activation-based signal.
+
+    ``kind`` is ``"activation"`` (the activation value ``h``) or
+    ``"activation_gradient"`` (the loss gradient ``dL/dh``). Both share the same
+    sites and static widths -- ``dL/dh`` has the same shape as ``h`` -- so the
+    space resolution is identical; only the captured tensor differs downstream.
+    """
     selector = signal_options(signal).get("token_selector")
     if callable(selector):
         raise ValueError(
@@ -552,7 +560,7 @@ def resolve_activation_signal_space(base_model: nn.Module, signal: Any, scope: A
         input_dim += int(dim)
 
     return ResolvedSignalSpace(
-        kind="activation",
+        kind=kind,
         signal_id=signal_id(signal),
         input_dim=input_dim,
         mapping=tuple(mapping),
@@ -593,6 +601,14 @@ def resolve_signal_training_plan(
             )
         elif kind == "activation":
             spaces.append(resolve_activation_signal_space(base_model, item, scope))
+        elif kind == "activation_gradient":
+            # Same activation-space resolution (dL/dh shares h's sites/widths);
+            # only the captured tensor differs, downstream in the extractor.
+            spaces.append(
+                resolve_activation_signal_space(
+                    base_model, item, scope, kind="activation_gradient"
+                )
+            )
         else:
             raise NotImplementedError(
                 f"Signal training plan resolution for Signal(kind={kind!r}) is not implemented yet."

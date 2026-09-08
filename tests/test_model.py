@@ -25,8 +25,8 @@ class TestGradiendModel:
         model1 = GradiendModel(input_dim=100, latent_dim=1)
         assert model1.input_dim == 100
         assert model1.latent_dim == 1
-        assert model1.bias_encoder is False
-        assert model1.encoder[0].bias is None
+        assert model1.bias_encoder is True
+        assert model1.encoder[0].bias is not None
         
         model2 = GradiendModel(input_dim=500, latent_dim=2, activation_encoder="relu")
         assert model2.input_dim == 500

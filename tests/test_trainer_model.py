@@ -456,8 +456,8 @@ class TestGetModelDuringTraining:
         )
 
         assert model.gradiend.mapping_kind == "activation"
-        assert model.gradiend.bias_encoder is False
-        assert model.gradiend.encoder[0].bias is None
+        assert model.gradiend.bias_encoder is True
+        assert model.gradiend.encoder[0].bias is not None
         assert model.gradiend.input_dim > 0
         assert "activation:embeddings" in model.gradiend.param_map
         assert not any(name.startswith("activation:classifier") for name in model.gradiend.param_map)

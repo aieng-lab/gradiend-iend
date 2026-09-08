@@ -162,6 +162,33 @@ class TestImgFormatVisualizerOutputPath:
         finally:
             plt.close("all")
 
+    def test_plot_training_convergence_external_legend_with_multiple_axes(self):
+        pytest.importorskip("matplotlib")
+        import matplotlib.pyplot as plt
+
+        classes = {str(i): float(i) / 10 for i in range(6)}
+        feature_classes = {f"feature_{i}": float(i) / 20 for i in range(6)}
+        training_stats = {
+            "training_stats": {
+                "mean_by_class": {0: classes, 1: classes},
+                "mean_by_feature_class": {0: feature_classes, 1: feature_classes},
+                "scores": {0: 0.5, 1: 0.8},
+            },
+            "best_score_checkpoint": {},
+        }
+        try:
+            fig, axes = plot_training_convergence(
+                training_stats=training_stats,
+                show=False,
+                return_fig_ax=True,
+                class_spread="iqr",
+                plot_mean_by_feature_class=True,
+            )
+            assert len(axes) == 3
+            assert len(fig.legends) == 1
+        finally:
+            plt.close("all")
+
     def test_plot_training_convergence_class_spread_ci95(self):
         pytest.importorskip("matplotlib")
         import matplotlib.pyplot as plt
