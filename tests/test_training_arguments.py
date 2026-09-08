@@ -36,6 +36,10 @@ class TestTrainingArguments:
         args = TrainingArguments()
         assert args.include_other_classes is False
 
+    def test_encoder_bias_defaults_true(self):
+        args = TrainingArguments()
+        assert args.bias_encoder is True
+
     def test_mask_placeholder_is_serialized_and_validated(self):
         args = TrainingArguments(mask_placeholder="[PRONOUN]")
 

@@ -14,7 +14,10 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Type, Uni
 import pandas as pd
 
 from gradiend.evaluator.encoder import EncoderEvaluator
-from gradiend.evaluator.decoder import DecoderEvaluator
+from gradiend.evaluator.decoder import (
+    DEFAULT_DECODER_REFINE_POINTS,
+    DecoderEvaluator,
+)
 from gradiend.util.logging import get_logger
 from gradiend.visualizer.plot_delegation import see_implementation
 
@@ -144,7 +147,7 @@ class Evaluator:
         plot: bool = False,
         show: Optional[bool] = None,
         plot_kwargs: Optional[Dict[str, Any]] = None,
-        refine_points: int = 0,
+        refine_points: int = DEFAULT_DECODER_REFINE_POINTS,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation and return summary + grid for one direction (strengthen or weaken).
@@ -191,12 +194,13 @@ class Evaluator:
                 Restricts feature factors and datasets for efficiency. When None, evaluates for all target classes.
             increase_target_probabilities: If True (default), compute strengthen summaries only (keys e.g. "3SG").
                 If False, compute weaken summaries only (keys e.g. "3SG_weaken"). Only required combinations are evaluated.
-            plot: If True, after selection run any missing dataset evaluations for plotting, update cache, then plot.
+            plot: If True, render the probabilities already present in the
+                decoder grid. Plotting never initiates decoder evaluation.
             show: If True, display the plot; if False, only save. When None and plot=True, defaults to True.
             plot_kwargs: Optional dict of options forwarded to plot_probability_shifts when plot=True.
-            refine_points: If > 0, forwarded to the underlying ``DecoderEvaluator`` to
-                binary-search the LMS-gate boundary after the coarse ``lrs`` sweep
-                (see ``DecoderEvaluator.evaluate_decoder``'s own docstring).
+            refine_points: Number of LMS-boundary bisection points per target class,
+                defaulting to 10. Forwarded to the underlying ``DecoderEvaluator``;
+                pass 0 only for an explicit coarse-grid ablation.
 
         Returns:
             Flat dict: for strengthen, keys like result['3SG']; for weaken, keys like result['3SG_weaken'].
@@ -612,17 +616,10 @@ class Evaluator:
             figsize: Optional Matplotlib figure size.
             highlight_non_convergence: Override non-convergence markers in title.
             return_fig_ax: If True, return Matplotlib ``(fig, ax)``.
-            split: Decoder-eval split ``decoder_results`` was actually
-                evaluated against. Pass this whenever it isn't ``"test"`` --
-                otherwise the plot-refresh step re-derives against the wrong
-                split's data. Explicit parameter (not ``**kwargs``) so it
-                can't be silently dropped by an intermediate layer -- see
-                ``gradiend.visualizer.visualizer.plot_probability_shifts``
-                for the production bug this class of mistake caused.
-            training_like_df: Optional caller-supplied evaluation frame,
-                paired with ``neutral_df``, reused as-is for the plot-refresh
-                step instead of being re-derived from the trainer's internal
-                (narrower) data.
+            split: Split used only when decoder results are omitted and must
+                first be evaluated.
+            training_like_df: Optional caller-supplied evaluation frame used
+                only when decoder results are omitted.
             neutral_df: Optional caller-supplied neutral frame, paired with
                 ``training_like_df``.
             **kwargs: Additional keyword arguments forwarded to the visualizer.

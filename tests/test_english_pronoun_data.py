@@ -57,6 +57,42 @@ def test_english_pronoun_generation_config_scans_full_source_with_publish_cap():
     config = english_pronoun_generation_config()
     assert config["base_max_size"] is None
     assert config["max_size_per_class"] == 10_000
+    assert config["deduplicate"] is True
+    assert config["drop_ambiguous_masked"] is True
+
+
+def _publication_frame() -> pd.DataFrame:
+    rows = []
+    for split, prefix in (("train", "T"), ("validation", "V"), ("test", "E")):
+        rows.append(
+            {
+                "masked": f"{prefix} [MASK] works.",
+                "split": split,
+                "label_class": "3SG",
+                "label": "he",
+                "feature_class_id": "3SG",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_pronoun_publisher_rejects_duplicate_prediction_examples():
+    from scripts.upload_english_pronoun_hf_datasets import validate_training_frame
+
+    frame = _publication_frame()
+    frame = pd.concat([frame, frame.iloc[[0]]], ignore_index=True)
+    with pytest.raises(ValueError, match="duplicate prediction examples"):
+        validate_training_frame(frame)
+
+
+def test_pronoun_publisher_rejects_prompt_cross_split_leakage():
+    from scripts.upload_english_pronoun_hf_datasets import validate_training_frame
+
+    frame = _publication_frame()
+    frame.loc[1, "masked"] = frame.loc[0, "masked"]
+    frame.loc[1, "label"] = "she"
+    with pytest.raises(ValueError, match="shared across data splits"):
+        validate_training_frame(frame)
 
 
 @pytest.mark.parametrize("neutral_contents", ["", "text\n"])

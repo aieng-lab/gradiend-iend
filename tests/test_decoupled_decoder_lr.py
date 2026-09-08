@@ -1,8 +1,9 @@
-"""Tests for the optional decoupled decoder learning rate.
+"""Tests for the automatic/optional decoupled decoder learning rate.
 
-The default (``learning_rate_decoder=None``) must reproduce the historical
-single-group optimizer exactly; the opt-in path must place decoder parameters,
-and only decoder parameters, in a second group at the requested rate.
+Explicit ``learning_rate_decoder=None`` must reproduce the historical
+single-group optimizer exactly; the public ``TrainingArguments`` default uses
+``"auto"``. Numeric/auto paths must place decoder parameters, and only decoder
+parameters, in a second group.
 
 Motivation: Adam-family updates are scale-free, so total decoder displacement is
 capped at roughly ``lr * steps * sqrt(output_dim)`` regardless of gradient
@@ -15,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.signals import Signal
 from gradiend.trainer.core.training import build_optimizer_parameter_groups
 
 
@@ -31,7 +33,7 @@ def _all_params(model):
     return list(model.parameters())
 
 
-class TestDefaultIsUnchanged:
+class TestExplicitNoneIsUnchanged:
     def test_none_returns_the_caller_list_unchanged(self):
         """The default path must hand the optimizer a plain parameter list."""
         model = _FakeGradiend()
@@ -55,8 +57,23 @@ class TestDefaultIsUnchanged:
         assert len(optimizer.param_groups) == 1
         assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
 
-    def test_default_training_arguments_leave_the_field_unset(self):
-        assert TrainingArguments().learning_rate_decoder is None
+    def test_default_decoder_lr_is_signal_kind_aware(self):
+        # The default is signal-kind-aware (was a blanket "auto"): auto for
+        # activation-space encoder-decoders (ACTIEND/AGIEND), None (shared) for a
+        # gradient (GRADIEND) signal or when no signal is set. Explicit "auto" is
+        # still honored on any signal.
+        assert TrainingArguments().learning_rate_decoder is None  # default -> gradient
+        assert TrainingArguments(signal=Signal.gradient()).learning_rate_decoder is None
+        assert TrainingArguments(signal=Signal.activation()).learning_rate_decoder == "auto"
+        # activation_gradient (AGIEND/CAGA) default -> None (lift unvalidated there),
+        # NOT auto -- only pure activation gets the auto default.
+        assert (
+            TrainingArguments(signal=Signal.activation_gradient()).learning_rate_decoder is None
+        )
+        assert (
+            TrainingArguments(signal=Signal.gradient(), learning_rate_decoder="auto").learning_rate_decoder
+            == "auto"
+        )
 
 
 class TestDecoupledPath:
@@ -74,6 +91,15 @@ class TestDecoupledPath:
         assert decoder["lr"] == pytest.approx(1e-3)
         assert {id(p) for p in decoder["params"]} == decoder_ids
         assert not ({id(p) for p in other["params"]} & decoder_ids)
+
+    def test_auto_starts_with_a_separate_decoder_group_at_shared_lr(self):
+        model = _FakeGradiend()
+        groups = build_optimizer_parameter_groups(
+            model, _all_params(model), learning_rate=2e-5, learning_rate_decoder="auto"
+        )
+        assert len(groups) == 2
+        assert groups[-1]["lr"] == pytest.approx(2e-5)
+        assert groups[-1]["weight_decay"] == 0.0
 
     def test_every_trainable_parameter_is_assigned_exactly_once(self):
         """No parameter may be dropped from, or duplicated across, the groups."""
@@ -126,7 +152,6 @@ class TestDecoupledPath:
             model, params, learning_rate=1e-5, learning_rate_decoder=1e-3
         )
 
-        decoder_group = groups[-1]
         # The duplicate ids land in the decoder group; none leak into the other
         # group, which is what would corrupt the encoder's effective rate.
         other_ids = {id(p) for p in groups[0]["params"]}
@@ -228,10 +253,14 @@ class TestFailureModes:
         with pytest.raises(ValueError, match="must be positive"):
             TrainingArguments(learning_rate_decoder=value)
 
-    @pytest.mark.parametrize("value", ["1e-3", True, [1e-3]])
+    @pytest.mark.parametrize("value", [True, [1e-3]])
     def test_non_numeric_rate_rejected(self, value):
-        with pytest.raises(TypeError, match="must be a number or None"):
+        with pytest.raises(TypeError, match="must be a number, 'auto', or None"):
             TrainingArguments(learning_rate_decoder=value)
+
+    def test_unknown_string_rate_rejected(self):
+        with pytest.raises(ValueError, match="must be 'auto'"):
+            TrainingArguments(learning_rate_decoder="fast")
 
 
 class TestSerialization:
@@ -242,8 +271,26 @@ class TestSerialization:
         assert payload["learning_rate_decoder"] == pytest.approx(2e-3)
         assert payload["learning_rate"] == pytest.approx(1e-5)
 
-    def test_unset_field_serializes_as_none(self):
+    def test_default_field_serializes_signal_kind_aware(self):
+        # Default resolves before serialization: gradient/no-signal -> None,
+        # activation-space -> "auto".
         assert TrainingArguments().to_dict()["learning_rate_decoder"] is None
+        assert (
+            TrainingArguments(signal=Signal.activation()).to_dict()["learning_rate_decoder"]
+            == "auto"
+        )
+
+    def test_explicit_none_serializes_as_none(self):
+        assert TrainingArguments(learning_rate_decoder=None).to_dict()["learning_rate_decoder"] is None
 
     def test_integer_rate_is_normalized_to_float(self):
         assert isinstance(TrainingArguments(learning_rate_decoder=1).learning_rate_decoder, float)
+
+    def test_auto_round_trips_as_a_string(self):
+        args = TrainingArguments(learning_rate_decoder="AUTO")
+        assert args.learning_rate_decoder == "auto"
+        assert args.to_dict()["learning_rate_decoder"] == "auto"
+
+    def test_auto_requires_positive_eval_interval(self):
+        with pytest.raises(ValueError, match="requires eval_steps >= 1"):
+            TrainingArguments(learning_rate_decoder="auto", eval_steps=0)

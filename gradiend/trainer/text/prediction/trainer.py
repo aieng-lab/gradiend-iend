@@ -1996,17 +1996,10 @@ class TextPredictionTrainer(Trainer):
             dpi: Optional output DPI. Defaults to trainer config when available.
             highlight_non_convergence: Override non-convergence markers.
             return_fig_ax: If True, return Matplotlib ``(fig, ax)``.
-            split: Decoder-eval split ``decoder_results`` was actually
-                evaluated against (defaults to ``"test"`` deep in the plot-
-                refresh step if omitted). Pass this whenever you called
-                ``evaluate_decoder(..., split=...)`` with a non-default
-                split, or the plot-refresh step will silently re-score
-                against a different population than your headline result.
-            training_like_df: Optional evaluation frame to reuse for the
-                plot-refresh step, paired with ``neutral_df`` -- pass the
-                SAME frame you gave ``evaluate_decoder(...)`` if you supplied
-                one, or this step re-derives its own (narrower,
-                trainer-internal) frame instead.
+            split: Split used only when decoder results are omitted and must
+                first be evaluated.
+            training_like_df: Optional evaluation frame used only when
+                decoder results are omitted.
             neutral_df: Optional neutral frame to reuse, paired with
                 ``training_like_df``.
             **kwargs: Additional keyword arguments forwarded to the evaluator.
@@ -2581,7 +2574,16 @@ class TextPredictionTrainer(Trainer):
         is_seq2seq = is_seq2seq_model(tokenizer)
         is_decoder_only_model = kwargs.get("is_decoder_only_model")
         if is_decoder_only_model is None:
-            is_decoder_only_model = False if is_seq2seq else tokenizer.mask_token_id is None
+            # Consult the model config first. "No mask token means causal" is
+            # wrong for a causal model whose tokenizer ships an unused MLM
+            # special (Gemma-3), which routed it down the masked-LM path.
+            from gradiend.model.utils import (
+                is_decoder_only_model as _is_decoder_only,
+            )
+
+            is_decoder_only_model = False if is_seq2seq else _is_decoder_only(
+                model_or_tokenizer
+            )
         if objective_name == "clm_sequence_cloze":
             is_decoder_only_model = True
         elif objective_name == "seq2seq_decoder_sequence_cloze":
@@ -2916,7 +2918,7 @@ class TextPredictionTrainer(Trainer):
             signals=kwargs.get("signals"),
             context="TextPredictionTrainer.create_gradient_training_dataset",
         )
-        if signal.kind == "activation":
+        if signal.kind in ("activation", "activation_gradient"):
             if kwargs.get("signals") is not None:
                 kwargs.pop("signals")
             kwargs.pop("signal", None)
@@ -3241,6 +3243,7 @@ class TextPredictionTrainer(Trainer):
         # resolution differs upstream in score_probability_shift.
         # Weaken: P(class) on its own factual dataset.
         probs_factual: Dict[str, float] = {}
+        selection_dataset_by_metric: Dict[str, str] = {}
         if prob_on_other_class and label_dataset_col and probs_by_dataset:
             counterfactual_probs = {}
             for class_name in class_names_for_metrics:
@@ -3248,10 +3251,16 @@ class TextPredictionTrainer(Trainer):
                 for other in other_classes:
                     if other in probs_by_dataset and class_name in probs_by_dataset[other]:
                         counterfactual_probs[class_name] = float(probs_by_dataset[other][class_name])
+                        selection_dataset_by_metric[str(class_name)] = str(other)
                         break
                 if class_name in probs_by_dataset and class_name in probs_by_dataset[class_name]:
                     probs_factual[class_name] = float(probs_by_dataset[class_name][class_name])
-            probs = counterfactual_probs if counterfactual_probs else next(iter(probs_by_dataset.values()))
+            if counterfactual_probs:
+                probs = counterfactual_probs
+            else:
+                fallback_dataset, probs = next(iter(probs_by_dataset.items()))
+                for class_name in probs:
+                    selection_dataset_by_metric[str(class_name)] = str(fallback_dataset)
         else:
             # Same-panel strengthen (one-pole): selection uses P(class) on that class's dataset.
             # Mirror pair-mode contract: expose under probs[class], not *_factual suffixes.
@@ -3264,9 +3273,15 @@ class TextPredictionTrainer(Trainer):
                 for class_name in selection_classes:
                     if class_name in probs_by_dataset and class_name in probs_by_dataset[class_name]:
                         probs_factual[class_name] = float(probs_by_dataset[class_name][class_name])
-            probs = dict(probs_factual) if probs_factual else (
-                next(iter(probs_by_dataset.values())) if probs_by_dataset else {}
-            )
+                        selection_dataset_by_metric[str(class_name)] = str(class_name)
+            if probs_factual:
+                probs = dict(probs_factual)
+            elif probs_by_dataset:
+                fallback_dataset, probs = next(iter(probs_by_dataset.items()))
+                for class_name in probs:
+                    selection_dataset_by_metric[str(class_name)] = str(fallback_dataset)
+            else:
+                probs = {}
 
         # Compute LMS
         ignore_tokens = self.config.decoder_eval_ignore_tokens
@@ -3307,6 +3322,10 @@ class TextPredictionTrainer(Trainer):
             'probs': probs,  # Counterfactual probs for selection (P(target) on other factual dataset)
             'lms': lms,
             '_probs_by_dataset_grouping': 'label_class' if label_dataset_col == 'label_class' else 'factual_id',
+            # Exact panel used to flatten probs_by_dataset into each strengthen
+            # selection metric. Plotting must consume this metadata rather than
+            # re-derive "the other class" from a potentially different order.
+            '_selection_dataset_by_metric': selection_dataset_by_metric,
         }
         # Add probs_by_dataset if available
         if probs_by_dataset is not None:
@@ -3351,65 +3370,27 @@ class TextPredictionTrainer(Trainer):
             model_with_gradiend: ModelWithGradiend instance. If None, uses self.get_model().
             class_ids: Classes to evaluate probabilities for. If None, uses all_classes if available,
                 else target_classes.
-            use_cache: Whether to use cached results when re-evaluating.
-            intervention_kwargs: Application-policy kwargs forwarded to ``intervene`` while
-                refreshing plot panels (token_selector, activation_gate, etc.). When omitted,
-                uses ``decoder_results["intervention_kwargs"]`` if present, otherwise the
-                historical decoder-eval default (``encoder_direction``).
-            split: Decoder-eval split to use when (re-)deriving training_like_df/
-                neutral_df. Defaults to ``"test"`` when omitted -- callers that
-                evaluated their decoder grid against a specific split (e.g.
-                ``"validation"``) MUST pass it here too, or this step silently
-                re-derives against a different split's data.
-            training_like_df: Optional caller-supplied evaluation frame. Reused
-                as-is (together with ``neutral_df``) instead of being
-                re-derived from the trainer's own internal data when BOTH are
-                given -- callers that already evaluated a decoder grid
-                against an explicit (study-supplied) frame must pass the SAME
-                frame here, or this step silently substitutes the trainer's
-                own internal one-pole-scoped view (missing rival classes) for
-                the plot refresh. This is exactly the same class of bug
-                fixed in decoder.py's dataset-narrowing removal -- see
-                CLAUDE.md in the study repo. Promoted from ``**kwargs`` to an
-                explicit parameter deliberately: a value buried in a generic
-                kwargs bag is silently dropped if an intermediate layer
-                doesn't know to forward it by name (exactly what happened
-                here before this fix) -- an explicit parameter makes that
-                impossible without a visible signature change at every layer.
-            neutral_df: Optional caller-supplied neutral frame, paired with
-                ``training_like_df`` (see above).
+            use_cache: Whether cached results may be used when
+                ``decoder_results`` is omitted.
+            intervention_kwargs: Retained for API compatibility. Plotting an
+                existing decoder grid never applies an intervention.
+            split: Split forwarded only if ``decoder_results`` is omitted and
+                decoder evaluation must first produce a grid.
+            training_like_df: Optional frame forwarded only when decoder
+                evaluation itself is requested because ``decoder_results`` is
+                omitted. It is never used to refresh an existing grid.
+            neutral_df: Optional neutral frame paired with
+                ``training_like_df``.
             **kwargs: Other decoder evaluation options such as
                 ``max_size_training_like``, ``max_size_neutral``, ``max_size``,
                 and ``eval_batch_size``. Omitted size options default to
                 ``TrainingArguments``.
 
         Returns:
-            Dict with 'plotting_data' (extended grid with probs_by_dataset) and 'summary' (summary entries from decoder_results).
+            Dict with ``plotting_data`` (the existing grid, copied without
+            model evaluation) and ``summary``.
         """
-        from gradiend.evaluator.decoder import (
-            _decoder_grid_model_context,
-            _normalize_decoder_intervention_kwargs,
-        )
-        from gradiend.evaluator.decoder_eval_utils import parse_grid_candidate_id
-
-        resolved_split = split if split is not None else "test"
-        cached_training_like_df = training_like_df
-        cached_neutral_df = neutral_df
-        max_size = kwargs.get("max_size")
-        max_size_training_like = kwargs.get("max_size_training_like")
-        max_size_neutral = kwargs.get("max_size_neutral")
-        eval_batch_size = kwargs.get("eval_batch_size")
-        if max_size_training_like is None:
-            max_size_training_like = max_size
-        if max_size_neutral is None:
-            max_size_neutral = max_size
-        max_size_training_like = self._default_from_training_args(
-            max_size_training_like, "decoder_eval_max_size_training_like"
-        )
-        max_size_neutral = self._default_from_training_args(
-            max_size_neutral, "decoder_eval_max_size_neutral"
-        )
-        eval_batch_size = self._default_from_training_args(eval_batch_size, "eval_batch_size")
+        from gradiend.evaluator.decoder import DecoderPlotDataError
 
         if decoder_results is None:
             # evaluate_decoder's own `split` parameter defaults to "test",
@@ -3430,98 +3411,29 @@ class TextPredictionTrainer(Trainer):
         grid = decoder_results.get("grid", {})
         _reserved = {"grid", "plot_path", "plot_paths", "intervention_kwargs"}
         summary = {k: v for k, v in decoder_results.items() if k not in _reserved}
-        if intervention_kwargs is None:
-            intervention_kwargs = decoder_results.get("intervention_kwargs")
-        resolved_intervention_kwargs = _normalize_decoder_intervention_kwargs(
-            intervention_kwargs=intervention_kwargs,
-        )
-        
-        # Determine classes to evaluate
-        if class_ids is None:
-            class_ids = self.all_classes if self.all_classes else self.target_classes
-        
-        if not class_ids:
-            raise ValueError("No classes specified for plotting analysis. Provide class_ids or ensure all_classes/target_classes are set.")
-        
-        # Get model and tokenizer
-        if model_with_gradiend is None:
-            model_with_gradiend = self.get_model()
-        
-        if model_with_gradiend is None:
-            raise ValueError("No model available. Provide model_with_gradiend or ensure model is loaded.")
-        
-        base_model = model_with_gradiend.base_model
-        tokenizer = model_with_gradiend.tokenizer
-        
-        # Get training_like_df for evaluation. Reuse a caller-supplied frame
-        # as-is when both are given -- do not silently substitute the
-        # trainer's own internal (narrower, one-pole-scoped) view for a
-        # frame the caller explicitly evaluated the decoder grid against.
-        if cached_training_like_df is not None and cached_neutral_df is not None:
-            training_like_df, neutral_df = cached_training_like_df, cached_neutral_df
-        else:
-            training_like_df, neutral_df = self._get_decoder_eval_dataframe(
-                tokenizer,
-                split=resolved_split,
-                max_size_training_like=max_size_training_like,
-                max_size_neutral=max_size_neutral,
-                cached_training_like_df=cached_training_like_df,
-                cached_neutral_df=cached_neutral_df,
+        if not isinstance(grid, dict) or not grid:
+            raise ValueError("Decoder results contain no grid to plot.")
+
+        missing_panels = [
+            str(candidate_id)
+            for candidate_id, entry in grid.items()
+            if not isinstance(entry, dict) or not entry.get("probs_by_dataset")
+        ]
+        if missing_panels:
+            preview = ", ".join(missing_panels[:5])
+            suffix = "..." if len(missing_panels) > 5 else ""
+            raise DecoderPlotDataError(
+                "Decoder grid lacks cached probs_by_dataset for "
+                f"{len(missing_panels)} cell(s): {preview}{suffix}. Plotting is "
+                "read-only and will not run decoder evaluation implicitly. "
+                "Generate plot data in an explicitly requested decoder-evaluation run."
             )
-        
-        # Resolve targets and row-wise mode (plotting uses same evaluation path; row-wise needs no static targets).
-        targets, use_row_wise = self._resolve_decoder_eval_targets(training_like_df)
-        if use_row_wise:
-            extended_targets = {cls: [] for cls in class_ids}  # placeholder; row-wise uses per-row factual/alternative
-        else:
-            extended_targets = {cls: targets[cls] for cls in class_ids if targets and cls in targets}
-        if not extended_targets and not use_row_wise:
-            raise ValueError(f"Could not build targets for classes {class_ids}. Ensure decoder_eval_targets includes these classes.")
-        
-        # Always refresh plot panels from full factual-grouped evaluation (never reuse
-        # selection-subset or legacy alternative_id-grouped probs_by_dataset).
-        # Application policy must match the decoder grid that produced these candidates.
-        extended_grid = {}
-        part = getattr(self.config, "decoder_eval_part", "decoder")
-        for candidate_id, entry in grid.items():
-            extended_entry = dict(entry)
 
-            if candidate_id == "base":
-                rewritten = nullcontext(base_model)
-            else:
-                parsed = parse_grid_candidate_id(candidate_id, entry if isinstance(entry, dict) else None)
-                if parsed is None:
-                    logger.warning(f"Unknown candidate_id format: {candidate_id}, skipping")
-                    extended_grid[candidate_id] = extended_entry
-                    continue
-                feature_factor, lr = parsed
-                rewritten = _decoder_grid_model_context(
-                    model_with_gradiend,
-                    base_model=base_model,
-                    learning_rate=lr,
-                    feature_factor=feature_factor,
-                    part=part,
-                    intervention_kwargs=resolved_intervention_kwargs,
-                )
-
-            with rewritten as eval_model:
-                eval_result = self.evaluate_base_model(
-                    eval_model,
-                    tokenizer,
-                    training_like_df=training_like_df,
-                    neutral_df=neutral_df,
-                    max_size_training_like=max_size_training_like,
-                    max_size_neutral=max_size_neutral,
-                    eval_batch_size=eval_batch_size,
-                    use_cache=False,
-                )
-            if "probs_by_dataset" in eval_result:
-                extended_entry["probs_by_dataset"] = eval_result["probs_by_dataset"]
-            grouping = eval_result.get("_probs_by_dataset_grouping")
-            if grouping:
-                extended_entry["_probs_by_dataset_grouping"] = grouping
-
-            extended_grid[candidate_id] = extended_entry
+        # A shallow copy prevents plotting helpers from mutating the caller's
+        # grid while preserving the complete cached probability panels.
+        extended_grid = {
+            candidate_id: dict(entry) for candidate_id, entry in grid.items()
+        }
         
         return {
             "plotting_data": extended_grid,

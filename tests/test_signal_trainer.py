@@ -131,7 +131,7 @@ def test_signal_trainer_runs_inherited_training_lifecycle(tmp_path):
         model,
         torch.ones(4, 3),
         -torch.ones(4, 3),
-        args=_args(tmp_path),
+        args=_args(tmp_path, learning_rate_decoder=None),
         target_classes=["present", "absent"],
     )
     output_dir = tmp_path / "model"
@@ -153,6 +153,7 @@ def test_signal_trainer_multi_seed_reuses_the_shared_base_model(tmp_path):
             max_steps=1,
             convergent_metric="loss",
             convergent_score_threshold=100.0,
+            learning_rate_decoder=None,
         ),
     )
     output_dir = tmp_path / "multi-seed-model"

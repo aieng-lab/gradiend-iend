@@ -661,6 +661,23 @@ def test_both_consecutive_batches_have_opposite_targets_for_same_pair():
     assert even["label"] == -odd["label"]
 
 
+def test_opt_in_diff_combination_reuses_factual_storage():
+    dataset = SignalTrainingDatasetBase(
+        _FixedPairRows(n=1),
+        _RecordingExtractor(),
+        source="factual",
+        target="diff",
+        signal=Signal.gradient(),
+        device=torch.device("cpu"),
+        combine_diff_in_place=True,
+    )
+
+    row = dataset[0]
+
+    assert row["target"].tolist() == [-9.0, -18.0]
+    assert row["source"].data_ptr() == row["target"].data_ptr()
+
+
 def test_both_identity_row_zero_target_and_label():
     dataset = SignalTrainingDatasetBase(
         _IdentityRow(),

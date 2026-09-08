@@ -649,7 +649,7 @@ def _make_trainer() -> TextPredictionTrainer:
         num_train_epochs=5,
         max_steps=MAX_STEPS,
         eval_steps=100,
-        bias_encoder=False,
+        bias_encoder=True,
         learning_rate=1e-5,
         target="diff",
         source="factual",

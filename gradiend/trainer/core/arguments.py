@@ -116,11 +116,35 @@ class TrainingArguments:
     learning_rate: float = 1e-5
     """Peak learning rate."""
 
-    learning_rate_decoder: Optional[float] = None
+    learning_rate_decoder: Optional[Union[float, Literal["auto", "default"]]] = "default"
     """Optional separate learning rate for the GRADIEND/ACTIEND decoder.
 
-    ``None`` (default) keeps the historical behaviour exactly: encoder and
-    decoder share ``learning_rate`` in a single optimizer parameter group.
+    The default sentinel ``"default"`` is SIGNAL-KIND-AWARE: it resolves to ``"auto"``
+    ONLY for the ``activation`` signal (ACTIEND), where the reachability lift was
+    validated. For ``gradient`` (GRADIEND) and ``activation_gradient`` (AGIEND/CAGA) --
+    and when no signal is set -- it resolves to ``None`` (shared), because the lift is
+    unvalidated there (and CAGA is closed-form). Passing ``"auto"`` EXPLICITLY forces
+    auto on any signal.
+
+    ``"auto"`` is SIGNAL-KIND-AWARE only via the default; when set it always means: start
+    the decoder at
+    ``learning_rate`` and, at the first ``eval_steps`` boundary, raises it to the
+    model-local reachability floor -- BUT only for ACTIVATION-space signals
+    (``activation`` / ``activation_gradient``, i.e. ACTIEND / AGIEND), where the
+    ridge optimum is far and Adam's per-step displacement cannot reach it
+    (IEND_THEORY_PLAN 2.7, measured for ACTIEND). For a ``gradient`` (weight-space,
+    GRADIEND) signal -- and the default when no signal is set -- ``"auto"`` resolves
+    to ``None`` (shared) instead, because the GRADIEND decoder historically shared
+    the encoder rate and was never shown to need lifting; a blanket ``"auto"``
+    default silently decoupled it across a package version. The reachability
+    estimator reuses Adam's existing decoder first moments and stores only
+    latent-sized Hessian statistics (no decoder-sized tensor, no extra pass); it
+    requires Adam/AdamW, an identity decoder, and MSE loss, and disables decoder
+    weight decay (encoder weight decay unchanged).
+
+    ``None`` keeps the historical behaviour exactly: encoder and decoder share
+    ``learning_rate`` in a single optimizer parameter group. Pass an explicit
+    float to force a decoupled rate on ANY signal (including gradient).
 
     Set a value to give the decoder its own group. Adam-family updates are
     scale-free, so per-step displacement is bounded by roughly ``lr`` per
@@ -135,6 +159,7 @@ class TrainingArguments:
 
     Incompatible with ``supervised_encoder=True``, which trains no decoder
     parameter; that combination raises instead of silently doing nothing.
+
     """
 
     num_train_epochs: int = 3
@@ -308,8 +333,8 @@ class TrainingArguments:
     activation_decoder: Optional[str] = None
     """Decoder activation name (e.g. 'id', 'tanh'). None = model default ('id')."""
 
-    bias_encoder: Optional[bool] = None
-    """Whether the encoder linear layer uses a bias term. None = model default (False)."""
+    bias_encoder: Optional[bool] = True
+    """Whether the encoder linear layer uses a bias term. Enabled by default; None also defers to the enabled model default."""
 
     bias_decoder: Optional[bool] = None
     """Whether the decoder linear layer uses a bias term. None = model default (True)."""
@@ -474,6 +499,30 @@ class TrainingArguments:
     def _coerce_signal_set(value: Any) -> Any:
         return coerce_signal_set(value)
 
+    def _signal_default_decoder_lr_is_auto(self) -> bool:
+        """Whether the ``'auto'`` decoder-LR default applies for this signal.
+
+        ``'auto'`` (the reachability-floor lift, IEND_THEORY_PLAN 2.7) was validated for
+        the ACTIVATION signal (ACTIEND); it applies by default ONLY when every configured
+        signal is ``activation``. For ``gradient`` (GRADIEND) the decoder historically
+        shared the encoder rate, and for ``activation_gradient`` (AGIEND/CAGA) the lift is
+        unvalidated (different signal magnitude/geometry; CAGA is closed-form so it does
+        not train a decoder at all) -- both default to ``None`` (shared). Explicit
+        ``'auto'`` / float still force a decoupled rate on any signal. Reads kinds directly
+        (runs before ``_normalize_signal_arguments``); the unset default is ``gradient``,
+        so no signal -> not auto."""
+        kinds = set()
+        if self.signal is not None:
+            kinds.add(getattr(self.signal, "kind", None))
+        if self.signals is not None:
+            try:
+                for s in self.signals:
+                    kinds.add(getattr(s, "kind", None))
+            except TypeError:
+                pass
+        kinds.discard(None)
+        return kinds == {"activation"}
+
     def _normalize_signal_arguments(self) -> None:
         signal, signals = normalize_signal_arguments(signal=self.signal, signals=self.signals)
         self.signal = signal
@@ -543,15 +592,33 @@ class TrainingArguments:
         if self.output_dir is not None and not isinstance(self.output_dir, str):
             raise TypeError(f"output_dir must be str or None, got {type(self.output_dir).__name__}")
         normalize_use_cache(self.use_cache)
+        if self.learning_rate_decoder == "default":
+            # Signal-kind-aware default: 'auto' (reachability lift, IEND_THEORY_PLAN
+            # 2.7) is validated only for the ACTIVATION signal (ACTIEND). gradient
+            # (GRADIEND) shared the encoder rate historically, and activation_gradient
+            # (AGIEND/CAGA) lift is unvalidated -- both default to None (shared). A
+            # blanket 'auto' default silently decoupled GRADIEND across a package
+            # version; this fixes that. Explicit 'auto'/None/float bypass this.
+            self.learning_rate_decoder = (
+                "auto" if self._signal_default_decoder_lr_is_auto() else None
+            )
         if self.learning_rate_decoder is not None:
-            if isinstance(self.learning_rate_decoder, bool) or not isinstance(
+            if isinstance(self.learning_rate_decoder, str):
+                normalized_decoder_lr = self.learning_rate_decoder.strip().lower()
+                if normalized_decoder_lr != "auto":
+                    raise ValueError(
+                        "learning_rate_decoder string value must be 'auto', got "
+                        f"{self.learning_rate_decoder!r}"
+                    )
+                self.learning_rate_decoder = normalized_decoder_lr
+            elif isinstance(self.learning_rate_decoder, bool) or not isinstance(
                 self.learning_rate_decoder, (int, float)
             ):
                 raise TypeError(
-                    "learning_rate_decoder must be a number or None, got "
+                    "learning_rate_decoder must be a number, 'auto', or None, got "
                     f"{type(self.learning_rate_decoder).__name__}"
                 )
-            if not self.learning_rate_decoder > 0:
+            elif not self.learning_rate_decoder > 0:
                 raise ValueError(
                     f"learning_rate_decoder must be positive, got {self.learning_rate_decoder}"
                 )
@@ -561,7 +628,8 @@ class TrainingArguments:
                     "no decoder parameter is trained, so the decoder learning rate "
                     "would have no effect."
                 )
-            self.learning_rate_decoder = float(self.learning_rate_decoder)
+            if self.learning_rate_decoder != "auto":
+                self.learning_rate_decoder = float(self.learning_rate_decoder)
         if not isinstance(self.reuse_pre_prune, bool):
             raise TypeError(f"reuse_pre_prune must be bool, got {type(self.reuse_pre_prune).__name__}")
         if not isinstance(self.fail_on_non_convergence, bool):
@@ -650,6 +718,11 @@ class TrainingArguments:
             raise TypeError(f"max_steps must be int, got {type(self.max_steps).__name__}")
         if not isinstance(self.eval_steps, int):
             raise TypeError(f"eval_steps must be int, got {type(self.eval_steps).__name__}")
+        if self.learning_rate_decoder == "auto" and self.eval_steps < 1:
+            raise ValueError(
+                "learning_rate_decoder='auto' requires eval_steps >= 1 because "
+                "the first evaluation boundary is the calibration boundary"
+            )
         if not isinstance(self.eval_batch_size, int):
             raise TypeError(f"eval_batch_size must be int, got {type(self.eval_batch_size).__name__}")
         if self.eval_batch_size < 1:

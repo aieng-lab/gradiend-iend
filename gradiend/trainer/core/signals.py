@@ -756,8 +756,15 @@ class ActivationSignalExtractor:
             raise TypeError("ActivationSignalExtractor requires a torch.nn.Module or object with .base_model")
         self.signal = signal or Signal.activation()
         self.signals = SignalSet(self.signal)
-        if self.signal.kind != "activation":
-            raise ValueError(f"ActivationSignalExtractor requires an activation signal, got {self.signal.kind!r}")
+        if self.signal.kind not in ("activation", "activation_gradient"):
+            raise ValueError(
+                "ActivationSignalExtractor requires an activation or activation_gradient "
+                f"signal, got {self.signal.kind!r}"
+            )
+        # activation_gradient captures dL/dh (loss gradient w.r.t. the activation)
+        # instead of the activation value h. Everything else -- sites, widths,
+        # token selection, scaling -- is identical, so only ``_capture`` branches.
+        self._capture_gradient = self.signal.kind == "activation_gradient"
         self.scope = coerce_signal_scope(scope)
         self.tokenizer = tokenizer or getattr(model, "tokenizer", None)
         if aggregate_batch not in {"mean", "none"}:
@@ -955,10 +962,25 @@ class ActivationSignalExtractor:
             prediction_mask = inputs.get("prediction_mask") if isinstance(inputs, Mapping) else None
             if not torch.is_tensor(prediction_mask):
                 raise ValueError("token_selector='prediction' requires inputs with prediction_mask")
+            # For dL/dh the gradient at the target (filled) span is identically zero
+            # in a causal LM -- the target at position p is predicted from p-1. So the
+            # activation_gradient signal reads the GENERATING positions (the target
+            # span shifted one left), which handles multi-token targets and carries
+            # the target-conditioned gradient even though the value there is
+            # target-independent. Value signals are unaffected.
+            selected_mask = (
+                self._generating_positions_mask(prediction_mask)
+                if self._capture_gradient
+                else prediction_mask
+            )
             return self._mean_selected_tokens(
                 activation,
-                prediction_mask,
+                selected_mask,
                 selector_name="prediction",
+                # dL/dh generating positions can be empty for a target at position 0
+                # (no predicting context); tolerate -> zero for that row instead of
+                # crashing the batch. Value signals keep the strict non-empty check.
+                allow_empty_rows=self._capture_gradient,
             )
         if selector in {"pre_prediction", "unfilled_prediction"}:
             # One token before the first prediction-span position (context site).
@@ -1001,11 +1023,29 @@ class ActivationSignalExtractor:
         return activation.gather(1, idx).squeeze(1)
 
     @staticmethod
+    def _generating_positions_mask(prediction_mask: torch.Tensor) -> torch.Tensor:
+        """Positions that PREDICT the target span (the span shifted one token left).
+
+        For a causal LM the target token at position ``p`` is predicted from the
+        activation at ``p-1``, so ``dL/dh`` is nonzero at these 'generating'
+        positions and identically zero at the target span itself. A multi-token
+        target span ``[p .. p+k]`` maps to generating positions ``[p-1 .. p+k-1]``.
+        A target at position 0 has no predicting context and is dropped (an
+        all-empty row then fails the selection's own non-empty check, which is
+        correct -- there is nothing to steer).
+        """
+        mask = prediction_mask.to(dtype=torch.bool)
+        generating = torch.zeros_like(mask)
+        generating[..., :-1] = mask[..., 1:]
+        return generating
+
+    @staticmethod
     def _mean_selected_tokens(
         activation: torch.Tensor,
         selected_positions: torch.Tensor,
         *,
         selector_name: str,
+        allow_empty_rows: bool = False,
     ) -> torch.Tensor:
         selected_positions = selected_positions.to(device=activation.device, dtype=torch.bool)
         if selected_positions.shape[:2] != activation.shape[:2]:
@@ -1013,8 +1053,12 @@ class ActivationSignalExtractor:
                 f"token_selector={selector_name!r} position mask shape {tuple(selected_positions.shape)} "
                 f"does not match activation prefix {tuple(activation.shape[:2])}"
             )
-        if not bool(selected_positions.any(dim=1).all().item()):
+        if not allow_empty_rows and not bool(selected_positions.any(dim=1).all().item()):
             raise ValueError(f"token_selector={selector_name!r} requires at least one selected token in every row")
+        # allow_empty_rows: a row with no selected token (e.g. a dL/dh generating mask
+        # for a target at position 0, which has no predicting context) yields a zero
+        # vector via the clamped denom below -- correct (no gradient signal there) and
+        # far better than crashing the whole extraction on one such row.
         weights = selected_positions.to(dtype=activation.dtype)
         while weights.dim() < activation.dim():
             weights = weights.unsqueeze(-1)
@@ -1081,6 +1125,9 @@ class ActivationSignalExtractor:
         )
 
     def _capture(self, inputs: Any) -> Tuple[Dict[str, torch.Tensor], Any]:
+        if self._capture_gradient:
+            return self._capture_gradient_signal(inputs)
+        # ---- activation VALUE capture (unchanged from the original path) ----
         captured: Dict[str, torch.Tensor] = {}
         handles = []
 
@@ -1101,6 +1148,104 @@ class ActivationSignalExtractor:
         if missing:
             raise RuntimeError(f"Activation hooks did not capture expected sites: {missing!r}")
         return captured, prepared_inputs
+
+    def _capture_gradient_signal(self, inputs: Any) -> Tuple[Dict[str, torch.Tensor], Any]:
+        """Capture ``dL/dh`` at each site (activation_gradient signal only).
+
+        Hooks store each site's (non-leaf) activation IN the graph -- no detaching
+        or replacing, so sequential sites (e.g. every residual layer) stay
+        connected to the loss. ``autograd.grad`` then yields ``dL/dh`` at each site
+        without populating ``p.grad``. Param grad-tracking is enabled only for this
+        forward and restored, so the activation subgraph is differentiable even
+        when the base model's params are frozen. The captured tensor has the same
+        shape as the activation, so downstream token-selection/flattening is
+        identical to the value path.
+        """
+        live: Dict[str, torch.Tensor] = {}
+        handles = []
+
+        def make_hook(name: str):
+            def hook(_module: nn.Module, _args: Tuple[Any, ...], output: Any) -> None:
+                live[name] = self._first_tensor(output)
+
+            return hook
+
+        params = list(self.base_model.parameters())
+        saved_requires_grad = [p.requires_grad for p in params]
+        try:
+            for param in params:
+                param.requires_grad_(True)
+            for name, module in self._module_items:
+                handles.append(module.register_forward_hook(make_hook(name)))
+            prepared_inputs, loss = self._forward_with_loss(inputs)
+            missing = [name for name, _module in self._module_items if name not in live]
+            if missing:
+                raise RuntimeError(f"Activation hooks did not capture expected sites: {missing!r}")
+            ordered = [live[name] for name, _module in self._module_items]
+            grads = torch.autograd.grad(loss, ordered, allow_unused=True)
+        finally:
+            for handle in handles:
+                handle.remove()
+            for param, was in zip(params, saved_requires_grad):
+                param.requires_grad_(was)
+        captured = {
+            name: (grad.detach() if grad is not None else torch.zeros_like(live[name]))
+            for (name, _module), grad in zip(self._module_items, grads)
+        }
+        return captured, prepared_inputs
+
+    def _forward_with_loss(self, inputs: Any) -> Tuple[Any, torch.Tensor]:
+        """Grad-enabled forward returning ``(prepared_inputs, loss)`` for dL/dh capture.
+
+        Mirrors ``_forward`` but WITHOUT ``torch.no_grad`` (the graph from the
+        re-injected leaves to the loss must exist) and requires the base model to
+        return a loss. Only the activation_gradient path calls this; the value
+        path still uses ``_forward``.
+        """
+        prepared = self._prepare_inputs(inputs)
+        model_inputs = prepared
+        if isinstance(prepared, Mapping):
+            model_inputs = {
+                key: value
+                for key, value in prepared.items()
+                if key not in self._NON_MODEL_INPUT_KEYS
+            }
+            # The activation item fills the target token(s) into the text and marks
+            # them in ``prediction_mask`` (no ``labels``). The loss whose dL/dh we
+            # want is exactly "predict those filled tokens", so build labels from
+            # the prediction mask: target ids where predicted, -100 elsewhere.
+            if "labels" not in model_inputs:
+                labels = self._labels_from_prediction_mask(prepared, model_inputs)
+                if labels is not None:
+                    model_inputs = {**model_inputs, "labels": labels}
+        if isinstance(model_inputs, Mapping):
+            outputs = self.base_model(**model_inputs)
+        else:
+            outputs = self.base_model(model_inputs)
+        loss = getattr(outputs, "loss", None)
+        if loss is None:
+            raise ValueError(
+                "activation_gradient extraction requires a supervised loss. The item "
+                "must carry 'labels', or 'prediction_mask' + 'input_ids' so labels can "
+                "be derived, and the base model must return outputs.loss."
+            )
+        return prepared, loss
+
+    @staticmethod
+    def _labels_from_prediction_mask(prepared: Any, model_inputs: Mapping) -> Optional[torch.Tensor]:
+        """Causal-LM labels selecting the filled (predicted) tokens; -100 elsewhere."""
+        if not isinstance(prepared, Mapping):
+            return None
+        mask = prepared.get("prediction_mask")
+        input_ids = model_inputs.get("input_ids")
+        if mask is None or input_ids is None or not torch.is_tensor(input_ids):
+            return None
+        mask_t = mask if torch.is_tensor(mask) else torch.as_tensor(mask)
+        mask_t = mask_t.to(device=input_ids.device).bool()
+        if mask_t.shape != input_ids.shape:
+            return None
+        return input_ids.masked_fill(~mask_t, -100)
+
 
     def _cat_flattened(
         self,

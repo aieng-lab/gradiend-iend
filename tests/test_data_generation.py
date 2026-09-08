@@ -80,6 +80,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=50,
             format="unified",
+            deduplicate=False,
             min_rows_per_class_for_split=0,
             balance="strict",
             min_rows_per_target_for_balance=10,
@@ -102,6 +103,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=50,
             format="unified",
+            deduplicate=False,
             min_rows_per_class_for_split=0,
             balance="strict",
             min_rows_per_target_for_balance=10,
@@ -126,6 +128,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=50,
             format="unified",
+            deduplicate=False,
             min_rows_per_class_for_split=0,
             balance="try",
             min_rows_per_target_for_balance=10,
@@ -219,6 +222,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=30,
             format="unified",
+            deduplicate=False,
             train_ratio=0.8,
             val_ratio=0.1,
             test_ratio=0.1,
@@ -260,7 +264,11 @@ class TestCreatorOutputFormats:
                 output_format="csv",
                 seed=42,
             )
-            result = creator.generate_training_data(max_size_per_class=20, format="unified")
+            result = creator.generate_training_data(
+                max_size_per_class=20,
+                format="unified",
+                deduplicate=False,
+            )
             assert set(result["label_class"]) == {"3SG"}
 
             training_csv = base / "training.csv"
@@ -290,6 +298,7 @@ class TestCreatorOutputFormats:
                 creator.generate_training_data(
                     max_size_per_class=20,
                     format="unified",
+                    deduplicate=False,
                     raise_on_incomplete_classes=True,
                 )
             assert (Path(tmp) / "training.csv").is_file()
@@ -643,6 +652,7 @@ class TestSplitByTarget:
             max_size_per_class=20,
             format="unified",
             min_rows_per_class_for_split=0,
+            drop_ambiguous_masked=False,
         )
         for label in result["label"].dropna().unique():
             splits = result.loc[result["label"] == label, "split"].unique()
@@ -669,3 +679,55 @@ class TestSplitByTarget:
         hate_splits = out.loc[out["label"].str.casefold() == "hate", "split"].unique()
         assert len(hate_splits) == 1
         assert apply_split_group_key(" AMAZING ", [str.strip, str.casefold]) == "amazing"
+
+
+def test_prediction_creator_deduplicates_before_cap_and_keeps_scanning():
+    from gradiend import TextFilterConfig, TextPredictionDataCreator
+
+    creator = TextPredictionDataCreator(
+        base_data=["Alpha he runs.", "Alpha he runs.", "Beta he walks."],
+        feature_targets=[TextFilterConfig(target="he", id="3SG")],
+        min_left_context_words=0,
+        download_if_missing=False,
+    )
+    result = creator.generate_training_data(
+        max_size_per_class=2,
+        balance=False,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        min_rows_per_class_for_split=0,
+    )
+
+    assert len(result["3SG"]) == 2
+    assert result["3SG"]["masked"].nunique() == 2
+
+
+def test_prediction_creator_drops_masked_prompts_with_conflicting_targets():
+    from gradiend import TextFilterConfig, TextPredictionDataCreator
+
+    creator = TextPredictionDataCreator(
+        base_data=[
+            "Alpha he runs.",
+            "Alpha she runs.",
+            "Beta he walks.",
+            "Gamma she waits.",
+        ],
+        feature_targets=[
+            TextFilterConfig(target="he", id="3SG_M"),
+            TextFilterConfig(target="she", id="3SG_F"),
+        ],
+        min_left_context_words=0,
+        download_if_missing=False,
+    )
+    result = creator.generate_training_data(
+        balance=False,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        min_rows_per_class_for_split=0,
+    )
+
+    all_masked = set(result["3SG_M"]["masked"]) | set(result["3SG_F"]["masked"])
+    assert "Alpha [MASK] runs." not in all_masked
+    assert all(len(frame) == 1 for frame in result.values())

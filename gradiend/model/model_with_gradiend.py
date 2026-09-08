@@ -496,6 +496,11 @@ class ModelWithGradiend(nn.Module, ABC):
         return self.signal_kind == "activation_gradient"
 
     @property
+    def uses_activation_space(self) -> bool:
+        """Whether interventions belong at recorded activation sites."""
+        return self.uses_activations or self.uses_activation_gradients
+
+    @property
     def is_gradiend(self) -> bool:
         return self.uses_gradients
 
@@ -505,18 +510,18 @@ class ModelWithGradiend(nn.Module, ABC):
 
     @property
     def capabilities(self) -> ModelWithGradiendCapabilities:
-        uses_activations = self.uses_activations
+        uses_activation_space = self.uses_activation_space
         return ModelWithGradiendCapabilities(
-            activation_interventions=uses_activations,
-            activation_selector_coverage=uses_activations,
-            activation_module_ablation=uses_activations,
+            activation_interventions=uses_activation_space,
+            activation_selector_coverage=uses_activation_space,
+            activation_module_ablation=uses_activation_space,
             gradient_rewrite=self.uses_gradients,
         )
 
     @property
     def activation_site_modules(self) -> List[str]:
-        """Activation module names registered in this ACTIEND mapping."""
-        if not self.uses_activations:
+        """Activation module names registered in this activation-space mapping."""
+        if not self.uses_activation_space:
             return []
         param_map = getattr(getattr(self, "gradiend", None), "param_map", {}) or {}
         modules = [
@@ -1114,7 +1119,7 @@ class ModelWithGradiend(nn.Module, ABC):
             KeyError: If a gradient-space update references a parameter that is
                 missing from the copied base model.
         """
-        if not self.uses_activations:
+        if not self.uses_activation_space:
             return self.rewrite_base_model(
                 learning_rate=learning_rate,
                 feature_factor=feature_factor,
@@ -1147,12 +1152,12 @@ class ModelWithGradiend(nn.Module, ABC):
 
     def _intervention_signal_kind(self, signal: str = "auto") -> str:
         if signal == "auto":
-            return "activation" if self.uses_activations else "gradient"
+            return "activation" if self.uses_activation_space else "gradient"
         if signal not in {"gradient", "activation"}:
             raise ValueError("signal must be 'gradient', 'activation', or 'auto'")
-        if signal == "activation" and not self.uses_activations:
-            raise ValueError("signal='activation' requires an activation-space ACTIEND model")
-        if signal == "gradient" and self.uses_activations:
+        if signal == "activation" and not self.uses_activation_space:
+            raise ValueError("signal='activation' requires an activation-space model")
+        if signal == "gradient" and self.uses_activation_space:
             raise ValueError("signal='gradient' requires a gradient-space GRADIEND model")
         return signal
 
@@ -1173,9 +1178,21 @@ class ModelWithGradiend(nn.Module, ABC):
             )
         effective_value = effective_rewrite_learning_rate(value, self.source)
         update = (float(effective_value) * update.flatten()).detach()
-        if self.uses_activations:
+        if self.uses_activation_space:
             update = self._unscale_activation_update(update)
         return update
+
+    def intervention_update_vector(
+        self, *, value: float, feature_factor: Any, part: str = "decoder"
+    ) -> torch.Tensor:
+        """Return the exact flattened delta used by :meth:`intervene`.
+
+        This supports matched-vector controls without reaching into decoder
+        internals or confusing an opposite class pole with a random vector.
+        """
+        return self._intervention_update_vector(
+            value=value, feature_factor=feature_factor, part=part
+        ).detach().clone()
 
     def _unscale_activation_update(self, update: torch.Tensor) -> torch.Tensor:
         """Map scaled-space ACTIEND decode back to raw residual units when Signal scale is on."""
@@ -1355,8 +1372,8 @@ class ModelWithGradiend(nn.Module, ABC):
             ``total_positions``, global ``coverage``,
             ``scope_coverage``, and per-module rows.
         """
-        if not self.uses_activations:
-            raise ValueError("activation_selector_coverage requires an activation-space ACTIEND model")
+        if not self.uses_activation_space:
+            raise ValueError("activation_selector_coverage requires an activation-space model")
         update = self._intervention_update_vector(
             value=1.0,
             feature_factor=feature_factor,
@@ -1395,9 +1412,9 @@ class ModelWithGradiend(nn.Module, ABC):
         return summary
 
     def _activation_encoder_tensors(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """Return ACTIEND encoder tensors keyed by activation mapping name."""
-        if not self.uses_activations:
-            raise ValueError("ACTIEND encoder tensors require an activation-space GRADIEND model")
+        """Return activation encoder tensors keyed by activation mapping name."""
+        if not self.uses_activation_space:
+            raise ValueError("Encoder tensors require an activation-space GRADIEND model")
         entries = [
             (name, spec)
             for name, spec in self.gradiend.param_map.items()
@@ -1528,6 +1545,7 @@ class ModelWithGradiend(nn.Module, ABC):
         target_encoding: Optional[Any] = None,
         tolerance: float = 0.2,
         metadata: Optional[dict] = None,
+        update_vector: Optional[torch.Tensor] = None,
     ):
         """
         Temporarily intervene on the wrapped base model.
@@ -1546,6 +1564,10 @@ class ModelWithGradiend(nn.Module, ABC):
         activations, because otherwise MLM factual and alternative inputs would
         share the same mask-token activation at that position and provide no
         target-conditioned activation difference to decode.
+
+        ``update_vector`` is an advanced evaluation hook. When supplied, it is
+        treated as the already-scaled flattened delta and replaces decoder
+        generation, allowing genuine norm-matched controls through this API.
         """
         signal_kind = self._intervention_signal_kind(signal)
         effective_value = effective_rewrite_learning_rate(value, self.source)
@@ -1569,12 +1591,15 @@ class ModelWithGradiend(nn.Module, ABC):
         update: Optional[torch.Tensor] = None
 
         try:
-            if float(value) != 0.0:
-                update = self._intervention_update_vector(
-                    value=float(value),
-                    feature_factor=feature_factor,
-                    part=part,
-                )
+            if update_vector is not None or float(value) != 0.0:
+                if update_vector is None:
+                    update = self._intervention_update_vector(
+                        value=float(value),
+                        feature_factor=feature_factor,
+                        part=part,
+                    )
+                else:
+                    update = torch.as_tensor(update_vector).flatten().detach().clone()
                 info["num_dimensions"] = int(update.numel())
                 if signal_kind == "gradient":
                     info.update(self._apply_gradient_intervention_delta(update, sign=1.0))
@@ -1808,7 +1833,10 @@ class ModelWithGradiend(nn.Module, ABC):
         if not isinstance(signal_plan, SignalTrainingPlan):
             raise TypeError(f"signal_plan must be SignalTrainingPlan, got {type(signal_plan).__name__}")
         signal_space = signal_plan.single_space
-        if signal_space.kind == "activation":
+        # activation_gradient (dL/dh) shares the activation param-mapping; only the
+        # captured tensor differs (in the extractor). The activation value path is
+        # unchanged -- ``mapping_kind`` just carries the resolved kind through.
+        if signal_space.kind in ("activation", "activation_gradient"):
             if create_kwargs.get("pre_prune_config") is not None:
                 raise NotImplementedError(
                     "pre_prune_config is not yet defined for activation signal spaces. "
@@ -1835,7 +1863,7 @@ class ModelWithGradiend(nn.Module, ABC):
                 param_map=param_map_spec,
                 latent_dim=int(gradiend_kwargs.pop("latent_dim", 1)),
                 base_model=load_directory,
-                mapping_kind="activation",
+                mapping_kind=signal_space.kind,
                 signal_id=signal_space.signal_id,
                 gradiend_split=gradiend_split.to_dict() if gradiend_split is not None else None,
                 signal_space={

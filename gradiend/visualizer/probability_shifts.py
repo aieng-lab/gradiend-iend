@@ -3,23 +3,18 @@ Probability shifts plot: target token probabilities vs learning rate.
 
 Each subplot is keyed by **factual** class (``label_class`` / ``factual_id``):
 ``probs_by_dataset["3PL"]["3SG"]`` is P(3SG) on rows where the factual class is 3PL.
-Strengthening class T with ``decoder_eval_prob_on_other_class`` selects P(T) on the
-other factual class's panel (star on that curve).
+The evaluator records the exact selected feature factor, learning rate, metric
+class, and factual dataset panel. This module only renders those coordinates;
+it does not reproduce candidate-selection logic.
 
 Requires matplotlib. If missing, raises ImportError with install instructions.
 """
 
 import os
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from gradiend.visualizer.plot_optional import _require_matplotlib
-from gradiend.model._source_target import (
-    intervention_feature_factor_from_encoding_direction,
-    resolve_model_source,
-    resolve_model_signal_kind,
-    resolve_model_target,
-)
 from gradiend.util.logging import get_logger
 from gradiend.visualizer.labels import escape_matplotlib_usetex_text
 
@@ -349,47 +344,40 @@ def plot_probability_shifts(
         raise ValueError("No dataset classes found in grid data.")
     
     feature_factors = sorted(set(lr_data.keys()))
-    
-    # ff per class for strengthen plots (same rule as evaluate_decoder; see _source_target.py).
-    class_to_feature_factor: Dict[str, float] = {}
-    if trainer is not None and hasattr(trainer, "get_model"):
-        try:
-            model = trainer.get_model()
-            direction = getattr(model, "feature_class_encoding_direction", None)
-            if isinstance(direction, dict):
-                source = resolve_model_source(model, trainer)
-                target = resolve_model_target(model, trainer)
-                signal_kind = resolve_model_signal_kind(model, trainer)
-                for class_name in class_ids:
-                    if class_name in direction:
-                        class_to_feature_factor[class_name] = intervention_feature_factor_from_encoding_direction(
-                            direction[class_name],
-                            source,
-                            target,
-                            signal_kind=signal_kind,
-                        )
-        except ValueError as exc:
-            if "ACTIEND activation interventions currently require target='diff'" in str(exc):
-                raise
-        except Exception:
-            pass
-    if not class_to_feature_factor and feature_factors:
-        default_ff = feature_factors[0]
-        class_to_feature_factor = {class_name: default_ff for class_name in class_ids}
-    
-    # Strengthen: plot only the derived ff for this target class (never another class's orientation).
-    is_weaken = summary_key and summary_key.endswith("_weaken")
-    ff = class_to_feature_factor.get(base_metric)
-    if is_weaken and summary_key and summary_key in (summary or {}):
-        ff = summary[summary_key].get("feature_factor")
-    if ff is None:
-        ff = feature_factors[0] if feature_factors else None
-    if ff is None or ff not in lr_data:
-        derived = class_to_feature_factor.get(base_metric)
+
+    # Pure rendering contract: evaluation has already selected the complete
+    # cell and recorded all coordinates needed to render it. Never derive a
+    # feature factor or selection panel from trainer/model/class ordering here.
+    selected_summary = (summary or {}).get(summary_key)
+    if not isinstance(selected_summary, Mapping):
         raise ValueError(
-            f"No grid data for strengthen target_class={target_class!r} with feature_factor={derived!r}. "
-            f"Grid was evaluated for feature_factors={feature_factors}. "
-            f"Re-run evaluate_decoder(target_class={target_class!r}, use_cache=False)."
+            f"Decoder plot requires an evaluation-selected summary for "
+            f"target_class={target_class!r}; plotting does not select candidates."
+        )
+    required_selection_fields = (
+        "feature_factor",
+        "learning_rate",
+        "selection_metric_class",
+        "selection_dataset_class",
+    )
+    missing_selection_fields = [
+        key for key in required_selection_fields if selected_summary.get(key) is None
+    ]
+    if missing_selection_fields:
+        raise ValueError(
+            "Decoder plot requires evaluator-recorded selection metadata; "
+            f"summary[{summary_key!r}] is missing {missing_selection_fields}. "
+            "Plotting refuses to infer selection or run model evaluation; "
+            "legacy artifacts must be migrated explicitly at the experiment layer."
+        )
+    ff = float(selected_summary["feature_factor"])
+    selected_lr = float(selected_summary["learning_rate"])
+    selection_metric_class = str(selected_summary["selection_metric_class"])
+    selection_dataset_class = str(selected_summary["selection_dataset_class"])
+    if ff not in lr_data:
+        raise ValueError(
+            f"Selected feature_factor={ff!r} is absent from decoder grid; "
+            f"available feature_factors={feature_factors}."
         )
     
     # lr=0 (base) anchor on the x-axis
@@ -418,7 +406,6 @@ def plot_probability_shifts(
     
     # Subplots: 1) LMS, 2+) Dataset probability shifts (selection star on counterfactual or factual line)
     lrs = sorted(lr_data[ff].keys())
-    other_classes = [c for c in class_ids if c != base_metric]
     n_subplots = 1 + len(dataset_classes)
     if figsize is None:
         figsize = (8, 2 * n_subplots)
@@ -445,32 +432,19 @@ def plot_probability_shifts(
     _apply_lr_xscale(ax_lms, x_scale, linthresh)
     ax_lms.grid(True, alpha=0.3)
     
-    # Selection metric (strengthen 3SG → P(3SG) on factual 3PL panel, 3SG curve).
-    # Panel keys are factual label_class; see evaluate_base_model probs_by_dataset contract.
-    selection_metric_class = base_metric
-    if is_weaken:
-        selection_dataset_class = base_metric
-    elif getattr(getattr(trainer, "config", None), "decoder_eval_prob_on_other_class", True):
-        selection_dataset_class = other_classes[0] if other_classes else base_metric
-    else:
-        selection_dataset_class = base_metric
-    selection_metric_label = escape_matplotlib_usetex_text(f"P({selection_metric_class})")
-    selected_lr = None
-    if summary_key in (summary or {}):
-        selected_lr = summary[summary_key].get("learning_rate")
-    if selected_lr is not None:
-        selected_probs_by_dataset = lr_data[ff].get(selected_lr)
-        if selected_probs_by_dataset is None:
-            raise ValueError(
-                f"Selected decoder learning_rate={selected_lr!r} is absent from plotted grid "
-                f"for feature_factor={ff!r}."
-            )
-        _require_probability_cell(
-            selected_probs_by_dataset,
-            selection_dataset_class,
-            selection_metric_class,
-            context=f"feature_factor={ff!r}, learning_rate={selected_lr!r}",
+    # The exact metric cell comes from evaluator metadata above.
+    selected_probs_by_dataset = lr_data[ff].get(selected_lr)
+    if selected_probs_by_dataset is None:
+        raise ValueError(
+            f"Selected decoder learning_rate={selected_lr!r} is absent from plotted grid "
+            f"for feature_factor={ff!r}."
         )
+    _require_probability_cell(
+        selected_probs_by_dataset,
+        selection_dataset_class,
+        selection_metric_class,
+        context=f"feature_factor={ff!r}, learning_rate={selected_lr!r}",
+    )
 
     # Plot 2+: Dataset probability shifts — P(3PL) and P(3SG) on each dataset; highlight selection metric
     missing_probability_cells = set()
@@ -498,17 +472,14 @@ def plot_probability_shifts(
                 alpha=0.7,
                 linewidth=2.5 if is_selection_curve else 1.5,
             )
-        if summary_key in (summary or {}) and is_selection_dataset:
-            selected_lr = summary[summary_key].get("learning_rate")
-            if selected_lr is not None:
-                # Use same ff as plotted curves so star lies exactly on the selection-metric curve
-                sp = _require_probability_cell(
-                    lr_data[ff].get(selected_lr, {}),
-                    dataset_class,
-                    selection_metric_class,
-                    context=f"feature_factor={ff!r}, learning_rate={selected_lr!r}",
-                )
-                ax.scatter([selected_lr], [sp], marker="*", s=280, zorder=5, alpha=0.95, color="red", label="Selected")
+        if is_selection_dataset:
+            sp = _require_probability_cell(
+                lr_data[ff].get(selected_lr, {}),
+                dataset_class,
+                selection_metric_class,
+                context=f"feature_factor={ff!r}, learning_rate={selected_lr!r}",
+            )
+            ax.scatter([selected_lr], [sp], marker="*", s=280, zorder=5, alpha=0.95, color="red", label="Selected")
         ax.set_ylabel("Probability")
         ax.set_title(escape_matplotlib_usetex_text(f"Dataset: {dataset_class} — P(class)"))
         _apply_lr_xscale(ax, x_scale, linthresh)

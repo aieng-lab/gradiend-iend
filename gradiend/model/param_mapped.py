@@ -217,7 +217,7 @@ class ParamMappedGradiendModel(GradiendModel):
         param_map: Dict[str, Dict[str, Any]],
         activation_encoder: str = "tanh",
         activation_decoder: str = "id",
-        bias_encoder: bool = False,
+        bias_encoder: bool = True,
         bias_decoder: bool = True,
         torch_dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
@@ -240,7 +240,7 @@ class ParamMappedGradiendModel(GradiendModel):
                 any selection tensor required by the repr.
             activation_encoder: Encoder activation name.
             activation_decoder: Decoder activation name.
-            bias_encoder: Whether the encoder linear layer uses a bias term.
+            bias_encoder: Whether the encoder linear layer uses a bias term. Enabled by default.
             bias_decoder: Whether the decoder linear layer uses a bias term.
             torch_dtype: dtype used for model parameters.
             device: Optional default device for both encoder and decoder when specific

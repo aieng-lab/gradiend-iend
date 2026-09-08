@@ -37,6 +37,7 @@ from gradiend.util.paths import (
     remove_pre_prune_cache,
 )
 from gradiend.evaluator.decoder_eval_utils import read_decoder_stats_file
+from gradiend.evaluator.decoder import DEFAULT_DECODER_REFINE_POINTS
 from gradiend.util.logging import get_logger
 
 
@@ -2991,7 +2992,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         plot_kwargs: Optional[Dict[str, Any]] = None,
         decoder_lms_mode: Optional[str] = None,
         device: Optional[Any] = None,
-        refine_points: int = 0,
+        refine_points: int = DEFAULT_DECODER_REFINE_POINTS,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation for one direction (strengthen or weaken).
@@ -3068,10 +3069,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 :meth:`cpu`) or released via :meth:`unload_model`, call :meth:`cuda` /
                 :meth:`get_model` yourself or pass an explicit device; a warning is logged
                 when evaluation runs on CPU while CUDA is available.
-            refine_points: If > 0, binary-search up to this many additional points per target class
-                to sharpen the LMS-gate boundary the ``lrs`` grid found only coarsely. See
-                ``Evaluator.evaluate_decoder``'s ``refine_points`` docstring for the algorithm and
-                its assumptions/skip conditions.
+            refine_points: Number of LMS-boundary bisection points per target class,
+                defaulting to 10. Pass 0 only for an explicit coarse-grid ablation. See
+                ``Evaluator.evaluate_decoder``'s ``refine_points`` docstring for the
+                algorithm and its assumptions/skip conditions.
 
         Returns:
             Dict with flattened decoder summaries. For strengthen, keys like dec["3SG"]; for weaken,

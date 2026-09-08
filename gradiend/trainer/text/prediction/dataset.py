@@ -306,16 +306,23 @@ def _left_truncate_template_keeping_mask(
     """Drop left (and unused right) context so ``[MASK]`` fits in ``max_length`` tokens.
 
     Naive ``truncation=True`` keeps the *start* of the string and can cut the mask
-    off on long wiki templates. For filled / ACTIEND encoding we instead keep a
-    window that **ends at the last mask** (mask near the end of the window).
+    off on long wiki templates. We instead keep a window that **ends at the first
+    mask** (mask at the end of the window).
+
+    The first, not the last: with more than one placeholder, anchoring on the
+    last leaves the earlier ones in the prefix as literal ``[MASK]`` text, which
+    the model then attends to as context. Truncating after the first gives a
+    prefix with no stray placeholder in it. Single-placeholder templates -- the
+    normal case -- are unaffected, since first and last coincide.
     """
     template = str(template)
     mask_placeholder = str(mask_placeholder)
-    last = template.rfind(mask_placeholder)
-    if last < 0:
+    first = template.find(mask_placeholder)
+    if first < 0:
         return template
-    # RHS after the mask does not affect causal hidden states at the mask span.
-    clipped = template[: last + len(mask_placeholder)]
+    # RHS after the mask does not affect causal hidden states at the mask span,
+    # and dropping it also removes any later placeholders.
+    clipped = template[: first + len(mask_placeholder)]
     encoded = None
     try:
         encoded = tokenizer(
@@ -336,8 +343,8 @@ def _left_truncate_template_keeping_mask(
             return clipped
         approx_chars = max(len(mask_placeholder) + 8, int(max_length) * 3)
         start = max(0, len(clipped) - approx_chars)
-        if start > last:
-            start = last
+        if start > first:
+            start = first
         return clipped[start:]
 
     ids = list(encoded["input_ids"])
@@ -616,6 +623,7 @@ def create_masked_pair_from_text(
     excluded_tokens: Optional[List[str]] = None,
     mask_token: Optional[str] = None,
     min_prefix_tokens: int = 5,
+    mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
 ) -> Optional[Tuple[str, str]]:
     """Create a single (masked_text, target_token) pair from raw text.
 
@@ -628,8 +636,17 @@ def create_masked_pair_from_text(
         tokenizer: Tokenizer for encoding and decoding.
         is_decoder_only_model: If True, uses prefix+[MASK] mode; else uses MLM mask mode.
         excluded_tokens: Tokens to avoid masking (e.g., target class tokens).
-        mask_token: Mask token string for MLM (e.g., "[MASK]").
+        mask_token: The tokenizer's MLM special, used only to decide whether the
+            in-place masking branch applies and to detect already-masked input.
+            It is NOT written into the template -- see ``mask_placeholder``.
         min_prefix_tokens: Minimum prefix length for decoder-only mode.
+        mask_placeholder: Dataset-schema placeholder written into the returned
+            template. Masked templates carry the schema placeholder at every
+            stage; substituting ``tokenizer.mask_token`` is a tokenization-stage
+            concern handled later (``mask_placeholder_for_tokenizer``) and must
+            not leak into the dataframe, or
+            ``validate_masked_templates_in_dataframe`` rejects rows this
+            function itself produced.
 
     Returns:
         Tuple of (masked_text, target_token), or None if no valid pair could be created.
@@ -676,7 +693,12 @@ def create_masked_pair_from_text(
             return None
         mask_idx = random.choice(valid_indices)
         target_token = tokens[mask_idx]
-        tokens[mask_idx] = mask_token
+        # Write the dataset placeholder, never tokenizer.mask_token. Emitting
+        # the tokenizer special here produced templates the schema validator
+        # rejected, but only for a tokenizer that owns one -- every model used
+        # so far is a causal LM without a mask token, which is why the two
+        # branches silently disagreed.
+        tokens[mask_idx] = str(mask_placeholder)
         masked_text = tokenizer.convert_tokens_to_string(tokens)
         return (masked_text, target_token)
     if len(tokens) < 2:
@@ -697,7 +719,9 @@ def create_masked_pair_from_text(
     true_next_token = tokens[split_at]
     prefix_str = tokenizer.convert_tokens_to_string(prefix_tokens)
     next_str = tokenizer.convert_tokens_to_string([true_next_token])
-    masked_text = prefix_str + (" [MASK]" if next_str and (next_str[0] in " \t" or next_str[0] == "\u2581") else "[MASK]")
+    placeholder = str(mask_placeholder)
+    leading_space = bool(next_str) and (next_str[0] in ' 	' or next_str[0] == '▁')
+    masked_text = prefix_str + ((' ' + placeholder) if leading_space else placeholder)
     return (masked_text, true_next_token)
 
 
@@ -1131,8 +1155,8 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
 
     @staticmethod
     def default_signal(signal: Signal) -> Signal:
-        """Text-prediction default for activation signals: select the prediction span."""
-        if signal.kind != "activation":
+        """Text-prediction default for activation-based signals: select the prediction span."""
+        if signal.kind not in ("activation", "activation_gradient"):
             return signal
         options = dict(signal.options or {})
         if options.get("token_selector") is None:

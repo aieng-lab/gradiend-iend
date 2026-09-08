@@ -880,7 +880,7 @@ def _component_signature(gradiend: Any) -> Dict[str, Any]:
         "latent_dim": int(getattr(gradiend, "latent_dim")),
         "activation": getattr(gradiend, "activation", None),
         "activation_decoder": getattr(gradiend, "activation_decoder", None),
-        "bias_encoder": bool(getattr(gradiend, "bias_encoder", False)),
+        "bias_encoder": bool(getattr(gradiend, "bias_encoder", True)),
         "bias_decoder": bool(getattr(gradiend, "bias_decoder", False)),
         "components": [
             {
@@ -911,7 +911,7 @@ def stitch_gradiend_components(
     }
     if not bool(getattr(target_gradiend, "has_component_split", False)):
         raise ValueError("Component stitching requires an explicit GRADIEND component split")
-    if bool(getattr(target_gradiend, "bias_encoder", False)) and len(target_components) > 1:
+    if bool(getattr(target_gradiend, "bias_encoder", True)) and len(target_components) > 1:
         raise ValueError(
             "Component stitching with multiple components requires bias_encoder=False "
             "because the encoder bias is shared across components."
@@ -1002,7 +1002,7 @@ def stitch_gradiend_component_states(
     }
     if not bool(getattr(target_gradiend, "has_component_split", False)):
         raise ValueError("Component stitching requires an explicit GRADIEND component split")
-    if bool(getattr(target_gradiend, "bias_encoder", False)) and len(target_components) > 1:
+    if bool(getattr(target_gradiend, "bias_encoder", True)) and len(target_components) > 1:
         raise ValueError(
             "Component stitching with multiple components requires bias_encoder=False "
             "because the encoder bias is shared across components."

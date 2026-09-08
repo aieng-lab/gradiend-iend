@@ -1031,9 +1031,6 @@ class TestDecoderEvaluator:
         """Binary search should land far closer to the LMS-gate crossing than the coarse grid did."""
         from gradiend.evaluator.decoder import LMSThresholdPolicy, _bisect_refine_lms_boundary
 
-        # Simulated ground truth: lms falls linearly with lr, crossing the
-        # ratio*base_lms=0.9 cutoff exactly at lr=2.0. Coarse grid only has
-        # lr=1 (passing) and lr=10 (failing) — a 9x gap either side of it.
         def simulated_lms(lr: float) -> float:
             return max(0.0, 1.0 - 0.05 * lr)
 
@@ -1065,11 +1062,7 @@ class TestDecoderEvaluator:
 
         assert len(calls) == 10
         assert len(pairs) == 12 and len(lrs) == 12
-        # Every bisection point lands strictly inside the original coarse bracket.
         assert all(1.0 < lr < 10.0 for _ff, lr in calls)
-        # Converges within 0.01 of the true crossing (lr=2.0) — the nearest
-        # point a flat 10-point log-spaced grid over [1, 10] would offer is
-        # ~2.51, off by 0.5: bisection is >50x tighter here.
         passing_lrs = [lr for (_ff, lr) in calls if simulated_lms(lr) >= 0.9]
         failing_lrs = [lr for (_ff, lr) in calls if simulated_lms(lr) < 0.9]
         assert max(passing_lrs) == pytest.approx(2.0, abs=0.01)
@@ -1103,7 +1096,7 @@ class TestDecoderEvaluator:
         assert pairs == [(1.0, 1.0), (1.0, 2.0)]
 
     def test_evaluate_decoder_refine_points_is_opt_in_and_extends_grid(self):
-        """refine_points=0 (default) leaves grid untouched; >0 adds bisected cells."""
+        """refine_points=0 leaves grid untouched; >0 adds bisected cells."""
         from gradiend.evaluator.decoder import LMSThresholdPolicy
 
         evaluator = DecoderEvaluator()

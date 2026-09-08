@@ -29,7 +29,7 @@ import pytest
 import pandas as pd
 from unittest.mock import MagicMock
 
-from gradiend.evaluator.decoder import DecoderEvaluator
+from gradiend.evaluator.decoder import DecoderEvaluator, derive_feature_factor_for_class
 from tests.testing_mocks import MockTokenizer, bind_trainer_cache_resolver
 
 
@@ -368,6 +368,27 @@ class TestDecoderStrengthenWeakenDataset:
         # We return factual 3SG: base 0.1 (weaken 0.9), modified 0.05 (weaken 0.95) → selector picks 0.95
         assert "3SG_weaken" in result
         assert result["3SG_weaken"]["value"] == pytest.approx(0.95, abs=1e-5)
+
+    def test_pairwise_weaken_derives_the_rival_feature_factor(self):
+        """3SG weakening must steer toward 3PL, never reuse 3SG strengthen."""
+        evaluator = DecoderEvaluator()
+        trainer = TrainerForStrengthenWeakenTestGrid()
+        result = evaluator.evaluate_decoder(
+            trainer,
+            target_class="3SG",
+            increase_target_probabilities=False,
+            lrs=[1e-2],
+            refine_points=0,
+            plot=False,
+        )
+        rival_ff = derive_feature_factor_for_class(
+            trainer, trainer.get_model(), "3PL"
+        )
+        own_ff = derive_feature_factor_for_class(
+            trainer, trainer.get_model(), "3SG"
+        )
+        assert rival_ff != own_ff
+        assert result["3SG_weaken"]["feature_factor"] == rival_ff
 
     def test_same_panel_strengthen_uses_target_dataset(self):
         """One-pole strengthen must score on IO rows, not SUBJECT (other class)."""

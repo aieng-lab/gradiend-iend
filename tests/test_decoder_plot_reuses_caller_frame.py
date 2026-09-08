@@ -1,11 +1,7 @@
 """
-Regression test for a confirmed production bug: ``evaluate_decoder(...,
-plot=True)`` silently discarded the caller-supplied ``training_like_df``/
-``neutral_df``/``split`` during its plot-refresh pass and re-derived them
-from the trainer's own internal state instead (via
-``analyze_decoder_for_plotting`` -> ``_get_decoder_eval_dataframe(...,
-cached_training_like_df=None, cached_neutral_df=None)``, with ``split``
-defaulting to ``"test"``).
+Regression tests for decoder plotting data provenance. Decoder evaluation
+must store the complete factual-grouped panels during the grid sweep, and
+plotting must consume those stored panels without a second inference pass.
 
 This silently replaced every grid cell's ``probs_by_dataset`` -- computed
 correctly during the actual sweep -- with data scored against the trainer's
@@ -23,18 +19,16 @@ overwrote every cell with `dataset_class_col='factual_id'`,
 the trainer's own internal fallback, never from the study-supplied frame,
 which is how the substitution was detected.
 
-Fixed by threading `training_like_df`/`neutral_df`/`split` through the full
-plotting call chain (`_plot_all_target_classes` -> `trainer.
-plot_probability_shifts` -> `evaluator.plot_probability_shifts` ->
-`visualizer.plot_probability_shifts` -> `analyze_decoder_for_plotting`),
-which now reuses a caller-supplied frame instead of unconditionally
-re-deriving one.
+The old plot-refresh pass has been removed: a cache hit with ``plot=True`` is
+strictly read-only, and missing plot curves raise instead of evaluating a
+checkpoint implicitly.
 """
 import os
 from pathlib import Path
 
 import pandas as pd
 import pytest
+from unittest.mock import Mock
 
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
@@ -85,12 +79,16 @@ def test_plot_true_reuses_caller_training_like_df_not_trainer_internal_view(tmp_
     ])
     neutral_df = pd.DataFrame([{"text": "The report was filed on time yesterday afternoon."}])
 
+    original_evaluate = trainer.evaluate_base_model
+    trainer.evaluate_base_model = Mock(wraps=original_evaluate)
     result = trainer.evaluate_decoder(
         target_class=["F"], summary_metrics=["F"],
         feature_factors=[1.0], lrs=[1e-5, 1e-4],
         training_like_df=val_df, neutral_df=neutral_df,
         split="validation", plot=True, show=False, use_cache=False, refine_points=0,
     )
+    # Base plus two requested grid cells. Plotting must not double this to 6.
+    assert trainer.evaluate_base_model.call_count == 3
     _assert_full_coverage_no_substitution(result)
 
 
@@ -138,9 +136,13 @@ def test_plot_true_with_cache_hit_also_reuses_caller_frame(tmp_path):
     trainer.evaluate_decoder(plot=False, **eval_kw)
     assert (tmp_path / "decoder_grid_cache.json").is_file()
 
-    # Second call: cache now matches, AND plot=True -- must hit the
-    # cache-hit + plot-refresh branch and still reuse val_df.
+    # Second call: cache now matches, AND plot=True. Any model evaluation is
+    # a regression: plotting a valid grid must be read-only.
+    trainer.evaluate_base_model = Mock(
+        side_effect=AssertionError("cache-hit plotting ran decoder evaluation")
+    )
     result = trainer.evaluate_decoder(plot=True, show=False, **eval_kw)
+    trainer.evaluate_base_model.assert_not_called()
     _assert_full_coverage_no_substitution(result)
 
 
@@ -208,7 +210,7 @@ def _assert_full_coverage_no_substitution(result):
     assert grid, "evaluate_decoder produced no grid entries"
     for key, entry in grid.items():
         pbd = entry.get("probs_by_dataset") if isinstance(entry, dict) else None
-        assert pbd, f"grid entry {key} has no probs_by_dataset after plot-refresh"
+        assert pbd, f"grid entry {key} has no cached probs_by_dataset"
         # 'neutral' must never appear here -- it can only come from the
         # trainer's own internal fallback data, never from val_df.
         assert "neutral" not in pbd, (

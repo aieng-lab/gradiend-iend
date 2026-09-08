@@ -52,7 +52,8 @@ not contain any of the configured pronoun exclusion words:
 The data is generated with `gradiend.examples.create_english_pronoun_data`.
 Generation streams English Wikipedia, uses non-overlapping two-sentence
 windows, keeps windows between 20 and 200 characters, excludes the configured
-English pronouns, and collects up to 10,000 neutral examples.
+English pronouns, deduplicates exact text rows, and collects up to 10,000
+neutral examples. Exact counts are in `dataset_summary.json`.
 
 ## Bias, Risks, and Limitations
 
