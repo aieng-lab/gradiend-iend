@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from gradiend.util.metrics import accuracy_score
+from gradiend.util.metrics import accuracy_score, roc_auc_score
 
 from gradiend.util import json_loads
 from gradiend.util.encoder_splits import order_split_names
@@ -22,6 +22,8 @@ from gradiend.util.split_policy import (
 )
 
 logger = get_logger(__name__)
+
+COMPONENT_COLUMNS = ("component_index", "component_id", "component_label")
 
 
 def get_correlation(
@@ -50,6 +52,261 @@ def get_correlation(
 	if np.isnan(corr):
 		return 0.0
 	return float(corr)
+
+
+def _oriented_roc_auc(y: np.ndarray, scores: np.ndarray) -> float:
+	"""AUROC self-oriented like ``sae_eval.py``'s ``_roc_auc`` in the gradiend-sae
+	study repo: flips score sign so the positive-label group has the higher
+	mean before scoring.
+
+	Plain ``roc_auc_score(y, scores)`` assumes "higher score = positive label"
+	with no correction. An encoder's natural sign for a given class is
+	arbitrary (depends on random init / training dynamics, not something this
+	trainer constrains) -- without this flip, a checkpoint whose target class
+	happens to saturate on the numerically lower side reads as near-0 AUROC
+	(near-total *anti*-ranking under the naive convention) even when it is
+	near-perfectly separable in the other direction. That silently corrupts
+	one-pole checkpoint selection via ``min_auc_n_o`` (and plain ``roc_auc``
+	selection here too): a good checkpoint can look catastrophic and never get
+	selected, purely because of which way it happens to point. See
+	gradiend-sae's CLAUDE.md ("class_exclusivity/specificity shared one
+	Youden threshold...") for the eval-time analogue of this bug and how it
+	was found.
+	"""
+	mean_pos = float(scores[y == 1].mean())
+	mean_neg = float(scores[y == 0].mean())
+	oriented = scores if mean_pos >= mean_neg else -scores
+	auc = float(roc_auc_score(y.tolist(), oriented.tolist()))
+	if abs(mean_pos - mean_neg) < 1e-12:
+		# Equal means: orientation is undefined: report whichever side reads
+		# higher so a degenerate tie doesn't look like anti-ranking.
+		return float(max(auc, 1.0 - auc))
+	return auc
+
+
+def get_roc_auc_one_vs_rest(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+) -> float:
+	"""One-vs-rest ROC-AUC: positive = ``label > threshold``, else negative.
+
+	Default threshold ``0.5`` so only clearly positive labels (e.g. ``+1``) count
+	as the + pole; CF (``-1``), identity (``0``), and dataset neutrals are
+	negatives. Returns 0.5 when undefined. Self-orienting; see
+	``_oriented_roc_auc``.
+	"""
+	if len(df) < 2:
+		return 0.5
+	labels = np.asarray(df[label_col], dtype=float)
+	scores = np.asarray(df[encoded_col], dtype=float)
+	finite = np.isfinite(labels) & np.isfinite(scores)
+	if int(finite.sum()) < 2:
+		return 0.5
+	y = (labels[finite] > float(positive_label_threshold)).astype(int)
+	if y.min() == y.max():
+		return 0.5
+	return _oriented_roc_auc(y, scores[finite])
+
+
+def _roc_auc_masked(
+	labels: np.ndarray,
+	scores: np.ndarray,
+	*,
+	positive_mask: np.ndarray,
+	negative_mask: np.ndarray,
+) -> Optional[float]:
+	"""Binary AUROC on an explicit positive/negative mask pair; None if undefined.
+
+	Self-orienting; see ``_oriented_roc_auc``.
+	"""
+	keep = (positive_mask | negative_mask) & np.isfinite(labels) & np.isfinite(scores)
+	if int(keep.sum()) < 2:
+		return None
+	y = positive_mask[keep].astype(int)
+	if y.min() == y.max():
+		return None
+	return _oriented_roc_auc(y, scores[keep])
+
+
+def get_roc_auc_neutral(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+	neutral_abs_threshold: float = 0.5,
+) -> Optional[float]:
+	"""``auc_n``: target (``label > +thr``) vs neutrals (``|label| <= thr``)."""
+	if len(df) < 2:
+		return None
+	labels = np.asarray(df[label_col], dtype=float)
+	scores = np.asarray(df[encoded_col], dtype=float)
+	pos = labels > float(positive_label_threshold)
+	neu = np.abs(labels) <= float(neutral_abs_threshold)
+	return _roc_auc_masked(labels, scores, positive_mask=pos, negative_mask=neu)
+
+
+def get_roc_auc_other(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+	negative_label_threshold: float = -0.5,
+) -> Optional[float]:
+	"""``auc_o``: target (``label > +thr``) vs rivals (``label < -thr``)."""
+	if len(df) < 2:
+		return None
+	labels = np.asarray(df[label_col], dtype=float)
+	scores = np.asarray(df[encoded_col], dtype=float)
+	pos = labels > float(positive_label_threshold)
+	neg = labels < float(negative_label_threshold)
+	return _roc_auc_masked(labels, scores, positive_mask=pos, negative_mask=neg)
+
+
+def get_roc_auc_min_n_o(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	positive_label_threshold: float = 0.5,
+) -> Dict[str, Optional[float]]:
+	"""``min(auc_n, auc_o)`` plus components for one-pole checkpoint selection.
+
+	Missing side is omitted from the min (so pair data without neutrals can still
+	use ``auc_o`` alone). Returns ``min_auc_n_o=0.5`` when neither is defined.
+	"""
+	auc_n = get_roc_auc_neutral(
+		df,
+		encoded_col=encoded_col,
+		label_col=label_col,
+		positive_label_threshold=positive_label_threshold,
+	)
+	auc_o = get_roc_auc_other(
+		df,
+		encoded_col=encoded_col,
+		label_col=label_col,
+		positive_label_threshold=positive_label_threshold,
+	)
+	parts = [v for v in (auc_n, auc_o) if isinstance(v, (int, float))]
+	return {
+		"roc_auc_neutral": float(auc_n) if auc_n is not None else None,
+		"roc_auc_other": float(auc_o) if auc_o is not None else None,
+		"min_auc_n_o": float(min(parts)) if parts else 0.5,
+	}
+
+
+def _youden_tnr(pos: np.ndarray, neg: np.ndarray) -> Optional[float]:
+	"""Return negative-class TNR at a self-oriented Youden threshold."""
+	pos = np.asarray(pos, dtype=float)
+	neg = np.asarray(neg, dtype=float)
+	pos = pos[np.isfinite(pos)]
+	neg = neg[np.isfinite(neg)]
+	if pos.size == 0 or neg.size == 0:
+		return None
+	sign = 1.0 if float(pos.mean()) >= float(neg.mean()) else -1.0
+	pos_o = sign * pos
+	neg_o = sign * neg
+	uniq = np.unique(np.concatenate([pos_o, neg_o]))
+	if uniq.size == 1:
+		return float((neg_o <= float(uniq[0])).mean())
+	candidates = np.concatenate([
+		[uniq[0] - 1.0],
+		0.5 * (uniq[:-1] + uniq[1:]),
+		[uniq[-1]],
+	])
+	best_j = float("-inf")
+	best_tnr = 0.0
+	for tau in candidates:
+		tpr = float((pos_o > tau).mean())
+		tnr = float((neg_o <= tau).mean())
+		j = tpr + tnr - 1.0
+		if j > best_j:
+			best_j = j
+			best_tnr = tnr
+	return best_tnr
+
+
+def get_encoding_e(
+	df: pd.DataFrame,
+	encoded_col: str = "encoded",
+	label_col: str = "label",
+	*,
+	class_col: str = "source_id",
+) -> Dict[str, Optional[float]]:
+	"""Compute the fair validation bottleneck ``E`` used by gradiend-sae.
+
+	``E=min(auc_n, auc_rival, class_exclusivity)`` when factual rival rows
+	exist. Otherwise it falls back to ``min(auc_n, neutral_specificity)``.
+	Rival exclusivity uses one independently fitted target-vs-rival Youden
+	threshold per rival class, matching the study metric.
+	"""
+	labels = np.asarray(df[label_col], dtype=float)
+	scores = np.asarray(df[encoded_col], dtype=float)
+	finite = np.isfinite(labels) & np.isfinite(scores)
+	pos_mask = finite & (labels > 0.5)
+	neutral_mask = finite & (np.abs(labels) <= 0.5)
+	rival_mask = finite & (labels < -0.5)
+	pos = scores[pos_mask]
+	neutral = scores[neutral_mask]
+	parts = get_roc_auc_min_n_o(df, encoded_col=encoded_col, label_col=label_col)
+	auc_n = parts.get("roc_auc_neutral")
+	neutral_specificity = _youden_tnr(pos, neutral)
+
+	rival_groups: List[np.ndarray] = []
+	if rival_mask.any():
+		if class_col in df.columns:
+			classes = df[class_col].astype(str).to_numpy()
+			for class_id in pd.unique(classes[rival_mask]):
+				group = scores[rival_mask & (classes == class_id)]
+				if group.size:
+					rival_groups.append(group)
+		if not rival_groups:
+			rival_groups = [scores[rival_mask]]
+	exclusivities = [_youden_tnr(pos, rival) for rival in rival_groups]
+	exclusivity_values = [v for v in exclusivities if isinstance(v, (int, float))]
+	class_exclusivity = min(exclusivity_values) if exclusivity_values else None
+	rival_aucs = []
+	for rival in rival_groups:
+		if pos.size and rival.size:
+			y = np.concatenate([
+				np.ones(pos.size, dtype=int),
+				np.zeros(rival.size, dtype=int),
+			])
+			rival_aucs.append(_oriented_roc_auc(y, np.concatenate([pos, rival])))
+	auc_rival = min(rival_aucs) if rival_aucs else parts.get("roc_auc_other")
+
+	if (
+		isinstance(auc_n, (int, float))
+		and isinstance(auc_rival, (int, float))
+		and isinstance(class_exclusivity, (int, float))
+	):
+		encoding_e: Optional[float] = min(auc_n, auc_rival, class_exclusivity)
+	elif isinstance(auc_n, (int, float)) and isinstance(neutral_specificity, (int, float)):
+		encoding_e = min(auc_n, neutral_specificity)
+	elif isinstance(auc_n, (int, float)):
+		encoding_e = float(auc_n)
+	else:
+		encoding_e = None
+	return {
+		"roc_auc_neutral": float(auc_n) if isinstance(auc_n, (int, float)) else None,
+		"roc_auc_other": float(auc_rival) if isinstance(auc_rival, (int, float)) else None,
+		"auc_rival": float(auc_rival) if isinstance(auc_rival, (int, float)) else None,
+		"neutral_specificity": (
+			float(neutral_specificity) if isinstance(neutral_specificity, (int, float)) else None
+		),
+		"specificity": (
+			float(neutral_specificity) if isinstance(neutral_specificity, (int, float)) else None
+		),
+		"class_exclusivity": (
+			float(class_exclusivity) if isinstance(class_exclusivity, (int, float)) else None
+		),
+		"encoding_e": float(encoding_e) if isinstance(encoding_e, (int, float)) else None,
+		"encoding_E": float(encoding_e) if isinstance(encoding_e, (int, float)) else None,
+	}
 
 
 def _should_use_metrics_cache(csv_path: str, json_path: str) -> bool:
@@ -154,6 +411,19 @@ def _compute_split_generalization(
 		mask = pair_transition_mask(df_sg, target_classes)
 		df_sg = df_sg[mask]
 		if df_sg.empty:
+			input_types = (
+				df_for_means["input_type"].dropna().astype(str).unique().tolist()
+				if "input_type" in df_for_means.columns
+				else []
+			)
+			if "diff" in input_types:
+				raise ValueError(
+					"split_generalization requires encoder rows whose source_id/target_id "
+					"identify the trained target pair, but source='diff' rows use "
+					"feature_class_id as source_id and do not provide those transitions. "
+					"Evaluate split_generalization with factual/alternative rows or disable "
+					"split_generalization for diff-source encoder evaluation."
+				)
 			raise ValueError(
 				"split_generalization requires encoder rows for the trained target pair, "
 				f"but none were found for target_classes={list(target_classes)!r}."
@@ -195,9 +465,6 @@ def _compute_split_generalization(
 			continue
 		mean_by_fc_by_split[str(fc)] = by_split
 
-	pair = _split_pair_for_agreement(splits)
-	if pair is None:
-		return None
 	s_a, s_b = pair
 
 	for fc, by_split in mean_by_fc_by_split.items():
@@ -242,6 +509,7 @@ def _compute_metrics_from_df(
 	neutral_boundary: float = 0.0,
 	target_classes: Optional[Sequence[str]] = None,
 	generalization_splits: Optional[Tuple[str, str]] = None,
+	compute_rival_metrics: bool = True,
 ) -> Dict[str, Any]:
 	"""
 	Compute encoder metrics (correlation, accuracy) from an encoder DataFrame.
@@ -254,6 +522,7 @@ def _compute_metrics_from_df(
 
 	# Make a copy to avoid mutating the original
 	df_all = df_all.copy()
+	df_all.attrs = {}
 
 	if "type" not in df_all.columns:
 		# label == 0 is neutral, label != 0 is training
@@ -339,13 +608,32 @@ def _compute_metrics_from_df(
 	all_dimension_scores: Dict[int, Dict[str, Any]] = {}
 
 	for dim in range(first_len):
-		df_all["encoded"] = df_all["encoded_list"].apply(lambda x: x[dim])
+		df_all["encoded"] = df_all["encoded_list"].apply(lambda x, d=dim: x[d])
 
 		if "label" not in df_all.columns:
 			raise ValueError("DataFrame must have 'label' column for metrics computation")
 
 		if len(df_all) > 0:
 			pearson_all = get_correlation(df_all)
+			roc_auc_all = get_roc_auc_one_vs_rest(df_all)
+			if compute_rival_metrics:
+				min_parts_all = get_roc_auc_min_n_o(df_all)
+				encoding_e_all = get_encoding_e(df_all)
+			else:
+				auc_n = get_roc_auc_neutral(df_all)
+				min_parts_all = {
+					"roc_auc_neutral": auc_n,
+					"roc_auc_other": None,
+					"min_auc_n_o": float(auc_n) if auc_n is not None else 0.5,
+				}
+				encoding_e_all = {
+					"neutral_specificity": None,
+					"specificity": None,
+					"class_exclusivity": None,
+					"auc_rival": None,
+					"encoding_e": None,
+					"encoding_E": None,
+				}
 			df_all_labels = df_all["label"].astype(float).tolist()
 			df_all_preds = df_all["encoded"].astype(float).tolist()
 			actual_all = [_classify_value(v) for v in df_all_labels]
@@ -353,10 +641,26 @@ def _compute_metrics_from_df(
 			acc_all = accuracy_score(actual_all, pred_all)
 		else:
 			pearson_all = 0.0
+			roc_auc_all = 0.5
+			min_parts_all = {
+				"roc_auc_neutral": None,
+				"roc_auc_other": None,
+				"min_auc_n_o": 0.5,
+			}
+			encoding_e_all = {
+				"neutral_specificity": None,
+				"specificity": None,
+				"class_exclusivity": None,
+				"auc_rival": None,
+				"encoding_e": None,
+				"encoding_E": None,
+			}
 			acc_all = 0.0
 
 		if len(df_training) > 0:
 			pearson_training = get_correlation(df_training)
+			roc_auc_training = get_roc_auc_one_vs_rest(df_training)
+			min_parts_training = get_roc_auc_min_n_o(df_training)
 			df_training_labels = df_training["label"].astype(float).tolist()
 			df_training_preds = df_training["encoded"].astype(float).tolist()
 			actual_training = [_classify_value(v) for v in df_training_labels]
@@ -364,10 +668,18 @@ def _compute_metrics_from_df(
 			acc_training = accuracy_score(actual_training, pred_training)
 		else:
 			pearson_training = 0.0
+			roc_auc_training = 0.5
+			min_parts_training = {
+				"roc_auc_neutral": None,
+				"roc_auc_other": None,
+				"min_auc_n_o": 0.5,
+			}
 			acc_training = 0.0
 
 		if len(target_only_df) > 0:
 			pearson_target_only = get_correlation(target_only_df)
+			roc_auc_target_only = get_roc_auc_one_vs_rest(target_only_df)
+			min_parts_target = get_roc_auc_min_n_o(target_only_df)
 			labels_target_only = target_only_df["label"].astype(float).tolist()
 			preds_target_only = target_only_df["encoded"].astype(float).tolist()
 			actual_target_only = [_classify_binary(v) for v in labels_target_only]
@@ -375,19 +687,38 @@ def _compute_metrics_from_df(
 			acc_target_only = accuracy_score(actual_target_only, pred_target_only)
 		else:
 			pearson_target_only = 0.0
+			roc_auc_target_only = 0.5
+			min_parts_target = {
+				"roc_auc_neutral": None,
+				"roc_auc_other": None,
+				"min_auc_n_o": 0.5,
+			}
 			acc_target_only = 0.0
 
 		all_dimension_scores[dim] = {
 			"all_data": {
 				"correlation": float(pearson_all),
+				"roc_auc": float(roc_auc_all),
+				"roc_auc_neutral": min_parts_all.get("roc_auc_neutral"),
+				"roc_auc_other": min_parts_all.get("roc_auc_other"),
+				"min_auc_n_o": float(min_parts_all.get("min_auc_n_o", 0.5)),
+				**encoding_e_all,
 				"accuracy": float(acc_all),
 			},
 			"training_only": {
 				"correlation": float(pearson_training),
+				"roc_auc": float(roc_auc_training),
+				"roc_auc_neutral": min_parts_training.get("roc_auc_neutral"),
+				"roc_auc_other": min_parts_training.get("roc_auc_other"),
+				"min_auc_n_o": float(min_parts_training.get("min_auc_n_o", 0.5)),
 				"accuracy": float(acc_training),
 			},
 			"target_classes_only": {
 				"correlation": float(pearson_target_only),
+				"roc_auc": float(roc_auc_target_only),
+				"roc_auc_neutral": min_parts_target.get("roc_auc_neutral"),
+				"roc_auc_other": min_parts_target.get("roc_auc_other"),
+				"min_auc_n_o": float(min_parts_target.get("min_auc_n_o", 0.5)),
 				"accuracy": float(acc_target_only),
 			},
 		}
@@ -481,6 +812,14 @@ def _compute_metrics_from_df(
 
 	# Top-level correlation = training_only (for callbacks, best-checkpoint selection)
 	corr_training = all_dimension_scores[0]["training_only"]["correlation"]
+	# One-vs-rest AUROC on all_data so dataset neutrals (label 0) count as negatives —
+	# matches one-pole "only the + pole should fire" (label > 0.5) checkpoint selection.
+	roc_auc_all = all_dimension_scores[0]["all_data"]["roc_auc"]
+	# Split AUCs on all_data: auc_n = target vs neutral, auc_o = target vs rival.
+	# min_auc_n_o is the one-pole selection metric that cannot be carried by neutrals alone.
+	auc_n_all = all_dimension_scores[0]["all_data"].get("roc_auc_neutral")
+	auc_o_all = all_dimension_scores[0]["all_data"].get("roc_auc_other")
+	min_auc_all = all_dimension_scores[0]["all_data"].get("min_auc_n_o", 0.5)
 
 	result: Dict[str, Any] = {
 		"n_samples": n_samples,
@@ -494,6 +833,16 @@ def _compute_metrics_from_df(
 			"neutral_boundary": neutral_boundary,
 		},
 		"correlation": corr_training,
+		"roc_auc": float(roc_auc_all),
+		"roc_auc_neutral": float(auc_n_all) if isinstance(auc_n_all, (int, float)) else None,
+		"roc_auc_other": float(auc_o_all) if isinstance(auc_o_all, (int, float)) else None,
+		"min_auc_n_o": float(min_auc_all) if isinstance(min_auc_all, (int, float)) else 0.5,
+		"auc_rival": all_dimension_scores[0]["all_data"].get("auc_rival"),
+		"neutral_specificity": all_dimension_scores[0]["all_data"].get("neutral_specificity"),
+		"specificity": all_dimension_scores[0]["all_data"].get("specificity"),
+		"class_exclusivity": all_dimension_scores[0]["all_data"].get("class_exclusivity"),
+		"encoding_e": all_dimension_scores[0]["all_data"].get("encoding_e"),
+		"encoding_E": all_dimension_scores[0]["all_data"].get("encoding_E"),
 		"mean_by_class": mean_by_class,
 		"min_by_class": min_by_class,
 		"max_by_class": max_by_class,
@@ -543,13 +892,14 @@ def _compute_metrics_from_df(
 	if mean_by_target:
 		result["mean_by_target"] = mean_by_target
 
-	split_generalization = _compute_split_generalization(
-		df_for_means,
-		target_classes=target_classes,
-		compared_splits=generalization_splits,
-	)
-	if split_generalization:
-		result["split_generalization"] = split_generalization
+	if generalization_splits is not None:
+		split_generalization = _compute_split_generalization(
+			df_for_means,
+			target_classes=target_classes,
+			compared_splits=generalization_splits,
+		)
+		if split_generalization:
+			result["split_generalization"] = split_generalization
 
 	if len(all_dimension_scores) > 1:
 		result.update(all_dimension_scores)
@@ -557,14 +907,92 @@ def _compute_metrics_from_df(
 	return result
 
 
-def get_encoder_metrics_from_dataframe(
-	df: pd.DataFrame,
+def _component_metric_summary(metrics_by_component: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+	correlations = [
+		float(metrics.get("correlation"))
+		for metrics in metrics_by_component.values()
+		if isinstance(metrics.get("correlation"), (int, float))
+	]
+	summary: Dict[str, Any] = {
+		"n_components": len(metrics_by_component),
+	}
+	if correlations:
+		values = np.asarray(correlations, dtype=float)
+		summary.update({
+			"correlation_mean": float(values.mean()),
+			"correlation_median": float(np.median(values)),
+			"correlation_min": float(values.min()),
+			"correlation_max": float(values.max()),
+			"correlation_abs_mean": float(np.abs(values).mean()),
+			"correlation_abs_min": float(np.abs(values).min()),
+			"correlation_abs_max": float(np.abs(values).max()),
+		})
+	return summary
+
+
+def get_component_metrics_from_dataframe(
+	component_df: pd.DataFrame,
 	*,
 	neg_boundary: Optional[float] = -0.5,
 	pos_boundary: Optional[float] = 0.5,
 	neutral_boundary: float = 0.0,
 	target_classes: Optional[Sequence[str]] = None,
 	generalization_splits: Optional[Tuple[str, str]] = None,
+	compute_rival_metrics: bool = True,
+) -> Dict[str, Any]:
+	"""Compute encoder metrics independently for each explicit GRADIEND component."""
+	if component_df is None or component_df.empty:
+		return {}
+	if "component_index" not in component_df.columns or "component_id" not in component_df.columns:
+		raise ValueError("component_df must contain component_index and component_id columns")
+	component_df = component_df.copy()
+	component_df.attrs = {}
+	neg_val = neg_boundary if neg_boundary is not None else (neutral_boundary - 0.5)
+	pos_val = pos_boundary if pos_boundary is not None else (neutral_boundary + 0.5)
+	metrics_by_component: Dict[str, Dict[str, Any]] = {}
+	index_rows: List[Dict[str, Any]] = []
+	sort_df = component_df.sort_values(["component_index"])
+	for (component_index, component_id), group in sort_df.groupby(["component_index", "component_id"], sort=False):
+		component_key = str(component_id)
+		metrics = _compute_metrics_from_df(
+			group.copy(),
+			neg_boundary=neg_val,
+			pos_boundary=pos_val,
+			neutral_boundary=neutral_boundary,
+			target_classes=target_classes,
+			generalization_splits=generalization_splits,
+			compute_rival_metrics=compute_rival_metrics,
+		)
+		component_label = None
+		if "component_label" in group.columns and len(group) > 0:
+			component_label = group["component_label"].iloc[0]
+		metrics["component_index"] = int(component_index)
+		metrics["component_id"] = component_key
+		if component_label is not None:
+			metrics["component_label"] = str(component_label)
+		metrics_by_component[component_key] = metrics
+		index_rows.append({
+			"component_index": int(component_index),
+			"component_id": component_key,
+			"component_label": str(component_label) if component_label is not None else component_key,
+		})
+	return {
+		"index": index_rows,
+		"metrics_by_component": metrics_by_component,
+		"summary": _component_metric_summary(metrics_by_component),
+	}
+
+
+def get_encoder_metrics_from_dataframe(
+	df: pd.DataFrame,
+	*,
+	component_df: Optional[pd.DataFrame] = None,
+	neg_boundary: Optional[float] = -0.5,
+	pos_boundary: Optional[float] = 0.5,
+	neutral_boundary: float = 0.0,
+	target_classes: Optional[Sequence[str]] = None,
+	generalization_splits: Optional[Tuple[str, str]] = None,
+	compute_rival_metrics: bool = True,
 ) -> Dict[str, Any]:
 	"""
 	Compute unified encoder metrics from an encoder DataFrame. Single source of truth for
@@ -593,14 +1021,26 @@ def get_encoder_metrics_from_dataframe(
 	"""
 	neg_val = neg_boundary if neg_boundary is not None else (neutral_boundary - 0.5)
 	pos_val = pos_boundary if pos_boundary is not None else (neutral_boundary + 0.5)
-	return _compute_metrics_from_df(
+	result = _compute_metrics_from_df(
 		df,
 		neg_boundary=neg_val,
 		pos_boundary=pos_val,
 		neutral_boundary=neutral_boundary,
 		target_classes=target_classes,
 		generalization_splits=generalization_splits,
+		compute_rival_metrics=compute_rival_metrics,
 	)
+	if component_df is not None and not component_df.empty:
+		result["components"] = get_component_metrics_from_dataframe(
+			component_df,
+			neg_boundary=neg_boundary,
+			pos_boundary=pos_boundary,
+			neutral_boundary=neutral_boundary,
+			target_classes=target_classes,
+			generalization_splits=generalization_splits,
+			compute_rival_metrics=compute_rival_metrics,
+		)
+	return result
 
 
 def get_model_metrics(
@@ -689,7 +1129,13 @@ def get_model_metrics(
 
 __all__ = [
 	"get_model_metrics",
+	"get_component_metrics_from_dataframe",
 	"get_encoder_metrics_from_dataframe",
 	"get_correlation",
+	"get_roc_auc_one_vs_rest",
+	"get_roc_auc_neutral",
+	"get_roc_auc_other",
+	"get_roc_auc_min_n_o",
+	"get_encoding_e",
 	"invalidate_encoder_metrics_cache",
 ]

@@ -517,12 +517,17 @@ def filter_sentences_multi(
     total_target_overall: Optional[int] = None,
     stats: Optional[dict] = None,
     min_left_context_words_default: int = 0,
+    deduplicate_matches: bool = True,
 ) -> Tuple[dict, dict]:
     """Single pass over sentences: prefilter once, then test only candidate configs.
 
     A sentence can match multiple classes; each match is recorded for that class.
-    Returns (class_id -> list of (sentence, spans), stats dict with sentences_processed and, when capped,
-    sentences_when_cap_reached: {class_id: sentence count when that class first reached its cap}).
+    Exact repeated sentence/span matches are ignored by default, so repeated
+    source documents or overlapping preprocessing windows cannot consume the
+    cap or later leak into different data splits. Returns (class_id -> list of
+    (sentence, spans), stats dict with sentences_processed and, when capped,
+    sentences_when_cap_reached: {class_id: sentence count when that class first
+    reached its cap}).
     """
     if not configs_with_ids:
         return {}, stats or {}
@@ -539,6 +544,7 @@ def filter_sentences_multi(
         nlp = load_spacy_model(spacy_model, download_if_missing=download_if_missing)
 
     results: dict = {cid: [] for cid, _ in configs_with_ids}
+    seen_matches: dict = {cid: set() for cid, _ in configs_with_ids}
     sentences_when_cap_reached: dict = {}  # class_id -> sentence count when that class first hit cap
     active_filters = list(compiled_filters)
     prefer_ahocorasick = False
@@ -585,6 +591,10 @@ def filter_sentences_multi(
                 class_id = compiled.class_id
                 spans = _match_sentence_compiled(sent, compiled, doc=doc, nlp=nlp)
                 if spans:
+                    match_key = (sent, tuple(spans))
+                    if deduplicate_matches and match_key in seen_matches[class_id]:
+                        continue
+                    seen_matches[class_id].add(match_key)
                     results[class_id].append((sent, spans))
                     if (
                         max_matches_per_class is not None

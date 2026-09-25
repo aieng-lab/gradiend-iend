@@ -20,8 +20,11 @@ from gradiend.trainer.text.common.loading import AutoModelForLM
 from gradiend.trainer.text.common.lm_eval import compute_lms
 from gradiend.trainer.trainer import Trainer
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.cache_policy import coerce_artifact_use_cache
+from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
 from gradiend.model import ModelWithGradiend
-from gradiend.trainer.core.dataset import GradientTrainingDataset
+from gradiend.trainer.core.dataset import GradientTrainingDataset, SignalTrainingDatasetBase
+from gradiend.trainer.core.signals import ActivationSignalExtractor, require_single_signal
 from gradiend.util import normalize_split_name
 from gradiend.util.encoder_splits import EncoderSplit, resolve_encoder_splits
 from gradiend.trainer.text.classification.config import TextClassificationConfig
@@ -251,20 +254,48 @@ class TextClassificationTrainer(Trainer):
             **kwargs: Optional gradient dataset settings such as ``source`` and
                 ``target``.
         """
-        from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
-
         source = kwargs.pop("source", GRADIENT_DATASET_KWARG_UNSET)
         target = kwargs.pop("target", GRADIENT_DATASET_KWARG_UNSET)
+        args = getattr(self, "training_args", None)
+        signal = kwargs.pop("signal", getattr(args, "signal", None))
+        signals = kwargs.pop("signals", getattr(args, "signals", None))
+        selected_signal = require_single_signal(
+            signal=signal,
+            signals=signals,
+            context="TextClassificationTrainer.create_gradient_training_dataset",
+        )
         if source is GRADIENT_DATASET_KWARG_UNSET:
-            source = getattr(self.training_args, "source", "factual")
+            source = getattr(args, "source", "factual")
         if target is GRADIENT_DATASET_KWARG_UNSET:
-            target = getattr(self.training_args, "target", "diff")
+            target = getattr(args, "target", "diff")
         tokenizer = model_with_gradiend.tokenizer
         pad_token_id = getattr(tokenizer, "pad_token_id", 0) or 0
 
         def get_padding_value(subkey: str) -> int:
             """Return the padding value for a tensor field named by ``subkey``."""
             return pad_token_id if "input_ids" in subkey else 0
+
+        if selected_signal.kind == "activation":
+            return SignalTrainingDatasetBase(
+                raw_training_data,
+                ActivationSignalExtractor(
+                    model_with_gradiend,
+                    signal=selected_signal,
+                    scope=kwargs.pop("signal_scope", getattr(args, "signal_scope", None)),
+                    tokenizer=tokenizer,
+                ),
+                source=source,
+                target=target,
+                cache_dir=cache_dir,
+                use_cached_signals=use_cached_gradients,
+                cache_key_fields=["input_text", "label"] if (cache_dir and use_cached_gradients) else None,
+                dtype=getattr(model_with_gradiend.gradiend, "torch_dtype", torch.float32),
+                device=getattr(model_with_gradiend.gradiend, "device_encoder", None),
+                get_padding_value=get_padding_value,
+                timing_steps=kwargs.pop("timing_steps", 0),
+                timing_label=kwargs.pop("timing_label", "classification-activation"),
+                **kwargs,
+            )
 
         return GradientTrainingDataset(
             raw_training_data,
@@ -279,6 +310,8 @@ class TextClassificationTrainer(Trainer):
             get_padding_value=get_padding_value,
             timing_steps=kwargs.pop("timing_steps", 0),
             timing_label=kwargs.pop("timing_label", "classification-gradient"),
+            signal=signal,
+            signals=signals,
         )
 
     def _get_decoder_eval_dataframe(
@@ -789,12 +822,8 @@ class TextClassificationTrainer(Trainer):
         if out is None:
             raise ValueError("experiment_dir or output_path required for train_classification_head")
         if use_cache is None and self.training_args is not None:
-            from gradiend.trainer.core.cache_policy import coerce_artifact_use_cache
-
             use_cache = coerce_artifact_use_cache(getattr(self.training_args, "use_cache", False))
         elif use_cache is not None:
-            from gradiend.trainer.core.cache_policy import coerce_artifact_use_cache
-
             use_cache = coerce_artifact_use_cache(use_cache)
         if train_df is None:
             head_df, label2id, id2label, num_labels, split_col = self._classification_head_data()

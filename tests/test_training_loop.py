@@ -12,11 +12,14 @@ import torch
 
 from gradiend.trainer.core.training import format_non_convergence_error, train
 from gradiend.trainer.core.arguments import TrainingArguments
-from gradiend.trainer.core.dataset import GradientTrainingDataset
+from gradiend.trainer.core.dataset import GradientTrainingDataset, SignalTrainingDatasetBase
+from gradiend.trainer.core.signals import Signal, SignalBatch, SignalSet
 from gradiend.trainer.core.stats import (
     _best_checkpoint_step_is_after_initial,
     _best_step_min_target_class_abs_mean,
+    _best_step_positive_target_class_mean,
     _best_step_target_class_mean_product,
+    correlation_checkpoint_rank,
     load_training_stats,
 )
 from gradiend.model import GradiendModel
@@ -26,29 +29,29 @@ from tests.testing_mocks import SimpleMockModel
 
 class MockModelWithGradiend:
     """Mock ModelWithGradiend for training tests."""
-    
+
     def __init__(self):
         self.gradiend = GradiendModel(input_dim=100, latent_dim=1)
         self.base_model = SimpleMockModel()
         self.name_or_path = "mock-model"
-    
+
     def __len__(self):
         return 100
-    
+
     def parameters(self, recurse=True):
         return self.gradiend.parameters(recurse=recurse)
-    
+
     def to(self, dtype=None):
         if dtype is not None:
             self.base_model.dtype = dtype
         return self
-    
+
     def train(self):
         return self
-    
+
     def eval(self):
         return self
-    
+
     def save_pretrained(self, save_directory, **kwargs):
         """Create output dir so training loop and tests can assume path exists."""
         os.makedirs(save_directory, exist_ok=True)
@@ -60,14 +63,14 @@ class MockModelWithGradiend:
 
 class MockTrainingData:
     """Mock training dataset."""
-    
+
     def __init__(self, items, batch_size=1):
         self.items = items
         self.batch_size = batch_size
-    
+
     def __len__(self):
         return len(self.items)
-    
+
     def __getitem__(self, idx):
         return self.items[idx]
 
@@ -214,6 +217,124 @@ class TestTrainingLoop:
         assert len(seen_base_shapes) == 4  # factual+alternative for two GRADIEND rows
         assert all(shape[0] == 2 for shape in seen_base_shapes)
 
+    def test_gradient_dataset_accepts_gradient_signal_api(self):
+        """The existing gradient dataset should expose the normalized signal API."""
+        training_data = MockTrainingData(
+            [
+                {
+                    "factual": torch.tensor([1.0]),
+                    "alternative": torch.tensor([0.0]),
+                    "label": 1.0,
+                }
+            ]
+        )
+
+        def gradient_creator(inputs):
+            return torch.ones(100)
+
+        dataset = GradientTrainingDataset(
+            training_data=training_data,
+            gradient_creator=gradient_creator,
+            source="factual",
+            target="diff",
+            signal=Signal.gradient(),
+        )
+
+        row = dataset[0]
+
+        assert dataset.signal == Signal.gradient()
+        assert isinstance(dataset.signals, SignalSet)
+        assert dataset.signals.ids == ("gradient",)
+        assert torch.equal(row["source"], torch.ones(100))
+        assert torch.equal(row["target"], torch.zeros(100))
+
+    def test_gradient_dataset_rejects_unsupported_activation_signal(self):
+        training_data = MockTrainingData(
+            [
+                {
+                    "factual": torch.tensor([1.0]),
+                    "alternative": torch.tensor([0.0]),
+                    "label": 1.0,
+                }
+            ]
+        )
+
+        def gradient_creator(inputs):
+            return torch.ones(100)
+
+        with pytest.raises(NotImplementedError, match="Signal.gradient"):
+            GradientTrainingDataset(
+                training_data=training_data,
+                gradient_creator=gradient_creator,
+                signal=Signal.activation(),
+            )
+
+    def test_signal_training_dataset_base_uses_generic_signal_extractor(self):
+        """Shared dataset logic should work for non-gradient single-signal extractors."""
+        class FakeActivationExtractor:
+            signal = Signal.activation(name="activation", token_selector="mask")
+            signals = SignalSet(signal)
+
+            def __init__(self):
+                self.calls = []
+
+            def __call__(
+                self,
+                factual_inputs=None,
+                alternative_inputs=None,
+                *,
+                requires_factual=True,
+                requires_alternative=True,
+            ):
+                self.calls.append((factual_inputs, alternative_inputs, requires_factual, requires_alternative))
+                factual = factual_inputs * 2 if requires_factual else None
+                alternative = alternative_inputs * 3 if requires_alternative else None
+                return SignalBatch.from_factual_alternative(
+                    factual,
+                    alternative,
+                    signal_id=self.signal.id,
+                )
+
+        training_data = MockTrainingData(
+            [
+                {
+                    "factual": torch.tensor([2.0, 4.0]),
+                    "alternative": torch.tensor([1.0, 3.0]),
+                    "label": 1.0,
+                }
+            ]
+        )
+        extractor = FakeActivationExtractor()
+
+        dataset = SignalTrainingDatasetBase(
+            training_data=training_data,
+            signal_extractor=extractor,
+            source="factual",
+            target="diff",
+        )
+        row = dataset[0]
+
+        assert dataset.signal == Signal.activation(name="activation", token_selector="mask")
+        assert torch.equal(row["source"], torch.tensor([4.0, 8.0]))
+        assert torch.equal(row["target"], torch.tensor([1.0, -1.0]))
+        assert len(extractor.calls) == 2
+        assert torch.equal(extractor.calls[0][0], torch.tensor([2.0, 4.0]))
+        assert extractor.calls[0][1:] == (None, True, False)
+        assert extractor.calls[1][0] is None
+        assert torch.equal(extractor.calls[1][1], torch.tensor([1.0, 3.0]))
+        assert extractor.calls[1][2:] == (False, True)
+
+    def test_signal_training_dataset_base_requires_signal_metadata(self):
+        class SignalExtractorWithoutMetadata:
+            def __call__(self, **kwargs):
+                return SignalBatch.from_factual_alternative(torch.ones(1), None)
+
+        with pytest.raises(ValueError, match="requires signal"):
+            SignalTrainingDatasetBase(
+                training_data=MockTrainingData([]),
+                signal_extractor=SignalExtractorWithoutMetadata(),
+            )
+
     def test_precomputed_training_dataset_matches_wrapped_dataset(self):
         """Precomputed wrapper should yield the same rows in the same order."""
         from gradiend.trainer.core.dataset import PreComputedTrainingDataset
@@ -240,13 +361,13 @@ class TestTrainingLoop:
         batch = next(iter(DataLoader(wrapped, batch_size=2)))
         assert batch["source"].shape == (2, 1)
         assert batch["target"].shape == (2, 1)
-    
+
     def test_train_basic_flow(self, temp_dir, set_seed):
         """Test that basic training flow works."""
         set_seed(42)
-        
+
         model = MockModelWithGradiend()
-        
+
         # Create simple training data
         training_data = MockTrainingData([
             {
@@ -255,7 +376,7 @@ class TestTrainingLoop:
                 "label": 1.0
             }
         ] * 10)
-        
+
         def gradient_creator(inputs):
             # Handle both single inputs and batched inputs
             if isinstance(inputs, dict):
@@ -265,42 +386,42 @@ class TestTrainingLoop:
             else:
                 # Single input
                 return torch.randn(100)
-        
+
         dataset = GradientTrainingDataset(
             training_data=training_data,
             gradient_creator=gradient_creator,
             source="factual",
             target="diff"
         )
-        
+
         from torch.utils.data import DataLoader
         # Use batch_size=1 to avoid batching complexity in tests
         dataloader = DataLoader(dataset, batch_size=1)
-        
+
         training_args = TrainingArguments(
             output_dir=temp_dir,
             max_steps=5,  # Use max_steps instead of max_steps
             learning_rate=1e-3,
             train_batch_size=1  # Match DataLoader batch_size
         )
-        
+
         # Train
         output_path = train(
             model_with_gradiend=model,
             data=dataloader,
             training_args=training_args
         )
-        
+
         # Should return output path
         assert isinstance(output_path, str)
         assert os.path.exists(output_path)
-    
+
     def test_train_parameter_overwriting(self, temp_dir, set_seed):
         """Test that parameters passed to train() override TrainingArguments."""
         set_seed(42)
-        
+
         model = MockModelWithGradiend()
-        
+
         training_data = MockTrainingData([
             {
                 "factual": torch.randn(10),
@@ -308,20 +429,20 @@ class TestTrainingLoop:
                 "label": 1.0
             }
         ] * 10)
-        
+
         def gradient_creator(inputs):
             return torch.randn(100)
-        
+
         dataset = GradientTrainingDataset(
             training_data=training_data,
             gradient_creator=gradient_creator,
             source="factual",
             target="diff"
         )
-        
+
         from torch.utils.data import DataLoader
         dataloader = DataLoader(dataset, batch_size=1)
-        
+
         # Create TrainingArguments with default values
         training_args = TrainingArguments(
             output_dir=temp_dir,
@@ -329,7 +450,7 @@ class TestTrainingLoop:
             learning_rate=1e-4,  # Default learning rate
             train_batch_size=1
         )
-        
+
         # Override learning_rate via kwargs
         output_path = train(
             model_with_gradiend=model,
@@ -341,7 +462,116 @@ class TestTrainingLoop:
         stats = load_training_stats(temp_dir)
         assert stats["training_args"]["learning_rate"] == pytest.approx(1e-3)
         assert isinstance(output_path, str)
-    
+
+    def test_train_accepts_signal_kwarg_and_serializes_it(self, temp_dir, set_seed):
+        """train(..., signal=...) should be part of the existing public kwargs API."""
+        set_seed(42)
+        model = MockModelWithGradiend()
+        training_data = MockTrainingData([
+            {
+                "factual": torch.randn(10),
+                "alternative": torch.randn(10),
+                "label": 1.0,
+            }
+        ] * 4)
+
+        def gradient_creator(inputs):
+            return torch.randn(100)
+
+        dataset = GradientTrainingDataset(
+            training_data=training_data,
+            gradient_creator=gradient_creator,
+            source="factual",
+            target="diff",
+        )
+
+        from torch.utils.data import DataLoader
+        dataloader = DataLoader(dataset, batch_size=1)
+
+        train(
+            model_with_gradiend=model,
+            data=dataloader,
+            training_args=TrainingArguments(output_dir=temp_dir, max_steps=1),
+            signal="gradient",
+        )
+
+        stats = load_training_stats(temp_dir)
+        assert stats["training_args"]["signal"] == {
+            "kind": "gradient",
+            "name": None,
+            "options": {},
+        }
+        assert stats["training_args"]["signals"] == [
+            {
+                "kind": "gradient",
+                "name": None,
+                "options": {},
+            }
+        ]
+
+    def test_train_accepts_activation_signal_with_matching_signal_tensors(self, temp_dir, set_seed):
+        """Regression: core_train must not reject activation signals after datasets produce tensors."""
+        set_seed(42)
+        model = MockModelWithGradiend()
+        training_data = MockTrainingData([
+            {
+                "source": torch.randn(100),
+                "target": torch.randn(100),
+                "label": 1.0,
+            }
+        ] * 4)
+
+        from torch.utils.data import DataLoader
+
+        train(
+            model_with_gradiend=model,
+            data=DataLoader(training_data, batch_size=1),
+            training_args=TrainingArguments(output_dir=temp_dir, max_steps=1, do_eval=False),
+            signal=Signal.activation(token_selector="mask"),
+        )
+
+        stats = load_training_stats(temp_dir)
+        assert stats["training_args"]["signal"] == {
+            "kind": "activation",
+            "name": None,
+            "options": {"token_selector": "mask"},
+        }
+        assert stats["training_stats"]["global_step"] == 1
+
+    def test_train_delegates_standard_reconstruction_loss_to_gradiend_model(self, temp_dir, set_seed):
+        set_seed(42)
+        model = MockModelWithGradiend()
+        calls = []
+        original_reconstruction_loss = model.gradiend.reconstruction_loss
+
+        def wrapped_reconstruction_loss(*args, **kwargs):
+            calls.append(kwargs.get("aggregation"))
+            return original_reconstruction_loss(*args, **kwargs)
+
+        model.gradiend.reconstruction_loss = wrapped_reconstruction_loss
+        training_data = MockTrainingData([
+            {
+                "source": torch.randn(100),
+                "target": torch.randn(100),
+                "label": 1.0,
+            }
+        ])
+
+        from torch.utils.data import DataLoader
+
+        train(
+            model_with_gradiend=model,
+            data=DataLoader(training_data, batch_size=1),
+            training_args=TrainingArguments(
+                output_dir=temp_dir,
+                max_steps=1,
+                do_eval=False,
+                gradiend_split_loss="sum",
+            ),
+        )
+
+        assert calls == ["sum"]
+
     def test_train_seed_handling(self, temp_dir, set_seed):
         """Same seed should yield identical per-step loss traces."""
         def _run_once(output_subdir: str):
@@ -385,13 +615,13 @@ class TestTrainingLoop:
         losses_a = _run_once("seed_a")
         losses_b = _run_once("seed_b")
         assert losses_a == losses_b
-    
+
     def test_train_with_callbacks(self, temp_dir, set_seed):
         """Test that training works with custom callbacks."""
         set_seed(42)
-        
+
         model = MockModelWithGradiend()
-        
+
         training_data = MockTrainingData([
             {
                 "factual": torch.randn(10),
@@ -399,20 +629,20 @@ class TestTrainingLoop:
                 "label": 1.0
             }
         ] * 10)
-        
+
         def gradient_creator(inputs):
             return torch.randn(100)
-        
+
         dataset = GradientTrainingDataset(
             training_data=training_data,
             gradient_creator=gradient_creator,
             source="factual",
             target="diff"
         )
-        
+
         from torch.utils.data import DataLoader
         dataloader = DataLoader(dataset, batch_size=1)
-        
+
         from gradiend.trainer.core.callbacks import LoggingCallback
 
         logged_steps = []
@@ -423,13 +653,13 @@ class TestTrainingLoop:
                 return super().on_step_end(*args, **kwargs)
 
         custom_callback = RecordingLoggingCallback(n_loss_report=10)
-        
+
         training_args = TrainingArguments(
             output_dir=temp_dir,
             max_steps=1,
             train_batch_size=1
         )
-        
+
         output_path = train(
             model_with_gradiend=model,
             data=dataloader,
@@ -439,33 +669,33 @@ class TestTrainingLoop:
 
         assert isinstance(output_path, str)
         assert logged_steps, "Custom callback should be invoked during training"
-    
+
     def test_train_empty_dataloader_raises_error(self, temp_dir):
         """Test that training raises error for empty dataloader."""
         model = MockModelWithGradiend()
-        
+
         from torch.utils.data import DataLoader
         empty_dataloader = DataLoader([], batch_size=2)
-        
+
         training_args = TrainingArguments(
             output_dir=temp_dir,
             max_steps=10,
             train_batch_size=1
         )
-        
+
         with pytest.raises(ValueError, match="empty"):
             train(
                 model_with_gradiend=model,
                 data=empty_dataloader,
                 training_args=training_args
             )
-    
+
     def test_train_output_dir_creation(self, temp_dir, set_seed):
         """Test that output directory is created during training."""
         set_seed(42)
-        
+
         model = MockModelWithGradiend()
-        
+
         training_data = MockTrainingData([
             {
                 "factual": torch.randn(10),
@@ -473,44 +703,44 @@ class TestTrainingLoop:
                 "label": 1.0
             }
         ] * 10)
-        
+
         def gradient_creator(inputs):
             return torch.randn(100)
-        
+
         dataset = GradientTrainingDataset(
             training_data=training_data,
             gradient_creator=gradient_creator,
             source="factual",
             target="diff"
         )
-        
+
         from torch.utils.data import DataLoader
         dataloader = DataLoader(dataset, batch_size=1)
-        
+
         output_subdir = os.path.join(temp_dir, "train_output")
         training_args = TrainingArguments(
             output_dir=output_subdir,
             max_steps=1,
             train_batch_size=1
         )
-        
+
         output_path = train(
             model_with_gradiend=model,
             data=dataloader,
             training_args=training_args
         )
-        
+
         # Output directory should exist
         assert os.path.exists(output_subdir)
         assert isinstance(output_path, str)
         assert os.path.exists(output_path)
-    
+
     def test_train_multiple_parameter_overrides(self, temp_dir, set_seed):
         """Test that multiple parameters can be overridden."""
         set_seed(42)
-        
+
         model = MockModelWithGradiend()
-        
+
         training_data = MockTrainingData([
             {
                 "factual": torch.randn(10),
@@ -518,27 +748,27 @@ class TestTrainingLoop:
                 "label": 1.0
             }
         ] * 10)
-        
+
         def gradient_creator(inputs):
             return torch.randn(100)
-        
+
         dataset = GradientTrainingDataset(
             training_data=training_data,
             gradient_creator=gradient_creator,
             source="factual",
             target="diff"
         )
-        
+
         from torch.utils.data import DataLoader
         dataloader = DataLoader(dataset, batch_size=1)
-        
+
         training_args = TrainingArguments(
             output_dir=temp_dir,
             max_steps=10,
             learning_rate=1e-4,
             train_batch_size=1
         )
-        
+
         # Override multiple parameters
         output_path = train(
             model_with_gradiend=model,
@@ -552,11 +782,11 @@ class TestTrainingLoop:
         assert stats["training_args"]["learning_rate"] == pytest.approx(1e-3)
         assert stats["training_args"]["max_steps"] == 20
         assert isinstance(output_path, str)
-    
+
     def test_train_invalid_parameter_raises_error(self, temp_dir):
         """Test that invalid parameters raise ValueError."""
         model = MockModelWithGradiend()
-        
+
         training_data = MockTrainingData([
             {
                 "factual": torch.randn(10),
@@ -564,26 +794,26 @@ class TestTrainingLoop:
                 "label": 1.0
             }
         ] * 10)
-        
+
         def gradient_creator(inputs):
             return torch.randn(100)
-        
+
         dataset = GradientTrainingDataset(
             training_data=training_data,
             gradient_creator=gradient_creator,
             source="factual",
             target="diff"
         )
-        
+
         from torch.utils.data import DataLoader
         dataloader = DataLoader(dataset, batch_size=1)
-        
+
         training_args = TrainingArguments(
             output_dir=temp_dir,
             max_steps=10,
             train_batch_size=1
         )
-        
+
         # Invalid parameter should raise ValueError
         with pytest.raises(ValueError, match="Invalid training argument"):
             train(
@@ -636,6 +866,24 @@ class TestConvergenceCriteria:
 
         assert product == pytest.approx(0.36)
 
+    def test_positive_target_class_mean_uses_numeric_label_plus_one(self):
+        training_stats = {
+            "mean_by_class": {
+                "50": {
+                    "-1.0": 0.4,
+                    "0.0": -0.1,
+                    "1.0": 0.9,
+                }
+            }
+        }
+
+        value = _best_step_positive_target_class_mean(
+            training_stats,
+            {"global_step": 50},
+        )
+
+        assert value == pytest.approx(0.9)
+
     def test_target_class_mean_product_is_none_without_exactly_two_targets(self):
         training_stats = {
             "mean_by_class": {
@@ -681,6 +929,63 @@ class TestConvergenceCriteria:
         min_abs = _best_step_min_target_class_abs_mean(training_stats, best_score_checkpoint)
 
         assert min_abs == pytest.approx(0.6)
+
+    def test_correlation_checkpoint_rank_prefers_convergent_over_peak_corr(self):
+        """With prefer_convergent=True, peak |corr| with weak means loses to a convergent step."""
+        weak = correlation_checkpoint_rank(
+            step=100,
+            correlation=0.908,
+            mean_by_class={1.0: 0.80, -1.0: -0.2937},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=True,
+        )
+        strong = correlation_checkpoint_rank(
+            step=500,
+            correlation=0.858,
+            mean_by_class={1.0: 0.6425, -1.0: -0.9010},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=True,
+        )
+        assert strong > weak
+        assert strong[0] == 1
+        assert weak[0] == 0
+
+    def test_correlation_checkpoint_rank_default_keeps_peak_corr(self):
+        """Default prefer_convergent=False selects by |correlation| alone."""
+        peak = correlation_checkpoint_rank(
+            step=100,
+            correlation=0.908,
+            mean_by_class={1.0: 0.80, -1.0: -0.2937},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=False,
+        )
+        later = correlation_checkpoint_rank(
+            step=500,
+            correlation=0.858,
+            mean_by_class={1.0: 0.6425, -1.0: -0.9010},
+            score_threshold=0.5,
+            mean_threshold=0.5,
+            prefer_convergent=False,
+        )
+        assert peak > later
+        assert peak[0] == 0
+        assert later[0] == 0
+
+    def test_correlation_checkpoint_rank_without_thresholds_uses_abs_corr(self):
+        higher = correlation_checkpoint_rank(
+            step=10,
+            correlation=0.9,
+            mean_by_class={1.0: 0.1, -1.0: -0.1},
+        )
+        lower = correlation_checkpoint_rank(
+            step=20,
+            correlation=0.5,
+            mean_by_class={1.0: 0.9, -1.0: -0.9},
+        )
+        assert higher > lower
 
 
 class TestFinalStepEvaluation:

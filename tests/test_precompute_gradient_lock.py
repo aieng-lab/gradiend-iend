@@ -195,6 +195,7 @@ def _mock_trainer(tmpdir: str, **training_kw):
         max_seeds=1,
         save_steps=0,
         eval_strategy="steps",
+        add_neutral_identity_transitions=False,
     )
     defaults.update(training_kw)
     args = TrainingArguments(**defaults)

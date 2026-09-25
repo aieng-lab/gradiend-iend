@@ -93,6 +93,7 @@ nav:
     - Trainer suites: guides/trainer-suites.md
     - Saving & loading: guides/saving-loading.md
     - Training arguments: guides/training-arguments.md
+    - Signals, scopes and components: guides/signals.md
     - Token prediction methods: guides/token-prediction-methods.md
     - Decoder-only models: guides/decoder-only.md
     - Decoder evaluation targets: guides/decoder-eval-targets.md
@@ -127,6 +128,10 @@ nav:
             - PositiveFeatureDefinition: api/training/PositiveFeatureDefinition.md
             - MultiSeedTrainerView: api/training/MultiSeedTrainerView.md
             - TrainerConfig: api/training/TrainerConfig.md
+            - Signal: api/training/Signal.md
+            - SignalScope: api/training/SignalScope.md
+            - GradiendSplit: api/training/GradiendSplit.md
+            - SignalTrainer: api/training/SignalTrainer.md
             - TransitionSpec: api/training/TransitionSpec.md
             - set_seed: api/training/set_seed.md
         - Evaluation:

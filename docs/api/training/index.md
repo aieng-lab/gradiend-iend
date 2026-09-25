@@ -7,6 +7,10 @@ Trainer, arguments, suites, and pruning:
 - **[`TextPredictionConfig`][gradiend.trainer.text.prediction.trainer.TextPredictionConfig]** — Config for text prediction
 - **[`TextPredictionTrainer`][gradiend.trainer.text.prediction.trainer.TextPredictionTrainer]** — Trainer for text prediction
 - **[`TrainerConfig`][gradiend.trainer.config.TrainerConfig]** — Shared trainer configuration base
+- **[`Signal`][gradiend.trainer.core.signals.Signal]** — What is measured (gradient, activation, activation gradient)
+- **[`SignalScope`][gradiend.trainer.core.signals.SignalScope]** — Where the signal is measured
+- **[`GradiendSplit`][gradiend.gradiend_split.GradiendSplit]** — Component partition of the resolved signal space
+- **[`SignalTrainer`][gradiend.trainer.signal_trainer.SignalTrainer]** — Trainer for precomputed signal vectors
 - **[`PrePruneConfig`][gradiend.trainer.core.pruning.PrePruneConfig]** — Pre-pruning
 - **[`PostPruneConfig`][gradiend.trainer.core.pruning.PostPruneConfig]** — Post-pruning
 

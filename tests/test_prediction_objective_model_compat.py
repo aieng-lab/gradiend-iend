@@ -50,6 +50,18 @@ class _GptTokenizerStub:
         return type("GPT2Tokenizer", (), {"__name__": "GPT2Tokenizer"})
 
 
+class _GemmaTokenizerWithMaskStub:
+    """Gemma 3 remains a causal LM despite exposing a tokenizer mask token."""
+
+    name_or_path = "google/gemma-3-270m"
+    mask_token = "<mask>"
+    mask_token_id = 9
+
+    @property
+    def __class__(self):
+        return type("GemmaTokenizerFast", (), {"__name__": "GemmaTokenizerFast"})
+
+
 def test_format_seq2seq_objective_hint_lists_all_three():
     hint = format_seq2seq_objective_hint()
     assert "seq2seq_decoder" in hint
@@ -94,6 +106,13 @@ def test_clm_next_token_rejects_t5():
             "clm_next_token",
             _T5TokenizerStub(),
         )
+
+
+def test_clm_next_token_accepts_gemma_tokenizer_with_mask_token():
+    validate_prediction_objective_for_model(
+        "clm_next_token",
+        _GemmaTokenizerWithMaskStub(),
+    )
 
 
 def test_resolve_prediction_objective_validates_with_tokenizer():

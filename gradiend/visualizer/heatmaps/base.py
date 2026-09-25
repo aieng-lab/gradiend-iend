@@ -9,6 +9,7 @@ import math
 
 from gradiend.util.deprecation import warn_deprecated_annot_fmt
 from gradiend.visualizer.heatmaps.ordering import _reorder_comparison_data
+from gradiend.visualizer.color_norm import resolve_encoding_color_norm
 from gradiend.visualizer.plot_optional import _require_matplotlib, _require_seaborn
 from gradiend.visualizer.plot_style import disable_usetex_for_axis_text
 from gradiend.visualizer.labels import (
@@ -18,6 +19,7 @@ from gradiend.visualizer.labels import (
     format_label_with_convergence,
     format_transition_label,
     label_contains_matplotlib_latex,
+    escape_matplotlib_usetex_text,
     resolve_axis_convergence_for_comparison_heatmap,
 )
 
@@ -32,8 +34,17 @@ def filter_comparison_heatmap_plot_kwargs(kwargs: Optional[Dict[str, Any]]) -> D
     return {k: v for k, v in kwargs.items() if k not in _MATRIX_COMPUTE_KWARGS}
 
 
-def _encoding_measure_is_signed(measure: Optional[str]) -> bool:
+_DISPERSION_CELL_STAT_FIELDS = frozenset({"std", "range_half_width"})
+
+
+def _encoding_measure_is_signed(
+    measure: Optional[str],
+    *,
+    cell_stat_field: Optional[str] = None,
+) -> bool:
     """Whether encoded-value heatmaps use a diverging (signed) color scale."""
+    if cell_stat_field in _DISPERSION_CELL_STAT_FIELDS:
+        return False
     if not measure:
         return False
     name = str(measure)
@@ -48,10 +59,15 @@ def _encoding_measure_is_signed(measure: Optional[str]) -> bool:
     return False
 
 
-def _default_colormap_for_measure(measure: Optional[str], cmap: str) -> str:
+def _default_colormap_for_measure(
+    measure: Optional[str],
+    cmap: str,
+    *,
+    cell_stat_field: Optional[str] = None,
+) -> str:
     if cmap != "viridis":
         return cmap
-    if _encoding_measure_is_signed(measure):
+    if _encoding_measure_is_signed(measure, cell_stat_field=cell_stat_field):
         return "coolwarm"
     return cmap
 
@@ -150,6 +166,11 @@ def plot_comparison_heatmap(
     models: Optional[Dict[str, object]] = None,
     converged_by_id: Optional[Dict[str, Optional[bool]]] = None,
     highlight_non_convergence: bool = True,
+    color_center: Optional[Union[str, float]] = None,
+    neutral_value: Optional[float] = None,
+    neutral_values: Optional[Any] = None,
+    color_range: Union[str, Tuple[float, float], List[float], None] = "symmetric",
+    color_extent: Optional[float] = 1.0,
 ) -> Any:
     """Plot a precomputed comparison matrix as a heatmap.
 
@@ -202,6 +223,15 @@ def plot_comparison_heatmap(
         models: Optional model mapping for non-convergence label lookup.
         converged_by_id: Optional explicit convergence status by stable model id.
         highlight_non_convergence: Whether labels mark non-converged runs.
+        color_center: Optional diverging color center. Use ``"neutral"`` with
+            ``neutral_value``/``neutral_values`` to put the neutral color at a
+            measured neutral encoding instead of zero.
+        neutral_value: Explicit neutral encoded value for ``color_center="neutral"``.
+        neutral_values: Neutral sample encodings averaged for ``color_center="neutral"``.
+        color_range: ``"symmetric"``, ``"auto"``, or explicit ``(vmin, vmax)`` bounds
+            used when ``color_center`` is provided.
+        color_extent: Symmetric extent around ``color_center``. ``1.0`` means a
+            neutral value of ``0.4`` maps to bounds ``[-0.6, 1.4]``.
     """
     warn_deprecated_annot_fmt(fmt=fmt, annot_fmt=annot_fmt, stacklevel=1)
     if not isinstance(comparison_data, dict):
@@ -235,6 +265,8 @@ def plot_comparison_heatmap(
         raise ValueError("scale must be 'linear', 'log', 'sqrt', or 'power'")
     if scale == "power" and (scale_gamma is None or float(scale_gamma) <= 0):
         raise ValueError("scale_gamma must be > 0 when scale='power'")
+    if color_center is not None and scale != "linear":
+        raise ValueError("color_center is only supported with scale='linear'")
 
     plt = _require_matplotlib()
     sns = _require_seaborn()
@@ -311,7 +343,7 @@ def plot_comparison_heatmap(
     measure_name = str(comparison_data.get("measure") or "")
     value_name = comparison_data.get("value")
     cell_stat_field = _comparison_cell_stat_field(comparison_data)
-    is_dispersion_stat_matrix = cell_stat_field in {"std", "range_half_width"}
+    is_dispersion_stat_matrix = cell_stat_field in _DISPERSION_CELL_STAT_FIELDS
     base_measure = _base_measure_name(measure_name, cell_stat_field)
 
     if percentages:
@@ -406,13 +438,45 @@ def plot_comparison_heatmap(
     row_normalized_by_diagonal = bool(comparison_data.get("row_normalized_by_diagonal"))
     normalized_cross_encoding = row_normalized_by_diagonal and str(measure).startswith("cross_encoding_")
     cross_encoding_difference = measure == "cross_encoding_positive_minus_negative"
-    signed_encoding = _encoding_measure_is_signed(measure)
+    signed_encoding = _encoding_measure_is_signed(
+        measure,
+        cell_stat_field=cell_stat_field,
+    )
     signed_measures = {"cosine_signed", "spearman_signed", "cross_encoding_positive_minus_negative"}
     bounded_unit_measures = {"cosine", "cosine_signed", "spearman", "spearman_signed", "mass_overlap", "cross_encoding_positive_mean", "cross_encoding_negative_mean", "cross_encoding_positive_minus_negative"}
-    cmap = _default_colormap_for_measure(measure, cmap)
+    cmap = _default_colormap_for_measure(
+        measure,
+        cmap,
+        cell_stat_field=cell_stat_field,
+    )
+    color_norm = None
+    if color_center is not None:
+        color_norm = resolve_encoding_color_norm(
+            mat_arr,
+            neutral_values=neutral_values,
+            neutral_value=neutral_value,
+            center=color_center,
+            color_range=color_range,
+            extent=color_extent,
+        )
+        if custom_vmin or custom_vmax:
+            if vmin is None or vmax is None:
+                raise ValueError("Custom heatmap bounds with color_center require both vmin and vmax")
+            color_norm = resolve_encoding_color_norm(
+                mat_arr,
+                neutral_values=neutral_values,
+                neutral_value=neutral_value,
+                center=color_center,
+                color_range=(float(vmin), float(vmax)),
+                extent=color_extent,
+            )
+        vmin = color_norm.vmin
+        vmax = color_norm.vmax
+        if cbar_label is None:
+            cbar_label = color_norm.legend_label
     if vmin is None:
         if is_dispersion_stat_matrix:
-            vmin = float(np.nanmin(mat_arr))
+            vmin = 0.0
         elif cross_encoding_difference or signed_encoding:
             vmin, _ = _symmetric_value_limits(mat_arr)
         elif measure in signed_measures:
@@ -451,7 +515,11 @@ def plot_comparison_heatmap(
 
     norm = None
     eps = max(1e-10, np.finfo(float).tiny)
-    if scale == "log":
+    if color_norm is not None:
+        from matplotlib.colors import TwoSlopeNorm
+
+        norm = TwoSlopeNorm(vmin=float(vmin), vcenter=color_norm.center, vmax=float(vmax))
+    elif scale == "log":
         norm = LogNorm(vmin=max(eps, float(vmin)), vmax=float(vmax))
     elif scale == "sqrt":
         norm = PowerNorm(gamma=0.5, vmin=float(vmin), vmax=float(vmax))
@@ -468,6 +536,18 @@ def plot_comparison_heatmap(
     cbar_kws = {"shrink": 0.75 if cbar_shrink is None else float(cbar_shrink)}
     if cbar_pad is not None:
         cbar_kws["pad"] = cbar_pad
+    if is_dispersion_stat_matrix and color_norm is None and scale == "linear":
+        from matplotlib.ticker import MaxNLocator
+
+        lower = float(vmin)
+        upper = float(vmax)
+        interior_ticks = MaxNLocator(nbins=5).tick_values(lower, upper)
+        interior_ticks = interior_ticks[
+            (interior_ticks >= lower) & (interior_ticks <= upper)
+        ]
+        cbar_kws["ticks"] = np.unique(
+            np.concatenate(([lower], interior_ticks, [upper]))
+        )
     # Do not pass cbar_label through cbar_kws: "%" is a TeX comment when usetex is on.
 
     def _draw_heatmap_with_plain_seaborn_text():
@@ -565,9 +645,15 @@ def plot_comparison_heatmap(
         resolved_axis_label_fontsize = float(tick_label_fontsize) + 2
 
     if xlabel:
-        ax.set_xlabel(xlabel, fontsize=resolved_axis_label_fontsize)
+        ax.set_xlabel(
+            escape_matplotlib_usetex_text(xlabel),
+            fontsize=resolved_axis_label_fontsize,
+        )
     if ylabel:
-        ax.set_ylabel(ylabel, fontsize=resolved_axis_label_fontsize)
+        ax.set_ylabel(
+            escape_matplotlib_usetex_text(ylabel),
+            fontsize=resolved_axis_label_fontsize,
+        )
 
     active_groups = comparison_data.get("pretty_groups")
     if active_groups is not None:

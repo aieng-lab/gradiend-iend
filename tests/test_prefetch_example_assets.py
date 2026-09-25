@@ -13,6 +13,9 @@ def test_prefetch_manifest_covers_smoke_example_assets():
     models = {asset.repo_id for asset in prefetch.EXAMPLE_MODELS}
 
     assert ("aieng-lab/gentypes", None, "train") in datasets
+    assert ("aieng-lab/en-pronouns", None, "train") in datasets
+    assert ("aieng-lab/en-pronouns", None, "validation") in datasets
+    assert ("aieng-lab/en-pronoun-neutral", None, "train") in datasets
     assert ("cardiffnlp/tweet_eval", "sentiment", "test") in datasets
     assert ("vladinc/nrc", None, "train") in datasets
     assert {

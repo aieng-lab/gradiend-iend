@@ -1,11 +1,15 @@
 import pandas as pd
 import pytest
 import torch
+from unittest.mock import MagicMock
 
+from gradiend.trainer.core.dataset import SignalTrainingDatasetBase
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.signals import ActivationSignalExtractor, Signal, SignalScope
 from gradiend.trainer.text.classification.config import TextClassificationConfig
 from gradiend.trainer.text.classification.classification_head import _ClassificationDataset
 from gradiend.trainer.text.classification.trainer import TextClassificationTrainer
+from tests.testing_mocks import SimpleMockModel
 
 
 def _make_trainer(df: pd.DataFrame) -> TextClassificationTrainer:
@@ -225,6 +229,91 @@ def test_training_dataset_uses_semantic_classes_for_encoder_ids():
     assert item["alternative_id"] == "non-commutative"
     assert item["feature_class_id"] == "commutative"
     assert item["label"] == pytest.approx(1.0)
+
+
+def test_gradient_dataset_uses_training_args_signal():
+    df = pd.DataFrame(
+        [
+            {
+                "text": "a+b",
+                "text_alternative": "a*b",
+                "label": "commutative",
+                "label_alternative": "non-commutative",
+                "split": "train",
+            },
+            {
+                "text": "a*b",
+                "text_alternative": "a+b",
+                "label": "non-commutative",
+                "label_alternative": "commutative",
+                "split": "train",
+            },
+        ]
+    )
+    config = TextClassificationConfig(
+        data=df,
+        target_classes=["commutative", "non-commutative"],
+    )
+    trainer = TextClassificationTrainer(
+        model="bert-base-uncased",
+        args=TrainingArguments(signal=Signal.gradient()),
+        config=config,
+    )
+    raw = trainer.create_training_data(_DummyTokenizer(), split="train")
+    model = MagicMock(return_value=torch.randn(4))
+    model.tokenizer = _DummyTokenizer()
+    model.gradiend.torch_dtype = torch.float32
+    model.gradiend.device_encoder = torch.device("cpu")
+
+    dataset = trainer.create_gradient_training_dataset(raw, model)
+
+    assert dataset.signal == Signal.gradient()
+    assert dataset.signals.ids == ("gradient",)
+
+
+def test_classification_gradient_dataset_uses_activation_signal_extractor():
+    df = pd.DataFrame(
+        [
+            {
+                "text": "a+b",
+                "text_alternative": "a*b",
+                "label": "commutative",
+                "label_alternative": "non-commutative",
+                "split": "train",
+            },
+            {
+                "text": "a*b",
+                "text_alternative": "a+b",
+                "label": "non-commutative",
+                "label_alternative": "commutative",
+                "split": "train",
+            },
+        ]
+    )
+    config = TextClassificationConfig(
+        data=df,
+        target_classes=["commutative", "non-commutative"],
+    )
+    trainer = TextClassificationTrainer(
+        model="bert-base-uncased",
+        args=TrainingArguments(
+            signal=Signal.activation(token_selector="cls"),
+            signal_scope=SignalScope.from_values(activation_sites=["embeddings"]),
+        ),
+        config=config,
+    )
+    raw = trainer.create_training_data(_DummyTokenizer(), split="train")
+    model = MagicMock()
+    model.base_model = SimpleMockModel(vocab_size=200, hidden_size=4)
+    model.tokenizer = _DummyTokenizer()
+    model.gradiend.torch_dtype = torch.float32
+    model.gradiend.device_encoder = torch.device("cpu")
+
+    dataset = trainer.create_gradient_training_dataset(raw, model)
+
+    assert isinstance(dataset, SignalTrainingDatasetBase)
+    assert isinstance(dataset.signal_extractor, ActivationSignalExtractor)
+    assert dataset.signal == Signal.activation(token_selector="cls")
 
 
 def test_classification_head_dataset_supports_sequence_pairs():

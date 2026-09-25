@@ -55,7 +55,7 @@ class Evaluator(Protocol):
 
         Args:
             model_with_gradiend: ModelWithGradiend instance to evaluate
-            eval_data: GradientTrainingDataset (gradients + labels)
+            eval_data: SignalTrainingDatasetBase-style dataset (signals + labels)
             eval_batch_size: Batch size for evaluation
             **kwargs: Additional arguments
 

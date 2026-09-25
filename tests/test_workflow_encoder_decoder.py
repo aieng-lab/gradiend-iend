@@ -98,7 +98,22 @@ def test_standard_workflow_mlm_train_encoder_decoder(use_pre_prune):
             trainer = TextPredictionTrainer(
                 model="bert-base-uncased",
                 data=training,
-                eval_neutral_data=neutral,
+                # add_neutral_identity_transitions defaults True whenever
+                # TrainingArguments is present, which now hard-requires the
+                # shared neutral_data pool (eval_neutral_data is eval-only and
+                # does not feed training-time identity transitions). Omitting
+                # eval_neutral_data falls back to this same pool for eval too
+                # (TextPredictionTrainer._resolve_eval_neutral_dataframe).
+                neutral_data=neutral,
+                # MINI_TEXTS only yields 3 pronoun-free neutral rows; the
+                # shared pool has no split column of its own, so it falls back
+                # to an auto row-split using these ratios (auto_split_if_missing
+                # in _resolve_neutral_source_dataframe). With val_ratio=0.0 the
+                # split validator only requires train/test coverage, matching
+                # the factual data above (which also uses val_ratio=0.0).
+                split_train_ratio=0.8,
+                split_val_ratio=0.0,
+                split_test_ratio=0.2,
                 max_counterfactuals_per_sentence=1,
                 args=args,
             )

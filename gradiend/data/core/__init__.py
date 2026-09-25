@@ -6,7 +6,7 @@ from gradiend.data.core.balancing import (
     balance_dataframe_per_target_with_floor,
     cap_dataframe_balanced,
 )
-from gradiend.data.core.base_loader import resolve_base_data
+from gradiend.data.core.base_loader import iter_resolved_base_data, resolve_base_data
 from gradiend.data.core.dataframe_splitting import (
     split_dataframe,
     split_dataframe_by_group_key,
@@ -34,6 +34,7 @@ from gradiend.data.core.unified_splitting import (
 
 __all__ = [
     "resolve_base_data",
+    "iter_resolved_base_data",
     "DataCreator",
     "SplitGroupKey",
     "SplitRatiosInput",

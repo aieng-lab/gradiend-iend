@@ -5,7 +5,11 @@ This module defines shared constants used across training components,
 including source/target keywords for gradient computation.
 """
 
-from gradiend.model._source_target import SOURCE_TARGET_KEYWORDS, validate_source_target
+from gradiend.model._source_target import (
+    SOURCE_TARGET_KEYWORDS,
+    validate_source_target,
+    validate_source_target_combination,
+)
 
 # Sentinel: create_gradient_training_dataset uses training-args default only when omitted.
 GRADIENT_DATASET_KWARG_UNSET = object()
@@ -22,6 +26,7 @@ source_target_keywords = {None} | SOURCE_TARGET_KEYWORDS
 __all__ = [
     "SOURCE_TARGET_KEYWORDS",
     "validate_source_target",
+    "validate_source_target_combination",
     "GRADIENT_DATASET_KWARG_UNSET",
     "factual_computation_required_keywords",
     "alternative_computation_required_keywords",

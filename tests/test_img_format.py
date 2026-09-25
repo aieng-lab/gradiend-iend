@@ -10,6 +10,7 @@ from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
 from gradiend.visualizer.convergence import (
     plot_training_convergence,
+    _class_spread_title_suffix,
     _confidence_interval_series,
     _range_series,
     _steps_and_values,
@@ -161,6 +162,33 @@ class TestImgFormatVisualizerOutputPath:
         finally:
             plt.close("all")
 
+    def test_plot_training_convergence_external_legend_with_multiple_axes(self):
+        pytest.importorskip("matplotlib")
+        import matplotlib.pyplot as plt
+
+        classes = {str(i): float(i) / 10 for i in range(6)}
+        feature_classes = {f"feature_{i}": float(i) / 20 for i in range(6)}
+        training_stats = {
+            "training_stats": {
+                "mean_by_class": {0: classes, 1: classes},
+                "mean_by_feature_class": {0: feature_classes, 1: feature_classes},
+                "scores": {0: 0.5, 1: 0.8},
+            },
+            "best_score_checkpoint": {},
+        }
+        try:
+            fig, axes = plot_training_convergence(
+                training_stats=training_stats,
+                show=False,
+                return_fig_ax=True,
+                class_spread="iqr",
+                plot_mean_by_feature_class=True,
+            )
+            assert len(axes) == 3
+            assert len(fig.legends) == 1
+        finally:
+            plt.close("all")
+
     def test_plot_training_convergence_class_spread_ci95(self):
         pytest.importorskip("matplotlib")
         import matplotlib.pyplot as plt
@@ -205,6 +233,13 @@ class TestImgFormatVisualizerOutputPath:
             assert len(collections) >= 1
         finally:
             plt.close("all")
+
+    def test_plot_training_convergence_class_spread_ci95_escapes_percent_for_usetex(self, monkeypatch):
+        pytest.importorskip("matplotlib")
+        import matplotlib as mpl
+
+        monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+        assert _class_spread_title_suffix("ci95") == r" (shaded: 95\% CI)"
 
     def test_plot_encoder_distributions_output_path_uses_img_format(self, tmp_path):
         pytest.importorskip("matplotlib")
@@ -286,6 +321,40 @@ class TestImgFormatVisualizerOutputPath:
             )
             assert fig._suptitle is None
             assert ax.get_title() == ""
+            assert ax.get_title() != "None"
+        finally:
+            plt.close("all")
+
+    def test_plot_encoder_distributions_missing_run_id_does_not_title_none(self):
+        """title=True with no run_id must not render the literal string 'None'."""
+        pytest.importorskip("matplotlib")
+        import matplotlib.pyplot as plt
+
+        trainer = MagicMock()
+        trainer.run_id = None
+        trainer.pair = None
+        trainer.experiment_dir = None
+        trainer.training_args = None
+        trainer._training_args = None
+        trainer.get_model = MagicMock(return_value=None)
+        encoder_df = pd.DataFrame({
+            "encoded": [0.1, -0.2, 0.2, -0.3],
+            "label": [1.0, -1.0, 1.0, -1.0],
+            "source_id": ["1", "2", "1", "2"],
+            "target_id": ["2", "1", "2", "1"],
+            "type": ["training"] * 4,
+        })
+        try:
+            fig, ax = plot_encoder_distributions(
+                trainer=trainer,
+                encoder_df=encoder_df,
+                title=True,
+                show=False,
+                return_fig_ax=True,
+            )
+            assert fig._suptitle is None
+            assert ax.get_title() == ""
+            assert ax.get_title() != "None"
         finally:
             plt.close("all")
 

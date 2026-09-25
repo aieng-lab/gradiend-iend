@@ -24,6 +24,7 @@ class TextGradientTrainingDataset(GradientTrainingDataset):
         *,
         source: str = 'factual',
         target: str = 'diff',
+        expand_encoder_eval_poles: bool = False,
         cache_dir: Optional[str] = None,
         use_cached_gradients: bool = True,
         dtype: torch.dtype = torch.float32,
@@ -31,6 +32,9 @@ class TextGradientTrainingDataset(GradientTrainingDataset):
         return_metadata: bool = False,
         timing_steps: int = 0,
         timing_label: str = "text-gradient",
+        signal: Any = None,
+        signals: Any = None,
+        combine_diff_in_place: bool = False,
     ):
         pad_token_id = getattr(tokenizer, 'pad_token_id', 0) if tokenizer is not None else 0
 
@@ -42,6 +46,7 @@ class TextGradientTrainingDataset(GradientTrainingDataset):
             gradient_creator,
             source=source,
             target=target,
+            expand_encoder_eval_poles=expand_encoder_eval_poles,
             cache_dir=cache_dir,
             use_cached_gradients=use_cached_gradients,
             cache_key_fields=self.CACHE_KEY_FIELDS if (cache_dir and use_cached_gradients) else None,
@@ -51,5 +56,8 @@ class TextGradientTrainingDataset(GradientTrainingDataset):
             get_padding_value=get_padding_value,
             timing_steps=timing_steps,
             timing_label=timing_label,
+            signal=signal,
+            signals=signals,
+            combine_diff_in_place=combine_diff_in_place,
         )
         self.tokenizer = tokenizer

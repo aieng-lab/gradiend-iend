@@ -38,7 +38,12 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 
-from gradiend.model.model import GradiendModel
+from gradiend.model.model import (
+    DEFAULT_INIT_FAN_IN_FLOOR,
+    GradiendComponent,
+    GradiendModel,
+    _coerce_saved_component_slices,
+)
 from gradiend.model.utils import (
     _load_tensor_dict,
     _save_tensor_dict,
@@ -212,12 +217,16 @@ class ParamMappedGradiendModel(GradiendModel):
         param_map: Dict[str, Dict[str, Any]],
         activation_encoder: str = "tanh",
         activation_decoder: str = "id",
+        bias_encoder: bool = True,
         bias_decoder: bool = True,
         torch_dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
         device_encoder: Optional[torch.device] = None,
         device_decoder: Optional[torch.device] = None,
         lazy_init: bool = False,
+        init_fan_in_floor: Optional[int] = DEFAULT_INIT_FAN_IN_FLOOR,
+        component_slices: Optional[List[Union[GradiendComponent, Dict[str, Any]]]] = None,
+        component_split_mode: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -231,6 +240,7 @@ class ParamMappedGradiendModel(GradiendModel):
                 any selection tensor required by the repr.
             activation_encoder: Encoder activation name.
             activation_decoder: Decoder activation name.
+            bias_encoder: Whether the encoder linear layer uses a bias term. Enabled by default.
             bias_decoder: Whether the decoder linear layer uses a bias term.
             torch_dtype: dtype used for model parameters.
             device: Optional default device for both encoder and decoder when specific
@@ -238,6 +248,11 @@ class ParamMappedGradiendModel(GradiendModel):
             device_encoder: Device for encoder parameters.
             device_decoder: Device for decoder parameters.
             lazy_init: If True, do not create encoder/decoder weights; build on prune.
+            init_fan_in_floor: Optional lower bound for component/input fan-in
+                used by fresh encoder/decoder initialization. The default keeps
+                small activation-space components on a conservative random scale
+                while leaving larger gradient-space models unchanged.
+            component_slices: Optional default split metadata over the flattened GRADIEND input space.
             **kwargs: Stored in `self.kwargs` and serialized into config.json metadata
                 on save.
         """
@@ -246,15 +261,20 @@ class ParamMappedGradiendModel(GradiendModel):
             latent_dim=latent_dim,
             activation_encoder=activation_encoder,
             activation_decoder=activation_decoder,
+            bias_encoder=bias_encoder,
             bias_decoder=bias_decoder,
             torch_dtype=torch_dtype,
             device=device,
             device_encoder=device_encoder,
             device_decoder=device_decoder,
             lazy_init=lazy_init,
+            init_fan_in_floor=init_fan_in_floor,
+            component_slices=component_slices,
+            component_split_mode=component_split_mode,
             **kwargs,
         )
         self.param_map = param_map
+        self.mapping_kind = str(kwargs.get("mapping_kind", "gradient") or "gradient")
         self._base_global_index_map: Optional[torch.Tensor] = None
         self._base_global_index_map_version: int = 0
         self._param_map_version: int = 0
@@ -681,6 +701,141 @@ class ParamMappedGradiendModel(GradiendModel):
             else:
                 raise ValueError(f"Unknown param repr {r!r} for {selector.name}")
         return out
+
+    def gradient_cosine_streaming(
+        self,
+        model: torch.nn.Module,
+        backward_fn: Callable[[], Any],
+        direction: torch.Tensor,
+    ) -> float:
+        """Cosine between mapped gradients and ``direction`` without flattening.
+
+        This is the memory-safe readout for full-width gradient directions.  It
+        accumulates ``g·d`` and ``||g||²`` one mapped parameter at a time while
+        backward runs, and clears each parameter's ``.grad`` immediately when
+        supported by PyTorch.  In particular, it never creates the additional
+        model-width tensor that ``extract_gradients(...)->torch.concat`` needs.
+        """
+        base_model = model.module if hasattr(model, "module") else model
+        param_lookup = {}
+        for n, p in base_model.named_parameters():
+            param_lookup[n] = p
+            param_lookup.setdefault(_normalize_param_name(n), p)
+
+        def _get_param_for_map_name(name: str):
+            p = param_lookup.get(name)
+            if p is not None:
+                return p
+            p = param_lookup.get(_normalize_param_name(name))
+            if p is not None:
+                return p
+            p = param_lookup.get(f"module.{name}")
+            if p is not None:
+                return p
+            raise KeyError(
+                f"Parameter '{name}' not found in model.named_parameters(). "
+                f"Examples: {list(param_lookup.keys())[:10]}"
+            )
+
+        selectors = [
+            selector
+            for selector in self._get_compiled_param_selectors()
+            if selector.num_selected > 0
+        ]
+        expected = sum(selector.num_selected for selector in selectors)
+        direction_flat = direction.detach().reshape(-1)
+        if direction_flat.numel() != expected:
+            raise ValueError(
+                f"direction has {direction_flat.numel()} entries, mapped gradient has {expected}"
+            )
+
+        # Every individual model parameter is normally well below BLAS's int32
+        # element-count limit.  Chunk anyway so this remains true for unusual
+        # giant embeddings too.
+        dot_chunk = 1 << 30
+
+        def _dot(a: torch.Tensor, b: torch.Tensor) -> float:
+            total = 0.0
+            for start in range(0, a.numel(), dot_chunk):
+                total += float(
+                    torch.dot(a[start:start + dot_chunk], b[start:start + dot_chunk])
+                )
+            return total
+
+        dot_gd = 0.0
+        norm_g_sq = 0.0
+        cache_key = (
+            direction_flat.data_ptr(),
+            int(getattr(direction_flat, "_version", 0)),
+            direction_flat.numel(),
+            str(direction_flat.device),
+            str(direction_flat.dtype),
+        )
+        cached = getattr(self, "_gradient_cosine_direction_norm_cache", None)
+        norm_d_sq = float(cached[1]) if cached and cached[0] == cache_key else 0.0
+        compute_direction_norm = not (cached and cached[0] == cache_key)
+        handles = []
+        mapped_params = []
+        seen = set()
+        offset = 0
+
+        for selector in selectors:
+            p = _get_param_for_map_name(selector.name)
+            mapped_params.append(p)
+            start = offset
+            stop = start + selector.num_selected
+            offset = stop
+
+            def _make_hook(param_selector: _CompiledParamSelector, lo: int, hi: int):
+                def _hook(grad: torch.Tensor):
+                    nonlocal dot_gd, norm_g_sq, norm_d_sq
+                    g = param_selector.select_from_param_grad(grad).reshape(-1)
+                    d = direction_flat[lo:hi]
+                    if d.device != g.device:
+                        d = d.to(g.device, non_blocking=False)
+                    # Float32 matches the historical flattened cosine while
+                    # bounding temporary storage to one parameter, not one model.
+                    if g.dtype != torch.float32:
+                        g = g.float()
+                    if d.dtype != torch.float32:
+                        d = d.float()
+                    dot_gd += _dot(g, d)
+                    norm_g_sq += _dot(g, g)
+                    if compute_direction_norm:
+                        norm_d_sq += _dot(d, d)
+                    seen.add(param_selector.name)
+                    return grad
+
+                return _hook
+
+            handles.append(p.register_hook(_make_hook(selector, start, stop)))
+            if hasattr(p, "register_post_accumulate_grad_hook"):
+                def _clear_grad(param: torch.nn.Parameter):
+                    param.grad = None
+
+                handles.append(p.register_post_accumulate_grad_hook(_clear_grad))
+
+        try:
+            backward_fn()
+        finally:
+            for handle in handles:
+                handle.remove()
+            for p in mapped_params:
+                p.grad = None
+
+        missing = [selector.name for selector in selectors if selector.name not in seen]
+        if missing:
+            raise RuntimeError(
+                f"Gradients were not collected for parameters: {missing}. "
+                "This indicates a bug in gradient computation."
+            )
+        if compute_direction_norm:
+            self._gradient_cosine_direction_norm_cache = (cache_key, norm_d_sq)
+        if not math.isfinite(dot_gd) or not math.isfinite(norm_g_sq) or not math.isfinite(norm_d_sq):
+            return 0.0
+        if norm_g_sq <= 0.0 or norm_d_sq <= 0.0:
+            return 0.0
+        return dot_gd / math.sqrt(norm_g_sq * norm_d_sq)
 
     def flatten_gradient_dict(self, grad_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -1229,6 +1384,11 @@ class ParamMappedGradiendModel(GradiendModel):
 
         arch = cfg["architecture"]
         meta = cfg.get("metadata") or {}
+        component_slices = cfg.get("components")
+        component_split_mode = cfg.get("component_split_mode")
+        component_slices = _coerce_saved_component_slices(
+            component_slices, component_split_mode, arch["input_dim"]
+        )
 
         model = cls(
             input_dim=arch["input_dim"],
@@ -1236,10 +1396,14 @@ class ParamMappedGradiendModel(GradiendModel):
             param_map=param_map_spec,
             activation_encoder=arch.get("activation_encoder", "tanh"),
             activation_decoder=arch.get("activation_decoder", "id"),
+            bias_encoder=arch.get("bias_encoder", core.bias_encoder),
             bias_decoder=arch.get("bias_decoder", True),
+            init_fan_in_floor=core.init_fan_in_floor,
             torch_dtype=core.torch_dtype,
             device_encoder=core.device_encoder,
             device_decoder=core.device_decoder,
+            component_slices=component_slices,
+            component_split_mode=component_split_mode,
             **meta,
         )
 

@@ -40,8 +40,20 @@ def _make_plotting_data(lrs=(1e-5, 0.001, 0.1, 1.0, 10.0, 100.0, 1000.0), ff=-1.
 def _make_decoder_results(selected_lr=0.1, selected_ff=-1.0):
     """Build decoder_results in flat format (class keys at top level) for target_class 3PL."""
     return {
-        "3SG": {"learning_rate": selected_lr, "feature_factor": selected_ff, "value": 0.5},
-        "3PL": {"learning_rate": selected_lr, "feature_factor": selected_ff, "value": 0.5},
+        "3SG": {
+            "learning_rate": selected_lr,
+            "feature_factor": selected_ff,
+            "value": 0.5,
+            "selection_metric_class": "3SG",
+            "selection_dataset_class": "3PL",
+        },
+        "3PL": {
+            "learning_rate": selected_lr,
+            "feature_factor": selected_ff,
+            "value": 0.5,
+            "selection_metric_class": "3PL",
+            "selection_dataset_class": "3SG",
+        },
         "grid": {},
     }
 
@@ -83,7 +95,13 @@ class TestPlotProbabilityShifts:
         }
         plotting_data = {"plotting_data": grid}
         decoder_results = {
-            "3SG": {"learning_rate": 0.1, "feature_factor": -1.0, "value": 0.55},
+            "3SG": {
+                "learning_rate": 0.1,
+                "feature_factor": -1.0,
+                "value": 0.55,
+                "selection_metric_class": "3SG",
+                "selection_dataset_class": "3PL",
+            },
             "grid": {},
         }
 
@@ -110,6 +128,165 @@ class TestPlotProbabilityShifts:
         assert len(star_scatters) == 1
         _ax, args, _kwargs = star_scatters[0]
         assert args[1] == [0.55]
+
+    def test_strengthen_plot_uses_summary_feature_factor_for_entire_grid_slice(self):
+        """Curves, LMS points, star, and selected LR must come from one FF slice.
+
+        Regression for a subtle multi-feature-factor plot bug: strengthen plots
+        re-derived the feature factor (or fell back to the first sorted one)
+        while taking the selected LR from the summary. Because every FF usually
+        shares the same LR grid, the existing presence check passed and produced
+        a plausible-looking plot whose bisection points belonged to a different
+        intervention direction than its star/dashed line.
+        """
+        pytest.importorskip("matplotlib")
+        grid = {
+            "base": {
+                "probs_by_dataset": {
+                    "A": {"A": 0.5, "B": 0.5},
+                    "B": {"A": 0.5, "B": 0.5},
+                },
+                "lms": {"lms": 0.9},
+            }
+        }
+        for ff, lms_values in ((-1.0, (0.4, 0.3)), (1.0, (0.8, 0.7))):
+            for lr, lms in zip((0.1, 1.0), lms_values):
+                grid[(ff, lr)] = {
+                    "id": {"feature_factor": ff, "learning_rate": lr},
+                    "probs_by_dataset": {
+                        "A": {"A": 0.5 + 0.1 * ff, "B": 0.5 - 0.1 * ff},
+                        "B": {"A": 0.5 + 0.1 * ff, "B": 0.5 - 0.1 * ff},
+                    },
+                    "lms": {"lms": lms},
+                }
+        decoder_results = {
+            "A": {
+                "learning_rate": 1.0,
+                "feature_factor": 1.0,
+                "value": 0.6,
+                "selection_metric_class": "A",
+                "selection_dataset_class": "B",
+            },
+            "grid": {},
+        }
+
+        with patch("matplotlib.pyplot.show"):
+            fig, axes = plot_probability_shifts(
+                decoder_results=decoder_results,
+                plotting_data={"plotting_data": grid},
+                class_ids=["A", "B"],
+                target_class="A",
+                show=False,
+                return_fig_ax=True,
+            )
+
+        try:
+            # The selected summary says ff=+1, whose LMS values are 0.8/0.7.
+            # ff=-1 is the old fallback and would incorrectly plot 0.4/0.3.
+            assert list(axes[0].get_lines()[0].get_ydata()) == [0.9, 0.8, 0.7]
+        finally:
+            __import__("matplotlib").pyplot.close(fig)
+
+    def test_plot_refuses_to_infer_missing_selection_metadata(self):
+        """A renderer must not reconstruct the selector's dataset panel."""
+        pytest.importorskip("matplotlib")
+        decoder_results = _make_decoder_results()
+        del decoder_results["3SG"]["selection_dataset_class"]
+
+        with pytest.raises(ValueError, match="Plotting refuses to infer selection"):
+            plot_probability_shifts(
+                decoder_results=decoder_results,
+                plotting_data=_make_plotting_data(),
+                class_ids=["3SG", "3PL"],
+                target_class="3SG",
+                show=False,
+            )
+
+    def test_missing_probability_cells_plot_as_nan_not_zero(self):
+        """A missing class/dataset probability is an absent measurement, not P=0."""
+        pytest.importorskip("matplotlib")
+        grid = {
+            "base": {
+                "probs_by_dataset": {
+                    "B": {"A": 0.2, "B": 0.8},
+                },
+                "lms": {"lms": 0.5},
+            },
+            (-1.0, 0.1): {
+                "id": {"feature_factor": -1.0, "learning_rate": 0.1},
+                "probs_by_dataset": {
+                    "B": {"A": 0.3},
+                },
+                "lms": {"lms": 0.5},
+            },
+        }
+        decoder_results = {
+            "A": {
+                "learning_rate": 0.1,
+                "feature_factor": -1.0,
+                "value": 0.3,
+                "selection_metric_class": "A",
+                "selection_dataset_class": "B",
+            },
+            "grid": {},
+        }
+
+        with patch("matplotlib.pyplot.show"):
+            fig, axes = plot_probability_shifts(
+                decoder_results=decoder_results,
+                plotting_data={"plotting_data": grid},
+                class_ids=["A", "B"],
+                target_class="A",
+                show=False,
+                return_fig_ax=True,
+            )
+
+        try:
+            probability_lines = axes[1].get_lines()
+            missing_class_y = list(probability_lines[1].get_ydata())
+            assert 0.0 not in missing_class_y
+            assert any(value != value for value in missing_class_y)
+        finally:
+            __import__("matplotlib").pyplot.close(fig)
+
+    def test_missing_selected_probability_cell_raises(self):
+        """The selected metric cell must exist; otherwise the star would be fake."""
+        pytest.importorskip("matplotlib")
+        grid = {
+            "base": {
+                "probs_by_dataset": {
+                    "B": {"A": 0.2, "B": 0.8},
+                },
+                "lms": {"lms": 0.5},
+            },
+            (-1.0, 0.1): {
+                "id": {"feature_factor": -1.0, "learning_rate": 0.1},
+                "probs_by_dataset": {
+                    "B": {"B": 0.7},
+                },
+                "lms": {"lms": 0.5},
+            },
+        }
+        decoder_results = {
+            "A": {
+                "learning_rate": 0.1,
+                "feature_factor": -1.0,
+                "value": 0.3,
+                "selection_metric_class": "A",
+                "selection_dataset_class": "B",
+            },
+            "grid": {},
+        }
+
+        with pytest.raises(ValueError, match=r"probs_by_dataset\['B'\]\['A'\]"):
+            with patch("matplotlib.pyplot.show"):
+                plot_probability_shifts(
+                    decoder_results=decoder_results,
+                    plotting_data={"plotting_data": grid},
+                    class_ids=["A", "B"],
+                    target_class="A",
+                    show=False,
+                )
 
     def test_vertical_line_at_selected_lr(self, tmp_path):
         """Vertical line (axvline) is drawn at selected learning rate on all subplots."""
@@ -226,11 +403,42 @@ class TestPlotProbabilityShifts:
         try:
             assert fig._suptitle is None
             assert axes[0].get_title() == "LMS (Language Modeling Score)"
+            assert axes[0].get_legend() is None
             assert axes[1].get_title() == "Dataset: 3PL — P(class)"
             assert axes[2].get_title() == "Dataset: 3SG — P(class)"
             assert fig.legends
             legend = fig.legends[0]
             assert legend._loc == 9  # upper center
+            assert [text.get_text() for text in legend.get_texts()] == ["3PL", "3SG"]
+        finally:
+            __import__("matplotlib").pyplot.close(fig)
+
+    def test_plot_accepts_figure_title_kwarg(self):
+        """Passing title sets a figure-level suptitle with the shared legend still on top."""
+        pytest.importorskip("matplotlib")
+        plotting_data = _make_plotting_data()
+        decoder_results = _make_decoder_results()
+
+        with patch("matplotlib.pyplot.show"):
+            fig, axes = plot_probability_shifts(
+                decoder_results=decoder_results,
+                plotting_data=plotting_data,
+                class_ids=["3PL", "3SG"],
+                target_class="3PL",
+                show=False,
+                return_fig_ax=True,
+                title="gender_en | steering | target=M",
+            )
+
+        try:
+            assert fig._suptitle is not None
+            assert fig._suptitle.get_text() == "gender_en | steering | target=M"
+            assert axes[0].get_title() == "LMS (Language Modeling Score)"
+            assert axes[0].get_legend() is None
+            assert fig.legends
+            legend = fig.legends[0]
+            # Shared legend stays above the panels, under the title.
+            assert float(legend._bbox_to_anchor._bbox.ymax) >= 0.97
             assert [text.get_text() for text in legend.get_texts()] == ["3PL", "3SG"]
         finally:
             __import__("matplotlib").pyplot.close(fig)
@@ -343,3 +551,7 @@ class TestPlotProbabilityShifts:
         # Strengthen 3SG: P(3SG) on factual 3PL rows
         assert result["probs"]["3SG"] == 0.8
         assert result["probs"]["3PL"] == 0.4
+        assert result["_selection_dataset_by_metric"] == {
+            "3SG": "3PL",
+            "3PL": "3SG",
+        }

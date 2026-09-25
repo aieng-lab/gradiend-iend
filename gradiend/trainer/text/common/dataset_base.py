@@ -36,7 +36,7 @@ class TextBatchedDatasetBase(Dataset, ABC):
         max_size: Optional[int] = None,
         seed: int = 42,
         shuffle_batches: Optional[bool] = None,
-        max_length: int = 256,
+        max_length: int = 128,
         balance_column: Optional[str] = None,
         shuffle_within: Optional[bool] = None,
     ):
@@ -121,6 +121,15 @@ class TextBatchedDatasetBase(Dataset, ABC):
             f"BalancedBatchedTrainingDataset created with {self.total_batches} batches "
             f"({self.total_samples} samples) across {len(self.balance_keys)} balance groups."
         )
+
+    @property
+    def n_balance_groups(self) -> int:
+        """Number of balance groups used by the batch scheduler (at least 1).
+
+        ``source='both'`` reads this so pole alternation stays orthogonal to
+        ``batch_idx % n_balance_groups`` cycling (see ``_both_side_for_batch``).
+        """
+        return max(1, len(self.balance_keys))
 
     def reshuffle(self):
         """Reshuffle batches inside each balance group (call at each epoch)."""

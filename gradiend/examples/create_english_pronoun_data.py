@@ -30,14 +30,14 @@ DEFAULT_OUTPUT_DIR = "data/english_pronouns"
 TRAINING_BASENAME = "training"
 NEUTRAL_BASENAME = "neutral"
 GENERATION_CONFIG_BASENAME = "generation_config.json"
-GENERATION_CONFIG_VERSION = 3
-MAX_SIZE_PER_CLASS = 1000
-NEUTRAL_MAX_SIZE = 1000
+GENERATION_CONFIG_VERSION = 4
+MAX_SIZE_PER_CLASS = 10_000
+NEUTRAL_MAX_SIZE = 10_000
 MIN_LEFT_CONTEXT_WORDS = 5
 # Parquet-based HF dataset (datasets>=4); legacy ``wikipedia`` loading scripts are unsupported.
 WIKIPEDIA_DATASET = "wikimedia/wikipedia"
 WIKIPEDIA_HF_CONFIG = "20231101.en"
-WIKIPEDIA_BASE_MAX_SIZE = 50_000
+WIKIPEDIA_BASE_MAX_SIZE = None
 
 # English pronouns for neutral data exclusion (example-specific)
 NEUTRAL_EXCLUDE_ENGLISH_PRONOUNS = [
@@ -62,6 +62,8 @@ def english_pronoun_generation_config() -> Dict[str, Any]:
         "min_left_context_words": MIN_LEFT_CONTEXT_WORDS,
         "max_size_per_class": MAX_SIZE_PER_CLASS,
         "balance": "try",
+        "deduplicate": True,
+        "drop_ambiguous_masked": True,
         "neutral_max_size": NEUTRAL_MAX_SIZE,
         "neutral_excluded_words": NEUTRAL_EXCLUDE_ENGLISH_PRONOUNS,
     }
@@ -201,6 +203,8 @@ def ensure_english_pronoun_data(
             max_size_per_class=MAX_SIZE_PER_CLASS,
             format="per_class",
             balance="try",
+            deduplicate=True,
+            drop_ambiguous_masked=True,
             min_rows_per_class_for_split=MIN_ROWS_PER_CLASS_FOR_SPLIT,
             raise_on_incomplete_classes=True,
         )

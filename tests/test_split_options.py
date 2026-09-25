@@ -537,7 +537,10 @@ class TestEncoderSplitOptions:
                 "type": ["training"] * 4,
             }
         )
-        metrics = get_encoder_metrics_from_dataframe(encoder_df)
+        metrics = get_encoder_metrics_from_dataframe(
+            encoder_df,
+            generalization_splits=("train", "test"),
+        )
         sg = metrics["split_generalization"]
         assert "agreement" in sg
         assert "white" in sg["agreement_by_feature_class"]
@@ -558,7 +561,7 @@ class TestEncoderSplitOptions:
             other = "black" if cls == "white" else "white"
             rows.append(
                 {
-                    UNIFIED_MASKED: "The person is [MASK].",
+                    UNIFIED_MASKED: "The person is [MASK]",
                     UNIFIED_SPLIT: split,
                     UNIFIED_FACTUAL_CLASS: cls,
                     UNIFIED_ALTERNATIVE_CLASS: other,
@@ -570,7 +573,9 @@ class TestEncoderSplitOptions:
         trainer = TextPredictionTrainer(
             model="distilbert-base-cased",
             target_classes=["white", "black"],
-            args=__import__("gradiend").TrainingArguments(seed=1, experiment_dir=None),
+            args=__import__("gradiend").TrainingArguments(
+                seed=1, experiment_dir=None, add_neutral_identity_transitions=False
+            ),
         )
         trainer._combined_data = pd.DataFrame(rows)
         trainer._data_loaded = True

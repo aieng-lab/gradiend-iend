@@ -1,7 +1,7 @@
 """
 T5 seq2seq GRADIEND with encoder-side MLM (``seq2seq_encoder_mlm``).
 
-Same English 3SG/3PL pronoun data as ``train_english_pronouns.py`` / ``start_workflow.py``,
+Same published English 3SG/3PL pronoun data as ``train_english_pronouns.py``,
 but on ``t5-small``. With ``prediction_objective="auto"``, seq2seq models resolve to
 encoder-side MLM — BERT-like ``[MASK]`` scoring on the encoder stack.
 
@@ -17,17 +17,20 @@ from __future__ import annotations
 from pathlib import Path
 
 from gradiend import TextPredictionTrainer, TrainingArguments
-from gradiend.examples.create_english_pronoun_data import ensure_english_pronoun_data
+from gradiend.examples.english_pronoun_datasets import (
+    EN_PRONOUN_HF_SPLITS,
+    EN_PRONOUNS_HF_DATASET,
+    load_english_pronoun_neutral_data,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATA_DIR = PROJECT_ROOT / "data" / "english_pronouns"
 EXPERIMENT_DIR = PROJECT_ROOT / "runs" / "examples" / "t5_encoder_mlm"
 TARGET_CLASSES = ("3SG", "3PL")
 
 
 if __name__ == "__main__":
-    training_path, neutral_path = ensure_english_pronoun_data(output_dir=str(DATA_DIR))
-    print(f"=== English pronoun data: using CSVs in {DATA_DIR} ===")
+    neutral_data = load_english_pronoun_neutral_data()
+    print(f"=== English pronoun data: using {EN_PRONOUNS_HF_DATASET} ===")
 
     args = TrainingArguments(
         experiment_dir=str(EXPERIMENT_DIR),
@@ -43,9 +46,10 @@ if __name__ == "__main__":
     trainer = TextPredictionTrainer(
         model="t5-small",
         run_id="t5_3sg_3pl_encoder_mlm",
-        data=training_path,
+        hf_dataset=EN_PRONOUNS_HF_DATASET,
+        hf_splits=EN_PRONOUN_HF_SPLITS,
         target_classes=list(TARGET_CLASSES),
-        eval_neutral_data=neutral_path,
+        eval_neutral_data=neutral_data,
         args=args,
     )
 

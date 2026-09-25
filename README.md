@@ -190,7 +190,7 @@ More examples: [gradiend/examples](https://github.com/aieng-lab/gradiend/tree/ma
 Example scripts and notebooks: [gradiend/examples](https://github.com/aieng-lab/gradiend/tree/main/gradiend/examples) on GitHub (not in the pip package; download a file or read to get inspired).
 
 - [start_workflow.py](gradiend/examples/start_workflow.py) — Minimal runnable example
-- [train_english_pronouns.ipynb](gradiend/examples/train_english_pronouns.ipynb) — English pronouns (3SG vs 3PL): data creation from Wikipedia → training → evaluation ([script](gradiend/examples/train_english_pronouns.py))
+- [train_english_pronouns.ipynb](gradiend/examples/train_english_pronouns.ipynb) — English pronouns (3SG vs 3PL): published HF data → training → evaluation ([script](gradiend/examples/train_english_pronouns.py); datasets: [en-pronouns](https://huggingface.co/datasets/aieng-lab/en-pronouns), [en-pronoun-neutral](https://huggingface.co/datasets/aieng-lab/en-pronoun-neutral))
 - [train_sentiment.py](gradiend/examples/train_sentiment.py) — Sentiment example with split-aware evaluation and visualization
 - [train_gender_de.py](gradiend/examples/train_gender_de.py) — German gender (masc_nom vs fem_nom)
 - [train_multi_seed_stability.py](gradiend/examples/train_multi_seed_stability.py) — Multi-seed training and stability comparison
@@ -203,9 +203,54 @@ Example scripts and notebooks: [gradiend/examples](https://github.com/aieng-lab/
 
 **GRADIEND-modified models:** [bert-base-cased-gradiend-gender-debiased](https://huggingface.co/aieng-lab/bert-base-cased-gradiend-gender-debiased), [gpt2-gradiend-gender-debiased](https://huggingface.co/aieng-lab/gpt2-gradiend-gender-debiased), [Llama-3.2-3B-gradiend-gender-debiased](https://huggingface.co/aieng-lab/Llama-3.2-3B-gradiend-gender-debiased), and others.
 
+## Temporary and saved interventions
+
+Use `intervene()` for scoped causal probes without leaving global model state behind:
+
+```python
+with model_with_gradiend.intervene(value=0.5, signal="auto", part="decoder") as intervention:
+    outputs = model_with_gradiend(**inputs)
+    print(intervention["signal"], intervention["num_dimensions"])
+```
+
+`value=0` is a no-op. Gradient-space GRADIEND interventions temporarily apply
+and then roll back a weight delta; activation-space ACTIEND interventions
+temporarily install and remove activation hooks.
+
+For ACTIEND, `evaluate_decoder(target_class=...)` uses a directional encoder
+selector: it applies the decoded activation delta at the trained activation site
+only for tokens whose ACTIEND encoding points toward the selected target-class
+direction. For concept/topic steering during generation, use an unconditional
+runtime selector such as `token_selector="all"`.
+For ablations, keep the two axes separate: `token_selector` chooses where
+steering is allowed, while `activation_gate` optionally adds an ACTIEND
+encoder-fired condition, for example
+`token_selector="prediction", activation_gate="encoder_direction"`.
+Use `activation_modules="transformer.h.9"` to restrict a hooked ACTIEND model
+to one trained activation site for layer/site ablations.
+
+When debugging ACTIEND selectors, measure operational coverage separately from
+encoder AUC/correlation: `activation_selector_coverage(...)` reports how often
+the same selector mask used by hooks would fire on a batch. Low neutral coverage
+is a specificity sanity check; the causal choice should still be judged by
+decoder probability shift under the LMS gate.
+
+Use `modify_model()` for a chosen intervention you want to keep:
+
+```python
+modified = trainer.modify_model(decoder_results=decoder_stats, target_class="3SG")
+modified.save_pretrained_modified("./modified-actiend")
+
+from gradiend import load_modified_model
+reloaded = load_modified_model("./modified-actiend")
+```
+
+Passing `output_dir` to `trainer.modify_model(...)` saves directly and returns
+the saved path.
+
 ## Citation
 
-The Python package paper:
+The [Python package paper](https://arxiv.org/html/2602.23993):
 ```bibtex
 @misc{drechsel2026gradiendpythonpackage,
       title={The {GRADIEND} Python Package: An End-to-End System for Gradient-Based Feature Learning}, 
@@ -218,16 +263,14 @@ The Python package paper:
 }
 ```
 
-The original GRADIEND method paper:
+The original [GRADIEND method paper](https://openreview.net/forum?id=1vBNAnAgCD):
 ```bibtex
-@misc{drechsel2025gradiend,
-  title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases},
-  author={Jonathan Drechsel and Steffen Herbold},
-  year={2025},
-  eprint={2502.01406},
-  archivePrefix={arXiv},
-  primaryClass={cs.LG},
-  url={https://arxiv.org/abs/2502.01406},
+@inproceedings{drechsel2026gradiend,
+    title={{GRADIEND}: Feature Learning within Neural Networks Exemplified through Biases},
+    author={Jonathan Drechsel and Steffen Herbold},
+    booktitle={The Fourteenth International Conference on Learning Representations},
+    year={2026},
+    url={https://openreview.net/forum?id=1vBNAnAgCD}
 }
 ```
 

@@ -69,13 +69,41 @@ EXAMPLE_DATASETS: tuple[DatasetAsset, ...] = (
     ),
     DatasetAsset("aieng-lab/gradiend_race_data", config="white", reason="multi-seed stability"),
     DatasetAsset("aieng-lab/gradiend_race_data", config="black", reason="multi-seed stability"),
+    DatasetAsset("aieng-lab/en-pronouns", split="train", reason="train_english_pronouns"),
+    DatasetAsset("aieng-lab/en-pronouns", split="validation", reason="train_english_pronouns"),
+    DatasetAsset("aieng-lab/en-pronouns", split="test", reason="train_english_pronouns"),
+    DatasetAsset("aieng-lab/en-pronoun-neutral", split="train", reason="English pronoun neutral evaluation"),
+    DatasetAsset(
+        "aieng-lab/en-sentiment-nrc",
+        config="split",
+        split="train",
+        reason="train_sentiment vocabulary-held-out",
+    ),
+    DatasetAsset(
+        "aieng-lab/en-sentiment-nrc",
+        config="split",
+        split="validation",
+        reason="train_sentiment vocabulary-held-out",
+    ),
+    DatasetAsset(
+        "aieng-lab/en-sentiment-nrc",
+        config="split",
+        split="test",
+        reason="train_sentiment vocabulary-held-out",
+    ),
+    DatasetAsset(
+        "aieng-lab/en-sentiment-nrc-neutral",
+        split="train",
+        reason="English sentiment neutral evaluation",
+    ),
+    # Generation showcase (create_english_sentiment_data) still needs the raw sources:
+    DatasetAsset("cardiffnlp/tweet_eval", config="sentiment", split="train", reason="create_english_sentiment_data"),
+    DatasetAsset("cardiffnlp/tweet_eval", config="sentiment", split="validation", reason="create_english_sentiment_data"),
+    DatasetAsset("cardiffnlp/tweet_eval", config="sentiment", split="test", reason="create_english_sentiment_data"),
+    DatasetAsset("vladinc/nrc", split="train", reason="create_english_sentiment_data lexicon"),
     # Wikipedia is handled separately because streaming a few rows does not
     # populate a complete offline cache. _prepare_wikipedia_snapshot()
     # downloads the entire raw dataset repository without preprocessing it.
-    DatasetAsset("cardiffnlp/tweet_eval", config="sentiment", split="train", reason="sentiment data"),
-    DatasetAsset("cardiffnlp/tweet_eval", config="sentiment", split="validation", reason="sentiment data"),
-    DatasetAsset("cardiffnlp/tweet_eval", config="sentiment", split="test", reason="sentiment data"),
-    DatasetAsset("vladinc/nrc", split="train", reason="sentiment lexicon"),
 )
 
 

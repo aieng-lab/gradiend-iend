@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Iterable, Iterator, List, Optional, Union
 
 import pandas as pd
 
@@ -125,6 +125,48 @@ def resolve_base_data(
     return texts
 
 
+def iter_resolved_base_data(
+    source: Union[str, pd.DataFrame, List[str]],
+    text_column: str = "text",
+    max_size: Optional[int] = None,
+    split: str = "train",
+    seed: int = 42,
+    hf_config: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
+) -> Iterable[str]:
+    """Resolve input to an iterable of text strings.
+
+    Unlike :func:`resolve_base_data`, Hugging Face dataset IDs are loaded in
+    streaming mode so callers can scan a full split without materializing it in
+    memory. DataFrames, CSV files, and Python lists keep the existing
+    materialized/shuffled behavior.
+    """
+    if isinstance(source, str):
+        path = Path(source)
+        is_csv_or_path = path.suffix.lower() == ".csv" and path.exists()
+        if not is_csv_or_path:
+            return _iter_hf_string_source(
+                source,
+                text_column,
+                split,
+                hf_config,
+                trust_remote_code,
+                max_size,
+            )
+
+    return iter(
+        resolve_base_data(
+            source,
+            text_column=text_column,
+            max_size=max_size,
+            split=split,
+            seed=seed,
+            hf_config=hf_config,
+            trust_remote_code=trust_remote_code,
+        )
+    )
+
+
 def _load_from_string_source(
     source: str,
     text_column: str,
@@ -178,3 +220,40 @@ def _load_from_string_source(
         raise ValueError(f"HF dataset missing column '{text_column}'. Columns: {list(df.columns)}")
     texts = df[text_column].dropna().astype(str).str.strip().tolist()
     return [x for x in texts if x]
+
+
+def _iter_hf_string_source(
+    source: str,
+    text_column: str,
+    split: str,
+    hf_config: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
+    max_size: Optional[int] = None,
+) -> Iterator[str]:
+    """Stream text rows from a Hugging Face dataset ID."""
+    try:
+        from datasets import load_dataset
+    except ImportError as e:
+        raise ImportError("HuggingFace datasets required for HF source. pip install datasets") from e
+
+    load_kwargs = _hf_load_kwargs(
+        split=split,
+        trust_remote_code=trust_remote_code,
+        streaming=True,
+    )
+    source = normalize_hf_dataset_id(source)
+    if hf_config is not None:
+        ds = load_dataset(source, hf_config, **load_kwargs)
+    else:
+        ds = load_dataset(source, **load_kwargs)
+
+    yielded = 0
+    for row in ds:
+        val = row[text_column] if text_column in row else row.get(text_column)
+        text = str(val).strip() if val is not None else ""
+        if not text:
+            continue
+        yield text
+        yielded += 1
+        if max_size is not None and yielded >= max_size:
+            break

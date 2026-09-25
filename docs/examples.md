@@ -11,12 +11,12 @@ evaluation, and plotting loop is clear.
 ## Quick examples
 
 - [:material-file-code-outline: `start_workflow.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/start_workflow.py) — [Train your first GRADIEND model](start.md)
-- [:material-file-code-outline: `train_english_pronouns.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.py)
+- [:material-file-code-outline: `train_english_pronouns.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.py) — uses the published [`aieng-lab/en-pronouns`](https://huggingface.co/datasets/aieng-lab/en-pronouns) dataset
 - [:material-file-code-outline: `train_gender_de.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_gender_de.py)
 
 ## Real-data workflows
 
-- [:material-file-code-outline: `train_sentiment.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment.py)
+- [:material-file-code-outline: `train_sentiment.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment.py) — uses [`aieng-lab/en-sentiment-nrc`](https://huggingface.co/datasets/aieng-lab/en-sentiment-nrc) (config `split`) + neutrals
 - [:material-file-code-outline: `train_race_symmetric_suite.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_race_symmetric_suite.py) — [Trainer suites](guides/trainer-suites.md)
 - [:material-file-code-outline: `train_sentiment_positive_suite.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment_positive_suite.py)
 - [:material-file-code-outline: `train_sentiment_positive_suite_all_but_one.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment_positive_suite_all_but_one.py)
@@ -50,4 +50,5 @@ For documentation plot regeneration, see [docs/img/README.md](img/README.md) and
 ## Data creation
 
 - [:material-file-code-outline: `create_german_article_data.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/create_german_article_data.py)
-- [:material-file-code-outline: `create_english_pronoun_data.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/create_english_pronoun_data.py)
+- [:material-file-code-outline: `create_english_pronoun_data.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/create_english_pronoun_data.py) — generator for the published English pronoun datasets
+- [:material-file-code-outline: `create_english_sentiment_data.py`](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/create_english_sentiment_data.py) — generator for the published NRC adjective sentiment datasets

@@ -11,7 +11,17 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union, Set
 import numpy as np
 
 from gradiend.util.paths import resolve_output_path, ARTIFACT_CONVERGENCE_PLOT
-from gradiend.visualizer.labels import resolve_highlight_non_convergence, resolve_plot_title_with_convergence
+from gradiend.visualizer.labels import (
+    CORRELATION_LABEL,
+    ENCODED_VALUE_LABEL,
+    MEAN_ENCODED_VALUE_LABEL,
+    escape_matplotlib_usetex_text,
+    resolve_highlight_non_convergence,
+    resolve_plot_title_with_convergence,
+)
+from gradiend.visualizer.components import (
+    plot_training_component_artifacts,
+)
 from gradiend.visualizer.plot_optional import _require_matplotlib
 from gradiend.util.logging import get_logger
 
@@ -42,7 +52,7 @@ def _class_spread_title_suffix(mode: Literal["minmax", "iqr", "ci95"]) -> str:
     if mode == "iqr":
         return " (shaded: IQR)"
     if mode == "ci95":
-        return " (shaded: 95% CI)"
+        return escape_matplotlib_usetex_text(" (shaded: 95% CI)")
     return " (shaded: min-max)"
 
 
@@ -57,6 +67,19 @@ def _normalize_step_keys(d: Dict[str, Any]) -> Dict[int, Any]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def _resolve_plot_output_path(
+    *,
+    output: Optional[str],
+    experiment_dir: Optional[str],
+    img_format: str,
+) -> Optional[str]:
+    out_path = output or resolve_output_path(experiment_dir, None, ARTIFACT_CONVERGENCE_PLOT)
+    if out_path and img_format:
+        ext = img_format if img_format.startswith(".") else f".{img_format}"
+        out_path = os.path.splitext(out_path)[0] + ext
+    return out_path
 
 
 def _steps_and_values(
@@ -202,7 +225,13 @@ def _plot_mean_series_with_range(
         if not pts:
             continue
         xs, ys = zip(*pts)
-        (line,) = ax.plot(xs, ys, label=name_fn(label_key), marker=".", markersize=2)
+        (line,) = ax.plot(
+            xs,
+            ys,
+            label=escape_matplotlib_usetex_text(name_fn(label_key)),
+            marker=".",
+            markersize=2,
+        )
         if show_range and range_series:
             range_pts = sorted(range_series.get(label_key, []))
             if range_pts:
@@ -383,7 +412,7 @@ def draw_convergence_axes(
         )
         if best_step_val is not None:
             ax.axvline(x=best_step_val, color="gray", linestyle="--", alpha=0.8, label="best step")
-        ax.set_ylabel("encoded value")
+        ax.set_ylabel(ENCODED_VALUE_LABEL)
         ax.set_xlabel("Step" if not (plot_mean_by_feature_class or plot_correlation) else "")
         if not use_external_legend:
             leg_kw = {"loc": leg_loc, "fontsize": legend_fontsize}
@@ -394,7 +423,7 @@ def draw_convergence_axes(
         title = "Mean by class"
         if spread_mode and range_by_class:
             title += _class_spread_title_suffix(spread_mode)
-        ax.set_title(title)
+        ax.set_title(escape_matplotlib_usetex_text(title))
         ax_idx += 1
 
     legend_fontsize_fc = 6 if use_external_legend else 8
@@ -413,7 +442,7 @@ def draw_convergence_axes(
         )
         if best_step_val is not None:
             ax.axvline(x=best_step_val, color="gray", linestyle="--", alpha=0.8, label="best step")
-        ax.set_ylabel("Mean encoded value")
+        ax.set_ylabel(MEAN_ENCODED_VALUE_LABEL)
         ax.set_xlabel("Step" if not plot_correlation else "")
         if not use_external_legend:
             leg_kw_fc = {"loc": leg_loc_fc, "fontsize": legend_fontsize_fc}
@@ -424,10 +453,12 @@ def draw_convergence_axes(
         title = "Mean by feature class"
         if spread_mode and range_by_fc:
             title += _class_spread_title_suffix(spread_mode)
-        ax.set_title(title)
+        ax.set_title(escape_matplotlib_usetex_text(title))
         ax_idx += 1
 
-    if use_external_legend and axes:
+    # ``axes`` is a NumPy array for multi-panel plots. Testing the array itself
+    # for truth is ambiguous once it contains more than one axis.
+    if use_external_legend and len(axes) > 0:
         legend_axes = []
         i = 0
         if plot_mean_by_class and series_by_class:
@@ -463,11 +494,11 @@ def draw_convergence_axes(
             ax.axvline(x=best_step_val, color="gray", linestyle="--", alpha=0.8, label="best step")
             if best_corr is not None:
                 ax.scatter([best_step_val], [float(best_corr)], color="red", s=40, zorder=5, label="best")
-        ax.set_ylabel("Correlation")
+        ax.set_ylabel(CORRELATION_LABEL)
         ax.set_xlabel("Step")
         ax.legend(loc="best", fontsize=8)
         ax.grid(True, alpha=0.3)
-        ax.set_title("Correlation")
+        ax.set_title(CORRELATION_LABEL)
 
 
 def plot_training_convergence(
@@ -493,6 +524,7 @@ def plot_training_convergence(
     legend_loc: Optional[str] = None,
     highlight_non_convergence: Optional[bool] = None,
     return_fig_ax: bool = False,
+    log_saved: bool = True,
     **kwargs: Any,
 ) -> Any:
     """
@@ -543,6 +575,7 @@ def plot_training_convergence(
         return_fig_ax: If True, return ``(fig, axes)`` and leave the figure open so callers can
             customize it before showing, saving again, or closing it. Existing saving/display
             behavior still runs when ``output``/``experiment_dir`` or ``show`` are set.
+        log_saved: Whether to log the saved plot path.
         **kwargs: Reserved for compatibility with trainer visualizer wrappers.
 
     Returns:
@@ -574,6 +607,7 @@ def plot_training_convergence(
         raise ValueError("Provide one of trainer, model_path, or training_stats")
 
     plt = _require_matplotlib()
+    exp_dir = experiment_dir or (getattr(trainer, "experiment_dir", None) if trainer is not None else None)
 
     ts = run_info.get("training_stats") or run_info
     if isinstance(ts, dict) and "training_stats" in ts:
@@ -645,18 +679,15 @@ def plot_training_convergence(
         highlight_non_convergence=highlight,
     )
     if resolved_title is not False:
-        fig.suptitle(str(resolved_title), fontsize=10)
+        fig.suptitle(escape_matplotlib_usetex_text(resolved_title), fontsize=10)
     plt.tight_layout()
 
     out_path = None
-    if output:
-        out_path = output
-    else:
-        exp_dir = experiment_dir or (getattr(trainer, "experiment_dir", None) if trainer is not None else None)
-        out_path = resolve_output_path(exp_dir, None, ARTIFACT_CONVERGENCE_PLOT)
-    if out_path and img_format:
-        ext = img_format if img_format.startswith(".") else f".{img_format}"
-        out_path = os.path.splitext(out_path)[0] + ext
+    out_path = _resolve_plot_output_path(
+        output=output,
+        experiment_dir=exp_dir,
+        img_format=img_format,
+    )
 
     if out_path is None and not show and not return_fig_ax:
         raise ValueError(
@@ -669,7 +700,28 @@ def plot_training_convergence(
         if dpi is not None:
             save_kwargs["dpi"] = dpi
         plt.savefig(out_path, **save_kwargs)
-        logger.info("Saved convergence plot: %s", out_path)
+        if log_saved:
+            logger.info("Saved convergence plot: %s", out_path)
+    if not return_fig_ax:
+        try:
+            plot_training_component_artifacts(
+                trainer=trainer,
+                run_info=run_info,
+                output=out_path,
+                experiment_dir=exp_dir,
+                show=False,
+                img_format=img_format,
+                dpi=dpi,
+                plot_mean_by_class=plot_mean_by_class,
+                plot_mean_by_feature_class=plot_mean_by_feature_class,
+                plot_correlation=plot_correlation,
+                class_spread=class_spread,
+                label_name_mapping=label_name_mapping,
+            )
+        except ImportError as e:
+            logger.warning("Skipping component convergence plots: %s", e)
+        except Exception as e:
+            logger.warning("Skipping component convergence plots: %s", e)
     if show:
         plt.show()
     if return_fig_ax:

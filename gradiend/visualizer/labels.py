@@ -11,6 +11,9 @@ from typing import Any, Dict, Optional, Sequence, Tuple, Union
 # the latter is missing from common Matplotlib fonts and can disappear in PDFs.
 NON_CONVERGENCE_MARKER = "†"
 NON_CONVERGENCE_MARKER_TEX = r"\textdagger{}"
+ENCODED_VALUE_LABEL = "Encoded value"
+MEAN_ENCODED_VALUE_LABEL = "Mean encoded value"
+CORRELATION_LABEL = "Correlation"
 
 _TRANSITION_DIRECTED_RE = re.compile(r"\s*(?:->|→)\s*")
 _TRANSITION_BIDI_RE = re.compile(r"\s*(?:<->|↔)\s*")
@@ -19,7 +22,7 @@ PLOTLY_LABEL_OVERRIDES = {
     "color": "Label",
     "data_split": "Split",
     "display_text": "Text",
-    "encoded": "Encoded value",
+    "encoded": ENCODED_VALUE_LABEL,
     "factual": "Factual",
     "factual_token": "Factual token",
     "feature_class": "Feature class",
@@ -45,6 +48,32 @@ def matplotlib_usetex_enabled() -> bool:
         return bool(mpl.rcParams.get("text.usetex", False))
     except Exception:
         return False
+
+
+def escape_matplotlib_usetex_text(text: Any) -> str:
+    """Escape plain text that Matplotlib will pass through LaTeX.
+
+    Matplotlib's ``text.usetex`` sends ordinary labels through LaTeX, where an
+    unescaped percent sign starts a comment and ``<``/``>`` are not valid in
+    text mode. Keep math segments (``$...$``) untouched. Avoid double-escaping
+    already-escaped ``%``, ``\\textless``, and ``\\textgreater``.
+    """
+    value = str(text)
+    if not matplotlib_usetex_enabled():
+        return value
+
+    def _escape_plain(segment: str) -> str:
+        segment = re.sub(r"(?<!\\)%", r"\\%", segment)
+        # Protect already-escaped forms, then escape raw < / >.
+        segment = segment.replace(r"\textless", "\0LESS\0").replace(r"\textgreater", "\0GREATER\0")
+        segment = segment.replace("<", r"\textless{}").replace(">", r"\textgreater{}")
+        return segment.replace("\0LESS\0", r"\textless").replace("\0GREATER\0", r"\textgreater")
+
+    parts = re.split(r"(\$[^$]*\$)", value)
+    return "".join(
+        part if part.startswith("$") and part.endswith("$") else _escape_plain(part)
+        for part in parts
+    )
 
 
 def label_contains_matplotlib_latex(text: Any) -> bool:
@@ -90,16 +119,18 @@ def format_transition_label(label: Any, *, use_latex: Optional[bool] = None) -> 
     mode = resolve_transition_arrow_mode(use_latex=use_latex)
     if mode == "latex":
         if _TRANSITION_BIDI_RE.search(text):
-            return _TRANSITION_BIDI_RE.sub(
+            formatted = _TRANSITION_BIDI_RE.sub(
                 lambda _match: transition_bidi_arrow(use_latex=True),
                 text,
             )
+            return escape_matplotlib_usetex_text(formatted)
         if _TRANSITION_DIRECTED_RE.search(text):
-            return _TRANSITION_DIRECTED_RE.sub(
+            formatted = _TRANSITION_DIRECTED_RE.sub(
                 lambda _match: transition_directed_arrow(use_latex=True),
                 text,
             )
-        return text
+            return escape_matplotlib_usetex_text(formatted)
+        return escape_matplotlib_usetex_text(text)
     if mode == "ascii":
         if _TRANSITION_BIDI_RE.search(text):
             return _TRANSITION_BIDI_RE.sub(" <-> ", text)
@@ -269,7 +300,7 @@ def resolve_highlight_non_convergence(
 
 
 def format_label_with_convergence(
-    label: str,
+    label: Optional[str],
     *,
     converged: Optional[bool] = None,
     highlight_non_convergence: bool = True,
@@ -282,13 +313,15 @@ def format_label_with_convergence(
         converged: Whether the corresponding run converged.
         highlight_non_convergence: Whether to append the marker for non-converged runs.
     """
+    if label is None:
+        return ""
     text = str(label)
     if not highlight_non_convergence or converged is not False:
-        return text
+        return escape_matplotlib_usetex_text(text)
     marker = marker if marker is not None else non_convergence_marker_for_matplotlib()
     if text.endswith(marker) or text.endswith(NON_CONVERGENCE_MARKER):
-        return text
-    return f"{text} {marker}"
+        return escape_matplotlib_usetex_text(text)
+    return escape_matplotlib_usetex_text(f"{text} {marker}")
 
 
 def non_convergence_marker_for_matplotlib() -> str:
@@ -309,7 +342,7 @@ def resolve_plot_title_with_convergence(
     trainer: Any = None,
     run_info: Optional[Dict[str, Any]] = None,
     highlight_non_convergence: bool = True,
-    default: str = "Training convergence",
+    default: Optional[str] = "Training convergence",
 ) -> Union[str, bool]:
     """Resolve plot title and append non-convergence marker when applicable.
 
@@ -319,6 +352,7 @@ def resolve_plot_title_with_convergence(
         run_info: Optional parsed training stats.
         highlight_non_convergence: Whether to mark non-converged runs.
         default: Fallback title when no trainer run id is available.
+            ``None`` means no fallback (disable the title when nothing else is available).
     """
     if title is False or title is None:
         return False
@@ -329,9 +363,14 @@ def resolve_plot_title_with_convergence(
         converged = converged_for_trainer(trainer)
     if title is True:
         base = getattr(trainer, "run_id", None) if trainer is not None else None
-        base = base or default
+        base = base if base is not None else default
     else:
-        base = str(title)
+        base = title
+    if base is None:
+        return False
+    base = str(base)
+    if not base.strip():
+        return False
     if not highlight_non_convergence:
         return base
     return format_label_with_convergence(

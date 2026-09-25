@@ -80,6 +80,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=50,
             format="unified",
+            deduplicate=False,
             min_rows_per_class_for_split=0,
             balance="strict",
             min_rows_per_target_for_balance=10,
@@ -102,6 +103,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=50,
             format="unified",
+            deduplicate=False,
             min_rows_per_class_for_split=0,
             balance="strict",
             min_rows_per_target_for_balance=10,
@@ -126,6 +128,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=50,
             format="unified",
+            deduplicate=False,
             min_rows_per_class_for_split=0,
             balance="try",
             min_rows_per_target_for_balance=10,
@@ -219,6 +222,7 @@ class TestCreatorOutputFormats:
         result = creator.generate_training_data(
             max_size_per_class=30,
             format="unified",
+            deduplicate=False,
             train_ratio=0.8,
             val_ratio=0.1,
             test_ratio=0.1,
@@ -260,7 +264,11 @@ class TestCreatorOutputFormats:
                 output_format="csv",
                 seed=42,
             )
-            result = creator.generate_training_data(max_size_per_class=20, format="unified")
+            result = creator.generate_training_data(
+                max_size_per_class=20,
+                format="unified",
+                deduplicate=False,
+            )
             assert set(result["label_class"]) == {"3SG"}
 
             training_csv = base / "training.csv"
@@ -290,6 +298,7 @@ class TestCreatorOutputFormats:
                 creator.generate_training_data(
                     max_size_per_class=20,
                     format="unified",
+                    deduplicate=False,
                     raise_on_incomplete_classes=True,
                 )
             assert (Path(tmp) / "training.csv").is_file()
@@ -513,6 +522,92 @@ class TestCreatorOutputDirAndSave:
 
         assert calls == {"class_0": 1, "class_1": 1, "class_2": 1}
 
+    def test_generate_training_data_streams_hf_source_without_base_cap(self, monkeypatch):
+        class _StreamingRows:
+            def __iter__(self):
+                rows = [
+                    {"text": "He walks."},
+                    {"text": "They run."},
+                    {"text": "He returns."},
+                    {"text": "They leave."},
+                    {"text": "He should not be needed."},
+                ]
+                return iter(rows)
+
+            def to_pandas(self):
+                raise AssertionError("HF source should not be materialized")
+
+        calls = []
+
+        def fake_load_dataset(repo_id, hf_config=None, **kwargs):
+            calls.append((repo_id, hf_config, kwargs))
+            assert kwargs["streaming"] is True
+            return _StreamingRows()
+
+        monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+        creator = TextPredictionDataCreator(
+            base_data="example/wiki",
+            hf_config="20231101.en",
+            feature_targets=[
+                TextFilterConfig(id="3SG", targets=["he"]),
+                TextFilterConfig(id="3PL", targets=["they"]),
+            ],
+            min_left_context_words=0,
+            base_max_size=None,
+            seed=42,
+        )
+        result = creator.generate_training_data(
+            max_size_per_class=2,
+            format="unified",
+            min_rows_per_class_for_split=0,
+            balance=False,
+        )
+
+        assert len(calls) == 1
+        assert calls[0][0] == "example/wiki"
+        assert calls[0][1] == "20231101.en"
+        assert result["label_class"].value_counts().to_dict() == {"3SG": 2, "3PL": 2}
+
+    def test_classification_training_data_streams_hf_source_without_base_cap(self, monkeypatch):
+        class _StreamingRows:
+            def __iter__(self):
+                return iter(
+                    [
+                        {"text": "positive example"},
+                        {"text": "negative example"},
+                    ]
+                )
+
+            def to_pandas(self):
+                raise AssertionError("HF source should not be materialized")
+
+        calls = []
+
+        def fake_load_dataset(repo_id, hf_config=None, **kwargs):
+            calls.append((repo_id, hf_config, kwargs))
+            assert kwargs["streaming"] is True
+            return _StreamingRows()
+
+        monkeypatch.setattr("datasets.load_dataset", fake_load_dataset)
+
+        creator = TextClassificationDataCreator(
+            base_data="example/classification",
+            hf_config="demo",
+            label_fn=lambda text: "positive" if "positive" in text else "negative",
+            base_max_size=None,
+            seed=42,
+        )
+        result = creator.generate_training_data(
+            min_rows_for_split=0,
+            balance=False,
+        )
+
+        assert len(calls) == 1
+        assert calls[0][0] == "example/classification"
+        assert calls[0][1] == "demo"
+        assert set(result["label"]) == {"positive", "negative"}
+
 
 class TestSplitByTarget:
     """Vocabulary-held-out splits: each target token confined to one split."""
@@ -557,6 +652,7 @@ class TestSplitByTarget:
             max_size_per_class=20,
             format="unified",
             min_rows_per_class_for_split=0,
+            drop_ambiguous_masked=False,
         )
         for label in result["label"].dropna().unique():
             splits = result.loc[result["label"] == label, "split"].unique()
@@ -583,3 +679,55 @@ class TestSplitByTarget:
         hate_splits = out.loc[out["label"].str.casefold() == "hate", "split"].unique()
         assert len(hate_splits) == 1
         assert apply_split_group_key(" AMAZING ", [str.strip, str.casefold]) == "amazing"
+
+
+def test_prediction_creator_deduplicates_before_cap_and_keeps_scanning():
+    from gradiend import TextFilterConfig, TextPredictionDataCreator
+
+    creator = TextPredictionDataCreator(
+        base_data=["Alpha he runs.", "Alpha he runs.", "Beta he walks."],
+        feature_targets=[TextFilterConfig(target="he", id="3SG")],
+        min_left_context_words=0,
+        download_if_missing=False,
+    )
+    result = creator.generate_training_data(
+        max_size_per_class=2,
+        balance=False,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        min_rows_per_class_for_split=0,
+    )
+
+    assert len(result["3SG"]) == 2
+    assert result["3SG"]["masked"].nunique() == 2
+
+
+def test_prediction_creator_drops_masked_prompts_with_conflicting_targets():
+    from gradiend import TextFilterConfig, TextPredictionDataCreator
+
+    creator = TextPredictionDataCreator(
+        base_data=[
+            "Alpha he runs.",
+            "Alpha she runs.",
+            "Beta he walks.",
+            "Gamma she waits.",
+        ],
+        feature_targets=[
+            TextFilterConfig(target="he", id="3SG_M"),
+            TextFilterConfig(target="she", id="3SG_F"),
+        ],
+        min_left_context_words=0,
+        download_if_missing=False,
+    )
+    result = creator.generate_training_data(
+        balance=False,
+        train_ratio=1.0,
+        val_ratio=0.0,
+        test_ratio=0.0,
+        min_rows_per_class_for_split=0,
+    )
+
+    all_masked = set(result["3SG_M"]["masked"]) | set(result["3SG_F"]["masked"])
+    assert "Alpha [MASK] runs." not in all_masked
+    assert all(len(frame) == 1 for frame in result.values())

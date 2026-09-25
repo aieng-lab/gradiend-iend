@@ -17,6 +17,8 @@ from gradiend.util.encoder_splits import order_split_names
 from gradiend.util.logging import get_logger
 from gradiend.util.paths import ARTIFACT_ENCODER_PLOT, resolve_output_path
 from gradiend.visualizer.labels import (
+    ENCODED_VALUE_LABEL,
+    escape_matplotlib_usetex_text,
     resolve_highlight_non_convergence,
     resolve_plot_title_with_convergence,
 )
@@ -235,7 +237,14 @@ def _apply_point_labels(
     if not texts:
         return
     text_artists = [
-        ax.text(float(x), float(y), str(t), fontsize=fontsize, ha="center", va="bottom")
+        ax.text(
+            float(x),
+            float(y),
+            escape_matplotlib_usetex_text(t),
+            fontsize=fontsize,
+            ha="center",
+            va="bottom",
+        )
         for x, y, t in zip(xs, ys, texts)
         if t
     ]
@@ -507,16 +516,16 @@ def plot_encoder_strip_by_split(
                 s=point_size**2,
                 color=palette[hi % len(palette)],
                 alpha=0.85,
-                label=str(hue_val),
+                label=escape_matplotlib_usetex_text(hue_val),
                 edgecolors="none",
             )
 
     ax.set_xticks(range(len(group_order)))
     ax.set_xticklabels(group_order)
-    ax.set_ylabel("Encoded value")
+    ax.set_ylabel(ENCODED_VALUE_LABEL)
     ax.set_xlabel(encoder_plot_xlabel(includes_neutral_groups=includes_neutral))
     if plot_title:
-        ax.set_title(str(plot_title))
+        ax.set_title(escape_matplotlib_usetex_text(plot_title))
     if n_hue > 1:
         ax.legend(title="Split", loc="best", fontsize=8)
 

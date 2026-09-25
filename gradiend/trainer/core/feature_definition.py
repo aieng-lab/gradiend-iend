@@ -17,6 +17,7 @@ import os
 
 from gradiend.trainer.core.protocols import DataProvider
 from gradiend.trainer.core.config import validate_source_target
+from gradiend.trainer.core.split_col_modes import data_split_column
 from gradiend.trainer.core.unified_schema import UNIFIED_SPLIT
 from gradiend.util.deprecation import resolve_include_other_classes
 from gradiend.util.paths import (
@@ -117,7 +118,9 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def _resolve_eval_group(self, source: Optional[str] = None) -> str:
         resolved_source = self._default_from_training_args(source, "source", fallback="factual")
-        return "factual_id" if resolved_source == "factual" else "feature_class_id"
+        # both compiles each batch to factual/diff (with optional fac↔alt swap),
+        # so factual_id describes the encoded pole after that transform.
+        return "factual_id" if resolved_source in ("factual", "both") else "feature_class_id"
 
     @property
     def eval_group(self) -> str:
@@ -215,8 +218,11 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def get_target_feature_class_ids(self) -> Optional[List[Any]]:
         """
-        Feature class IDs used for target classes (for stratification, e.g. pre_prune).
-        Neutral/identity classes are excluded. Override in subclasses; base returns None.
+        Keys used for pole / class stratification (balance groups, legacy pre-prune).
+
+        Text prediction uses named poles (``pos`` / ``neg``) matching ``feature_pole``.
+        Pre-prune prefers :meth:`get_target_feature_classes` on ``factual_id`` when
+        available. Neutral/identity classes are excluded. Override in subclasses; base raises.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement get_target_feature_class_ids() "
@@ -225,10 +231,11 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def get_target_feature_classes(self) -> Optional[List[str]]:
         """
-        Return target feature classes as string IDs when possible.
+        Semantic target class names for decoder / metrics (strings).
 
-        Uses get_target_feature_class_ids() and maps via map_target_feature_class_ids().
-        This is used by the target_classes property.
+        Default: map :meth:`get_target_feature_class_ids` via
+        :meth:`map_target_feature_class_ids`. Subclasses may override when names are not
+        a 1:1 map from pole keys (e.g. one-pole text prediction).
         """
         ids = self.get_target_feature_class_ids()
         mapped = self.map_target_feature_class_ids(ids)
@@ -238,11 +245,11 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
     def map_target_feature_class_ids(self, ids: Optional[List[Any]]) -> Optional[List[Any]]:
         """
-        Map target feature class IDs to string class IDs when possible.
+        Map target feature class IDs / pole keys to string class IDs when possible.
 
         Default behavior:
 
-        - If `pair` is available (exactly 2 target classes) and ids are 0/1 (int or float), map to pair[0]/pair[1].
+        - If `pair` is available and ids are ``pos``/``neg`` (or legacy 0/1), map to pair[0]/pair[1].
         - Else if target_classes are available and ids are integer indices, map to target_classes[idx].
         - Otherwise return ids unchanged.
         """
@@ -253,8 +260,10 @@ class FeatureLearningDefinition(DataProvider, ABC):
         if pair is not None:
             mapped: List[Any] = []
             for v in ids:
-                if isinstance(v, (int, float)) and v in (0, 1):
-                    mapped.append(pair[int(v)])
+                if v in ("pos", 0, 0.0) or (isinstance(v, (int, float)) and int(v) == 0):
+                    mapped.append(pair[0])
+                elif v in ("neg", 1, 1.0) or (isinstance(v, (int, float)) and int(v) == 1):
+                    mapped.append(pair[1])
                 else:
                     mapped.append(v)
             return mapped
@@ -409,7 +418,26 @@ class FeatureLearningDefinition(DataProvider, ABC):
                 f"{type(self).__name__}.create_model_with_gradiend() requires a model_with_gradiend_cls "
                 "argument or a default_model_with_gradiend_cls property on the definition."
             )
-        return cls.from_pretrained(load_directory, **kwargs)
+        model = cls.from_pretrained(load_directory, **kwargs)
+        self._configure_model(model)
+        return model
+
+    def _configure_model(self, model: ModelWithGradiend) -> None:
+        """Hook: stamp run-level configuration on every model this definition hands out.
+
+        Every model reaches callers through :meth:`create_model_with_gradiend`
+        (``get_model``, ``load_model`` and training), so configuration that
+        single-row code paths need but the model cannot derive itself is set here
+        once. Modalities override this; the default is a no-op.
+        """
+        """Whether a shared neutral pool is configured (modality hook; default: no)."""
+        return False
+
+    def neutral_identity_transitions_enabled(self, args: Any = None) -> bool:
+        """Resolve ``TrainingArguments.add_neutral_identity_transitions`` (``None`` = auto)."""
+        args = args if args is not None else getattr(self, "training_args", None)
+        flag = getattr(args, "add_neutral_identity_transitions", None)
+        return self._has_shared_neutral_data() if flag is None else bool(flag)
 
     def resolve_split_for_role(self, role: str) -> str:
         """
@@ -441,21 +469,21 @@ class FeatureLearningDefinition(DataProvider, ABC):
             **kwargs: Keyword arguments defined by the concrete trainer.
 
         Returns:
-            Training dataset compatible with GradientTrainingDataset
+            Training dataset compatible with SignalTrainingDatasetBase.
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement create_training_data")
 
     @abstractmethod
     def create_gradient_training_dataset(self, *args, **kwargs):
         """
-        Create training dataset with gradient computation, wrapping the raw training data.
+        Create signal training dataset, wrapping the raw training data.
 
         Args:
             *args: Positional arguments defined by the concrete trainer.
             **kwargs: Keyword arguments defined by the concrete trainer.
 
         Returns:
-            Gradient-aware dataset used by the core training loop.
+            Signal-aware dataset used by the core training loop.
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement create_gradient_training_dataset")
 
@@ -476,7 +504,8 @@ class FeatureLearningDefinition(DataProvider, ABC):
         Create evaluation data for encoder/decoder evaluation.
 
         Generic implementation: create raw training data via create_training_data,
-        then wrap via create_gradient_training_dataset (modality-specific).
+        then wrap via create_gradient_training_dataset (legacy name; modality-specific
+        signal dataset construction).
 
         Uses encoder_eval_balance from training args to set balance_column for
         create_training_data. For factual-source evaluation the natural balancing
@@ -485,7 +514,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
         Args:
             model_with_gradiend:
-                Model used to create gradients / encoder values for evaluation.
+                Model used to create signal tensors / encoder values for evaluation.
             split:
                 Dataset split to evaluate. Defaults to ``"validation"``.
             source:
@@ -515,8 +544,10 @@ class FeatureLearningDefinition(DataProvider, ABC):
 
         Returns:
             Evaluation dataset compatible with encoder analysis. The returned
-            gradient dataset always uses ``target=None`` because encoder
-            evaluation only encodes ``source`` gradients.
+            signal dataset always uses ``target=None`` because encoder
+            evaluation only encodes ``source`` signals. For **one-pole** configs,
+            poles are expanded so bipolar metrics remain defined; normal two-pole
+            runs encode only the configured ``source`` (no fac/alt expand).
         """
         source = self._default_from_training_args(source, "source", fallback="factual")
         validate_source_target("source", source)
@@ -562,6 +593,16 @@ class FeatureLearningDefinition(DataProvider, ABC):
             for k, v in kwargs.items()
             if k not in ("include_other_classes", "use_all_transitions", "transition_selection", "encoder_eval_balance", "target")
         }
+        # One-pole only: expand fac/alt so correlation still sees ±1. Never for
+        # normal two-pole gender/etc. (encode source texts only).
+        is_one_pole = False
+        checker = getattr(self, "_is_one_pole_config", None)
+        if callable(checker):
+            try:
+                is_one_pole = bool(checker())
+            except Exception:
+                is_one_pole = False
+        grad_kwargs.setdefault("expand_encoder_eval_poles", is_one_pole)
         return self.create_gradient_training_dataset(
             raw,
             model_with_gradiend,
@@ -575,7 +616,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
     def _get_expected_encoder_keys(self, source_type: str) -> FrozenSet[Any]:
         """
         Expected (source_id, target_id) or source_id keys for encoder analysis, without iterating eval data.
-        Modality-independent; uses definition.target_classes, definition.pair, definition.training_args.add_identity_for_other_classes.
+        Modality-independent; uses definition.target_classes, definition.pair, and identity augmentation flags.
         When add_identity_for_other_classes=False: every pair of classes (excluding identities).
         When add_identity_for_other_classes=True: the two training transitions + identity pairs for non-target
         classes only (all_classes \\ target_classes; none if all_classes equals target_classes).
@@ -585,18 +626,25 @@ class FeatureLearningDefinition(DataProvider, ABC):
         pair = self.pair
         if not target_classes:
             return frozenset()
-        neutral_aug = getattr(getattr(self, "training_args", None), "add_identity_for_other_classes", False)
+        args = getattr(self, "training_args", None)
+        neutral_aug = getattr(args, "add_identity_for_other_classes", False)
+        neutral_identity_aug = self.neutral_identity_transitions_enabled(args)
         if source_type == "factual":
-            return frozenset(target_classes)
-        if not neutral_aug:
+            keys = set(target_classes)
+            if neutral_identity_aug:
+                keys.add("neutral")
+            return frozenset(keys)
+        if not neutral_aug and not neutral_identity_aug:
             return frozenset((s, t) for s in target_classes for t in target_classes if s != t)
         if pair is None:
             return frozenset()
         c1, c2 = pair[0], pair[1]
-        training = frozenset({(c1, c2), (c2, c1)})
+        training = {(c1, c2), (c2, c1)}
         # Identity only for non-target classes (all_classes \ target_classes)
-        identity_others = frozenset((c, c) for c in (self.non_target_classes or []))
-        return training | identity_others
+        training.update((c, c) for c in (self.non_target_classes or []) if neutral_aug)
+        if neutral_identity_aug:
+            training.add(("neutral", "neutral"))
+        return frozenset(training)
 
     @abstractmethod
     def _get_decoder_eval_dataframe(

@@ -73,6 +73,7 @@ def test_create_training_data_loads_mlm_head_labels_from_run_experiment_dir():
             args=TrainingArguments(
                 experiment_dir=str(base_exp),
                 prediction_objective="clm_mlm_head",
+                add_neutral_identity_transitions=False,
             ),
         )
         trainer._prediction_objective = lambda _tokenizer=None: mock_objective

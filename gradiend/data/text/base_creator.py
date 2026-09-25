@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Union
 
 import pandas as pd
 
 from gradiend.data.core import split_dataframe
-from gradiend.data.core.base_loader import resolve_base_data
+from gradiend.data.core.base_loader import iter_resolved_base_data, resolve_base_data
 from gradiend.util.logging import get_logger
 
 logger = get_logger(__name__)
@@ -93,6 +93,38 @@ class TextDataCreator(ABC):
         self._data_cache = _resolve(self.base_data)
         return self._data_cache
 
+    def _iter_data(
+        self,
+        base_override: Optional[Union[str, pd.DataFrame, List[str]]] = None,
+    ) -> Iterable[str]:
+        """Return text rows, streaming Hugging Face sources when possible."""
+        def _is_hf_source(src: Union[str, pd.DataFrame, List[str]]) -> bool:
+            return isinstance(src, str) and Path(src).suffix.lower() != ".csv"
+
+        if base_override is not None:
+            return iter_resolved_base_data(
+                base_override,
+                text_column=self.text_column,
+                max_size=self.base_max_size,
+                split=self.split,
+                seed=self.seed,
+                hf_config=self.hf_config if _is_hf_source(base_override) else None,
+                trust_remote_code=self.trust_remote_code if _is_hf_source(base_override) else None,
+            )
+        if self._data_cache is not None:
+            return iter(self._data_cache)
+        if _is_hf_source(self.base_data):
+            return iter_resolved_base_data(
+                self.base_data,
+                text_column=self.text_column,
+                max_size=self.base_max_size,
+                split=self.split,
+                seed=self.seed,
+                hf_config=self.hf_config,
+                trust_remote_code=self.trust_remote_code,
+            )
+        return iter(self._get_data())
+
     def _get_extension(self) -> str:
         """File extension for output format. Override for formats like 'hf' (no ext)."""
         if self.output_format == "csv":
@@ -137,8 +169,8 @@ class LabelDataCreator(TextDataCreator):
         ...
 
     def _build_labeled_dataframe(self) -> pd.DataFrame:
-        """Build labeled DataFrame from _get_data() and _label(), no max_size or split. For use before balance/split."""
-        data = self._get_data()
+        """Build labeled DataFrame from _iter_data() and _label(), no max_size or split. For use before balance/split."""
+        data = self._iter_data()
         rows: List[Dict[str, Any]] = []
         self._last_generation_interrupted = False
         try:
@@ -164,8 +196,8 @@ class LabelDataCreator(TextDataCreator):
         split_col: str,
         min_rows_for_split: int,
     ) -> pd.DataFrame:
-        """Build labeled DataFrame from _get_data() and _label(). Modality-independent."""
-        data = self._get_data()
+        """Build labeled DataFrame from _iter_data() and _label(). Modality-independent."""
+        data = self._iter_data()
         rows: List[Dict[str, Any]] = []
         self._last_generation_interrupted = False
         try:

@@ -40,16 +40,18 @@ def _release_test_memory():
     """Close matplotlib figures between tests (full suite can otherwise grow)."""
     yield
     _close_matplotlib_figures()
-    if os.environ.get("GRADIEND_GC_EACH_TEST") == "1":
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def pytest_configure(config):
-    repo_basetemp = Path(__file__).resolve().parents[1] / ".pytest_tmp_local"
-    repo_basetemp.mkdir(parents=True, exist_ok=True)
-    config.option.basetemp = str(repo_basetemp)
+    # Keep the repository-local default, but honor an explicit pytest
+    # ``--basetemp`` so constrained runners can select a writable location.
+    if config.option.basetemp is None:
+        repo_basetemp = Path(__file__).resolve().parents[1] / ".pytest_tmp_local"
+        repo_basetemp.mkdir(parents=True, exist_ok=True)
+        config.option.basetemp = str(repo_basetemp)
 
     if os.environ.get("GRADIEND_PROFILE_TEST_MEMORY") != "1":
         return
