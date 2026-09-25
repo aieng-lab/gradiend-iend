@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from gradiend.model import ParamMappedGradiendModel
-from gradiend.trainer.signal import SignalPairDataset, SignalTrainer
+from gradiend.trainer.signal_trainer import SignalPairDataset, SignalTrainer
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.core.signals import Signal
 from gradiend.trainer.text.prediction.model_with_gradiend import TextPredictionModelWithGradiend

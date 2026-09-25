@@ -4,31 +4,25 @@ Training vs decoder evaluation
 ------------------------------
 
 * **Training** uses ``TrainingArguments.source`` for which gradients feed the encoder
-
   (``factual``, ``alternative``, ``diff``, or ``both``).
 
 * ``source="both"`` alternates the encoder pole **per training batch** (factual on even
-
   batch indices, alternative on odd). Internally each batch is compiled to the
   existing ``factual`` + ``diff`` path by optionally swapping factual/alternative
   (and inverting the label) so target is always ``input − opposite``.
 
 * **Encoder evaluation** (``target=None``) encodes the configured training
-
   ``source`` only (``factual`` / ``alternative`` / ``diff``). It does **not**
   expand each row to both poles on normal two-pole data.
 
 * **One-pole exception:** when ``expand_encoder_eval_poles=True``, encoder eval
-
   expands each base example to both poles so labels ``+1`` and ``-1`` remain
   available for correlation (a single factual class would otherwise be unipolar).
 
 * **``source="both"``:** encoder eval still visits both poles (that *is* the source).
 
 * **Decoder rewrite/intervention** uses ``model.source`` and ``model.target``
-
   (persisted in ``gradiend_context.json``) to
-
   pick the default ``feature_factor`` sign per class. It is set once before training
   via :func:`sync_model_source_target_from_training_args` and must not be overwritten
   when loading a finished checkpoint for analysis.
@@ -201,13 +195,11 @@ def resolve_model_signal_kind(model: Any, trainer: Any = None, *, default: str =
     gradiend = getattr(model, "gradiend", None) if model is not None else None
     mapping_kind = getattr(gradiend, "mapping_kind", None)
     if mapping_kind is not None:
-        # activation_gradient (dL/dh) is an activation-space signal for intervention
-        # sign semantics -- steered in activation space, not weight-rewritten.
-        return (
-            "activation"
-            if str(mapping_kind).strip().lower() in ("activation", "activation_gradient")
-            else "gradient"
-        )
+        # ``activation_gradient`` is applied through activation hooks, but the
+        # decoded vector still represents dL/dh.  Strengthening therefore uses
+        # gradient sign semantics (move against the loss gradient), unlike an
+        # ACTIEND activation displacement which is added directly.
+        return "activation" if str(mapping_kind).strip().lower() == "activation" else "gradient"
 
     if trainer is not None:
         args = getattr(trainer, "_training_args", None) or getattr(trainer, "training_args", None)

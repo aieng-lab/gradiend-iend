@@ -212,17 +212,13 @@ def scope_mode(scope: Any) -> str:
 
 
 def scope_params(scope: Any, *, base_model: Optional[nn.Module] = None) -> Optional[Tuple[str, ...]]:
-    """Return parameter patterns carried by a SignalScope-like object.
+    """Return the weight-parameter patterns selected by a scope.
 
-    ``scope.params`` (an explicit include-list) always wins when present. When
-    it is absent but the scope carries a semantic ``activation_selector``
-    (``SignalScope.layers()``/``.layer()``/``.embeddings()``/``.word_embedding()``)
-    and ``base_model`` is given, resolves it into weight-parameter wildcards
-    via ``gradient_params_from_selector`` -- see that function's docstring for
-    why this matters (a gradient signal used to silently ignore that field
-    entirely). ``base_model=None`` (the default, for callers that only need
-    ``scope.params`` and have no model handy) preserves the old behavior of
-    returning ``None`` when only a selector is set.
+    An explicit ``scope.params`` include-list always wins. Otherwise, when the scope
+    carries a semantic ``activation_selector`` (``SignalScope.layers()`` etc.) and
+    ``base_model`` is given, the selector is resolved into parameter wildcards via
+    :func:`gradient_params_from_selector`. Without ``base_model`` such a scope
+    yields ``None`` (no restriction known).
     """
     if scope is None:
         return None
@@ -465,35 +461,16 @@ def _activation_sites_from_selector(base_model: nn.Module, selector: Tuple[Any, 
 
 
 def gradient_params_from_selector(base_model: nn.Module, selector: Tuple[Any, ...]) -> Tuple[str, ...]:
-    """Translate a semantic ``SignalScope`` selector (``.layers()``/``.layer()``/
-    ``.embeddings()``/``.word_embedding()``) into weight-parameter wildcard
-    patterns for a gradient signal, via the same architecture-agnostic
-    ``ModelTopology`` the activation-signal path already uses.
+    """Translate a semantic ``SignalScope`` selector into weight-parameter wildcards.
 
-    ``SignalScope``'s semantic shortcuts are documented as scope metadata
-    independent of signal kind, but only the activation-signal path
-    (``resolve_activation_modules``, via ``_activation_sites_from_selector``)
-    actually resolved them -- ``scope_params``/``scope_mode`` (what a gradient
-    signal's weight-parameter scope is built from, see
-    ``gradiend/model/core/backbone.py::build_gradiend_from_base_model``) never
-    consulted ``activation_selector`` at all, so attaching e.g.
-    ``SignalScope.layers()`` to ``Signal.gradient()`` silently resolved to no
-    scope restriction whatsoever. Fixed by resolving the same selector into
-    module paths via ``_activation_sites_from_selector`` (identical topology,
-    identical error messages for out-of-range layers / unsupported
-    architectures) and appending ``.*`` so each path becomes a parameter-name
-    wildcard matching every weight under that module -- module dotted-paths
-    match nothing on their own in ``named_parameters()``, only their leaf
-    parameters do.
+    ``SignalScope.layers()/.layer()/.embeddings()/.word_embedding()`` name modules via
+    the model's :class:`~gradiend.model_topology.ModelTopology`. A gradient signal is
+    measured on *parameters*, so each resolved module path ``m`` becomes the wildcard
+    ``m.*`` (module paths alone match no parameter name).
 
-    Note this is deliberately narrower than "backbone minus embeddings": for
-    gpt2, ``topology.layers`` covers only ``transformer.h.*`` (the residual
-    blocks), not the final ``transformer.ln_f`` layer norm applied after the
-    last block -- that's consistent with ``.layers()``'s own documented
-    "transformer-layer outputs" semantics, but callers wanting backbone-minus-
-    embeddings specifically (as opposed to residual-blocks-only) should keep
-    using an explicit ``SignalScope.from_values(params=[...])`` include-list
-    instead.
+    The selection is deliberately narrow: ``layers()`` covers the residual blocks
+    only (e.g. ``transformer.h.*`` for GPT-2, not the final layer norm). Use
+    ``SignalScope.from_values(params=[...])`` for anything else.
     """
     sites = _activation_sites_from_selector(base_model, selector)
     return tuple(f"{site}.*" for site in sites)

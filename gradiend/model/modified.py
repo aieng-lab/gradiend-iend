@@ -11,6 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from gradiend.util.hook_outputs import first_tensor as _first_tensor, replace_first_tensor as _replace_first_tensor
+from gradiend.util.positions import last_real_token_positions
+
 
 MODIFIED_CONFIG_NAME = "gradiend_modified_config.json"
 MODIFIED_TENSORS_NAME = "gradiend_modified_tensors.pt"
@@ -21,59 +24,33 @@ def _named_modules(model: nn.Module) -> Dict[str, nn.Module]:
     return dict(model.named_modules())
 
 
+def _module_name_candidates(name: str) -> List[str]:
+    """``name`` first, then where multimodal wrappers put the text stack.
+
+    Gemma-3 4B/27B (and other vision-language checkpoints) load as a conditional-generation model whose
+    decoder layers live under ``language_model``: ``model.language_model.layers.N`` in current
+    transformers, ``language_model.model.layers.N`` in the 4.50-4.51 layout. A text-only checkpoint of the
+    same family (Gemma-3 270M) keeps ``model.layers.N``, so one registry template cannot name both.
+    """
+    candidates = [name]
+    if name.startswith("model."):
+        candidates.append("model.language_model." + name[len("model."):])
+    candidates.append("language_model." + name)
+    return candidates
+
+
 def _resolve_module(model: nn.Module, name: str) -> nn.Module:
     modules = _named_modules(model)
-    if name not in modules:
-        raise KeyError(f"Activation intervention module {name!r} not found in model")
-    return modules[name]
-
-
-def _first_tensor(value: Any) -> torch.Tensor:
-    if torch.is_tensor(value):
-        return value
-    if isinstance(value, Mapping):
-        for item in value.values():
-            try:
-                return _first_tensor(item)
-            except TypeError:
-                continue
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            try:
-                return _first_tensor(item)
-            except TypeError:
-                continue
-    raise TypeError(f"Hook output did not contain a tensor, got {type(value).__name__}")
-
-
-def _replace_first_tensor(value: Any, replacement: torch.Tensor) -> Any:
-    if torch.is_tensor(value):
-        return replacement
-    if isinstance(value, tuple):
-        out = list(value)
-        for i, item in enumerate(out):
-            try:
-                out[i] = _replace_first_tensor(item, replacement)
-                return tuple(out)
-            except TypeError:
-                continue
-    if isinstance(value, list):
-        out = list(value)
-        for i, item in enumerate(out):
-            try:
-                out[i] = _replace_first_tensor(item, replacement)
-                return out
-            except TypeError:
-                continue
-    if isinstance(value, dict):
-        out = dict(value)
-        for key, item in out.items():
-            try:
-                out[key] = _replace_first_tensor(item, replacement)
-                return out
-            except TypeError:
-                continue
-    raise TypeError(f"Hook output did not contain a replaceable tensor, got {type(value).__name__}")
+    tried = _module_name_candidates(name)
+    for candidate in tried:
+        if candidate in modules:
+            return modules[candidate]
+    tail = ".".join(name.split(".")[-2:])
+    similar = sorted(n for n in modules if n == tail or n.endswith("." + tail))[:6]
+    raise KeyError(
+        f"Activation intervention module {name!r} not found in model (tried {tried}; "
+        f"modules ending in {tail!r}: {similar or 'none'})"
+    )
 
 
 def _input_context(args: Iterable[Any], kwargs: Mapping[str, Any]) -> Dict[str, Any]:
@@ -156,8 +133,10 @@ def _clm_prediction_position_mask(*, context: Mapping[str, Any], activation: tor
     mask = torch.zeros(activation.shape[:2], dtype=torch.bool, device=activation.device)
     attention_mask = context.get("attention_mask")
     if torch.is_tensor(attention_mask) and attention_mask.shape == activation.shape[:2]:
-        lengths = attention_mask.to(device=activation.device).long().sum(dim=1).clamp_min(1)
-        mask[torch.arange(activation.shape[0], device=activation.device), lengths - 1] = True
+        # Last REAL token for left and right padding alike (``sum() - 1`` is only
+        # right for right padding). An all-padding row keeps the old position 0.
+        last = last_real_token_positions(attention_mask.to(device=activation.device), allow_empty=True)
+        mask[torch.arange(activation.shape[0], device=activation.device), last] = True
     else:
         mask[:, -1] = True
     return mask

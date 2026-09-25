@@ -700,16 +700,6 @@ class GradiendModel(nn.Module):
         """Whether this model represents activation-gradient signals."""
         return self.signal_kind == "activation_gradient"
 
-    @property
-    def is_gradiend(self) -> bool:
-        """Alias for gradient-space GRADIEND semantics."""
-        return self.uses_gradients
-
-    @property
-    def is_actiend(self) -> bool:
-        """Alias for activation-space ACTIEND semantics."""
-        return self.uses_activations
-
     @staticmethod
     def signal_kind_from_metadata(metadata: Optional[Dict[str, Any]]) -> str:
         """Resolve a signal kind from serialized GRADIEND metadata."""

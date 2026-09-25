@@ -22,6 +22,7 @@ from gradiend.trainer.text.prediction.seq2seq import (
     seq2seq_mlm_probs_at_mask,
 )
 from gradiend.util.logging import get_logger
+from gradiend.util.positions import last_real_token_positions
 
 from gradiend.trainer.text.common.lm_eval import compute_lms
 
@@ -329,12 +330,10 @@ def _last_non_padding_positions(logits: torch.Tensor, inputs) -> torch.Tensor:
             "CLM decoder scoring received incompatible logits/attention_mask shapes: "
             f"logits={tuple(logits.shape)}, attention_mask={tuple(mask.shape)}."
         )
-    valid = mask.ne(0)
-    positions = torch.arange(mask.shape[1], device=logits.device).unsqueeze(0).expand_as(mask)
-    last_positions = positions.masked_fill(~valid, -1).max(dim=1).values
-    if (last_positions < 0).any():
-        raise ValueError("Cannot score CLM next-token probabilities for an empty tokenized prefix.")
-    return last_positions
+    try:
+        return last_real_token_positions(mask)
+    except ValueError as exc:
+        raise ValueError("Cannot score CLM next-token probabilities for an empty tokenized prefix.") from exc
 
 
 def _last_non_padding_logits(logits: torch.Tensor, inputs) -> torch.Tensor:
@@ -863,7 +862,7 @@ def compute_probability_shift_score_clm(
                         )
                     )
 
-    logger.info(
+    logger.debug(
         "compute_probability_shift_score_clm: eval_kind=%r dataset_class_col=%r "
         "expected metrics (targets.keys())=%s groups actually populated=%s "
         "metrics populated per group=%s",

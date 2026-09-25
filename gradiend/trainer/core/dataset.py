@@ -370,6 +370,25 @@ class SignalTrainingDatasetBase:
             return source, source if target is None else target
         return payload, payload
 
+    @staticmethod
+    def _load_cached_side(cache_file: str) -> Optional[tuple]:
+        """Load one cached pole as ``(source, target)``; None when there is no cache entry."""
+        if not cache_file or not os.path.exists(cache_file):
+            return None
+        return SignalTrainingDatasetBase._unpack_cached_side(torch.load(cache_file, weights_only=True))
+
+    def _compute_side(self, batch: dict, side: str, cache_file: str, *, mixed: bool) -> tuple:
+        """Extract one pole's ``(source, target)`` signals and write the cache entry if configured."""
+        inputs = batch[side]
+        source, target = self._extract_one_side(inputs, side=side)
+        del inputs
+        source = source.to(dtype=self.dtype, device=self.device)
+        target = target.to(dtype=self.dtype, device=self.device)
+        if cache_file:
+            os.makedirs(self.cache_dir, exist_ok=True)
+            torch.save(self._pack_cached_side(source, target, mixed=mixed), cache_file)
+        return source, target
+
     def _extract_one_side(self, inputs: Any, *, side: str) -> tuple:
         if side == "factual":
             batch = self.signal_extractor(
@@ -398,6 +417,18 @@ class SignalTrainingDatasetBase:
         return source, target
 
     def __getitem__(self, index: int) -> dict:
+        # Bounds-check like any indexable dataset: an out-of-range index otherwise
+        # resolves to an empty slice (``range(index*bs, min((index+1)*bs, N))`` is
+        # empty), _merge_batch returns ``{}``, and the caller only discovers it far
+        # downstream as a cryptic ``template=None`` / ``KeyError: 'factual'``. Raise
+        # IndexError here so a caller that iterates past ``len(self)`` fails clearly.
+        length = len(self)
+        if index < 0:
+            index += length
+        if not (0 <= index < length):
+            raise IndexError(
+                f"{type(self).__name__} index {index} out of range for length {length}"
+            )
         timing_enabled = self.timing_steps > 0 and (index == 0 or (index + 1) % self.timing_steps == 0)
         if timing_enabled:
             self._sync_cuda_for_timing()
@@ -451,72 +482,39 @@ class SignalTrainingDatasetBase:
                 cache_file_factual = os.path.join(self.cache_dir, f'factual_{h}.pt')
                 cache_file_alternative = os.path.join(self.cache_dir, f'alternative_{h}.pt')
 
-            factual_source = None
-            factual_target = None
-            alternative_source = None
-            alternative_target = None
+            factual_source = factual_target = None
+            alternative_source = alternative_target = None
             identity_batch = self._is_identity_batch(batch)
             mixed = self._is_mixed_site()
+            use_cache = self.use_cached_signals and self.cache_dir is not None
 
-            if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
-                if os.path.exists(cache_file_factual):
-                    factual_source, factual_target = self._unpack_cached_side(
-                        torch.load(cache_file_factual, weights_only=True)
-                    )
-                if not identity_batch and os.path.exists(cache_file_alternative):
-                    alternative_source, alternative_target = self._unpack_cached_side(
-                        torch.load(cache_file_alternative, weights_only=True)
-                    )
+            if use_cache and cache_file_factual:
+                cached = self._load_cached_side(cache_file_factual)
+                if cached is not None:
+                    factual_source, factual_target = cached
+                if not identity_batch:
+                    cached = self._load_cached_side(cache_file_alternative)
+                    if cached is not None:
+                        alternative_source, alternative_target = cached
 
             requires_factual = source in factual_computation_required_keywords or self.target in factual_computation_required_keywords
-            if identity_batch and (source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords):
-                requires_factual = True
+            requires_alternative = source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords
+            if identity_batch and requires_alternative:
+                requires_factual = True  # the alternative pole reuses the factual signal
             if factual_source is None and requires_factual:
-                factual_inputs = batch["factual"]
-                factual_source, factual_target = self._extract_one_side(factual_inputs, side="factual")
-                del factual_inputs
-                factual_source = factual_source.to(dtype=self.dtype, device=self.device)
-                factual_target = factual_target.to(dtype=self.dtype, device=self.device)
-                if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
-                    os.makedirs(self.cache_dir, exist_ok=True)
-                    torch.save(
-                        self._pack_cached_side(factual_source, factual_target, mixed=mixed),
-                        cache_file_factual,
-                    )
+                factual_source, factual_target = self._compute_side(
+                    batch, "factual", cache_file_factual if use_cache else "", mixed=mixed
+                )
             if timing_enabled:
                 self._sync_cuda_for_timing()
                 t_factual = time.perf_counter()
 
-            requires_alternative = source in alternative_computation_required_keywords or self.target in alternative_computation_required_keywords
             if identity_batch and requires_alternative:
-                if factual_source is None:
-                    factual_inputs = batch["factual"]
-                    factual_source, factual_target = self._extract_one_side(factual_inputs, side="factual")
-                    del factual_inputs
-                    factual_source = factual_source.to(dtype=self.dtype, device=self.device)
-                    factual_target = factual_target.to(dtype=self.dtype, device=self.device)
-                    if self.use_cached_signals and self.cache_dir is not None and cache_file_factual:
-                        os.makedirs(self.cache_dir, exist_ok=True)
-                        torch.save(
-                            self._pack_cached_side(factual_source, factual_target, mixed=mixed),
-                            cache_file_factual,
-                        )
-                alternative_source = factual_source
-                alternative_target = factual_target
+                alternative_source, alternative_target = factual_source, factual_target
             elif alternative_source is None and requires_alternative:
-                alternative_inputs = batch['alternative']
-                alternative_source, alternative_target = self._extract_one_side(
-                    alternative_inputs, side="alternative"
+                alternative_source, alternative_target = self._compute_side(
+                    batch, "alternative", cache_file_alternative if use_cache else "", mixed=mixed
                 )
-                del alternative_inputs
-                alternative_source = alternative_source.to(dtype=self.dtype, device=self.device)
-                alternative_target = alternative_target.to(dtype=self.dtype, device=self.device)
-                if self.use_cached_signals and self.cache_dir is not None and cache_file_alternative:
-                    os.makedirs(self.cache_dir, exist_ok=True)
-                    torch.save(
-                        self._pack_cached_side(alternative_source, alternative_target, mixed=mixed),
-                        cache_file_alternative,
-                    )
             if timing_enabled:
                 self._sync_cuda_for_timing()
                 t_alternative = time.perf_counter()

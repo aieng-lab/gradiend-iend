@@ -6,6 +6,7 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 from gradiend.util.logging import get_logger
+from gradiend.trainer.core.metric_names import AUC_METRICS, normalize_metric_name
 from gradiend.util.util import to_jsonable
 from gradiend.util.paths import is_under_temp_dir
 
@@ -239,15 +240,9 @@ def metric_checkpoint_rank(
       - ``min_auc_n_o`` / ``min_auc``: compare raw ``min(auc_n, auc_o)`` (higher better)
       - ``encoding_e`` / ``E``: compare the fair validation bottleneck (higher better)
     """
-    name = str(metric or "correlation").strip().lower()
-    if name in {"auroc", "auc", "roc-auc"}:
-        name = "roc_auc"
-    if name in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
-        name = "min_auc_n_o"
-    if name in {"e", "encoding_e", "encoding-e", "encodinge"}:
-        name = "encoding_e"
+    name = normalize_metric_name(metric)
     raw = float(score) if isinstance(score, (int, float)) else None
-    is_auc_metric = name in {"roc_auc", "min_auc_n_o", "encoding_e"}
+    is_auc_metric = name in AUC_METRICS
     positive_target_mean = _positive_target_class_mean(mean_by_class) if is_auc_metric else None
     positive_target_ok = (
         isinstance(positive_target_mean, (int, float)) and positive_target_mean > 0.0

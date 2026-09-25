@@ -331,6 +331,43 @@ class TestTextGradientTrainingDataset:
         assert extractor.alternative_inputs["prediction_mask"].sum().item() == 1
         assert row["source"].abs().sum().item() > 0
 
+    def test_activation_gradient_next_token_uses_label_position(self):
+        """AGIEND's explicit next-token mode must not fill the candidate span."""
+        tokenizer = MockTokenizer()
+        raw = TextTrainingDataset(
+            data=pd.DataFrame({
+                "masked": ["The person [MASK]"],
+                "factual": ["he"], "alternative": ["she"],
+                "factual_class": ["M"], "alternative_class": ["F"],
+                "factual_id": ["M"], "alternative_id": ["F"],
+                "label": [1.0], "feature_class_id": ["M->F"], "feature_pole": ["pos"],
+            }),
+            tokenizer=tokenizer, batch_size=1, is_decoder_only_model=True,
+            prediction_objective="clm_next_token",
+        )
+
+        class RecordingExtractor:
+            signal = Signal.activation_gradient(token_selector="prediction")
+            def __call__(self, factual_inputs=None, alternative_inputs=None, **_kwargs):
+                self.factual_inputs, self.alternative_inputs = factual_inputs, alternative_inputs
+                return SignalBatch.from_factual_alternative(
+                    torch.zeros(1), torch.zeros(1), signal_id="activation_gradient"
+                )
+
+        extractor = RecordingExtractor()
+        dataset = TextActivationTrainingDataset(
+            raw, tokenizer, extractor, signal=extractor.signal,
+            prediction_objective="clm_next_token", source="both", target="diff",
+        )
+        dataset[0]
+        # The signal dataset may request only the factual side for this row;
+        # either side uses the same conversion.
+        for item in (extractor.factual_inputs, extractor.alternative_inputs):
+            if item is None:
+                continue
+            assert torch.equal(item["prediction_mask"], item["labels"].ne(-100))
+            assert item["prediction_mask"].sum().item() == 1
+
     def test_signal_dataset_mixed_site_uses_target_gather_for_diff(self):
         class OnePairRow:
             batch_size = 1
@@ -1335,3 +1372,38 @@ class TestTextDatasetDataLoadingVariations:
         for i in range(min(5, len(dataset))):
             item = dataset[i]
             assert "feature_class_id" in item
+
+
+class TestTokenizeWithOffsets:
+    """``tokenize_with_offsets`` must cope with every kind of tokenizer without offset support."""
+
+    def test_tokenizer_that_silently_ignores_the_keyword_yields_no_offsets(self):
+        from gradiend.util.tokenization import tokenize_with_offsets
+
+        encoded, offsets = tokenize_with_offsets(MockTokenizer(), "a b c", padding=False)
+        assert offsets is None
+        assert encoded["input_ids"]
+
+    def test_tokenizer_raising_not_implemented_yields_no_offsets(self):
+        from gradiend.util.tokenization import tokenize_with_offsets
+
+        class SlowTokenizer:
+            def __call__(self, text, return_offsets_mapping=False, **kwargs):
+                if return_offsets_mapping:
+                    raise NotImplementedError("offsets need a fast tokenizer")
+                return {"input_ids": [1, 2]}
+
+        encoded, offsets = tokenize_with_offsets(SlowTokenizer(), "a b")
+        assert offsets is None
+        assert encoded["input_ids"] == [1, 2]
+
+    def test_offsets_are_returned_when_supported(self):
+        from gradiend.util.tokenization import offset_pairs, tokenize_with_offsets
+
+        class FastTokenizer:
+            def __call__(self, text, return_offsets_mapping=False, **kwargs):
+                return {"input_ids": [1, 2], "offset_mapping": [(0, 1), (2, 3)]}
+
+        _, offsets = tokenize_with_offsets(FastTokenizer(), "a b")
+        assert offset_pairs(offsets) == [(0, 1), (2, 3)]
+        assert offset_pairs(torch.tensor([[[0, 1], [2, 3]]])) == [(0, 1), (2, 3)]

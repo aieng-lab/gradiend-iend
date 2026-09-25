@@ -14,6 +14,7 @@ import torch
 from gradiend import (
     load_modified_model,
     Signal,
+    SignalScope,
     TextPredictionConfig,
     TextPredictionTrainer,
     TrainingArguments,
@@ -23,12 +24,9 @@ from gradiend.examples.english_pronoun_datasets import (
     EN_PRONOUNS_HF_DATASET,
     load_english_pronoun_neutral_data,
 )
-from gradiend.gradiend_split import GradiendSplit
-from gradiend.trainer.core import SignalScope
 from gradiend.trainer.text.common.loading import AutoModelForLM
 
-MODEL_NAME = "bert-base-uncased"
-MODEL_NAME = "gpt2"
+MODEL_NAME = "gpt2"  # or "bert-base-uncased"
 
 RUN_MODIFY_MODEL_SMOKE = True
 MODIFY_TARGET_CLASS = "3SG"
@@ -103,10 +101,9 @@ if __name__ == "__main__":
         source="factual",
         signal=Signal.activation(),
         add_neutral_identity_transitions=True,
-        #signal=Signal.gradient(),
         signal_scope=SignalScope.layer(9),
-        #signal_scope=SignalScope.from_values(activation_sites=["bert.encoder.layer.10.output"]),
-        #gradiend_split=GradiendSplit.by_tensor(),
+        # signal_scope=SignalScope.from_values(activation_sites=["bert.encoder.layer.10.output"]),
+        # gradiend_split=GradiendSplit.by_tensor(),  # from gradiend import GradiendSplit
         fail_on_non_convergence=False,
         use_cache=False,
     )
@@ -159,7 +156,8 @@ if __name__ == "__main__":
             max_size=MODIFY_SMOKE_MAX_SIZE,
             #use_cache=False,
             plot=True,
-            lrs=[1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6], # DO NOT REMOVE THESE MANUAL LRs!!!
+            # Decoder updates live in raw activation units, so the default LR grid is far too small.
+            lrs=[1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6],
         )
         chosen = decoder_stats[MODIFY_TARGET_CLASS]
         print(

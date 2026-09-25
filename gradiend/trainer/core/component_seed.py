@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
+from gradiend.trainer.core.metric_names import normalize_metric_name
 
 COMPONENT_BEST_DIRNAME = "component_best"
 COMPONENT_BEST_FILENAME = "component_best.pt"
@@ -80,9 +81,7 @@ def _numeric(value: Any) -> Optional[float]:
 
 
 def _selection_score(candidate: Dict[str, Any], selection_metric: str) -> Optional[float]:
-	name = str(selection_metric or "correlation").strip().lower()
-	if name in {"e", "encoding-e", "encodinge"}:
-		name = "encoding_e"
+	name = normalize_metric_name(selection_metric)
 	value = _numeric(candidate.get(name))
 	if value is None and isinstance(candidate.get("metrics"), dict):
 		value = _numeric(candidate["metrics"].get(name))

@@ -25,6 +25,7 @@ from typing import Iterator, List, Optional, Dict, Any, Tuple, Union, Sequence, 
 
 import torch
 import torch.nn as nn
+
 from torch.nn import Parameter
 
 from gradiend.util import unwrap_model
@@ -59,6 +60,10 @@ from gradiend.model.utils import (
 )
 
 logger = get_logger(__name__)
+
+
+# Parameter dtypes whose in-place ``+delta``/``-delta`` round trip is not exact.
+_INEXACT_RESTORE_DTYPES: Tuple[torch.dtype, ...] = (torch.bfloat16, torch.float16)
 
 
 @dataclass(frozen=True)
@@ -499,14 +504,6 @@ class ModelWithGradiend(nn.Module, ABC):
     def uses_activation_space(self) -> bool:
         """Whether interventions belong at recorded activation sites."""
         return self.uses_activations or self.uses_activation_gradients
-
-    @property
-    def is_gradiend(self) -> bool:
-        return self.uses_gradients
-
-    @property
-    def is_actiend(self) -> bool:
-        return self.uses_activations
 
     @property
     def capabilities(self) -> ModelWithGradiendCapabilities:
@@ -961,7 +958,7 @@ class ModelWithGradiend(nn.Module, ABC):
 
         if part == "decoder":
             enhancer = self.gradiend.decoder(
-                torch.tensor(feature_factor, dtype=torch.float, device=model_device)
+                torch.tensor(feature_factor, dtype=self.gradiend.torch_dtype, device=model_device)
             )
         elif part in {"decoder-bias", "decoder-sum", "decoder-weight", "encoder-weight"}:
             enhancer = self.gradiend.get_update_vector(part).to(model_device)
@@ -1041,13 +1038,11 @@ class ModelWithGradiend(nn.Module, ABC):
         Signal-specific behavior:
 
         - Gradient-space GRADIEND checkpoints are converted to an ordinary
-
           weight-rewritten base model, equivalent to
           :meth:`rewrite_base_model` with the same ``learning_rate``,
           ``feature_factor``, and ``part``.
 
         - Activation-space ACTIEND checkpoints are converted to an ordinary
-
           base model copy with fixed PyTorch forward hooks.  The hooks add the
           decoded activation-space update at the activation sites recorded in
           the GRADIEND mapping.  The returned model owns a copy of the steering
@@ -1165,10 +1160,17 @@ class ModelWithGradiend(nn.Module, ABC):
         if not isinstance(feature_factor, list):
             feature_factor = [feature_factor]
         model_device = _first_param_device(unwrap_model(self.base_model))
+        generated_update = part == "decoder"
         if part == "decoder":
-            update = self.gradiend.decoder(
-                torch.tensor(feature_factor, dtype=torch.float, device=model_device)
-            )
+            # Decoder interventions are inference-only.  Building an autograd
+            # graph for a full-width decoded vector needlessly retains tensors;
+            # at 8B scale that vector alone is about 26 GiB in float32.
+            with torch.no_grad():
+                update = self.gradiend.decoder(
+                    torch.tensor(
+                        feature_factor, dtype=self.gradiend.torch_dtype, device=model_device
+                    )
+                )
         elif part in {"decoder-bias", "decoder-sum", "decoder-weight", "encoder-weight"}:
             update = self.gradiend.get_update_vector(part).to(model_device)
         else:
@@ -1177,7 +1179,16 @@ class ModelWithGradiend(nn.Module, ABC):
                 f"got {part!r}"
             )
         effective_value = effective_rewrite_learning_rate(value, self.source)
-        update = (float(effective_value) * update.flatten()).detach()
+        update = update.flatten().detach()
+        if generated_update:
+            # ``update`` is a fresh decoder output, so scaling it in place is
+            # safe.  An out-of-place multiply would materialize a second full
+            # vector (another ~26 GiB for an unpruned 8B CGA checkpoint).
+            update.mul_(float(effective_value))
+        else:
+            # Weight-derived parts may be views into learned parameters and
+            # must never be mutated in place.
+            update = (float(effective_value) * update).detach()
         if self.uses_activation_space:
             update = self._unscale_activation_update(update)
         return update
@@ -1461,10 +1472,27 @@ class ModelWithGradiend(nn.Module, ABC):
             )
         return tensors
 
-    def _apply_gradient_intervention_delta(self, update: torch.Tensor, *, sign: float) -> Dict[str, Any]:
+    def _apply_gradient_intervention_delta(
+        self,
+        update: torch.Tensor,
+        *,
+        sign: float,
+        snapshot: Optional[Dict[int, Tuple[torch.nn.Parameter, torch.Tensor]]] = None,
+        skip_dtypes: Tuple[torch.dtype, ...] = (),
+    ) -> Dict[str, Any]:
+        """Add ``sign * update`` in place to the mapped base-model parameters.
+
+        Half-precision parameters (bf16/fp16) cannot be restored by subtracting
+        the same delta: ``(w + d) - d != w`` once ``d`` is comparable to the
+        parameter's ulp, and the residual accumulates over a strength sweep (a
+        dense unit-norm delta on Llama-3.1-8B in bf16 left the base model with
+        up to ~10% relative drift). When ``snapshot`` is given, the pristine
+        value of every half-precision parameter is cloned into it *before* its
+        first modification so the caller can restore it bit-exactly.
+        """
         base_model = unwrap_model(self.base_model)
         param_lookup = _build_param_lookup_named(base_model)
-        applied: List[Tuple[torch.nn.Parameter, torch.Tensor]] = []
+        applied: List[Tuple[torch.nn.Parameter, str, Dict[str, Any], int, int]] = []
         metadata: Dict[str, Any] = {
             "resolved_params": [],
             "num_dimensions": int(update.numel()),
@@ -1482,6 +1510,28 @@ class ModelWithGradiend(nn.Module, ABC):
                 return p
             raise KeyError(f"Parameter {name!r} not found in model for GRADIEND intervention")
 
+        def _chunk_for(
+            p: torch.nn.Parameter,
+            repr_kind: str,
+            spec: Dict[str, Any],
+            start: int,
+            n: int,
+        ) -> torch.Tensor:
+            values = update[start: start + n].to(device=p.device, dtype=p.dtype)
+            if repr_kind == "all":
+                return values.reshape(p.shape)
+            if repr_kind == "mask":
+                mask = spec["mask"].to(device=p.device).bool()
+                chunk = torch.zeros_like(p)
+                chunk[mask] = values
+                return chunk
+            if repr_kind == "indices":
+                flat_idx = spec["indices"].to(device=p.device, dtype=torch.long)
+                flat = torch.zeros(p.numel(), dtype=p.dtype, device=p.device)
+                flat[flat_idx] = values
+                return flat.reshape(p.shape)
+            raise ValueError(f"Unknown param repr {repr_kind!r}")
+
         idx = 0
         try:
             with torch.no_grad():
@@ -1490,27 +1540,31 @@ class ModelWithGradiend(nn.Module, ABC):
                     r = spec["repr"]
                     if r == "all":
                         n = p.numel()
-                        chunk = update[idx: idx + n].to(device=p.device, dtype=p.dtype).reshape(p.shape)
-                        idx += n
                     elif r == "mask":
                         m = spec["mask"].to(device=p.device).bool()
                         n = int(m.sum().item())
-                        update_values = update[idx: idx + n].to(device=p.device, dtype=p.dtype)
-                        chunk = torch.zeros_like(p)
-                        chunk[m] = update_values
-                        idx += n
                     elif r == "indices":
                         flat_idx = spec["indices"].to(device=p.device, dtype=torch.long)
                         n = int(flat_idx.numel())
-                        update_values = update[idx: idx + n].to(device=p.device, dtype=p.dtype)
-                        flat = torch.zeros(p.numel(), dtype=p.dtype, device=p.device)
-                        flat[flat_idx] = update_values
-                        chunk = flat.reshape(p.shape)
-                        idx += n
                     else:
                         raise ValueError(f"Unknown param repr {r!r} for param {param_name}")
+                    start = idx
+                    if p.dtype in skip_dtypes:
+                        idx += n
+                        continue
+                    chunk = _chunk_for(p, r, spec, start, n)
+                    idx += n
+                    if (
+                        snapshot is not None
+                        and p.dtype in _INEXACT_RESTORE_DTYPES
+                        and id(p) not in snapshot
+                    ):
+                        snapshot[id(p)] = (p, p.detach().clone())
                     p.add_(float(sign) * chunk)
-                    applied.append((p, chunk))
+                    # Keep only cheap reconstruction metadata.  Retaining every
+                    # converted chunk until the end accumulated another full
+                    # model-sized copy during successful interventions.
+                    applied.append((p, r, spec, start, n))
                     metadata["resolved_params"].append({
                         "name": param_name,
                         "repr": r,
@@ -1519,14 +1573,14 @@ class ModelWithGradiend(nn.Module, ABC):
                     })
         except Exception:
             with torch.no_grad():
-                for p, chunk in reversed(applied):
-                    p.sub_(float(sign) * chunk)
+                for p, r, spec, start, n in reversed(applied):
+                    p.sub_(float(sign) * _chunk_for(p, r, spec, start, n))
             raise
 
         if idx != int(update.numel()):
             with torch.no_grad():
-                for p, chunk in reversed(applied):
-                    p.sub_(float(sign) * chunk)
+                for p, r, spec, start, n in reversed(applied):
+                    p.sub_(float(sign) * _chunk_for(p, r, spec, start, n))
             raise ValueError(f"Intervention update length mismatch: used {idx}, vector has {update.numel()}")
         return metadata
 
@@ -1589,6 +1643,9 @@ class ModelWithGradiend(nn.Module, ABC):
         handles: List[Any] = []
         gradient_applied = False
         update: Optional[torch.Tensor] = None
+        # Exact-restore snapshot for half-precision weights (see
+        # ``_apply_gradient_intervention_delta``); empty for fp32/fp64 models.
+        snapshot: Dict[int, Tuple[torch.nn.Parameter, torch.Tensor]] = {}
 
         try:
             if update_vector is not None or float(value) != 0.0:
@@ -1602,7 +1659,11 @@ class ModelWithGradiend(nn.Module, ABC):
                     update = torch.as_tensor(update_vector).flatten().detach().clone()
                 info["num_dimensions"] = int(update.numel())
                 if signal_kind == "gradient":
-                    info.update(self._apply_gradient_intervention_delta(update, sign=1.0))
+                    info.update(
+                        self._apply_gradient_intervention_delta(
+                            update, sign=1.0, snapshot=snapshot
+                        )
+                    )
                     gradient_applied = True
                 else:
                     interventions, tensors = self._activation_intervention_specs(
@@ -1630,7 +1691,20 @@ class ModelWithGradiend(nn.Module, ABC):
         finally:
             if handles:
                 remove_hook_handles(handles)
-            if gradient_applied and update is not None:
+            if snapshot:
+                # Bit-exact restore. Runs even if applying the delta raised
+                # part-way (its own rollback is inexact in half precision).
+                with torch.no_grad():
+                    for p, original in snapshot.values():
+                        p.copy_(original)
+                snapshot.clear()
+                if gradient_applied and update is not None:
+                    # Only the parameters that are not half precision (if any)
+                    # still carry the delta; restore those by subtraction.
+                    self._apply_gradient_intervention_delta(
+                        update, sign=-1.0, snapshot=None, skip_dtypes=_INEXACT_RESTORE_DTYPES
+                    )
+            elif gradient_applied and update is not None:
                 self._apply_gradient_intervention_delta(update, sign=-1.0)
             info["active"] = False
             if previous is None:
@@ -1976,6 +2050,23 @@ class ModelWithGradiend(nn.Module, ABC):
             base_model_max_memory=base_model_max_memory,
             **kwargs,
         )
+        # ``_get_device_config`` resolves the caller's placement overrides into
+        # ``device_config``.  Do not subsequently forward those raw overrides
+        # as well: ``_load_model(..., **kwargs, **device_config)`` otherwise
+        # receives (for example) ``device_encoder`` twice.  This was latent
+        # until CGA deliberately requested a CPU encoder while reloading a
+        # checkpoint to avoid constructing its inert full-width encoder on GPU.
+        load_kwargs = dict(kwargs)
+        for key in (
+            "device",
+            "device_encoder",
+            "device_decoder",
+            "device_base_model",
+            "base_model_device",
+            "base_model_device_map",
+            "base_model_max_memory",
+        ):
+            load_kwargs.pop(key, None)
         gradiend_device_config = {
             k: v for k, v in device_config.items()
             if k not in {"base_model_device", "base_model_device_map", "base_model_max_memory"}
@@ -1989,7 +2080,7 @@ class ModelWithGradiend(nn.Module, ABC):
                 load_directory_str,
                 base_model_id=base_model_id,
                 gradiend_kwargs=gradiend.kwargs,
-                **kwargs,
+                **load_kwargs,
                 **device_config,
             )
             if kwargs.get("param_map") and getattr(gradiend, "param_map", None) != kwargs["param_map"]:
@@ -2013,10 +2104,10 @@ class ModelWithGradiend(nn.Module, ABC):
             load_arg = load_directory if not isinstance(load_directory, str) else load_directory_str
             base_model, *extra = cls._load_model(
                 load_arg,
-                **kwargs,
+                **load_kwargs,
                 **device_config,
             )
-            create_gradiend_kwargs = dict(kwargs)
+            create_gradiend_kwargs = dict(load_kwargs)
             create_gradiend_kwargs.pop("base_model", None)
             if signal_plan is None:
                 signal_plan = resolve_signal_training_plan(

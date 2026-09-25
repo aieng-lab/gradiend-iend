@@ -31,6 +31,7 @@ SUPPORTED_PREDICTION_OBJECTIVES = {
     "auto",
     "mlm_mask_token",
     "clm_next_token",
+    "clm_target_span",
     "clm_mlm_head",
     "clm_sequence_cloze",
     "seq2seq_decoder",
@@ -48,7 +49,8 @@ SEQ2SEQ_PREDICTION_OBJECTIVES = frozenset(
 from gradiend.trainer.text.prediction.objective_hints import format_seq2seq_objective_hint
 DECODER_ONLY_PREDICTION_OBJECTIVES = frozenset(
     {
-        "clm_next_token",
+    "clm_next_token",
+    "clm_target_span",
         "clm_mlm_head",
         "clm_sequence_cloze",
     }
@@ -271,4 +273,3 @@ def resolve_prediction_objective(trainer: Any, model_or_tokenizer: Any = None) -
 def should_use_decoder_mlm_head_for_auto(trainer: Any) -> bool:
     """Whether resolve_model_path should substitute the cached decoder MLM head."""
     return resolve_prediction_objective(trainer).should_use_custom_prediction_head(trainer)
-

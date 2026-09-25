@@ -123,6 +123,14 @@ def test_derive_default_feature_factor_for_activation_space(source, target, expe
     assert derive_default_feature_factor(trainer, model, class_name="3PL") == expected_3pl
 
 
+def test_activation_gradient_uses_gradient_sign_semantics():
+    """dL/dh is hook-applied, but strengthening must move against the gradient."""
+    model = _MockModel("factual", target="diff", mapping_kind="activation_gradient")
+    trainer = _Trainer(model)
+    assert derive_default_feature_factor(trainer, model, class_name="3SG") == -1.0
+    assert derive_default_feature_factor(trainer, model, class_name="3PL") == 1.0
+
+
 @pytest.mark.parametrize("target", ["factual", "alternative"])
 def test_derive_default_feature_factor_rejects_activation_non_diff_targets(target):
     model = _MockModel("factual", target=target, mapping_kind="activation")

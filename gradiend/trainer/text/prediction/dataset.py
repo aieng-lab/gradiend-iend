@@ -28,6 +28,12 @@ from gradiend.trainer.core.unified_schema import (
 from gradiend.trainer.core.signals import Signal
 from gradiend.util import normalize_split_name
 from gradiend.util.logging import suppress_tokenizer_length_warning
+from gradiend.util.positions import (
+    assert_labels_on_real_tokens,
+    first_real_token_positions,
+    last_real_token_positions,
+)
+from gradiend.util.tokenization import offset_pairs, tokenize_with_offsets
 
 # Dataset-level cloze placeholder (matches TextFilterConfig.mask). Independent of
 # tokenizer.mask_token, which is an MLM model special and may be absent (e.g. GPT-2).
@@ -178,6 +184,46 @@ def _continuation_ids_from_prefix(tokenizer: Any, prefix: str, continuation: str
     return _ids_for_text(tokenizer, continuation)
 
 
+def decoder_only_label_token_ids(tokenizer: Any, label: Any) -> List[int]:
+    """Single source of truth: token ids that label a decoder-only prediction.
+
+    The label is written onto the LAST prefix token (the template's trailing space)
+    and, because causal-LM loss shifts by one, predicted from the token before it.
+    The natural next token after a word boundary is the *leading-space* variant
+    (``▁she`` / ``Ġshe``), so that is the label: ``tokenizer(" " + label)``.
+    ``vocab[label]`` (``she``) is the mid-word variant and is only kept for
+    ``label_token_protocol="legacy"``.
+
+    ``TextPredictionModelWithGradiend.create_inputs`` and the training dataset must
+    both call this; it returns all ids so callers can apply their own multi-token
+    policy (``create_inputs`` rejects them, the dataset uses the first).
+    """
+    return list(tokenizer(f" {label}", add_special_tokens=False)["input_ids"])
+
+
+def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "legacy") -> int:
+    """The one token id a decoder-only *training* item supervises for ``label``.
+
+    ``protocol`` is ``TrainingArguments.label_token_protocol``:
+
+    - ``"canonical"``: :func:`decoder_only_label_token_ids` (leading-space variant),
+      first id for multi-token labels.
+    - ``"legacy"``: ``vocab[label]`` (else the first id of ``tokenizer(label)``), the
+      rule every artifact trained before 2026-09-25 used.
+
+    The dataset and single-row scorers (e.g. CGA detection) must both resolve the
+    label through this function so their gradients live in the same signal space.
+    """
+    if protocol == "canonical":
+        return int(decoder_only_label_token_ids(tokenizer, label)[0])
+    if protocol != "legacy":
+        raise ValueError(f"label_token_protocol must be 'canonical' or 'legacy', got {protocol!r}")
+    label = str(label)
+    if hasattr(tokenizer, "vocab") and label in tokenizer.vocab:
+        return int(tokenizer.vocab[label])
+    return int(tokenizer(label, add_special_tokens=False)["input_ids"][0])
+
+
 def _find_subsequence(values: List[int], needle: List[int], start: int = 0) -> int:
     """Return the first index of ``needle`` in ``values`` at or after ``start``."""
     if not needle:
@@ -187,49 +233,6 @@ def _find_subsequence(values: List[int], needle: List[int], start: int = 0) -> i
         if values[idx : idx + len(needle)] == needle:
             return idx
     return -1
-
-
-def _prediction_positions_for_filled_text(
-    tokenizer: Any,
-    *,
-    template: str,
-    target: str,
-    input_ids: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-) -> List[int]:
-    """Locate the target span inserted into a filled prediction template.
-
-    Prefer :func:`_filled_prediction_from_template` for new call sites; this helper
-    remains for locating spans in already string-filled sequences.
-    """
-    template = require_mask_placeholder(template, DEFAULT_DATASET_MASK_PLACEHOLDER)
-    prefix, _suffix = template.split(DEFAULT_DATASET_MASK_PLACEHOLDER, 1)
-    prefix_ids = _ids_for_text(tokenizer, prefix)
-    target_ids = _continuation_ids_from_prefix(tokenizer, prefix, str(target))
-    if not target_ids:
-        target_ids = _ids_for_text(tokenizer, str(target))
-    if not target_ids:
-        raise ValueError(f"Could not tokenize prediction target {target!r}.")
-
-    ids = [int(v) for v in input_ids.tolist()]
-    if attention_mask is not None:
-        valid_len = int(attention_mask.to(dtype=torch.long).sum().item())
-        ids = ids[:valid_len]
-
-    prefix_end = 0
-    if prefix_ids:
-        prefix_start = _find_subsequence(ids, [int(v) for v in prefix_ids])
-        if prefix_start >= 0:
-            prefix_end = prefix_start + len(prefix_ids)
-
-    start = _find_subsequence(ids, [int(v) for v in target_ids], start=prefix_end)
-    if start < 0:
-        start = _find_subsequence(ids, [int(v) for v in target_ids])
-    if start < 0:
-        raise ValueError(
-            f"Could not locate filled prediction target {target!r} in tokenized template {template!r}."
-        )
-    return list(range(start, start + len(target_ids)))
 
 
 def _target_token_ids_for_fill(tokenizer: Any, target: str, *, prefix: str = "") -> List[int]:
@@ -323,22 +326,11 @@ def _left_truncate_template_keeping_mask(
     # RHS after the mask does not affect causal hidden states at the mask span,
     # and dropping it also removes any later placeholders.
     clipped = template[: first + len(mask_placeholder)]
-    encoded = None
-    try:
-        encoded = tokenizer(
-            clipped,
-            add_special_tokens=True,
-            truncation=False,
-            return_offsets_mapping=True,
-        )
-    except (TypeError, NotImplementedError):
-        encoded = None
-
-    # Some tokenizers (slow/non-fast tokenizers, or tokenizer stubs in tests)
-    # silently ignore ``return_offsets_mapping`` instead of raising, so the
-    # exception handler above alone is not enough to catch every case.
-    if encoded is None or "offset_mapping" not in encoded:
-        ids = tokenizer(clipped, add_special_tokens=True, truncation=False)["input_ids"]
+    encoded, raw_offsets = tokenize_with_offsets(
+        tokenizer, clipped, add_special_tokens=True, truncation=False
+    )
+    if raw_offsets is None:
+        ids = encoded["input_ids"]
         if len(ids) <= int(max_length):
             return clipped
         approx_chars = max(len(mask_placeholder) + 8, int(max_length) * 3)
@@ -348,7 +340,7 @@ def _left_truncate_template_keeping_mask(
         return clipped[start:]
 
     ids = list(encoded["input_ids"])
-    offsets = [(int(a), int(b)) for a, b in encoded["offset_mapping"]]
+    offsets = offset_pairs(raw_offsets)
     if len(ids) <= int(max_length):
         return clipped
 
@@ -366,7 +358,42 @@ def _left_truncate_template_keeping_mask(
     first_mask_char = char_spans[0][0]
     if char_start > first_mask_char:
         char_start = first_mask_char
-    return clipped[char_start:]
+    # Token offsets were computed with the original left context.  Removing that
+    # context can change how a boundary piece is tokenized (notably for
+    # SentencePiece tokenizers and a window beginning mid-word).  Consequently
+    # the substring may be one or more tokens longer when it is tokenized again
+    # below, which would let ``truncation=True`` remove the trailing mask.
+    #
+    # Recheck candidate windows using their *actual* tokenization.  Advancing to
+    # later original token boundaries only removes left context, so it is safe
+    # for a causal prediction site at the trailing mask.  Keep the first window
+    # which fits to retain as much context as possible.
+    candidate_starts = []
+    for offset_start, offset_end in offsets[start_tok:]:
+        if int(offset_end) <= int(offset_start):
+            continue
+        candidate_start = int(offset_start)
+        if candidate_start > first_mask_char:
+            candidate_start = first_mask_char
+        if candidate_start not in candidate_starts:
+            candidate_starts.append(candidate_start)
+    if char_start not in candidate_starts:
+        candidate_starts.insert(0, char_start)
+
+    for candidate_start in candidate_starts:
+        candidate = clipped[candidate_start:]
+        candidate_ids = tokenizer(
+            candidate,
+            add_special_tokens=True,
+            truncation=False,
+        )["input_ids"]
+        if len(candidate_ids) <= int(max_length):
+            return candidate
+
+    # The mask itself is guaranteed to fit in normal configurations.  If a
+    # tokenizer makes even the shortest token-boundary suffix too long, return
+    # that suffix and let the caller raise a precise mask-location error.
+    return clipped[first_mask_char:]
 
 
 def _locate_mask_spans_in_encoded(
@@ -447,21 +474,14 @@ def _mask_placeholder_token_spans(
         padding=False,
     )
     with suppress_tokenizer_length_warning():
-        try:
-            encoded = tokenizer(template, return_offsets_mapping=True, **encode_kwargs)
-        except TypeError:
-            encoded = tokenizer(template, **encode_kwargs)
+        encoded, raw_offsets = tokenize_with_offsets(tokenizer, template, **encode_kwargs)
 
     filled_ids = [int(v) for v in encoded["input_ids"].squeeze(0).tolist()]
-    offsets = encoded.get("offset_mapping")
-    offset_pairs = None
-    if offsets is not None:
-        offset_list = offsets.squeeze(0).tolist() if hasattr(offsets, "tolist") else list(offsets)
-        offset_pairs = [(int(a), int(b)) for a, b in offset_list]
+    pairs = offset_pairs(raw_offsets) if raw_offsets is not None else None
 
     token_spans = _locate_mask_spans_in_encoded(
         filled_ids=filled_ids,
-        offsets=offset_pairs,
+        offsets=pairs,
         char_spans=char_spans,
         tokenizer=tokenizer,
         mask_placeholder=mask_placeholder,
@@ -860,7 +880,10 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                 end = min(valid_len, prefix_len + candidate_len + int(rhs_window))
             start = min(prefix_len, valid_len)
             if start < end:
-                labels[:, start:end] = input_ids[:, start:end]
+                # Real tokens begin after the pad block under LEFT padding.
+                offset = int(first_real_token_positions(attention_mask[:1])[0])
+                labels[:, offset + start:offset + end] = input_ids[:, offset + start:offset + end]
+            assert_labels_on_real_tokens(labels, attention_mask, where="clm_sequence_cloze item")
             return {"input_ids": input_ids.squeeze(0), "attention_mask": attention_mask.squeeze(0), "labels": labels.squeeze(0)}
         is_seq2seq_model = getattr(self, "is_seq2seq_model", False)
         if is_seq2seq_model:
@@ -901,13 +924,25 @@ class TextBatchedDataset(TextBatchedDatasetBase):
             attention_mask = encoded["attention_mask"]
             labels = torch.full_like(input_ids, -100)
             last_idxs = attention_mask.sum(dim=1)
-            if hasattr(self.tokenizer, "vocab") and target in self.tokenizer.vocab:
-                target_idx = self.tokenizer.vocab[target]
-            else:
-                target_idx = self.tokenizer(target, add_special_tokens=False)["input_ids"][0]
+            target_idx = training_label_token_id(
+                self.tokenizer, target, getattr(self, "label_token_protocol", "legacy")
+            )
+            last_positions = last_real_token_positions(attention_mask, allow_empty=True)
             for i, last_idx in enumerate(last_idxs):
-                if last_idx < input_ids.size(1):
-                    labels[i, last_idx - 1] = target_idx
+                if last_idx == 0:
+                    # No context token at all: the target is the first word of the text and the tokenizer
+                    # adds no BOS (GPT-2, Pythia, Qwen), so the row is entirely padding. Nothing precedes
+                    # the target, hence no sentence-dependent signal; the row is kept exactly as it always
+                    # was (label on the last position of the fully masked row), not filtered.
+                    labels[i, -1] = target_idx
+                elif last_idx < input_ids.size(1):
+                    # Last REAL token. ``last_idx - 1`` is only that under right
+                    # padding; with left padding (Gemma, ...) it points into the pad
+                    # block, which made every sentence's gradient identical.
+                    labels[i, last_positions[i]] = target_idx
+            assert_labels_on_real_tokens(
+                labels, attention_mask, where="decoder-only training item", allow_empty_rows=True
+            )
             return {"input_ids": input_ids.squeeze(0), "attention_mask": attention_mask.squeeze(0), "labels": labels.squeeze(0)}
 
         if not self.mask_token:
@@ -973,10 +1008,15 @@ class TextTrainingDataset(TextBatchedDataset):
         rhs_window: int = -1,
         mlm_head_target_labels: Optional[List[str]] = None,
         mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
+        label_token_protocol: str = "legacy",
     ):
         """Initialize the training dataset.
 
         Args:
+            label_token_protocol: ``"canonical"`` labels decoder-only items with the
+                leading-space token (see :func:`decoder_only_label_token_ids`);
+                ``"legacy"`` (default here, so direct callers are unchanged) uses
+                ``vocab[label]``. The trainer passes ``TrainingArguments.label_token_protocol``.
             data: DataFrame with masked, factual, alternative columns (unified schema).
             tokenizer: Tokenizer for encoding.
             batch_size: Batch size.
@@ -1010,6 +1050,11 @@ class TextTrainingDataset(TextBatchedDataset):
         self.mlm_head_target_labels = list(mlm_head_target_labels) if mlm_head_target_labels else None
         self.rhs_window = rhs_window
         self.mask_placeholder = str(mask_placeholder)
+        if label_token_protocol not in ("canonical", "legacy"):
+            raise ValueError(
+                f"label_token_protocol must be 'canonical' or 'legacy', got {label_token_protocol!r}"
+            )
+        self.label_token_protocol = label_token_protocol
         validate_masked_templates_in_dataframe(
             self.data,
             self.mask_placeholder,
@@ -1122,6 +1167,7 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
         signal: Any = None,
         signals: Any = None,
         mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
+        prediction_objective: str = "clm_next_token",
     ):
         if signal is not None:
             signal = self.default_signal(signal)
@@ -1152,6 +1198,15 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
         )
         self.tokenizer = tokenizer
         self.mask_placeholder = str(mask_placeholder)
+        # Use the package's shared next-token objective. Full target-span loss
+        # remains available only when requested explicitly.
+        self.prediction_objective = str(prediction_objective or "clm_next_token")
+        if self.prediction_objective not in {"clm_target_span", "clm_next_token"}:
+            raise ValueError(
+                "Activation signals support prediction_objective='clm_target_span' "
+                "or 'clm_next_token', got "
+                f"{self.prediction_objective!r}"
+            )
 
     @staticmethod
     def default_signal(signal: Signal) -> Signal:
@@ -1193,6 +1248,23 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
 
     def _merge_batch(self, indices: list) -> dict:
         batch = super()._merge_batch(indices)
+        if (
+            self.signal is not None
+            and self.signal.kind == "activation_gradient"
+            and self.prediction_objective == "clm_next_token"
+        ):
+            # Reuse the TextTrainingDataset item: its single non--ignore label
+            # defines the next-token loss. Expose that label
+            # position as prediction_mask so ActivationSignalExtractor shifts it
+            # left to the matching generating residual position.
+            for side in ("factual", "alternative"):
+                item = dict(batch[side])
+                labels = item.get("labels")
+                if not torch.is_tensor(labels):
+                    raise ValueError("clm_next_token activation-gradient items require tensor labels")
+                item["prediction_mask"] = labels.ne(-100)
+                batch[side] = item
+            return batch
         templates = self._as_list(batch.get("template"))
         factual_tokens = self._as_list(batch.get("factual_token"))
         alternative_tokens = self._as_list(batch.get("alternative_token"))

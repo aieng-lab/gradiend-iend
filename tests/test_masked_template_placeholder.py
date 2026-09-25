@@ -208,3 +208,42 @@ class TestTruncationAnchorsOnFirstMask:
         block = text[text.index("def _left_truncate_template_keeping_mask") :][:1600]
         assert "rfind" not in block
         assert "template.find(mask_placeholder)" in block
+
+    def test_rechecks_window_after_context_sensitive_retokenization(self):
+        """A window starting mid-word must still leave room for the mask.
+
+        Some subword tokenizers split a fragment differently when it becomes
+        the start of a new string.  The initial offset-based window can then
+        gain a token during the final tokenization and truncate the trailing
+        ``[MASK]`` unless the helper advances its left boundary once more.
+        """
+        from gradiend.trainer.text.prediction.dataset import (
+            _left_truncate_template_keeping_mask,
+        )
+
+        class _ContextSensitiveTokenizer:
+            def __call__(self, text, **_kwargs):
+                text = str(text)
+                # In the original context, "Mu" and "hammad" are separate
+                # pieces.  Starting from "hammad" creates an extra piece.
+                if text == "Muhammad beta gamma [MASK]":
+                    spans = [(0, 2), (2, 8), (9, 13), (14, 19), (20, 26)]
+                elif text == "hammad beta gamma [MASK]":
+                    spans = [(0, 1), (1, 6), (7, 11), (12, 17), (18, 24)]
+                elif text == "beta gamma [MASK]":
+                    spans = [(0, 4), (5, 10), (11, 17)]
+                else:
+                    spans = []
+                result = {"input_ids": list(range(len(spans)))}
+                if _kwargs.get("return_offsets_mapping"):
+                    result["offset_mapping"] = spans
+                return result
+
+        out = _left_truncate_template_keeping_mask(
+            _ContextSensitiveTokenizer(),
+            "Muhammad beta gamma [MASK]",
+            mask_placeholder="[MASK]",
+            max_length=4,
+        )
+
+        assert out == "beta gamma [MASK]"

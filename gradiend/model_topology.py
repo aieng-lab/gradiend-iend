@@ -1,9 +1,15 @@
-"""Explicit model-topology adapters for semantic signal scopes."""
+"""Explicit model-topology adapters for semantic signal scopes.
+
+A *topology* names the modules of a supported Hugging Face model family that
+semantic scopes such as ``SignalScope.layers()`` / ``.embeddings()`` refer to.
+Every family is described declaratively by a :class:`_FamilySpec`; adding an
+architecture means adding one spec to :data:`_FAMILIES`.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Dict, FrozenSet, Optional, Sequence, Tuple
 
 import torch.nn as nn
 
@@ -19,8 +25,31 @@ class ModelTopology:
     prediction_heads: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _FamilySpec:
+    """Where a family keeps its modules, relative to its backbone prefix."""
+
+    label: str
+    #: ``config.model_type`` / architecture tokens dispatched to this family.
+    types: FrozenSet[str]
+    #: Candidate backbone prefixes, tried in order (``""`` = the model itself).
+    prefixes: Tuple[str, ...]
+    #: Candidate module-list paths holding the transformer blocks, tried in order.
+    layer_paths: Tuple[str, ...]
+    #: Candidate word-embedding paths relative to the prefix, tried in order.
+    word_embeddings: Tuple[str, ...]
+    #: Absolute word-embedding paths tried when no relative path exists.
+    word_embedding_fallbacks: Tuple[str, ...] = ()
+    #: Relative path of a combined embedding stream (BERT-style); when ``None`` the
+    #: word embedding is the only embedding site.
+    combined_embeddings: Optional[str] = None
+    #: Top-level prediction-head module names present on the model, in order.
+    heads: Tuple[str, ...] = ()
+
+
 # Human-readable family labels used in error messages.
 SUPPORTED_TOPOLOGY_FAMILIES: Tuple[str, ...] = (
+    "gemma3 multimodal wrapper (Gemma3ForConditionalGeneration)",
     "bert-like (bert, roberta, deberta, electra, albert, mpnet, camembert, xlm-roberta, ...)",
     "distilbert (distilbert / DistilBert*)",
     "gpt2-like (gpt2, gpt_neo, gptj, bloom, falcon, ...)",
@@ -29,84 +58,80 @@ SUPPORTED_TOPOLOGY_FAMILIES: Tuple[str, ...] = (
     "gpt_neox (gpt_neox)",
 )
 
-_BERT_TYPES = frozenset(
-    {
-        "bert",
-        "roberta",
-        "deberta",
-        "deberta-v2",
-        "electra",
-        "albert",
-        "mpnet",
-        "camembert",
-        "xlm-roberta",
-        "xlm_roberta",
-        "layoutlm",
-        "layoutlmv2",
-        "layoutlmv3",
-        "ernie",
-        "fnet",
-        "squeezebert",
-        "nystromformer",
-        "megatron-bert",
-        "mobilebert",
-    }
+# Order matters for the structural fallback: DistilBERT must be tried before GPT-2.
+# Both use a ``transformer`` root, but DistilBERT stores blocks at ``transformer.layer``
+# while GPT-2 uses ``transformer.h``.
+_FAMILIES: Tuple[_FamilySpec, ...] = (
+    _FamilySpec(
+        label="bert",
+        types=frozenset(
+            {
+                "bert", "roberta", "deberta", "deberta-v2", "electra", "albert", "mpnet",
+                "camembert", "xlm-roberta", "xlm_roberta", "layoutlm", "layoutlmv2",
+                "layoutlmv3", "ernie", "fnet", "squeezebert", "nystromformer",
+                "megatron-bert", "mobilebert",
+            }
+        ),
+        prefixes=("bert", "roberta", "deberta", "electra", "albert", "mpnet", "camembert", "xlm_roberta", ""),
+        layer_paths=("encoder.layer",),
+        word_embeddings=("embeddings.word_embeddings",),
+        combined_embeddings="embeddings",
+        heads=("cls", "lm_head", "classifier", "qa_outputs"),
+    ),
+    _FamilySpec(
+        label="distilbert",
+        types=frozenset({"distilbert"}),
+        prefixes=("distilbert", ""),
+        layer_paths=("transformer.layer",),
+        word_embeddings=("embeddings.word_embeddings",),
+        combined_embeddings="embeddings",
+        heads=("vocab_transform", "vocab_projector", "classifier", "pre_classifier", "qa_outputs"),
+    ),
+    _FamilySpec(
+        label="gpt2",
+        types=frozenset(
+            {"gpt2", "gpt_neo", "gptj", "openai-gpt", "bloom", "falcon", "mpt", "gpt_bigcode", "codegen"}
+        ),
+        prefixes=("transformer", ""),
+        layer_paths=("h", "blocks"),  # ``blocks``: MPT-style
+        word_embeddings=("wte", "word_embeddings"),
+        heads=("lm_head", "score"),
+    ),
+    _FamilySpec(
+        label="llama",
+        types=frozenset(
+            {
+                "llama", "mistral", "gemma", "gemma2", "gemma3", "gemma3_text", "qwen2", "qwen3",
+                "qwen3_5", "qwen3_moe", "qwen3_5_moe", "phi", "phi3", "stablelm", "cohere", "olmo",
+                "olmo2", "granite", "internlm2",
+            }
+        ),
+        prefixes=("model", ""),
+        layer_paths=("layers",),
+        word_embeddings=("embed_tokens",),
+        heads=("lm_head", "score"),
+    ),
+    _FamilySpec(
+        label="opt",
+        types=frozenset({"opt"}),
+        prefixes=("model.decoder", "decoder", "model", ""),
+        layer_paths=("layers",),
+        word_embeddings=("embed_tokens",),
+        # OPTForCausalLM often keeps embeddings on the top-level model.
+        word_embedding_fallbacks=("model.decoder.embed_tokens", "decoder.embed_tokens", "embed_tokens"),
+        heads=("lm_head", "score"),
+    ),
+    _FamilySpec(
+        label="gpt_neox",
+        types=frozenset({"gpt_neox"}),
+        prefixes=("gpt_neox", ""),
+        layer_paths=("layers",),
+        word_embeddings=("embed_in",),
+        heads=("embed_out", "lm_head", "score"),
+    ),
 )
-_DISTILBERT_TYPES = frozenset({"distilbert"})
-_GPT2_TYPES = frozenset(
-    {
-        "gpt2",
-        "gpt_neo",
-        "gptj",
-        "openai-gpt",
-        "bloom",
-        "falcon",
-        "mpt",
-        "gpt_bigcode",
-        "codegen",
-    }
-)
-_LLAMA_TYPES = frozenset(
-    {
-        "llama",
-        "mistral",
-        "gemma",
-        "gemma2",
-        "gemma3",
-        "gemma3_text",
-        "qwen2",
-        "qwen3",
-        "qwen3_5",
-        "qwen3_moe",
-        "qwen3_5_moe",
-        "phi",
-        "phi3",
-        "stablelm",
-        "cohere",
-        "olmo",
-        "olmo2",
-        "granite",
-        "internlm2",
-    }
-)
-_OPT_TYPES = frozenset({"opt"})
-_GPT_NEOX_TYPES = frozenset({"gpt_neox"})
 
-
-def _named_modules(model: nn.Module) -> dict[str, nn.Module]:
-    return dict(model.named_modules())
-
-
-def _module_exists(model: nn.Module, name: str) -> bool:
-    return name in _named_modules(model)
-
-
-def _first_existing_prefix(model: nn.Module, prefixes: Sequence[str]) -> Optional[str]:
-    modules = _named_modules(model)
-    for prefix in prefixes:
-        if prefix == "" or prefix in modules:
-            return prefix
-    return None
+_GEMMA3_MULTIMODAL_CONFIG_VALUES = frozenset({"gemma3", "gemma3forconditionalgeneration"})
 
 
 def _join(prefix: str, suffix: str) -> str:
@@ -117,18 +142,16 @@ def _join(prefix: str, suffix: str) -> str:
     return f"{prefix}.{suffix}"
 
 
-def _module_list_names(model: nn.Module, prefix: str, relative_path: str) -> Tuple[str, ...]:
-    modules = _named_modules(model)
-    name = _join(prefix, relative_path)
+def _module_list_names(modules: Dict[str, nn.Module], name: str) -> Tuple[str, ...]:
     module = modules.get(name)
     if not isinstance(module, (nn.ModuleList, nn.Sequential)):
         return ()
     return tuple(f"{name}.{index}" for index, child in enumerate(module) if isinstance(child, nn.Module))
 
 
-def _config_values(model: nn.Module) -> set[str]:
+def _config_values(model: nn.Module) -> set:
     config = getattr(model, "config", None)
-    values: set[str] = set()
+    values: set = set()
     model_type = getattr(config, "model_type", None)
     if isinstance(model_type, str):
         values.add(model_type.lower())
@@ -137,222 +160,125 @@ def _config_values(model: nn.Module) -> set[str]:
         for item in architectures:
             text = str(item).lower()
             values.add(text)
-            # DistilBertForMaskedLM / BertModel → also match family tokens in the class name.
-            for token in text.replace("-", "_").split("_"):
-                if token:
-                    values.add(token)
+            # DistilBertForMaskedLM / BertModel -> also match family tokens in the class name.
+            values.update(token for token in text.replace("-", "_").split("_") if token)
     return values
 
 
 def _config_model_type(model: nn.Module) -> Optional[str]:
-    config = getattr(model, "config", None)
-    model_type = getattr(config, "model_type", None)
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
     return model_type if isinstance(model_type, str) else None
 
 
 def _config_architectures(model: nn.Module) -> Tuple[str, ...]:
-    config = getattr(model, "config", None)
-    architectures = getattr(config, "architectures", None)
+    architectures = getattr(getattr(model, "config", None), "architectures", None)
     if isinstance(architectures, (list, tuple)):
         return tuple(str(item) for item in architectures)
     return ()
 
 
-def _prediction_heads(model: nn.Module, names: Sequence[str]) -> Tuple[str, ...]:
-    return tuple(name for name in names if _module_exists(model, name))
+def _existing(modules: Dict[str, nn.Module], names: Sequence[str]) -> Tuple[str, ...]:
+    return tuple(name for name in names if name in modules)
 
 
-def _pick_label(values: set[str], candidates: frozenset[str], fallback: str) -> str:
+def _pick_label(values: set, candidates: FrozenSet[str], fallback: str) -> str:
     matched = values & candidates
-    if matched:
-        return next(iter(matched))
-    return fallback
+    return sorted(matched)[0] if matched else fallback
 
 
-def _bert_topology(model: nn.Module, model_type: str) -> Optional[ModelTopology]:
-    prefix = _first_existing_prefix(
-        model,
-        ("bert", "roberta", "deberta", "electra", "albert", "mpnet", "camembert", "xlm_roberta", ""),
+def _prefix_topology(topology: ModelTopology, prefix: str, *, model_type: str) -> ModelTopology:
+    """Namespace a child model's semantic topology inside its parent wrapper."""
+    return ModelTopology(
+        model_type=model_type,
+        layers=tuple(_join(prefix, name) for name in topology.layers),
+        embeddings=tuple(_join(prefix, name) for name in topology.embeddings),
+        word_embedding=(
+            _join(prefix, topology.word_embedding) if topology.word_embedding is not None else None
+        ),
+        prediction_heads=tuple(_join(prefix, name) for name in topology.prediction_heads),
     )
+
+
+def _build_from_spec(
+    model: nn.Module, modules: Dict[str, nn.Module], spec: _FamilySpec, model_type: str
+) -> Optional[ModelTopology]:
+    """Resolve one family's topology on ``model`` (``None`` when its layout is absent)."""
+    prefix = next((p for p in spec.prefixes if p == "" or p in modules), None)
     if prefix is None:
         return None
-    layers = _module_list_names(model, prefix, "encoder.layer")
+    layers: Tuple[str, ...] = ()
+    for path in spec.layer_paths:
+        layers = _module_list_names(modules, _join(prefix, path))
+        if layers:
+            break
     if not layers:
         return None
 
-    embeddings = (_join(prefix, "embeddings"),) if _module_exists(model, _join(prefix, "embeddings")) else ()
-    word_embedding = _join(prefix, "embeddings.word_embeddings")
-    if not _module_exists(model, word_embedding):
-        word_embedding = None
+    word_embedding = next(
+        (name for name in (_join(prefix, rel) for rel in spec.word_embeddings) if name in modules),
+        None,
+    )
+    if word_embedding is None:
+        word_embedding = next((name for name in spec.word_embedding_fallbacks if name in modules), None)
 
-    heads = _prediction_heads(model, ("cls", "lm_head", "classifier", "qa_outputs"))
+    if spec.combined_embeddings is not None:
+        combined = _join(prefix, spec.combined_embeddings)
+        embeddings = (combined,) if combined in modules else ()
+    else:
+        embeddings = (word_embedding,) if word_embedding is not None else ()
+
     return ModelTopology(
         model_type=model_type,
         layers=layers,
         embeddings=embeddings,
         word_embedding=word_embedding,
-        prediction_heads=heads,
+        prediction_heads=_existing(modules, spec.heads),
     )
 
 
-def _distilbert_topology(model: nn.Module, model_type: str) -> Optional[ModelTopology]:
-    """DistilBERT uses ``transformer.layer`` (not BERT's ``encoder.layer``)."""
-    prefix = _first_existing_prefix(model, ("distilbert", ""))
-    if prefix is None:
-        return None
-    layers = _module_list_names(model, prefix, "transformer.layer")
-    if not layers:
+def _gemma3_multimodal_topology(model: nn.Module, model_type: str) -> Optional[ModelTopology]:
+    """Compose Gemma 3's multimodal wrapper with its text model topology.
+
+    ``Gemma3ForConditionalGeneration`` contains a causal language model under
+    ``language_model`` (older Transformers) or under its multimodal ``model``
+    body (newer Transformers). Semantic text scopes must describe that
+    contained language model, not the wrapper's unrelated vision modules.
+    Infer the child normally so both a ``Gemma3ForCausalLM`` child
+    (``model.layers``) and a bare text-model child (``layers``) are supported.
+    """
+    if not (_config_values(model) & _GEMMA3_MULTIMODAL_CONFIG_VALUES):
         return None
 
-    embeddings = (_join(prefix, "embeddings"),) if _module_exists(model, _join(prefix, "embeddings")) else ()
-    word_embedding = _join(prefix, "embeddings.word_embeddings")
-    if not _module_exists(model, word_embedding):
-        word_embedding = None
-
-    heads = _prediction_heads(
-        model,
-        ("vocab_transform", "vocab_projector", "classifier", "pre_classifier", "qa_outputs"),
-    )
+    language_model = getattr(model, "language_model", None)
+    language_model_prefix = "language_model"
+    if not isinstance(language_model, nn.Module):
+        language_model = getattr(getattr(model, "model", None), "language_model", None)
+        language_model_prefix = "model.language_model"
+    if not isinstance(language_model, nn.Module):
+        return None
+    topology = infer_model_topology(language_model)
+    if topology is None:
+        return None
+    nested = _prefix_topology(topology, language_model_prefix, model_type=model_type)
+    # Depending on the Transformers version, the LM head belongs either to the
+    # contained causal LM or to the outer conditional-generation wrapper.
+    outer_heads = _existing(dict(model.named_modules()), ("lm_head", "score"))
     return ModelTopology(
-        model_type=model_type,
-        layers=layers,
-        embeddings=embeddings,
-        word_embedding=word_embedding,
-        prediction_heads=heads,
+        model_type=nested.model_type,
+        layers=nested.layers,
+        embeddings=nested.embeddings,
+        word_embedding=nested.word_embedding,
+        prediction_heads=tuple(dict.fromkeys((*nested.prediction_heads, *outer_heads))),
     )
 
 
-def _gpt2_topology(model: nn.Module, model_type: str) -> Optional[ModelTopology]:
-    prefix = _first_existing_prefix(model, ("transformer", ""))
-    if prefix is None:
-        return None
-    layers = _module_list_names(model, prefix, "h")
-    if not layers:
-        # MPT-style blocks under the same transformer root.
-        layers = _module_list_names(model, prefix, "blocks")
-    if not layers:
-        return None
-
-    word_embedding = _join(prefix, "wte")
-    if not _module_exists(model, word_embedding):
-        word_embedding = _join(prefix, "word_embeddings")
-    if not _module_exists(model, word_embedding):
-        word_embedding = None
-
-    heads = _prediction_heads(model, ("lm_head", "score"))
-    embeddings = (word_embedding,) if word_embedding is not None else ()
-    return ModelTopology(
-        model_type=model_type,
-        layers=layers,
-        embeddings=embeddings,
-        word_embedding=word_embedding,
-        prediction_heads=heads,
-    )
-
-
-def _llama_topology(model: nn.Module, model_type: str) -> Optional[ModelTopology]:
-    prefix = _first_existing_prefix(model, ("model", "language_model.model", ""))
-    if prefix is None:
-        return None
-    layers = _module_list_names(model, prefix, "layers")
-    if not layers:
-        return None
-
-    word_embedding = _join(prefix, "embed_tokens")
-    if not _module_exists(model, word_embedding):
-        word_embedding = None
-
-    heads = _prediction_heads(model, ("lm_head", "score"))
-    embeddings = (word_embedding,) if word_embedding is not None else ()
-    return ModelTopology(
-        model_type=model_type,
-        layers=layers,
-        embeddings=embeddings,
-        word_embedding=word_embedding,
-        prediction_heads=heads,
-    )
-
-
-def _opt_topology(model: nn.Module, model_type: str) -> Optional[ModelTopology]:
-    prefix = _first_existing_prefix(model, ("model.decoder", "decoder", "model", ""))
-    if prefix is None:
-        return None
-    layers = _module_list_names(model, prefix, "layers")
-    if not layers:
-        return None
-
-    word_embedding = _join(prefix, "embed_tokens")
-    if not _module_exists(model, word_embedding):
-        # OPTForCausalLM often keeps embeddings on the top-level model.
-        for candidate in ("model.decoder.embed_tokens", "decoder.embed_tokens", "embed_tokens"):
-            if _module_exists(model, candidate):
-                word_embedding = candidate
-                break
-        else:
-            word_embedding = None
-
-    heads = _prediction_heads(model, ("lm_head", "score"))
-    embeddings = (word_embedding,) if word_embedding is not None else ()
-    return ModelTopology(
-        model_type=model_type,
-        layers=layers,
-        embeddings=embeddings,
-        word_embedding=word_embedding,
-        prediction_heads=heads,
-    )
-
-
-def _gpt_neox_topology(model: nn.Module, model_type: str) -> Optional[ModelTopology]:
-    prefix = _first_existing_prefix(model, ("gpt_neox", ""))
-    if prefix is None:
-        return None
-    layers = _module_list_names(model, prefix, "layers")
-    if not layers:
-        return None
-
-    word_embedding = _join(prefix, "embed_in")
-    if not _module_exists(model, word_embedding):
-        word_embedding = None
-
-    heads = _prediction_heads(model, ("embed_out", "lm_head", "score"))
-    embeddings = (word_embedding,) if word_embedding is not None else ()
-    return ModelTopology(
-        model_type=model_type,
-        layers=layers,
-        embeddings=embeddings,
-        word_embedding=word_embedding,
-        prediction_heads=heads,
-    )
-
-
-_TopologyBuilder = Callable[[nn.Module, str], Optional[ModelTopology]]
-
-# Ordered structural probes used when model_type is missing/unknown.
-# DistilBERT must be tried before GPT-2: both use a ``transformer`` root, but
-# DistilBERT stores blocks at ``transformer.layer`` while GPT-2 uses ``transformer.h``.
-_STRUCTURAL_ADAPTERS: Tuple[Tuple[str, _TopologyBuilder], ...] = (
-    ("bert", _bert_topology),
-    ("distilbert", _distilbert_topology),
-    ("gpt2", _gpt2_topology),
-    ("llama", _llama_topology),
-    ("opt", _opt_topology),
-    ("gpt_neox", _gpt_neox_topology),
-)
-
-
-def _typed_adapter(values: set[str]) -> Optional[Tuple[str, _TopologyBuilder, frozenset[str]]]:
-    if values & _BERT_TYPES:
-        return ("bert", _bert_topology, _BERT_TYPES)
-    if values & _DISTILBERT_TYPES or any("distilbert" in value for value in values):
-        return ("distilbert", _distilbert_topology, _DISTILBERT_TYPES)
-    if values & _GPT2_TYPES:
-        return ("gpt2", _gpt2_topology, _GPT2_TYPES)
-    if values & _LLAMA_TYPES:
-        return ("llama", _llama_topology, _LLAMA_TYPES)
-    if values & _OPT_TYPES:
-        return ("opt", _opt_topology, _OPT_TYPES)
-    if values & _GPT_NEOX_TYPES:
-        return ("gpt_neox", _gpt_neox_topology, _GPT_NEOX_TYPES)
+def _typed_family(values: set) -> Optional[_FamilySpec]:
+    for spec in _FAMILIES:
+        if values & spec.types:
+            return spec
+        # ``DistilBertForMaskedLM`` etc.: match the family name inside architecture strings.
+        if spec.label == "distilbert" and any("distilbert" in value for value in values):
+            return spec
     return None
 
 
@@ -363,21 +289,26 @@ def infer_model_topology(model: nn.Module) -> Optional[ModelTopology]:
     structural probing so common layouts still resolve when the type string is
     missing or custom.
     """
-
     values = _config_values(model)
-    typed = _typed_adapter(values)
+
+    # Wrapper composition precedes family dispatch: the wrapper's config says
+    # ``gemma3``, while the semantic text modules belong to its contained LM.
+    wrapped = _gemma3_multimodal_topology(model, _config_model_type(model) or "gemma3")
+    if wrapped is not None:
+        return wrapped
+
+    modules = dict(model.named_modules())
+    typed = _typed_family(values)
     if typed is not None:
-        label, builder, candidates = typed
-        topology = builder(model, _pick_label(values, candidates, label))
+        topology = _build_from_spec(model, modules, typed, _pick_label(values, typed.types, typed.label))
         if topology is not None:
             return topology
 
     # Structural fallback (and second chance if the typed adapter's paths missed).
-    preferred = typed[0] if typed is not None else None
-    for label, builder in _STRUCTURAL_ADAPTERS:
-        if label == preferred:
+    for spec in _FAMILIES:
+        if spec is typed:
             continue
-        topology = builder(model, _config_model_type(model) or label)
+        topology = _build_from_spec(model, modules, spec, _config_model_type(model) or spec.label)
         if topology is not None:
             return topology
     return None
@@ -408,12 +339,12 @@ def describe_model_for_topology_error(model: nn.Module) -> str:
         lines.append(
             "Pass an explicit site list instead, for example:\n"
             f'  signal_scope=SignalScope.from_values(activation_sites=["{example}.*"])\n'
-            "or add/extend an adapter in gradiend/model_topology.py for this architecture."
+            "or add a family to _FAMILIES in gradiend/model_topology.py for this architecture."
         )
     else:
         lines.append(
             "Pass an explicit site list, for example:\n"
             '  signal_scope=SignalScope.from_values(activation_sites=["path.to.module"])\n'
-            "or add/extend an adapter in gradiend/model_topology.py for this architecture."
+            "or add a family to _FAMILIES in gradiend/model_topology.py for this architecture."
         )
     return "\n".join(lines)

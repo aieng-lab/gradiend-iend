@@ -56,6 +56,17 @@ def _last_nonblank_index(lines: list[str]) -> int | None:
     return None
 
 
+def _list_item_indent(lines: list[str], idx: int) -> int | None:
+    """Indent of the list marker owning line ``idx`` (None if it is not in a list item)."""
+    for j in range(idx, -1, -1):
+        stripped = lines[j].lstrip()
+        if not stripped:
+            return None
+        if _is_list_start(stripped):
+            return len(lines[j]) - len(stripped)
+    return None
+
+
 def _has_blank_since(lines: list[str], since_idx: int) -> bool:
     for line in lines[since_idx + 1 :]:
         if not line.strip():
@@ -90,8 +101,11 @@ def fix_docstring_content_lines(content_lines: list[str]) -> list[str]:
 
         if not in_fence and stripped and not _is_list_start(stripped):
             prev_idx = _last_nonblank_index(out[:-1])
-            if prev_idx is not None and _is_list_start(out[prev_idx].lstrip()):
-                if not _has_blank_since(out[:-1], prev_idx):
+            if prev_idx is not None and not _has_blank_since(out[:-1], prev_idx):
+                marker_indent = _list_item_indent(out[:-1], prev_idx)
+                # A line indented deeper than the list marker is a hanging
+                # continuation of the item, not the end of the list.
+                if marker_indent is not None and len(_leading_ws(line)) <= marker_indent:
                     indent = _leading_ws(line) or _leading_ws(out[prev_idx])
                     out.insert(len(out) - 1, f"{indent.rstrip()}\n" if indent.strip() else "\n")
 

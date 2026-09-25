@@ -23,11 +23,9 @@ The old plot-refresh pass has been removed: a cache hit with ``plot=True`` is
 strictly read-only, and missing plot curves raise instead of evaluating a
 checkpoint implicitly.
 """
-import os
-from pathlib import Path
+import inspect
 
 import pandas as pd
-import pytest
 from unittest.mock import Mock
 
 from gradiend.trainer.core.arguments import TrainingArguments
@@ -146,24 +144,8 @@ def test_plot_true_with_cache_hit_also_reuses_caller_frame(tmp_path):
     _assert_full_coverage_no_substitution(result)
 
 
-def test_analyze_decoder_for_plotting_omitted_split_uses_evaluate_decoder_default(tmp_path):
-    """
-    Regression test for a bug introduced (and caught) while promoting split/
-    training_like_df/neutral_df from **kwargs to explicit named parameters
-    across the plot call chain: evaluate_decoder's own `split` parameter
-    defaults to "test", NOT None -- `split=None` is a distinct value
-    downstream (e.g. the decoder cache key treats split=None as "none", a
-    different bucket than "test"). Naively forwarding an omitted (i.e. None)
-    `split` from analyze_decoder_for_plotting straight into
-    self.evaluate_decoder(split=split, ...) would have silently overridden
-    evaluate_decoder's own "test" default with an explicit None -- exactly
-    the same *class* of silent-substitution bug this whole file guards
-    against, just introduced by the fix itself rather than predating it.
-
-    This trainer's own data only has a "test" split -- if the fix regresses
-    (split=None reaches evaluate_decoder), this either crashes with "no data
-    for split=..." or silently scores against a different, empty population.
-    """
+def test_analyze_decoder_for_plotting_omitted_split_uses_evaluate_decoder_default():
+    """Do not override the decoder's ``test`` default with explicit ``None``."""
     test_df = pd.DataFrame([
         _row("The nurse said that [MASK] would arrive shortly.", "F", "she", "M", "he", split="test"),
         _row("The doctor said that [MASK] would arrive shortly.", "M", "he", "F", "she", split="test"),
@@ -175,17 +157,14 @@ def test_analyze_decoder_for_plotting_omitted_split_uses_evaluate_decoder_defaul
     trainer = TextPredictionTrainer(
         model="gpt2",
         config=config,
-        training_args=TrainingArguments(
-            add_neutral_identity_transitions=False,
-            experiment_dir=str(tmp_path),
-        ),
+        training_args=TrainingArguments(add_neutral_identity_transitions=False),
     )
-    trainer._ensure_data()
+    assert inspect.signature(type(trainer).evaluate_decoder).parameters["split"].default == "test"
+    cached_panels = {"F": {"F": 0.5, "M": 0.5}, "M": {"F": 0.5, "M": 0.5}}
+    trainer.evaluate_decoder = Mock(
+        return_value={"grid": {"base": {"probs_by_dataset": cached_panels}}}
+    )
 
-    # No decoder_results and no split -- forces analyze_decoder_for_plotting
-    # to internally call self.evaluate_decoder(...) with whatever split it
-    # resolves, which must be "test" (evaluate_decoder's own default), not
-    # None, or this crashes / scores an empty frame.
     result = trainer.analyze_decoder_for_plotting(
         class_ids=["F", "M"],
         use_cache=False,
@@ -193,16 +172,11 @@ def test_analyze_decoder_for_plotting_omitted_split_uses_evaluate_decoder_defaul
         feature_factors=[1.0], lrs=[1e-5],
         refine_points=0, plot=False,
     )
-    plotting_data = result.get("plotting_data") or {}
-    assert plotting_data, "analyze_decoder_for_plotting produced no plotting data"
-    for key, entry in plotting_data.items():
-        pbd = entry.get("probs_by_dataset") if isinstance(entry, dict) else None
-        assert pbd, f"grid entry {key} has no probs_by_dataset"
-        assert set(pbd.keys()) == {"F", "M"}, (
-            f"grid entry {key} probs_by_dataset panels are {sorted(pbd.keys())}, "
-            "expected exactly {'F', 'M'} -- split=None must not have reached "
-            "evaluate_decoder instead of its own \"test\" default."
-        )
+    assert "split" not in trainer.evaluate_decoder.call_args.kwargs
+    assert result["plotting_data"]["base"]["probs_by_dataset"] == cached_panels
+
+    trainer.analyze_decoder_for_plotting(split="validation")
+    assert trainer.evaluate_decoder.call_args.kwargs["split"] == "validation"
 
 
 def _assert_full_coverage_no_substitution(result):

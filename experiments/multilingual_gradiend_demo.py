@@ -52,6 +52,7 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 import pandas as pd
 import torch
 
+from gradiend.util.logging import get_logger
 from gradiend.comparison.seed_policy import (
     enter_analysis_mode,
     enter_analysis_mode_for_trainers,
@@ -71,6 +72,7 @@ from gradiend import (
     plot_topk_overlap_heatmap,
     plot_topk_overlap_venn,
 )
+
 from gradiend.comparison.cross_encoding import (
     build_cross_task_encoder_summary,
     collect_unified_test_rows,
@@ -105,6 +107,8 @@ from gradiend.util.paths import (
     resolve_decoder_mlm_head_dir,
     resolve_output_path,
 )
+
+logger = get_logger(__name__)
 
 
 ENCODER_MODEL = "google-bert/bert-base-multilingual-cased"
