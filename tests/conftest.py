@@ -40,10 +40,9 @@ def _release_test_memory():
     """Close matplotlib figures between tests (full suite can otherwise grow)."""
     yield
     _close_matplotlib_figures()
-    if os.environ.get("GRADIEND_GC_EACH_TEST") == "1":
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def pytest_configure(config):

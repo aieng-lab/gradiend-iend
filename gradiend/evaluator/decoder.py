@@ -360,19 +360,16 @@ def derive_default_feature_factor(
     CONTRACT (do not change without explicit design review):
 
     - Gradient-space GRADIEND uses the historical weight-rewrite convention:
-
       factual/diff sources use ``-feature_class_encoding_direction[class_name]``;
       alternative sources use ``+feature_class_encoding_direction[class_name]``.
 
     - Activation-space ACTIEND uses direct activation-displacement semantics,
-
       so its feature factor is the negated GRADIEND weight-rewrite feature
       factor. For the usual ``target="diff"`` steering setup, that means
       factual/diff sources use ``+feature_class_encoding_direction[class_name]``
       and alternative sources use ``-feature_class_encoding_direction[class_name]``.
 
     - Rewrite/hook orientation is **only** this ``feature_factor`` ×
-
       decoder(latent); never flip LR. ``SignalScope`` chooses activation sites
       and does not participate in the sign convention.
 
@@ -1525,7 +1522,7 @@ class DecoderEvaluator:
 
         def _evaluate_pair(feature_factor: float, lr: float) -> Dict[str, Any]:
             id_key = (feature_factor, lr)
-            logger.info(
+            logger.debug(
                 "_evaluate_pair: ff=%r lr=%r id(training_like_df)=%s len(training_like_df)=%s "
                 "id(neutral_df)=%s len(neutral_df)=%s",
                 feature_factor,

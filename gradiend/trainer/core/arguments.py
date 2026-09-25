@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from gradiend.trainer.core.cache_policy import normalize_use_cache
+from gradiend.trainer.core.metric_names import normalize_metric_name
 from gradiend.trainer.core.config import validate_source_target, validate_source_target_combination
 from gradiend.trainer.core.pruning import PostPruneConfig, PrePruneConfig, _validate_topk
 from gradiend.trainer.core.signals import (
@@ -23,6 +24,39 @@ from gradiend.trainer.core.signals import (
     normalize_signal_arguments,
 )
 from gradiend.gradiend_split import GradiendSplit, coerce_gradiend_split
+
+
+def dtype_to_name(dtype: torch.dtype) -> str:
+    """Serialize a torch dtype as its bare name ("bfloat16", not "torch.bfloat16").
+
+    ``str(torch.bfloat16)`` returns ``"torch.bfloat16"``, which no longer
+    resolves through ``getattr(torch, name)``.  Writing the prefixed form and
+    reading it back silently produced ``float32``, so a configured
+    ``torch_dtype=bfloat16`` was lost on every ``to_dict()``/``from_dict()``
+    round trip -- and :class:`TextPredictionTrainer` round-trips its arguments
+    on construction, so no trainer ever saw the requested dtype.
+    """
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"dtype_to_name expects a torch.dtype, got {type(dtype).__name__}")
+    return str(dtype).split(".")[-1]
+
+
+def dtype_from_name(name: Any) -> torch.dtype:
+    """Resolve a serialized dtype name back to the torch dtype.
+
+    Accepts both the bare name and the legacy ``"torch."``-prefixed form so
+    configs and caches written before :func:`dtype_to_name` still load.  An
+    unknown name raises instead of falling back to ``float32``: a silent
+    fallback is what hid the round-trip loss described above.
+    """
+    if isinstance(name, torch.dtype):
+        return name
+    if not isinstance(name, str):
+        raise TypeError(f"dtype_from_name expects a str or torch.dtype, got {type(name).__name__}")
+    resolved = getattr(torch, name.split(".")[-1], None)
+    if not isinstance(resolved, torch.dtype):
+        raise ValueError(f"Unknown torch dtype name {name!r}")
+    return resolved
 
 
 @dataclass
@@ -55,12 +89,17 @@ class TrainingArguments:
     add_identity_for_other_classes: bool = False
     """If True, add identity (factual==alternative) examples for classes not in the target classes used for training."""
 
-    add_neutral_identity_transitions: bool = True
-    """If True, add neutral identity transitions from TextPredictionConfig.neutral_data.
+    add_neutral_identity_transitions: Optional[bool] = None
+    """Whether to add neutral identity transitions from ``TextPredictionConfig.neutral_data``.
 
     These rows have factual==alternative and label 0. For target='diff' they
     train the decoded GRADIEND/ACTIEND update toward the zero vector on neutral
     examples without adding a separate neutral-specific loss.
+
+    - ``None`` (default): enabled automatically when ``neutral_data`` is configured,
+      otherwise disabled.
+    - ``True``: always enabled; training fails if no ``neutral_data`` is configured.
+    - ``False``: never used, even if ``neutral_data`` is configured.
     """
 
     # ----- GRADIEND interpretation -----
@@ -117,49 +156,31 @@ class TrainingArguments:
     """Peak learning rate."""
 
     learning_rate_decoder: Optional[Union[float, Literal["auto", "default"]]] = "default"
-    """Optional separate learning rate for the GRADIEND/ACTIEND decoder.
+    """Optional separate learning rate for the decoder.
 
-    The default sentinel ``"default"`` is SIGNAL-KIND-AWARE: it resolves to ``"auto"``
-    ONLY for the ``activation`` signal (ACTIEND), where the reachability lift was
-    validated. For ``gradient`` (GRADIEND) and ``activation_gradient`` (AGIEND/CAGA) --
-    and when no signal is set -- it resolves to ``None`` (shared), because the lift is
-    unvalidated there (and CAGA is closed-form). Passing ``"auto"`` EXPLICITLY forces
-    auto on any signal.
+    - ``"default"`` (the default) resolves per signal kind at construction:
+      ``"auto"`` for pure activation signals (ACTIEND) and ``None`` otherwise.
+    - ``None``: encoder and decoder share ``learning_rate`` in one optimizer group
+      (the classic GRADIEND behavior).
+    - a float: the decoder gets its own parameter group with this rate.
+    - ``"auto"``: the decoder starts at ``learning_rate``; at the first
+      ``eval_steps`` boundary it is raised to a model-local reachability floor.
+      This needs training to run *past* the first ``eval_steps`` boundary, an
+      Adam/AdamW optimizer, an identity decoder and an ``MSELoss`` criterion, and
+      it sets the decoder weight decay to 0. The estimate reuses Adam's decoder
+      first moments and stores only latent-sized statistics, so it adds no
+      decoder-sized memory and no extra pass.
 
-    ``"auto"`` is SIGNAL-KIND-AWARE only via the default; when set it always means: start
-    the decoder at
-    ``learning_rate`` and, at the first ``eval_steps`` boundary, raises it to the
-    model-local reachability floor -- BUT only for ACTIVATION-space signals
-    (``activation`` / ``activation_gradient``, i.e. ACTIEND / AGIEND), where the
-    ridge optimum is far and Adam's per-step displacement cannot reach it
-    (IEND_THEORY_PLAN 2.7, measured for ACTIEND). For a ``gradient`` (weight-space,
-    GRADIEND) signal -- and the default when no signal is set -- ``"auto"`` resolves
-    to ``None`` (shared) instead, because the GRADIEND decoder historically shared
-    the encoder rate and was never shown to need lifting; a blanket ``"auto"``
-    default silently decoupled it across a package version. The reachability
-    estimator reuses Adam's existing decoder first moments and stores only
-    latent-sized Hessian statistics (no decoder-sized tensor, no extra pass); it
-    requires Adam/AdamW, an identity decoder, and MSE loss, and disables decoder
-    weight decay (encoder weight decay unchanged).
+    Why a separate decoder rate exists: Adam-family updates are scale-free, so the
+    decoder can move at most about ``lr * steps * sqrt(output_dim)``. When the
+    decoder optimum is far larger than the encoder's (ACTIEND reconstructs raw
+    activation differences), an encoder-tuned rate cannot reach it. Raising only
+    the decoder rate removes that limit without changing encoder optimization.
 
-    ``None`` keeps the historical behaviour exactly: encoder and decoder share
-    ``learning_rate`` in a single optimizer parameter group. Pass an explicit
-    float to force a decoupled rate on ANY signal (including gradient).
-
-    Set a value to give the decoder its own group. Adam-family updates are
-    scale-free, so per-step displacement is bounded by roughly ``lr`` per
-    coordinate regardless of gradient magnitude; the decoder can therefore move
-    at most about ``lr * steps * sqrt(output_dim)`` in total. When the decoder's
-    optimum has a far larger norm than the encoder's -- as it does for ACTIEND,
-    whose reconstruction target is a raw activation difference -- that cap can be
-    orders of magnitude below the distance it must travel, so the decoder cannot
-    converge under an encoder-tuned learning rate however correct its gradient
-    direction is. Raising only the decoder's rate lifts that constraint without
-    perturbing encoder optimization.
-
-    Incompatible with ``supervised_encoder=True``, which trains no decoder
-    parameter; that combination raises instead of silently doing nothing.
-
+    Incompatible with ``supervised_encoder=True`` (no decoder parameter is trained).
+    Note that ``"default"`` is resolved once in ``__post_init__``; when copying
+    arguments with ``dataclasses.replace(args, signal=...)`` pass
+    ``learning_rate_decoder="default"`` again to re-resolve it for the new signal.
     """
 
     num_train_epochs: int = 3
@@ -268,6 +289,24 @@ class TrainingArguments:
     """When False (default), pass use_cache=False to decoder model forward during training (KV cache disabled).
     Use True only for inference/generation. Decoder-only MLM head training respects this via train_decoder_only_mlm_head."""
 
+    label_token_protocol: str = "canonical"
+    """Which token id a decoder-only *training* item labels the prediction with.
+
+    ``"canonical"`` (default for new runs): the leading-space variant of the label
+    (``▁she`` / ``Ġshe``), i.e. ``tokenizer(" " + label)`` -- the rule
+    :meth:`TextPredictionModelWithGradiend.create_inputs` always used, so training
+    items and single-row scoring agree. The label is written onto the last prefix
+    token (the template's trailing space) and predicted from the token before it,
+    so the natural next token is the leading-space variant.
+
+    ``"legacy"``: the pre-2026-09-25 dataset rule, ``vocab[label]`` i.e. the
+    no-space variant (``she``), which the model almost never predicts after a
+    word boundary and which disagrees with ``create_inputs``.
+
+    Checkpoints/argument dicts that do not carry this key deserialize as
+    ``"legacy"`` (see :meth:`from_dict`), so already trained artifacts are never
+    silently re-interpreted."""
+
     prediction_objective: str = "auto"
     """Prediction objective for text-gradient training and decoder probability scoring.
     Supported: ``auto``, ``mlm_mask_token``, ``clm_next_token``, ``clm_mlm_head``,
@@ -303,16 +342,20 @@ class TrainingArguments:
     params: Optional[List[str]] = None
     """If set, only these parameter names or wildcards are included in the GRADIEND param map when building from a base model. None = include all backbone parameters (default). Enables future params selection processes."""
 
-    signal: Optional[Any] = None
-    """Signal measured for GRADIEND training. Defaults to ``Signal.gradient()``. Scope remains controlled by params/param_map and future split settings."""
+    signal: Optional[Union[Signal, str, Dict[str, Any]]] = None
+    """What is measured from the base model (``Signal.gradient()`` by default; also ``Signal.activation(...)``
+    and ``Signal.activation_gradient(...)``). *Where* it is measured is ``signal_scope``; how the resolved
+    space is partitioned is ``gradiend_split``. Strings (``"gradient"``, ``"activation"``) and dicts are coerced."""
 
-    signals: Optional[Any] = None
-    """Optional SignalSet or sequence of signals for future multi-signal training. Mutually exclusive with a distinct ``signal`` value."""
+    signals: Optional[Union[SignalSet, Signal, List[Any], Dict[str, Any]]] = None
+    """Optional ``SignalSet`` / sequence of signals. Reserved for multi-signal training (currently exactly one signal is
+    supported). Passing both ``signal`` and ``signals`` is only allowed when they describe the same single signal."""
 
-    signal_scope: Optional[Any] = None
-    """Optional SignalScope describing where a signal is measured, e.g. activation module sites. Signal itself remains only the measured quantity."""
+    signal_scope: Optional[Union[SignalScope, Dict[str, Any]]] = None
+    """Optional ``SignalScope`` describing where the signal is measured (parameters for gradient signals, module
+    sites for activation signals). ``None`` uses the default backbone scope."""
 
-    gradiend_split: Optional[Any] = None
+    gradiend_split: Optional[Union[GradiendSplit, str, Dict[str, Any]]] = None
     """Optional GradiendSplit describing component partitioning over the resolved signal space.
 
     ``signal`` defines what is measured and ``signal_scope`` defines where it is
@@ -398,9 +441,8 @@ class TrainingArguments:
     """Metric used for best-checkpoint and best-seed selection.
 
     ``None`` preserves the historical behavior by using ``convergent_metric``.
-    Set ``"encoding_e"``/``"E"`` to select by the same validation bottleneck
-    as the gradiend-sae SAE/CAA study while leaving convergence semantics
-    unchanged. For one-pole data this includes ``auc_rival`` and class
+    Set ``"encoding_e"``/``"E"`` to select by the encoding-E validation bottleneck
+    (see the evaluation guide) while leaving convergence semantics unchanged. For one-pole data this includes ``auc_rival`` and class
     exclusivity whenever rival factual rows exist."""
 
     convergent_score_threshold: Optional[float] = None
@@ -500,17 +542,11 @@ class TrainingArguments:
         return coerce_signal_set(value)
 
     def _signal_default_decoder_lr_is_auto(self) -> bool:
-        """Whether the ``'auto'`` decoder-LR default applies for this signal.
+        """Whether the ``"default"`` decoder learning rate resolves to ``"auto"``.
 
-        ``'auto'`` (the reachability-floor lift, IEND_THEORY_PLAN 2.7) was validated for
-        the ACTIVATION signal (ACTIEND); it applies by default ONLY when every configured
-        signal is ``activation``. For ``gradient`` (GRADIEND) the decoder historically
-        shared the encoder rate, and for ``activation_gradient`` (AGIEND/CAGA) the lift is
-        unvalidated (different signal magnitude/geometry; CAGA is closed-form so it does
-        not train a decoder at all) -- both default to ``None`` (shared). Explicit
-        ``'auto'`` / float still force a decoupled rate on any signal. Reads kinds directly
-        (runs before ``_normalize_signal_arguments``); the unset default is ``gradient``,
-        so no signal -> not auto."""
+        True only when every configured signal is ``activation``. Reads the kinds
+        directly because it runs before ``_normalize_signal_arguments``.
+        """
         kinds = set()
         if self.signal is not None:
             kinds.add(getattr(self.signal, "kind", None))
@@ -534,25 +570,10 @@ class TrainingArguments:
             and self.signal.kind == "gradient"
             and self.signal_scope.activation_sites is not None
         ):
-            # signal_scope.activation_selector (SignalScope.layers()/.layer()/
-            # .embeddings()/.word_embedding()) IS now resolved for a gradient
-            # signal too -- gradient_params_from_selector() in
-            # gradiend/signal_space.py translates it into weight-parameter
-            # wildcards via the same architecture-agnostic ModelTopology the
-            # activation-signal path already used, at model-construction time
-            # (scope_params(scope, base_model=...) in
-            # ModelWithGradiend._create_gradiend). See that function's
-            # docstring: fixed 2026-08-20 after gradiend-sae found
-            # SignalScope.layers() attached to Signal.gradient() silently
-            # training with no scope restriction at all.
-            #
-            # Raw activation_sites=... (an explicit include-list of exact/
-            # wildcard *module* paths, not the semantic shortcuts above) is
-            # NOT resolved for a gradient signal -- there is no generic,
-            # correct way to turn an arbitrary caller-supplied module-name
-            # pattern into the right parameter-name wildcard without risking
-            # a silently-wrong match (e.g. a pattern that already ends in a
-            # wildcard). Fail loudly here instead.
+            # Semantic shortcuts (SignalScope.layers()/.embeddings()/...) resolve to weight
+            # parameters for gradient signals (see signal_space.gradient_params_from_selector).
+            # A raw module-path include-list cannot be translated to parameter names
+            # unambiguously, so reject it instead of silently matching nothing.
             raise ValueError(
                 "signal_scope.activation_sites has no effect on a gradient signal "
                 "(Signal.gradient()) -- it is only resolved for Signal.activation(). "
@@ -568,7 +589,7 @@ class TrainingArguments:
                 "TrainingArguments.params is deprecated; use "
                 "TrainingArguments.signal_scope=SignalScope.from_values(params=...) instead.",
                 DeprecationWarning,
-                stacklevel=3,
+                stacklevel=4,
             )
             params_tuple = tuple(self.params)
             if self.signal_scope is None:
@@ -592,13 +613,13 @@ class TrainingArguments:
         if self.output_dir is not None and not isinstance(self.output_dir, str):
             raise TypeError(f"output_dir must be str or None, got {type(self.output_dir).__name__}")
         normalize_use_cache(self.use_cache)
+        if self.label_token_protocol not in ("canonical", "legacy"):
+            raise ValueError(
+                f"label_token_protocol must be 'canonical' or 'legacy', got {self.label_token_protocol!r}"
+            )
         if self.learning_rate_decoder == "default":
-            # Signal-kind-aware default: 'auto' (reachability lift, IEND_THEORY_PLAN
-            # 2.7) is validated only for the ACTIVATION signal (ACTIEND). gradient
-            # (GRADIEND) shared the encoder rate historically, and activation_gradient
-            # (AGIEND/CAGA) lift is unvalidated -- both default to None (shared). A
-            # blanket 'auto' default silently decoupled GRADIEND across a package
-            # version; this fixes that. Explicit 'auto'/None/float bypass this.
+            # Signal-kind-aware default: 'auto' only for pure activation signals (see the
+            # field documentation); explicit 'auto'/None/float bypass this.
             self.learning_rate_decoder = (
                 "auto" if self._signal_default_decoder_lr_is_auto() else None
             )
@@ -733,6 +754,13 @@ class TrainingArguments:
             raise ValueError(f"max_length must be >= 8, got {self.max_length}")
         if not isinstance(self.do_eval, bool):
             raise TypeError(f"do_eval must be bool, got {type(self.do_eval).__name__}")
+        if self.add_neutral_identity_transitions is not None and not isinstance(
+            self.add_neutral_identity_transitions, bool
+        ):
+            raise TypeError(
+                "add_neutral_identity_transitions must be bool or None, got "
+                f"{type(self.add_neutral_identity_transitions).__name__}"
+            )
         if self.seed is not None and not isinstance(self.seed, int):
             raise TypeError(f"seed must be int or None, got {type(self.seed).__name__}")
         if not isinstance(self.gradiend_split_loss, str):
@@ -815,13 +843,11 @@ class TrainingArguments:
         if not isinstance(self.seed_stability_part, str) or not self.seed_stability_part.strip():
             raise ValueError("seed_stability_part must be a non-empty string.")
 
-        metric = (self.convergent_metric or ("loss" if self.supervised_decoder else "correlation")).lower()
-        if metric in {"auroc", "auc", "roc-auc"}:
-            metric = "roc_auc"
-            self.convergent_metric = "roc_auc"
-        if metric in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)", "min_auc_n_o"}:
-            metric = "min_auc_n_o"
-            self.convergent_metric = "min_auc_n_o"
+        metric = normalize_metric_name(
+            self.convergent_metric or ("loss" if self.supervised_decoder else "correlation")
+        )
+        if self.convergent_metric is not None:
+            self.convergent_metric = metric
         if metric not in ("correlation", "loss", "roc_auc", "min_auc_n_o"):
             raise ValueError(
                 "convergent_metric must be 'correlation', 'roc_auc'/'auroc', "
@@ -840,15 +866,7 @@ class TrainingArguments:
             raise ValueError("convergent_score_threshold is required when convergent_metric='loss'.")
 
         if self.selection_metric is not None:
-            selection = str(self.selection_metric).strip().lower()
-            if selection in {"e", "encoding_e", "encoding-e", "encodinge"}:
-                selection = "encoding_e"
-            elif selection in {"auroc", "auc", "roc-auc"}:
-                selection = "roc_auc"
-            elif selection in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
-                selection = "min_auc_n_o"
-            elif selection == "corr":
-                selection = "correlation"
+            selection = normalize_metric_name(self.selection_metric)
             if selection not in {"correlation", "loss", "roc_auc", "min_auc_n_o", "encoding_e"}:
                 raise ValueError(
                     "selection_metric must be 'correlation', 'roc_auc', 'min_auc_n_o', "
@@ -866,7 +884,13 @@ class TrainingArguments:
             v = getattr(self, k, None)
             if callable(v):
                 continue
-            if isinstance(v, (nn.Module, torch.dtype)):
+            if isinstance(v, torch.dtype):
+                # ``str(torch.bfloat16)`` is "torch.bfloat16"; ``from_dict``
+                # resolves the name via ``getattr(torch, name)``, which cannot
+                # see through that prefix.  Serialize the bare name so the
+                # round-trip is lossless (see ``dtype_from_name``).
+                result[k] = dtype_to_name(v)
+            elif isinstance(v, nn.Module):
                 result[k] = str(v) if v is not None else None
             elif k == "pre_prune_config" and v is not None:
                 cfg = dataclasses.asdict(v)
@@ -892,6 +916,9 @@ class TrainingArguments:
     def from_dict(cls, d: dict) -> "TrainingArguments":
         """Create from dict (e.g. loaded from JSON). Canonical keys only."""
         d = dict(d)
+        # A serialized dict without the key was written before the protocol existed:
+        # it must keep the old label convention, not silently pick up the new default.
+        d.setdefault("label_token_protocol", "legacy")
         if "signal" in d and isinstance(d.get("signal"), dict):
             d["signal"] = Signal.from_dict(d["signal"])
         if "signals" in d and isinstance(d.get("signals"), list):
@@ -901,7 +928,7 @@ class TrainingArguments:
         if "gradiend_split" in d and isinstance(d.get("gradiend_split"), dict):
             d["gradiend_split"] = GradiendSplit.from_dict(d["gradiend_split"])
         if "torch_dtype" in d and isinstance(d.get("torch_dtype"), str):
-            d["torch_dtype"] = getattr(torch, d["torch_dtype"], torch.float32)
+            d["torch_dtype"] = dtype_from_name(d["torch_dtype"])
         if "pre_prune_config" in d and isinstance(d.get("pre_prune_config"), dict):
             d["pre_prune_config"] = PrePruneConfig(**d["pre_prune_config"])
         if "post_prune_config" in d and isinstance(d.get("post_prune_config"), dict):

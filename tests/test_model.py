@@ -569,8 +569,6 @@ class TestParamMappedGradiendModel:
         assert gradient_model.signal_kind == "gradient"
         assert gradient_model.uses_gradients is True
         assert gradient_model.uses_activations is False
-        assert gradient_model.is_gradiend is True
-        assert gradient_model.is_actiend is False
 
         activation_model = ParamMappedGradiendModel(
             input_dim=2,
@@ -582,8 +580,6 @@ class TestParamMappedGradiendModel:
         assert activation_model.signal_kind == "activation"
         assert activation_model.uses_gradients is False
         assert activation_model.uses_activations is True
-        assert activation_model.is_gradiend is False
-        assert activation_model.is_actiend is True
     
     def test_param_mapped_model_flatten_gradient_dict(self):
         """Test flattening gradient dict to tensor."""
@@ -647,6 +643,97 @@ class TestParamMappedGradiendModel:
         torch.testing.assert_close(actual, expected)
         assert base_stream.weight.grad is None
         assert base_stream.bias.grad is None
+
+    def test_param_mapped_streaming_cosine_matches_flat_cosine_for_sparse_selectors(self, set_seed):
+        """Mask and index selections must match flattening without retaining grads."""
+        set_seed(7)
+        base = nn.Linear(4, 3)
+        base_stream = nn.Linear(4, 3)
+        base_stream.load_state_dict(base.state_dict())
+        mask = torch.tensor(
+            [[True, False, True, False], [False, True, False, True], [True, True, False, False]]
+        )
+        indices = torch.tensor([0, 2])
+        param_map = {
+            "weight": {"shape": tuple(base.weight.shape), "repr": "mask", "mask": mask},
+            "bias": {"shape": tuple(base.bias.shape), "repr": "indices", "indices": indices},
+        }
+        input_dim = int(mask.sum().item() + indices.numel())
+        gradiend = ParamMappedGradiendModel(input_dim=input_dim, latent_dim=1, param_map=param_map)
+        direction = torch.randn(input_dim)
+        x = torch.randn(5, 4)
+
+        base.zero_grad(set_to_none=True)
+        base(x).pow(2).sum().backward()
+        flat = gradiend.extract_gradients(base)
+        expected = float(torch.nn.functional.cosine_similarity(flat, direction, dim=0))
+        base.zero_grad(set_to_none=True)
+
+        actual = gradiend.gradient_cosine_streaming(
+            base_stream,
+            lambda: base_stream(x).pow(2).sum().backward(),
+            direction,
+        )
+        assert actual == pytest.approx(expected, rel=1e-6, abs=1e-7)
+        assert base_stream.weight.grad is None
+        assert base_stream.bias.grad is None
+
+    def test_param_mapped_streaming_cosine_matches_flat_cosine(self, set_seed):
+        """Streaming reduction must equal the historical flattened readout."""
+        set_seed(43)
+        base = nn.Linear(4, 3)
+        base_stream = nn.Linear(4, 3)
+        base_stream.load_state_dict(base.state_dict())
+        param_map = {
+            "weight": {"shape": tuple(base.weight.shape), "repr": "all"},
+            "bias": {"shape": tuple(base.bias.shape), "repr": "all"},
+        }
+        gradiend = ParamMappedGradiendModel(input_dim=15, latent_dim=1, param_map=param_map)
+        x = torch.randn(5, 4)
+        direction = torch.randn(15)
+
+        base.zero_grad(set_to_none=True)
+        base(x).pow(2).sum().backward()
+        flat = gradiend.extract_gradients(base)
+        expected = float(torch.nn.functional.cosine_similarity(flat, direction, dim=0))
+
+        actual = gradiend.gradient_cosine_streaming(
+            base_stream,
+            lambda: base_stream(x).pow(2).sum().backward(),
+            direction,
+        )
+        assert actual == pytest.approx(expected, abs=1e-6)
+        assert base_stream.weight.grad is None
+        assert base_stream.bias.grad is None
+
+    def test_param_mapped_streaming_cosine_recomputes_norm_after_direction_changes(self):
+        """An in-place direction update must invalidate the cached norm."""
+        base = nn.Linear(2, 1, bias=False)
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"weight": {"shape": (1, 2), "repr": "all"}},
+        )
+        direction = torch.tensor([1.0, 1.0])
+        input_ = torch.tensor([[1.0, 2.0]])
+
+        def backward():
+            base(input_).sum().backward()
+
+        first = gradiend.gradient_cosine_streaming(base, backward, direction)
+        expected_first = torch.nn.functional.cosine_similarity(
+            input_.flatten(), direction, dim=0
+        ).item()
+        assert first == pytest.approx(expected_first)
+
+        direction[0] = 4.0
+        second = gradiend.gradient_cosine_streaming(base, backward, direction)
+        expected_second = torch.nn.functional.cosine_similarity(
+            input_.flatten(), direction, dim=0
+        ).item()
+        assert second == pytest.approx(expected_second)
+        assert second != pytest.approx(first)
+        assert base.weight.grad is None
 
     def test_param_mapped_select_from_param_grad_matches_select_flat(self, set_seed):
         """Sparse selection should match flat indexing without cloning the full gradient."""
@@ -809,8 +896,6 @@ class TestModelWithGradiend:
         assert gradient_model.signal_kind == "gradient"
         assert gradient_model.uses_gradients is True
         assert gradient_model.uses_activations is False
-        assert gradient_model.is_gradiend is True
-        assert gradient_model.is_actiend is False
         assert gradient_model.capabilities.gradient_rewrite is True
         assert gradient_model.capabilities.activation_interventions is False
         assert gradient_model.capabilities.activation_selector_coverage is False
@@ -839,8 +924,6 @@ class TestModelWithGradiend:
         assert activation_model.signal_kind == "activation"
         assert activation_model.uses_gradients is False
         assert activation_model.uses_activations is True
-        assert activation_model.is_gradiend is False
-        assert activation_model.is_actiend is True
         assert activation_model.capabilities.gradient_rewrite is False
         assert activation_model.capabilities.activation_interventions is True
         assert activation_model.capabilities.activation_selector_coverage is True
@@ -2030,6 +2113,77 @@ class TestModelWithGradiend:
         assert not torch.allclose(during_logits, before_logits)
         assert torch.allclose(base_model.linear.weight, before_weight)
         assert not hasattr(model_with_gradiend, "active_intervention_metadata")
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_intervene_gradient_restores_half_precision_weights_bit_exactly(self, dtype):
+        """``(w + d) - d != w`` in bf16/fp16; a strength sweep must not drift the base model."""
+        from types import SimpleNamespace
+
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        n = 4096
+
+        class TinyBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = torch.nn.Linear(n, 1, bias=False)
+                self.fp32 = torch.nn.Linear(4, 1, bias=False)
+
+            def forward(self, input_ids=None, **kwargs):
+                return SimpleNamespace(logits=self.lin(input_ids.to(self.lin.weight.dtype)))
+
+        class TinyMWG(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        torch.manual_seed(0)
+        base = TinyBase()
+        with torch.no_grad():
+            base.lin.weight.copy_(torch.randn(1, n) * 0.02)
+        base.lin.to(dtype)  # fp32 sibling stays fp32: mixed-dtype maps must also restore
+        gradiend = ParamMappedGradiendModel(
+            input_dim=n + 4,
+            latent_dim=1,
+            param_map={
+                "lin.weight": {"shape": (1, n), "repr": "all"},
+                "fp32.weight": {"shape": (1, 4), "repr": "all"},
+            },
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        direction = torch.randn(n + 4)
+        direction = direction / direction.norm()
+        with torch.no_grad():
+            gradiend.decoder[0].linear.weight.copy_(direction.unsqueeze(1))
+        mwg = TinyMWG(base, gradiend)
+
+        before_half = base.lin.weight.detach().clone()
+        before_fp32 = base.fp32.weight.detach().clone()
+
+        # Sanity: the naive add/subtract round trip really is lossy at this scale.
+        update = (direction[:n] * 50.0).to(dtype)
+        naive = before_half.clone()
+        naive.add_(update.reshape_as(naive))
+        naive.sub_(update.reshape_as(naive))
+        assert not torch.equal(naive, before_half)
+
+        for lr in (0.5, 5.0, 50.0):  # sweep several strengths back to back
+            with mwg.intervene(value=lr, signal="gradient"):
+                assert not torch.equal(base.lin.weight, before_half)
+            assert torch.equal(base.lin.weight, before_half)
+            assert torch.allclose(base.fp32.weight, before_fp32, atol=1e-6)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with mwg.intervene(value=50.0, signal="gradient"):
+                raise RuntimeError("boom")
+        assert torch.equal(base.lin.weight, before_half)
 
     def test_intervene_activation_hooks_only_inside_context(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel

@@ -67,6 +67,19 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
         self._zero_base_grad(set_to_none=True)
         return gradients
 
+    def _gradient_cosine_from_loss(self, loss, direction):
+        """Read a full-width direction without materializing a flat gradient."""
+        base_for_grad = self._get_base_forward_model()
+        self._zero_base_grad(set_to_none=True)
+        try:
+            return self.gradiend.gradient_cosine_streaming(
+                base_for_grad,
+                lambda: self._backward_through_base_model(loss),
+                direction,
+            )
+        finally:
+            self._zero_base_grad(set_to_none=True)
+
     def create_gradients(self, text, label, return_dict=False, verbose=False):
         item = self.create_inputs(text, label)
         if self.use_seq2seq_encoder_mlm:
@@ -165,7 +178,10 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
                 if self.tokenizer.tokenizer.decode(label_token_id[0]).strip() == '':
                     label_token_id = label_token_id[1:]
             elif self.is_decoder_only_model:
-                label_token_id = self.tokenizer(f' {label}', add_special_tokens=False)['input_ids']
+                # Same rule as the training dataset's ``label_token_protocol="canonical"``.
+                from gradiend.trainer.text.prediction.dataset import decoder_only_label_token_ids
+
+                label_token_id = decoder_only_label_token_ids(self.tokenizer, label)
             else:
                 label_token_id = self.tokenizer(f'{label}', add_special_tokens=False)['input_ids']
             if len(label_token_id) > 1:
@@ -233,6 +249,25 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
                 return_dict=return_dict,
                 target_device=target_device,
             )
+
+    def forward_gradient_cosine(self, inputs, direction):
+        """Return cosine(base gradient, direction) with bounded peak memory."""
+        with self.exclusive_base_gradient_access():
+            inputs = self._place_inputs_for_base_forward(inputs)
+            inputs = {
+                k: v.unsqueeze(0) if v.ndim == 1 else (
+                    v.squeeze(dim=1) if v.ndim == 3 and v.shape[1] == 1 else v
+                )
+                for k, v in inputs.items()
+            }
+            base_forward_model = self._get_base_forward_model()
+            if self.use_seq2seq_encoder_mlm:
+                loss = seq2seq_encoder_mlm_loss(base_forward_model, inputs)
+            else:
+                loss = base_forward_model(**inputs).loss
+            if loss is None:
+                raise ValueError("Base model forward returned no loss for gradient cosine")
+            return self._gradient_cosine_from_loss(loss, direction)
 
     def forward_clm_gradients(self, inputs, return_dict=False, **kwargs):
         """Compute base gradients via the original causal LM (not the auxiliary MLM head).

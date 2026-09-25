@@ -10,10 +10,8 @@ from gradiend.trainer.core.callbacks import (
     _selection_metric_from_config,
 )
 from gradiend.trainer.core.component_seed import summarize_component_seed_runs
-from gradiend.trainer.trainer import (
-    _selection_eval_source,
-    _selection_metric_needs_rivals,
-)
+from gradiend.trainer.core.metric_names import metric_needs_rivals, normalize_metric_name
+from gradiend.trainer.trainer import _selection_eval_source
 
 
 def test_encoding_e_uses_auc_rival_and_worst_rival_exclusivity():
@@ -55,9 +53,9 @@ def test_selection_metric_is_independent_of_convergence_metric():
 
 
 def test_rival_encoding_is_only_required_by_auc_or_e_selectors():
-    assert not _selection_metric_needs_rivals("correlation")
-    assert _selection_metric_needs_rivals("encoding_e")
-    assert _selection_metric_needs_rivals("min_auc_n_o")
+    assert not metric_needs_rivals("correlation")
+    assert metric_needs_rivals("encoding_e")
+    assert metric_needs_rivals("min_auc_n_o")
     assert _selection_eval_source(
         one_pole=True,
         training_source="both",
@@ -117,3 +115,14 @@ def test_component_seed_selection_can_rank_by_encoding_e():
 
     assert summary["selected_components"]["L0"]["seed"] == 2
     assert summary["selection_metric"] == "encoding_e"
+
+
+def test_metric_aliases_normalize_to_canonical_names():
+    assert normalize_metric_name(None) == "correlation"
+    assert normalize_metric_name("Corr") == "correlation"
+    assert normalize_metric_name("AUROC") == "roc_auc"
+    assert normalize_metric_name("min(auc_n,auc_o)") == "min_auc_n_o"
+    assert normalize_metric_name("E") == "encoding_e"
+    assert normalize_metric_name("loss") == "loss"
+    assert metric_needs_rivals("auroc")
+    assert not metric_needs_rivals("loss")

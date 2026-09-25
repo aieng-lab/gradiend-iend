@@ -18,6 +18,7 @@ from typing import Optional, Callable, Dict, Any, Union, List
 from abc import ABC
 
 from gradiend.util.logging import get_logger
+from gradiend.trainer.core.metric_names import normalize_metric_name
 from gradiend.util.component_logging import format_component_convergence_fragment
 from gradiend.trainer.core.component_seed import (
     merge_rank_from_summary,
@@ -50,28 +51,13 @@ def _eval_enabled(config: Any, *, loss_only: bool = False) -> bool:
     return bool(_config_get(config, "do_eval", True))
 
 
-def _normalize_selection_metric(raw: Any) -> str:
-    name = str(raw or "correlation").strip().lower()
-    if name in {"auroc", "auc", "roc-auc"}:
-        return "roc_auc"
-    if name in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)", "min_auc_n_o"}:
-        return "min_auc_n_o"
-    if name in {"correlation", "corr"}:
-        return "correlation"
-    if name in {"e", "encoding_e", "encoding-e", "encodinge"}:
-        return "encoding_e"
-    if name == "loss":
-        return "loss"
-    return name
-
-
 def _selection_metric_from_config(config: Any, *, use_loss_for_best: bool = False) -> str:
     if use_loss_for_best:
         return "loss"
     explicit = _config_get(config, "selection_metric", None)
     if explicit is None:
         explicit = _config_get(config, "convergent_metric", "correlation")
-    return _normalize_selection_metric(explicit)
+    return normalize_metric_name(explicit)
 
 
 def _current_step_correlation(
@@ -107,7 +93,7 @@ def _current_step_selection_score(
     training_stats: Dict[str, Any],
     eval_result: Optional[Dict[str, Any]],
 ) -> Optional[float]:
-    name = _normalize_selection_metric(metric)
+    name = normalize_metric_name(metric)
     if name == "roc_auc":
         if isinstance(eval_result, dict) and eval_result.get("roc_auc") is not None:
             return float(eval_result["roc_auc"])
@@ -588,15 +574,12 @@ class CheckpointCallback(TrainingCallback):
     Behavior:
 
     - Saves the best model based on ``convergent_metric``
-
       (``correlation`` / ``roc_auc`` / ``min_auc_n_o``) or loss when ``use_loss_for_best=True``
 
     - For correlation: ``|correlation|`` by default; ``prefer_convergent_checkpoint`` can
-
       prefer threshold-satisfying steps
 
     - For roc_auc: raw one-vs-rest AUROC (higher better); label ``+1`` must have
-
       positive mean encoding; bipolar magnitude gating remains optional
 
     - For min_auc_n_o: ``min(auc_n, auc_o)`` so neutrals alone cannot carry selection

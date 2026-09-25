@@ -1768,6 +1768,9 @@ class TextPredictionTrainer(Trainer):
             return labels
         return None
 
+    def _has_shared_neutral_data(self) -> bool:
+        return getattr(self.config, "neutral_data", None) is not None
+
     def _get_expected_encoder_keys(self, source_type: str):
         if source_type != "factual" and self._is_one_pole_config():
             pos = self._one_pole_positive_class()
@@ -1776,7 +1779,7 @@ class TextPredictionTrainer(Trainer):
             if pos and cfs:
                 keys = {(pos, str(c)) for c in cfs} | {(str(c), pos) for c in cfs}
                 args = getattr(self, "training_args", None)
-                if getattr(args, "add_neutral_identity_transitions", True):
+                if self.neutral_identity_transitions_enabled(args):
                     keys.add(("neutral", "neutral"))
                 if getattr(args, "add_identity_for_other_classes", False):
                     cf_set = {str(c) for c in cfs}
@@ -2695,12 +2698,9 @@ class TextPredictionTrainer(Trainer):
             if training_args is not None
             else False
         )
-        # Default True only when TrainingArguments is present (package default).
-        # Without args, skip neutrals — there is no configured neutral pool.
-        add_neutral_identity = bool(
-            getattr(training_args, "add_neutral_identity_transitions", True)
-            if training_args is not None
-            else False
+        # Without TrainingArguments there is no opt-in, so no neutral identity rows.
+        add_neutral_identity = (
+            self.neutral_identity_transitions_enabled(training_args) if training_args is not None else False
         )
         mask_placeholder = resolve_mask_placeholder(
             config=self.config,
@@ -2865,7 +2865,25 @@ class TextPredictionTrainer(Trainer):
             rhs_window=getattr(getattr(self, "training_args", None), "decoder_sequence_cloze_rhs_window", -1),
             mlm_head_target_labels=mlm_head_target_labels,
             mask_placeholder=mask_placeholder,
+            label_token_protocol=self._label_token_protocol(),
         )
+
+    def _label_token_protocol(self) -> str:
+        """Label-token convention for decoder-only items (see ``TrainingArguments.label_token_protocol``).
+
+        One accessor for every dataset this trainer builds, so training, in-training
+        evaluation, neutral rows and post-training evaluation cannot disagree.
+        """
+        return str(getattr(getattr(self, "training_args", None), "label_token_protocol", "legacy") or "legacy")
+
+    def _configure_model(self, model: Any) -> None:
+        """Give single-row scorers (e.g. CGA detection) the run's label-token convention.
+
+        They receive only the model, but must label exactly as this trainer's
+        datasets do; see :func:`gradiend.trainer.text.prediction.dataset.training_label_token_id`.
+        """
+        super()._configure_model(model)
+        model.label_token_protocol = self._label_token_protocol()
 
     def create_gradient_training_dataset(
         self,
@@ -2918,6 +2936,15 @@ class TextPredictionTrainer(Trainer):
             signals=kwargs.get("signals"),
             context="TextPredictionTrainer.create_gradient_training_dataset",
         )
+        if (
+            signal.kind == "gradient"
+            and args is not None
+            and getattr(args, "prediction_objective", None) == "clm_target_span"
+        ):
+            raise NotImplementedError(
+                "prediction_objective='clm_target_span' is not implemented for "
+                "parameter-gradient training."
+            )
         if signal.kind in ("activation", "activation_gradient"):
             if kwargs.get("signals") is not None:
                 kwargs.pop("signals")
@@ -2945,6 +2972,11 @@ class TextPredictionTrainer(Trainer):
                 timing_label=kwargs.pop("timing_label", "text-activation"),
                 signal=signal,
                 mask_placeholder=activation_mask_placeholder,
+                prediction_objective=(
+                    getattr(args, "prediction_objective", None)
+                    if args is not None and getattr(args, "prediction_objective", None) not in (None, "auto")
+                    else "clm_next_token"
+                ),
                 **kwargs,
             )
         return TextGradientTrainingDataset(
@@ -3135,7 +3167,7 @@ class TextPredictionTrainer(Trainer):
 
         # Resolve targets and whether to use row-wise evaluation (P(factual) vs P(alternative) per row).
         targets, use_row_wise = self._resolve_decoder_eval_targets(training_like_df)
-        logger.info(
+        logger.debug(
             "evaluate_base_model: resolved decoder_eval targets (pre-restrict): "
             "use_row_wise=%s target_keys=%s",
             use_row_wise,
@@ -3155,7 +3187,7 @@ class TextPredictionTrainer(Trainer):
             target_classes_set = frozenset(str(c) for c in restrict_classes)
             pre_restrict_keys = sorted(targets.keys())
             targets = {k: v for k, v in targets.items() if k in target_classes_set}
-            logger.info(
+            logger.debug(
                 "evaluate_base_model: decoder_eval_restrict_to_target_classes -- "
                 "target_classes=%s decoder_eval_class_names/restrict_classes=%s "
                 "targets before=%s after=%s",
@@ -3184,7 +3216,7 @@ class TextPredictionTrainer(Trainer):
         # Do NOT group by alternative_id for panels — same key names, different semantics.
         dataset_class_col = label_dataset_col
 
-        logger.info(
+        logger.debug(
             "evaluate_base_model: scoring training_like_df rows=%d dataset_class_col=%r "
             "class_counts=%s use_row_wise=%s final_target_keys=%s",
             len(training_like_df),
@@ -3734,6 +3766,7 @@ class TextPredictionTrainer(Trainer):
                 balance_column="feature_pole",
                 mask_placeholder=mask_placeholder,
                 max_length=max_length,
+                label_token_protocol=self._label_token_protocol(),
             )
 
             # Use the same signal-aware dataset factory as training/evaluation.
@@ -3895,6 +3928,7 @@ class TextPredictionTrainer(Trainer):
             target_key="label",
             balance_column="feature_pole",
             max_length=max_length,
+            label_token_protocol=self._label_token_protocol(),
         )
 
         # Use the same signal-aware dataset factory as training/evaluation.

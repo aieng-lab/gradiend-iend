@@ -52,8 +52,8 @@ def test_decoder_cache_selection_matches_requires_context_when_present():
         classes_to_eval=["IO"],
         refine_points=10,
     )
-    # A legacy cache has no refinement contract and must not satisfy the new
-    # refined default. It remains reusable for an explicit coarse-grid call.
+    # A legacy cache has no refinement contract, so it cannot satisfy a request for
+    # refinement points. It remains reusable for a coarse-grid (refine_points=0) call.
     assert _decoder_cache_selection_matches({}, expected) is False
     coarse = dict(expected, refine_points=0)
     assert _decoder_cache_selection_matches({}, coarse) is True

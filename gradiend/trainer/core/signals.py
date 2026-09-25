@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 
 from gradiend.signal_space import infer_static_module_output_dim, resolve_activation_modules
+from gradiend.util.hook_outputs import first_tensor
 
 
 SignalKind = str
@@ -43,6 +44,11 @@ class ActivationRunningRms:
     @property
     def n_sites(self) -> int:
         return 0 if self._ms is None else int(self._ms.numel())
+
+    @property
+    def version(self) -> Tuple[int, bool]:
+        """Changes whenever the statistics change (used to avoid redundant persistence)."""
+        return (int(self._n_updates), bool(self._frozen))
 
     def state_dict(self) -> Dict[str, Any]:
         return {
@@ -158,7 +164,7 @@ class Signal:
 
     kind: SignalKind
     name: Optional[str] = None
-    options: Mapping[str, Any] = None
+    options: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, str) or not self.kind.strip():
@@ -199,16 +205,19 @@ class Signal:
         ``pre_prediction``, target ``prediction``). Omitted or equal selectors
         keep same-site source and target.
 
-        ``scale`` (optional):
-
-          - ``None`` / omitted: raw activations (historical default)
-          - ``"running_rms"``: divide each site (or the concat) by a running RMS
-
-            estimated online from extracted activations. Only O(n_sites) floats
-            of state — never buffers activations. Use for CAA/SAE-comparable
-            activation magnitude before the ACTIEND autoencoder.
-        ``scale_reduce``: ``"per_site"`` (default) or ``"global"``.
-        ``scale_momentum``: ``0`` freezes after the first batch; ``(0,1)`` is EMA.
+        Args:
+            token_selector: Encoder/source token gather (see above).
+            target_token_selector: Decoder/target token gather (see above).
+            scale: ``None`` (default) keeps raw activations. ``"running_rms"``
+                divides each site (or the concatenation) by a running RMS that is
+                estimated online from the extracted activations. Only O(n_sites)
+                floats of state are kept; activations are never buffered. Use it
+                for activation magnitudes comparable to CAA/SAE baselines.
+            scale_reduce: ``"per_site"`` (default) or ``"global"``.
+            scale_momentum: ``0`` freezes the statistics after the first batch;
+                a value in ``(0, 1)`` is an exponential moving average.
+            scale_eps: Lower bound applied to the mean square before the root.
+            name: Optional signal id (defaults to the kind).
         """
         options: Dict[str, Any] = {}
         if token_selector is not None:
@@ -416,11 +425,10 @@ def require_single_gradient_signal(
     context: str = "This path",
 ) -> Signal:
     """
-    Validate the current implementation path.
+    Validate that a path operates on exactly one raw-gradient signal.
 
-    Milestone 1 wires signal configuration into the existing raw-gradient
-    training path. Activation and multi-signal extraction are represented in the
-    API but are intentionally rejected here until their extractors are built.
+    Used by code paths that only implement the classic gradient pipeline;
+    activation and multi-signal configurations are rejected with a clear error.
     """
     normalized_signal, normalized_signals = normalize_signal_arguments(signal=signal, signals=signals)
     if not normalized_signals.is_single:
@@ -440,10 +448,16 @@ def require_single_gradient_signal(
 @dataclass(frozen=True)
 class SignalScope:
     """
-    Scope/eligibility metadata for signals.
+    Where a signal is measured (eligibility), independent of *what* is measured.
 
-    The first implementation stores metadata only; concrete scope resolution is
-    handled by existing params/param_map behavior.
+    - ``params``: weight-parameter names/wildcards (gradient signals).
+    - ``activation_sites``: module names/wildcards (activation signals).
+    - ``mode``: ``"default"`` (backbone/text tower) or ``"full"`` preset.
+    - ``activation_selector``: semantic shortcut built by :meth:`layers`,
+      :meth:`layer`, :meth:`embeddings` or :meth:`word_embedding`; resolved against
+      the model topology for both gradient and activation signals.
+
+    ``activation_sites`` and ``activation_selector`` are mutually exclusive.
     """
 
     params: Optional[Tuple[str, ...]] = None
@@ -774,6 +788,7 @@ class ActivationSignalExtractor:
         self._activation_width_validated = False
         opts = self.signal.options or {}
         self._scale: Optional[ActivationRunningRms] = None
+        self._persisted_scale_version: Optional[Tuple[int, bool]] = None
         if str(opts.get("scale") or "").lower() in {"running_rms", "rms"}:
             self._scale = ActivationRunningRms(
                 reduce=str(opts.get("scale_reduce") or "per_site"),
@@ -837,24 +852,6 @@ class ActivationSignalExtractor:
         if hasattr(self.model, "exclusive_base_gradient_access"):
             return self.model.exclusive_base_gradient_access()
         return nullcontext()
-
-    @staticmethod
-    def _first_tensor(value: Any) -> torch.Tensor:
-        if torch.is_tensor(value):
-            return value
-        if isinstance(value, Mapping):
-            for item in value.values():
-                try:
-                    return ActivationSignalExtractor._first_tensor(item)
-                except TypeError:
-                    continue
-        if isinstance(value, (list, tuple)):
-            for item in value:
-                try:
-                    return ActivationSignalExtractor._first_tensor(item)
-                except TypeError:
-                    continue
-        raise TypeError(f"Hook output did not contain a tensor, got {type(value).__name__}")
 
     def _input_device(self) -> Optional[torch.device]:
         try:
@@ -1133,7 +1130,7 @@ class ActivationSignalExtractor:
 
         def make_hook(name: str):
             def hook(_module: nn.Module, _args: Tuple[Any, ...], output: Any) -> None:
-                captured[name] = self._first_tensor(output).detach()
+                captured[name] = first_tensor(output).detach()
 
             return hook
 
@@ -1166,7 +1163,7 @@ class ActivationSignalExtractor:
 
         def make_hook(name: str):
             def hook(_module: nn.Module, _args: Tuple[Any, ...], output: Any) -> None:
-                live[name] = self._first_tensor(output)
+                live[name] = first_tensor(output)
 
             return hook
 
@@ -1246,7 +1243,6 @@ class ActivationSignalExtractor:
             return None
         return input_ids.masked_fill(~mask_t, -100)
 
-
     def _cat_flattened(
         self,
         captured: Mapping[str, torch.Tensor],
@@ -1258,6 +1254,27 @@ class ActivationSignalExtractor:
             self._flatten_site(captured[name], prepared_inputs, selector=selector)
             for name, _module in self._module_items
         ]
+        # A device-mapped backbone emits each hooked layer on that layer's
+        # shard.  The signal encoder, however, consumes one concatenated
+        # feature vector.  Move only these compact captured vectors to the
+        # encoder device; never move the sharded backbone itself.  CPU is not
+        # an appropriate implicit gather target (CGA may deliberately park its
+        # unused encoder there), so retain the first captured device in that
+        # case.
+        devices = {tensor.device for tensor in flattened}
+        if len(devices) > 1:
+            gradiend = getattr(self.model, "gradiend", None)
+            target = getattr(gradiend, "device_encoder", None)
+            try:
+                target_device = torch.device(target) if target is not None else flattened[0].device
+            except (TypeError, RuntimeError):
+                target_device = flattened[0].device
+            if target_device.type == "cpu":
+                target_device = flattened[0].device
+            flattened = [
+                tensor if tensor.device == target_device else tensor.to(target_device)
+                for tensor in flattened
+            ]
         if self._scale is not None:
             flattened = self._scale.update_and_scale(flattened)
             self._persist_scale_state()
@@ -1268,7 +1285,7 @@ class ActivationSignalExtractor:
 
     def _persist_scale_state(self) -> None:
         """Write O(n_sites) RMS stats onto gradiend.kwargs for checkpointing."""
-        if self._scale is None:
+        if self._scale is None or self._scale.version == self._persisted_scale_version:
             return
         gradiend = getattr(self.model, "gradiend", None)
         if gradiend is None:
@@ -1279,6 +1296,7 @@ class ActivationSignalExtractor:
         signal_space["activation_scale"] = kwargs["activation_scale"]
         kwargs["signal_space"] = signal_space
         gradiend.kwargs = kwargs
+        self._persisted_scale_version = self._scale.version
 
     def scale_state_dict(self) -> Optional[Dict[str, Any]]:
         return None if self._scale is None else self._scale.state_dict()

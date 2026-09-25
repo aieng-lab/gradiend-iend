@@ -608,7 +608,7 @@ def _compute_metrics_from_df(
 	all_dimension_scores: Dict[int, Dict[str, Any]] = {}
 
 	for dim in range(first_len):
-		df_all["encoded"] = df_all["encoded_list"].apply(lambda x: x[dim])
+		df_all["encoded"] = df_all["encoded_list"].apply(lambda x, d=dim: x[d])
 
 		if "label" not in df_all.columns:
 			raise ValueError("DataFrame must have 'label' column for metrics computation")

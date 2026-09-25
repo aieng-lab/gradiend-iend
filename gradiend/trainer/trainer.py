@@ -78,6 +78,7 @@ from gradiend.trainer.core.component_seed import (
     summarize_component_seed_runs,
 )
 from gradiend.trainer.core.config import validate_source_target
+from gradiend.trainer.core.metric_names import metric_needs_rivals, normalize_metric_name
 from gradiend.trainer.core.cache_policy import (
     is_unconditional_training_cache,
     should_reuse_seed_training_cache,
@@ -107,20 +108,9 @@ _ANALYZE_SEED_STABILITY_MIN_ONE_WARNING = (
 )
 
 
-def _selection_metric_needs_rivals(metric: Any) -> bool:
-    """Whether periodic validation must encode one-pole rival factual rows."""
-    name = str(metric or "correlation").strip().lower()
-    return name in {
-        "e", "encoding_e", "encoding-e", "encodinge",
-        "roc_auc", "auroc", "auc", "roc-auc",
-        "min_auc_n_o", "min_auc", "auc_min", "roc_auc_min",
-        "min_auc_no", "min(auc_n,auc_o)",
-    }
-
-
 def _selection_eval_source(*, one_pole: bool, training_source: Any, metric: Any) -> Any:
     """Use the minimal source population needed by the active selector."""
-    if one_pole and not _selection_metric_needs_rivals(metric):
+    if one_pole and not metric_needs_rivals(metric):
         return "factual"
     return training_source
 
@@ -1243,12 +1233,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             # rivals. Correlation selection stays pair-local and avoids the
             # repeated rival encodings; final encoder reporting can still ask
             # for include_other_classes=True once after training.
-            selection_name = str(
-                getattr(config, "selection_metric", None)
-                or getattr(config, "convergent_metric", None)
-                or "correlation"
-            ).strip().lower()
-            selection_needs_rivals = _selection_metric_needs_rivals(selection_name)
+            selection_name = normalize_metric_name(
+                getattr(config, "selection_metric", None) or getattr(config, "convergent_metric", None)
+            )
+            selection_needs_rivals = metric_needs_rivals(selection_name)
             if self._is_one_pole_config():
                 # source=both already supplies target and configured rival
                 # poles for E. Do not add reverse/full-class factual contexts
@@ -1427,6 +1415,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         else:
             args = TrainingArguments()
         args.__post_init__()  # validate e.g. not both supervised_encoder and supervised_decoder
+        # Pin the auto (None) neutral-identity flag so cache fingerprints and data assembly agree.
+        args.add_neutral_identity_transitions = self.neutral_identity_transitions_enabled(args)
 
         # Apply seed early so data loading, model init, and training are deterministic when seed is set
         if getattr(args, "seed", None) is not None:
@@ -1508,13 +1498,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 val = bsc.get("loss")
                 if isinstance(val, (int, float)):
                     return -float(val)
-            selection_name = str(
-                getattr(args, "selection_metric", None)
-                or getattr(args, "convergent_metric", None)
-                or "correlation"
-            ).strip().lower()
-            if selection_name in {"e", "encoding-e", "encodinge"}:
-                selection_name = "encoding_e"
+            selection_name = normalize_metric_name(
+                getattr(args, "selection_metric", None) or getattr(args, "convergent_metric", None)
+            )
             val = bsc.get(selection_name)
             if isinstance(val, (int, float)):
                 return float(val)
@@ -1667,11 +1653,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         )
 
                 convergent_metric = (args.convergent_metric or ("loss" if args.supervised_decoder else "correlation")).lower()
-                selection_metric = str(
+                selection_metric = normalize_metric_name(
                     getattr(args, "selection_metric", None) or convergent_metric
-                ).strip().lower()
-                if selection_metric in {"e", "encoding-e", "encodinge"}:
-                    selection_metric = "encoding_e"
+                )
                 threshold = args.convergent_score_threshold
                 min_convergent = args.min_convergent_seeds
                 convergent_count = 0
@@ -3069,9 +3053,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 :meth:`cpu`) or released via :meth:`unload_model`, call :meth:`cuda` /
                 :meth:`get_model` yourself or pass an explicit device; a warning is logged
                 when evaluation runs on CPU while CUDA is available.
-            refine_points: Number of LMS-boundary bisection points per target class,
-                defaulting to 10. Pass 0 only for an explicit coarse-grid ablation. See
-                ``Evaluator.evaluate_decoder``'s ``refine_points`` docstring for the
+            refine_points: Number of extra LMS-boundary bisection points per target class
+                (default ``DEFAULT_DECODER_REFINE_POINTS`` = 0, i.e. the requested grid is used
+                as is). See ``Evaluator.evaluate_decoder``'s ``refine_points`` docstring for the
                 algorithm and its assumptions/skip conditions.
 
         Returns:
@@ -3501,6 +3485,123 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         path = model_path if model_path is not None else self.model_path
         return super().get_encoder_metrics(path, encoder_df=encoder_df, **kwargs)
 
+    def _select_decoder_summaries(
+        self,
+        decoder_results: Optional[Dict[str, Any]],
+        target_class: Optional[Union[str, List[str]]],
+        increase_target_probabilities: bool,
+        decoder_stats_metric_name: Optional[str],
+        decoder_stats_kwargs: Dict[str, Any],
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return ``(summary_key, summary)`` per requested target class.
+
+        Loads ``decoder_results`` from the decoder cache under ``experiment_dir``
+        when omitted, then picks the strengthen (or ``*_weaken``) summary of each
+        requested class. Each summary carries the selected ``learning_rate`` and
+        ``feature_factor``.
+        """
+        if decoder_results is None:
+            experiment_dir = self.experiment_dir
+            if not experiment_dir:
+                raise ValueError(
+                    "decoder_results is required when experiment_dir is not set. "
+                    "Run evaluate_decoder() first or set experiment_dir on TrainingArguments."
+                )
+            load_metric = (
+                decoder_stats_metric_name
+                or (target_class[0] if isinstance(target_class, list) and target_class else target_class)
+                or "combined_score"
+            )
+            stats_file = resolve_decoder_stats_path(
+                experiment_dir,
+                metric_name=load_metric,
+                feature_factors=decoder_stats_kwargs.get("feature_factors"),
+                lrs=decoder_stats_kwargs.get("lrs"),
+                topk=decoder_stats_kwargs.get("topk"),
+                part=decoder_stats_kwargs.get("part"),
+                topk_part=decoder_stats_kwargs.get("topk_part"),
+            )
+            if not (stats_file and os.path.isfile(stats_file)):
+                raise ValueError(
+                    f"No decoder results cache found at {stats_file}. "
+                    "Run evaluate_decoder() first or provide decoder_results explicitly."
+                )
+            try:
+                decoder_results = read_decoder_stats_file(stats_file)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load decoder results from cache at {stats_file}: {e}. "
+                    "Run evaluate_decoder() first or provide decoder_results explicitly."
+                ) from e
+
+        reserved = {"grid", "plot_path", "plot_paths"}
+        # Prefer the nested "summary" dict (evaluate_decoder format), fall back to top-level keys.
+        if isinstance(decoder_results.get("summary"), dict):
+            summary_source = decoder_results["summary"]
+        else:
+            summary_source = {k: v for k, v in decoder_results.items() if k not in reserved}
+        raw_keys: List[str] = [target_class] if isinstance(target_class, str) else (target_class or [])
+        if not raw_keys:
+            raise ValueError(
+                "target_class must be a non-empty string or list of strings present in decoder results. "
+                f"Available keys: {list(summary_source.keys())}"
+            )
+
+        selected: List[Tuple[str, Dict[str, Any]]] = []
+        for raw_key in raw_keys:
+            key = raw_key if increase_target_probabilities else f"{raw_key}_weaken"
+            summary = summary_source.get(key)
+            if not summary or "feature_factor" not in summary or "learning_rate" not in summary:
+                hint = ""
+                if not increase_target_probabilities and not key.endswith("_weaken"):
+                    hint = " evaluate_decoder currently only produces strengthen summaries."
+                raise ValueError(
+                    f"Decoder results do not contain summary for metric '{key}'. "
+                    f"Available keys: {list(summary_source.keys())}.{hint}"
+                )
+            selected.append((key, summary))
+        return selected
+
+    def _check_model_output_target(self, output_dir: Optional[str], n_models: int, *, verb: str) -> bool:
+        """Validate the save target; return whether the produced models should be saved."""
+        if output_dir is not None and not str(output_dir).strip():
+            raise ValueError(
+                f"Cannot save {verb} model: no output path. "
+                "Set experiment_dir on TrainingArguments or pass a non-empty output_dir."
+            )
+        should_save = output_dir is not None
+        if should_save and n_models > 1 and not (self.experiment_dir and str(self.experiment_dir).strip()):
+            raise ValueError(
+                f"Cannot save multiple {verb} models without experiment_dir. "
+                "Set experiment_dir on TrainingArguments (output_dir is only used for a single target_class)."
+            )
+        return should_save
+
+    def _save_produced_models(
+        self,
+        models: Sequence[Any],
+        selected: Sequence[Tuple[str, Dict[str, Any]]],
+        output_dir: Optional[str],
+        *,
+        verb: str,
+        prefer_modified_saver: bool,
+    ) -> Union[str, List[str]]:
+        saved_paths: List[str] = []
+        for model, (key, summary) in zip(models, selected):
+            explicit = output_dir if len(selected) == 1 else None
+            key_output_dir = require_output_path(
+                self.experiment_dir, explicit, ARTIFACT_MODEL_CHANGED, target_class=key
+            )
+            os.makedirs(key_output_dir, exist_ok=True)
+            saver = getattr(model, "save_pretrained_modified", None) if prefer_modified_saver else None
+            (saver or model.save_pretrained)(key_output_dir)
+            logger.info(
+                "Saved %s model to %s (feature_factor=%s, lr=%s, metric=%s)",
+                verb, key_output_dir, summary["feature_factor"], summary["learning_rate"], key,
+            )
+            saved_paths.append(key_output_dir)
+        return saved_paths[0] if len(saved_paths) == 1 else saved_paths
+
     def rewrite_base_model(
         self,
         decoder_results: Optional[Dict[str, Any]] = None,
@@ -3509,17 +3610,13 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         output_dir: Optional[str] = None,
         base_model: Optional[Any] = None,
         decoder_stats_metric_name: Optional[str] = None,
-        token_selector: Optional[Any] = None,
-        activation_gate: Optional[Any] = None,
-        activation_modules: Optional[Any] = None,
-        threshold: float = 0.5,
-        direction: Optional[Any] = None,
-        target_encoding: Optional[Any] = None,
-        tolerance: float = 0.2,
         **decoder_stats_kwargs: Any,
     ) -> Union[Any, List[Any], str, List[str]]:
         """
         Rewrite the base model by applying GRADIEND decoder updates based on decoder evaluation results.
+
+        This is the weight-space (gradient-signal) path. Use :meth:`modify_model` for
+        activation-signal (ACTIEND) models or to control the intervention application policy.
 
         The decoder evaluation selects a feature factor and learning rate per target class and direction
         (strengthening vs weakening). This method applies the selected config: by default it strengthens
@@ -3570,123 +3667,25 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 "Base model is required to rewrite base model. "
                 "Provide a ModelWithGradiend instance or ensure the trainer has a valid model path."
             )
-
-        if decoder_results is None:
-            experiment_dir = self.experiment_dir
-            if not experiment_dir:
-                raise ValueError(
-                    "decoder_results is required when experiment_dir is not set. "
-                    "Run evaluate_decoder() first or set experiment_dir on TrainingArguments."
-                )
-            load_metric = (
-                decoder_stats_metric_name
-                or (target_class[0] if isinstance(target_class, list) and target_class else target_class)
-                or "combined_score"
-            )
-            stats_file = resolve_decoder_stats_path(
-                experiment_dir,
-                metric_name=load_metric,
-                feature_factors=decoder_stats_kwargs.get("feature_factors"),
-                lrs=decoder_stats_kwargs.get("lrs"),
-                topk=decoder_stats_kwargs.get("topk"),
-                part=decoder_stats_kwargs.get("part"),
-                topk_part=decoder_stats_kwargs.get("topk_part"),
-            )
-            if stats_file and os.path.isfile(stats_file):
-                try:
-                    decoder_results = read_decoder_stats_file(stats_file)
-                except Exception as e:
-                    raise ValueError(
-                        f"Failed to load decoder results from cache at {stats_file}: {e}. "
-                        "Run evaluate_decoder() first or provide decoder_results explicitly."
-                    )
-            else:
-                raise ValueError(
-                    f"No decoder results cache found at {stats_file}. "
-                    "Run evaluate_decoder() first or provide decoder_results explicitly."
-                )
-
-        _reserved = {"grid", "plot_path", "plot_paths"}
-        # Prefer nested \"summary\" dict (evaluate_decoder typical format), fall back to top-level keys.
-        if isinstance(decoder_results.get("summary"), dict):
-            summary_source = decoder_results["summary"]
-        else:
-            summary_source = {k: v for k, v in decoder_results.items() if k not in _reserved}
-        raw_keys: List[str] = (
-            [target_class] if isinstance(target_class, str) else (target_class or [])
+        selected = self._select_decoder_summaries(
+            decoder_results,
+            target_class,
+            increase_target_probabilities,
+            decoder_stats_metric_name,
+            decoder_stats_kwargs,
         )
-        if not raw_keys:
-            raise ValueError(
-                "target_class must be a non-empty string or list of strings present in decoder results. "
-                f"Available keys: {list(summary_source.keys())}"
+        should_save = self._check_model_output_target(output_dir, len(selected), verb="rewritten")
+        rewritten_models = [
+            base_model.rewrite_base_model(
+                learning_rate=summary["learning_rate"],
+                feature_factor=summary["feature_factor"],
             )
-        keys_to_process: List[str] = [
-            k if increase_target_probabilities else f"{k}_weaken" for k in raw_keys
+            for _key, summary in selected
         ]
-
-        # When output_dir is passed but empty, user intended to save but gave no path
-        if output_dir is not None and not str(output_dir).strip():
-            raise ValueError(
-                "Cannot save rewritten model: no output path. "
-                "Set experiment_dir on TrainingArguments or pass a non-empty output_dir to rewrite_base_model."
-            )
-
-        # Check if we need to save
-        should_save = output_dir is not None and str(output_dir).strip()
         if should_save:
-            has_experiment_dir = bool(self.experiment_dir and str(self.experiment_dir).strip())
-            has_output_dir = bool(output_dir is not None and str(output_dir).strip())
-            if not has_experiment_dir and not has_output_dir:
-                raise ValueError(
-                    "Cannot save rewritten model: no output path. "
-                    "Set experiment_dir on TrainingArguments or pass output_dir to rewrite_base_model."
-                )
-            if len(keys_to_process) > 1 and not has_experiment_dir:
-                raise ValueError(
-                    "Cannot save multiple rewritten models without experiment_dir. "
-                    "Set experiment_dir on TrainingArguments (output_dir is only used for a single target_class)."
-                )
-
-        rewritten_models: List[Any] = []
-        for key in keys_to_process:
-            summary = summary_source.get(key)
-            if not summary or "feature_factor" not in summary or "learning_rate" not in summary:
-                hint = ""
-                if not increase_target_probabilities and not key.endswith("_weaken"):
-                    hint = " evaluate_decoder currently only produces strengthen summaries."
-                raise ValueError(
-                    f"Decoder results do not contain summary for metric '{key}'. "
-                    f"Available keys: {list(summary_source.keys())}.{hint}"
-                )
-            feature_factor = summary["feature_factor"]
-            lr = summary["learning_rate"]
-            rewritten = base_model.rewrite_base_model(
-                learning_rate=lr,
-                feature_factor=feature_factor,
+            return self._save_produced_models(
+                rewritten_models, selected, output_dir, verb="rewritten", prefer_modified_saver=False
             )
-            rewritten_models.append(rewritten)
-
-        # Save if output_dir was provided
-        if should_save:
-            saved_paths: List[str] = []
-            for i, key in enumerate(keys_to_process):
-                summary = summary_source.get(key)
-                feature_factor = summary["feature_factor"]
-                lr = summary["learning_rate"]
-                explicit = output_dir if len(keys_to_process) == 1 else None
-                key_output_dir = require_output_path(
-                    self.experiment_dir, explicit, ARTIFACT_MODEL_CHANGED, target_class=key
-                )
-                os.makedirs(key_output_dir, exist_ok=True)
-                rewritten_models[i].save_pretrained(key_output_dir)
-                logger.info(
-                    f"Saved rewritten model to {key_output_dir} "
-                    f"(feature_factor={feature_factor}, lr={lr}, metric={key})"
-                )
-                saved_paths.append(key_output_dir)
-            return saved_paths[0] if len(saved_paths) == 1 else saved_paths
-
-        # Return models in memory
         return rewritten_models[0] if len(rewritten_models) == 1 else rewritten_models
 
     def modify_model(
@@ -3725,85 +3724,17 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 "Base model is required to modify model. "
                 "Provide a ModelWithGradiend instance or ensure the trainer has a valid model path."
             )
-
-        if decoder_results is None:
-            experiment_dir = self.experiment_dir
-            if not experiment_dir:
-                raise ValueError(
-                    "decoder_results is required when experiment_dir is not set. "
-                    "Run evaluate_decoder() first or set experiment_dir on TrainingArguments."
-                )
-            load_metric = (
-                decoder_stats_metric_name
-                or (target_class[0] if isinstance(target_class, list) and target_class else target_class)
-                or "combined_score"
-            )
-            stats_file = resolve_decoder_stats_path(
-                experiment_dir,
-                metric_name=load_metric,
-                feature_factors=decoder_stats_kwargs.get("feature_factors"),
-                lrs=decoder_stats_kwargs.get("lrs"),
-                topk=decoder_stats_kwargs.get("topk"),
-                part=decoder_stats_kwargs.get("part"),
-                topk_part=decoder_stats_kwargs.get("topk_part"),
-            )
-            if stats_file and os.path.isfile(stats_file):
-                try:
-                    decoder_results = read_decoder_stats_file(stats_file)
-                except Exception as e:
-                    raise ValueError(
-                        f"Failed to load decoder results from cache at {stats_file}: {e}. "
-                        "Run evaluate_decoder() first or provide decoder_results explicitly."
-                    )
-            else:
-                raise ValueError(
-                    f"No decoder results cache found at {stats_file}. "
-                    "Run evaluate_decoder() first or provide decoder_results explicitly."
-                )
-
-        _reserved = {"grid", "plot_path", "plot_paths"}
-        if isinstance(decoder_results.get("summary"), dict):
-            summary_source = decoder_results["summary"]
-        else:
-            summary_source = {k: v for k, v in decoder_results.items() if k not in _reserved}
-        raw_keys: List[str] = (
-            [target_class] if isinstance(target_class, str) else (target_class or [])
+        selected = self._select_decoder_summaries(
+            decoder_results,
+            target_class,
+            increase_target_probabilities,
+            decoder_stats_metric_name,
+            decoder_stats_kwargs,
         )
-        if not raw_keys:
-            raise ValueError(
-                "target_class must be a non-empty string or list of strings present in decoder results. "
-                f"Available keys: {list(summary_source.keys())}"
-            )
-        keys_to_process: List[str] = [
-            k if increase_target_probabilities else f"{k}_weaken" for k in raw_keys
-        ]
-
-        if output_dir is not None and not str(output_dir).strip():
-            raise ValueError(
-                "Cannot save modified model: no output path. "
-                "Set experiment_dir on TrainingArguments or pass a non-empty output_dir to modify_model."
-            )
-
-        should_save = output_dir is not None and str(output_dir).strip()
-        if should_save:
-            has_experiment_dir = bool(self.experiment_dir and str(self.experiment_dir).strip())
-            if len(keys_to_process) > 1 and not has_experiment_dir:
-                raise ValueError(
-                    "Cannot save multiple modified models without experiment_dir. "
-                    "Set experiment_dir on TrainingArguments (output_dir is only used for a single target_class)."
-                )
-
+        should_save = self._check_model_output_target(output_dir, len(selected), verb="modified")
+        modifier = getattr(base_model, "modify_model", None) or getattr(base_model, "rewrite_base_model")
         modified_models: List[Any] = []
-        for key in keys_to_process:
-            summary = summary_source.get(key)
-            if not summary or "feature_factor" not in summary or "learning_rate" not in summary:
-                raise ValueError(
-                    f"Decoder results do not contain summary for metric '{key}'. "
-                    f"Available keys: {list(summary_source.keys())}."
-                )
-            modifier = getattr(base_model, "modify_model", None)
-            if modifier is None:
-                modifier = getattr(base_model, "rewrite_base_model")
+        for _key, summary in selected:
             modify_kwargs = dict(
                 learning_rate=summary["learning_rate"],
                 feature_factor=summary["feature_factor"],
@@ -3818,22 +3749,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             if activation_modules is not None:
                 modify_kwargs["activation_modules"] = activation_modules
             modified_models.append(modifier(**modify_kwargs))
-
         if should_save:
-            saved_paths: List[str] = []
-            for i, key in enumerate(keys_to_process):
-                explicit = output_dir if len(keys_to_process) == 1 else None
-                key_output_dir = require_output_path(
-                    self.experiment_dir, explicit, ARTIFACT_MODEL_CHANGED, target_class=key
-                )
-                os.makedirs(key_output_dir, exist_ok=True)
-                save_modified = getattr(modified_models[i], "save_pretrained_modified", None)
-                if save_modified is not None:
-                    save_modified(key_output_dir)
-                else:
-                    modified_models[i].save_pretrained(key_output_dir)
-                logger.info(f"Saved modified model to {key_output_dir} (metric={key})")
-                saved_paths.append(key_output_dir)
-            return saved_paths[0] if len(saved_paths) == 1 else saved_paths
-
+            return self._save_produced_models(
+                modified_models, selected, output_dir, verb="modified", prefer_modified_saver=True
+            )
         return modified_models[0] if len(modified_models) == 1 else modified_models

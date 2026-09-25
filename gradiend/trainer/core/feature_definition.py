@@ -17,6 +17,7 @@ import os
 
 from gradiend.trainer.core.protocols import DataProvider
 from gradiend.trainer.core.config import validate_source_target
+from gradiend.trainer.core.split_col_modes import data_split_column
 from gradiend.trainer.core.unified_schema import UNIFIED_SPLIT
 from gradiend.util.deprecation import resolve_include_other_classes
 from gradiend.util.paths import (
@@ -417,7 +418,26 @@ class FeatureLearningDefinition(DataProvider, ABC):
                 f"{type(self).__name__}.create_model_with_gradiend() requires a model_with_gradiend_cls "
                 "argument or a default_model_with_gradiend_cls property on the definition."
             )
-        return cls.from_pretrained(load_directory, **kwargs)
+        model = cls.from_pretrained(load_directory, **kwargs)
+        self._configure_model(model)
+        return model
+
+    def _configure_model(self, model: ModelWithGradiend) -> None:
+        """Hook: stamp run-level configuration on every model this definition hands out.
+
+        Every model reaches callers through :meth:`create_model_with_gradiend`
+        (``get_model``, ``load_model`` and training), so configuration that
+        single-row code paths need but the model cannot derive itself is set here
+        once. Modalities override this; the default is a no-op.
+        """
+        """Whether a shared neutral pool is configured (modality hook; default: no)."""
+        return False
+
+    def neutral_identity_transitions_enabled(self, args: Any = None) -> bool:
+        """Resolve ``TrainingArguments.add_neutral_identity_transitions`` (``None`` = auto)."""
+        args = args if args is not None else getattr(self, "training_args", None)
+        flag = getattr(args, "add_neutral_identity_transitions", None)
+        return self._has_shared_neutral_data() if flag is None else bool(flag)
 
     def resolve_split_for_role(self, role: str) -> str:
         """
@@ -608,7 +628,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
             return frozenset()
         args = getattr(self, "training_args", None)
         neutral_aug = getattr(args, "add_identity_for_other_classes", False)
-        neutral_identity_aug = getattr(args, "add_neutral_identity_transitions", True)
+        neutral_identity_aug = self.neutral_identity_transitions_enabled(args)
         if source_type == "factual":
             keys = set(target_classes)
             if neutral_identity_aug:

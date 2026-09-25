@@ -107,6 +107,7 @@ EXPLICIT_OBJECTIVES = sorted(SUPPORTED_PREDICTION_OBJECTIVES - {"auto"})
 _COMPAT_OK = {
     "mlm_mask_token": {"bert"},
     "clm_next_token": {"gpt2"},
+    "clm_target_span": {"gpt2"},
     "clm_mlm_head": {"gpt2"},
     "clm_sequence_cloze": {"gpt2"},
     "seq2seq_decoder": {"t5"},

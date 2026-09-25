@@ -50,6 +50,8 @@ class LargeLinear(nn.Module):
     def forward(self, input):
         if input.device != self.linear.weight.device:
             input = input.to(self.linear.weight.device)
+        if input.dtype != self.linear.weight.dtype:
+            input = input.to(self.linear.weight.dtype)
 
         input_size = input.size(-1)
         output_size = self.out_features

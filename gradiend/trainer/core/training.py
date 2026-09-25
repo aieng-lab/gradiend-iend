@@ -14,6 +14,7 @@ from gradiend.util.tqdm_utils import gradiend_tqdm
 from torch.utils.data import DataLoader
 
 from gradiend.util.logging import get_logger
+from gradiend.trainer.core.metric_names import normalize_metric_name
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.core.decoder_lr import (
     AutoDecoderLearningRate,
@@ -76,33 +77,33 @@ def component_gradient_norms(
     gradiend: Any,
     train_params: Sequence[Any],
 ) -> dict:
-    """Gradient L2 norms for the decoder and for everything else.
+    """Gradient L2 norms for the decoder and for everything else (encoder side).
 
-    Both optimizers tested converge the encoder and neither converges the
-    decoder on the same objective, which rules out an optimizer-side
-    explanation and points at the objective's own conditioning: if the loss is
-    far less sensitive to decoder scale than to encoder direction, the decoder's
-    gradient is correspondingly smaller and no learning rate shared with the
-    encoder can close the distance.
+    Useful to tell whether the objective pushes the decoder much less than the
+    encoder, i.e. whether a decoder-specific learning rate can help.
 
     Must be called while gradients are live -- after ``backward()`` and before
     the next ``zero_grad()``. Parameters with no gradient are skipped rather
     than counted as zero, so a norm of 0.0 means "all gradients were zero", not
     "nothing had a gradient"; ``*_n`` reports how many tensors contributed.
     """
-    import torch as _torch
-
     decoder_params, other_params = split_encoder_decoder_parameters(
         gradiend, train_params
     )
 
     def _norm(parameters):
-        squares = [
-            float(_torch.linalg.vector_norm(p.grad.detach()).item()) ** 2
+        norms = [
+            torch.linalg.vector_norm(p.grad.detach().float())
             for p in parameters
             if getattr(p, "grad", None) is not None
         ]
-        return (float(sum(squares) ** 0.5), len(squares))
+        if not norms:
+            return (0.0, 0)
+        # One host sync for the whole group instead of one per tensor.
+        devices = {n.device for n in norms}
+        if len(devices) > 1:
+            norms = [n.to(next(iter(devices))) for n in norms]
+        return (float(torch.linalg.vector_norm(torch.stack(norms)).item()), len(norms))
 
     decoder_norm, decoder_n = _norm(decoder_params)
     other_norm, other_n = _norm(other_params)
@@ -393,6 +394,7 @@ def train(
     last_losses = []
     losses = []
     global_step = 0
+    grad_norms_enabled = True
     total_training_time_start = time.time()
 
     training_stats = {
@@ -679,20 +681,17 @@ def train(
                 auto_decoder_lr.observe(auto_encoded)
             # Read gradients here: they are live between backward() and the next
             # zero_grad(), and step() does not modify them.
-            try:
-                _grad_norms = component_gradient_norms(
-                    model_with_gradiend.gradiend, train_params
-                )
-            except Exception as _grad_exc:  # noqa: BLE001 - never stop training
-                # Log once rather than swallowing silently: an always-failing
-                # diagnostic leaves the key present but empty, which reads as
-                # "no data" instead of "broken".
-                if not globals().get("_GRAD_NORM_WARNED"):
-                    globals()["_GRAD_NORM_WARNED"] = True
+            _grad_norms = None
+            if grad_norms_enabled:
+                try:
+                    _grad_norms = component_gradient_norms(
+                        model_with_gradiend.gradiend, train_params
+                    )
+                except Exception as _grad_exc:  # noqa: BLE001 - a diagnostic must never stop training
+                    grad_norms_enabled = False
                     logger.warning(
                         "gradient-norm diagnostic disabled after error: %r", _grad_exc
                     )
-                _grad_norms = None
             optimizer.step()
             if runtime_monitor is not None:
                 runtime_monitor.mark("training:step:done", step=global_step + 1, epoch=epoch + 1)
@@ -773,9 +772,14 @@ def train(
                         int(auto_result["remaining_steps"]),
                     )
             time_stats['eval'] += time.time() - step_start
+            if control.get("should_stop"):
+                # A callback (e.g. an LR-probe stop rule) decided the run is settled; the epoch-end
+                # hooks below still run, so the final checkpoint and training.json are written.
+                logger.info("Training stopped early by a callback at step %d.", global_step)
+                break
             if max_iter is not None and global_step >= max_iter:
                 break
-            
+
             # Restart timer
             data_prep_start = time.time()
         
@@ -862,12 +866,7 @@ def train(
             selection_metric = getattr(cb, "_selection_metric", None) or (
                 "loss" if getattr(cb, "use_loss_for_best", False) else "correlation"
             )
-            if selection_metric in {"auroc", "auc", "roc-auc"}:
-                selection_metric = "roc_auc"
-            if selection_metric in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
-                selection_metric = "min_auc_n_o"
-            if selection_metric in {"e", "encoding_e", "encoding-e", "encodinge"}:
-                selection_metric = "encoding_e"
+            selection_metric = normalize_metric_name(selection_metric)
             if selection_metric == "loss" or getattr(cb, "use_loss_for_best", False):
                 best_score_checkpoint = {
                     "correlation": None,
@@ -922,11 +921,9 @@ def train(
         logger.info(f"Training completed. Best correlation: {best_corr:.6f}")
 
     # Check convergence status and warn if non-convergent
-    convergent_metric = (training_args.convergent_metric or ("loss" if training_args.supervised_decoder else "correlation")).lower()
-    if convergent_metric in {"auroc", "auc", "roc-auc"}:
-        convergent_metric = "roc_auc"
-    if convergent_metric in {"min_auc", "auc_min", "roc_auc_min", "min_auc_no", "min(auc_n,auc_o)"}:
-        convergent_metric = "min_auc_n_o"
+    convergent_metric = normalize_metric_name(
+        training_args.convergent_metric or ("loss" if training_args.supervised_decoder else "correlation")
+    )
     threshold = training_args.convergent_score_threshold
     min_convergent_seeds = training_args.min_convergent_seeds
     

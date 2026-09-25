@@ -198,9 +198,9 @@ class Evaluator:
                 decoder grid. Plotting never initiates decoder evaluation.
             show: If True, display the plot; if False, only save. When None and plot=True, defaults to True.
             plot_kwargs: Optional dict of options forwarded to plot_probability_shifts when plot=True.
-            refine_points: Number of LMS-boundary bisection points per target class,
-                defaulting to 10. Forwarded to the underlying ``DecoderEvaluator``;
-                pass 0 only for an explicit coarse-grid ablation.
+            refine_points: Number of extra LMS-boundary bisection points per target class
+                (default ``DEFAULT_DECODER_REFINE_POINTS`` = 0, i.e. the requested grid is used
+                as is). Forwarded to the underlying ``DecoderEvaluator``.
 
         Returns:
             Flat dict: for strengthen, keys like result['3SG']; for weaken, keys like result['3SG_weaken'].

@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import torch
 
 from gradiend.util.encoding_rows import visible_component_index
+from gradiend.util.hook_outputs import first_tensor as _first_tensor
+from gradiend.util.tokenization import tokenize_with_offsets
 from gradiend.visualizer.color_norm import (
     ColorCenter,
     ColorRange,
@@ -109,12 +111,7 @@ def _token_rows(tokenizer: Any, text: str, *, skip_special_tokens: bool, max_len
     }
     if max_length is not None:
         kwargs["max_length"] = max_length
-    try:
-        encoded = tokenizer(text, return_offsets_mapping=True, **kwargs)
-        offsets = encoded.get("offset_mapping")
-    except TypeError:
-        encoded = tokenizer(text, **kwargs)
-        offsets = None
+    encoded, offsets = tokenize_with_offsets(tokenizer, text, **kwargs)
     input_ids = encoded["input_ids"][0]
     ids = input_ids.detach().cpu().tolist() if hasattr(input_ids, "detach") else list(input_ids)
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
@@ -164,24 +161,6 @@ def _encode_signal(model_with_gradiend: Any, signal: Any, *, component_key: Any 
     if component_key is None:
         return _to_float(model_with_gradiend.encode(signal, return_float=False))
     return _to_float(gradiend._component_encoders[component_key](signal))
-
-
-def _first_tensor(value: Any) -> torch.Tensor:
-    if torch.is_tensor(value):
-        return value
-    if isinstance(value, dict):
-        for item in value.values():
-            try:
-                return _first_tensor(item)
-            except TypeError:
-                continue
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            try:
-                return _first_tensor(item)
-            except TypeError:
-                continue
-    raise TypeError(f"Hook output did not contain a tensor, got {type(value).__name__}")
 
 
 def _model_device(model_with_gradiend: Any) -> torch.device:
@@ -386,11 +365,9 @@ def compute_token_encodings(
     Compute one encoded value per visible token.
 
     - ACTIEND (``uses_activations``): encode the activation vector at each token
-
       position (one forward pass).
 
     - GRADIEND: mask each token, create gradients for that leave-one-out example,
-
       and encode the resulting gradient signal.
     """
     tokenizer = getattr(model_with_gradiend, "tokenizer", None)
