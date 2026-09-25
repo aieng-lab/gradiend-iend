@@ -23,6 +23,8 @@ At the end, plots in the experiment directory root:
   (GRADIEND × directed input transition, pre-anchor)
 - cross_encoding_oriented_factual_heatmap.pdf
   (dense oriented cross-encoding; columns = factual feature class $s(x)$)
+- cross_encoding_oriented_default_std_heatmap.pdf
+  (seed standard deviation for the source-aligned default matrix)
 - topk_overlap_venn_three_train_english_pronouns.pdf (when enough pronoun runs exist)
 
 Usage:
@@ -50,6 +52,7 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 import pandas as pd
 import torch
 
+from gradiend.util.logging import get_logger
 from gradiend.comparison.seed_policy import (
     enter_analysis_mode,
     enter_analysis_mode_for_trainers,
@@ -69,6 +72,7 @@ from gradiend import (
     plot_topk_overlap_heatmap,
     plot_topk_overlap_venn,
 )
+
 from gradiend.comparison.cross_encoding import (
     build_cross_task_encoder_summary,
     collect_unified_test_rows,
@@ -80,7 +84,17 @@ from gradiend.comparison.cross_encoding import (
 from gradiend.trainer import PrePruneConfig, PostPruneConfig
 from gradiend.examples.create_english_pronoun_data import (
     PRONOUN_CLASSES,
-    ensure_english_pronoun_data,
+)
+from gradiend.examples.english_pronoun_datasets import (
+    EN_PRONOUN_HF_SPLITS,
+    EN_PRONOUNS_HF_DATASET,
+    load_english_pronoun_neutral_data,
+)
+from gradiend.examples.english_sentiment_datasets import (
+    EN_SENTIMENT_NRC_HF_DATASET,
+    EN_SENTIMENT_NRC_HF_SUBSET_SPLIT,
+    english_sentiment_hf_training_kwargs,
+    load_english_sentiment_neutral_data,
 )
 from gradiend.trainer.text.prediction.decoder_only_mlm import train_mlm_head
 from gradiend.trainer.core.cache_policy import USE_CACHE_ALWAYS
@@ -93,6 +107,8 @@ from gradiend.util.paths import (
     resolve_decoder_mlm_head_dir,
     resolve_output_path,
 )
+
+logger = get_logger(__name__)
 
 
 ENCODER_MODEL = "google-bert/bert-base-multilingual-cased"
@@ -252,8 +268,7 @@ religion_configs = [
     ("religion", ("muslim", "jewish"), ["christian"]),
 ]
 
-PRONOUN_DATA_DIR = "data/english_pronouns"
-SENTIMENT_DATA_DIR = "data/sentiment_tweets"
+SENTIMENT_DATA_DIR = "data/sentiment_tweets"  # only for create_english_sentiment_data / good↔bad regen
 SENTIMENT_GOOD_BAD_DATA_DIR = "data/sentiment_nrc_good_bad"
 SENTIMENT_GOOD_BAD_PAIR = ("good", "bad")
 SENTIMENT_PRE_PRUNE_TOPK = 0.01
@@ -1021,8 +1036,14 @@ def _problem_for_trainer(trainer: TextPredictionTrainer) -> str:
     return "pronoun"
 
 
-def _pronoun_data_paths() -> Tuple[Path, Path]:
-    return ensure_english_pronoun_data(output_dir=PRONOUN_DATA_DIR)
+def _pronoun_data_paths() -> Tuple[Union[str, Path], Union[pd.DataFrame, str, Path]]:
+    return EN_PRONOUNS_HF_DATASET, load_english_pronoun_neutral_data()
+
+
+def _pronoun_training_kwargs(training_source: Union[str, Path]) -> Dict[str, Any]:
+    if isinstance(training_source, Path) or Path(str(training_source)).is_file():
+        return {"data": str(training_source)}
+    return {"hf_dataset": str(training_source), "hf_splits": EN_PRONOUN_HF_SPLITS}
 
 
 def _assert_suite_has_expected_trainers(
@@ -1034,18 +1055,19 @@ def _assert_suite_has_expected_trainers(
     actual = len(suite.trainers)
     if actual == expected_count:
         return
-    training_path, _ = _pronoun_data_paths()
+    training_source, _ = _pronoun_data_paths()
+    training_path = Path(str(training_source))
     sidecar = training_path.with_name(f"{training_path.stem}_incomplete_classes{training_path.suffix}")
     sidecar_hint = (
         f" Found incomplete-class sidecar at {sidecar}."
-        if sidecar.is_file()
+        if training_path.is_file() and sidecar.is_file()
         else ""
     )
     raise ValueError(
         f"{suite_label} expected {expected_count} trainers but built {actual}. "
         "TrainerSuite skips pair definitions when pronoun classes are listed in "
         f"{sidecar.name} or missing from training data.{sidecar_hint} "
-        "Regenerate with ensure_english_pronoun_data(force=True) or delete the stale sidecar."
+        "Use the published aieng-lab/en-pronouns dataset or regenerate local CSVs."
     )
 
 
@@ -1061,34 +1083,15 @@ def _require_local_prediction_data(data_dir: str, *, label: str, creation_module
     return training_path, neutral_path
 
 
-def _sentiment_data_paths() -> Tuple[Path, Path]:
-    base = Path(SENTIMENT_DATA_DIR)
-    training_path = base / "training.csv"
-    neutral_path = base / "neutral.csv"
-    if training_path.is_file() and neutral_path.is_file():
-        from gradiend.examples.train_sentiment import _normalize_training_labels
+def _sentiment_data_paths() -> Tuple[str, pd.DataFrame]:
+    """Published HF training repo + neutral frame (paper positive↔negative recipe)."""
+    return EN_SENTIMENT_NRC_HF_DATASET, load_english_sentiment_neutral_data()
 
-        cached = _normalize_training_labels(pd.read_csv(training_path))
-        if len(cached):
-            cached.to_csv(training_path, index=False)
-        return training_path, neutral_path
 
-    from gradiend.examples.train_sentiment import (
-        DEFAULT_LEXICON_WORDS_PER_CLASS,
-        DEFAULT_MAX_SIZE_PER_CLASS,
-        DEFAULT_MIN_OCCURRENCES_PER_TARGET,
-        generate_data,
-    )
-
-    print(f"=== Sentiment data: generating missing CSVs in {base} ===")
-    return generate_data(
-        output_dir=base,
-        max_size_per_class=DEFAULT_MAX_SIZE_PER_CLASS,
-        neutral_max_size=1000,
-        lexicon_words_per_class=DEFAULT_LEXICON_WORDS_PER_CLASS,
-        min_occurrences_per_target=DEFAULT_MIN_OCCURRENCES_PER_TARGET,
-        seed=42,
-    )
+def _sentiment_training_kwargs(training_source: Union[str, Path]) -> Dict[str, Any]:
+    if isinstance(training_source, Path) or Path(str(training_source)).is_file():
+        return {"data": str(training_source)}
+    return english_sentiment_hf_training_kwargs(subset=EN_SENTIMENT_NRC_HF_SUBSET_SPLIT)
 
 
 def _sentiment_single_pair_child_id(positive_word: str, negative_word: str) -> str:
@@ -1383,7 +1386,7 @@ def build_pronoun_suite(
     retain_models_in_memory: bool,
     cached_run_ids: Optional[FrozenSet[str]] = None,
 ) -> Optional[SymmetricTrainerSuite]:
-    training_path, neutral_path = _pronoun_data_paths()
+    training_source, neutral_source = _pronoun_data_paths()
     pair_definitions = _filter_pair_definitions_by_cache(
         [
             SuitePairDefinition(
@@ -1399,11 +1402,11 @@ def build_pronoun_suite(
         return None
     suite = SymmetricTrainerSuite(
         TextPredictionTrainer,
-        data=str(training_path),
+        **_pronoun_training_kwargs(training_source),
         all_classes=PRONOUN_CLASSES,
         masked_col="masked",
         split_col="split",
-        eval_neutral_data=str(neutral_path),
+        eval_neutral_data=neutral_source,
         pair_definitions=pair_definitions,
         **_suite_common_kwargs(
             config,
@@ -1427,7 +1430,7 @@ def build_pronoun_merged_suite(
     retain_models_in_memory: bool,
     cached_run_ids: Optional[FrozenSet[str]] = None,
 ) -> Optional[SymmetricTrainerSuite]:
-    training_path, neutral_path = _pronoun_data_paths()
+    training_source, neutral_source = _pronoun_data_paths()
     pair_definitions = []
     for run_id_prefix, class_merge_map, _label, transition_group in pronoun_merged_configs:
         merged_keys = list(class_merge_map.keys())
@@ -1445,10 +1448,10 @@ def build_pronoun_merged_suite(
         return None
     suite = SymmetricTrainerSuite(
         TextPredictionTrainer,
-        data=str(training_path),
+        **_pronoun_training_kwargs(training_source),
         masked_col="masked",
         split_col="split",
-        eval_neutral_data=str(neutral_path),
+        eval_neutral_data=neutral_source,
         pair_definitions=pair_definitions,
         **_suite_common_kwargs(
             config,
@@ -1534,14 +1537,11 @@ def _build_sentiment_full_lexicon_suite(
     retain_models_in_memory: bool,
     cached_run_ids: Optional[FrozenSet[str]] = None,
 ) -> Optional[SymmetricTrainerSuite]:
-    from gradiend.examples.train_sentiment import (
-        load_and_split_sentiment_training_data,
-        sentiment_training_arguments,
-    )
+    from gradiend.examples.train_sentiment import sentiment_training_arguments
 
     if cached_run_ids is not None and "sentiment_positive_negative" not in cached_run_ids:
         return None
-    training_path, neutral_path = _sentiment_data_paths()
+    training_source, neutral_source = _sentiment_data_paths()
     sentiment_args = sentiment_training_arguments(
         experiment_dir=config.args.experiment_dir,
         use_cache=False,
@@ -1570,17 +1570,13 @@ def _build_sentiment_full_lexicon_suite(
     objective = prediction_objective_for_problem(config, "sentiment")
     if objective is not None:
         sentiment_args = replace(sentiment_args, prediction_objective=objective)
-    training_df = load_and_split_sentiment_training_data(
-        training_path,
-        seed=int(sentiment_args.seed or 0),
-    )
     return SymmetricTrainerSuite(
         TextPredictionTrainer,
-        data=training_df,
+        **_sentiment_training_kwargs(training_source),
         all_classes=SENTIMENT_CLASSES,
         masked_col="masked",
         split_col="split",
-        eval_neutral_data=str(neutral_path),
+        eval_neutral_data=neutral_source,
         pair_definitions=[
             SuitePairDefinition(
                 target_classes=("positive", "negative"),
@@ -1839,7 +1835,7 @@ def _pretty_label(mid: str) -> str:
 def _cross_task_probe_trainers(config: ExperimentConfig) -> Dict[str, TextPredictionTrainer]:
     """Untrained trainers used only to materialize full-domain test transition pools."""
     probes: Dict[str, TextPredictionTrainer] = {}
-    training_path, neutral_path = _pronoun_data_paths()
+    training_source, neutral_source = _pronoun_data_paths()
     probe_args = problem_args(config, experiment_dir=None, use_cache=False)
     objective = prediction_objective_for_problem(config, "pronoun")
     if objective is not None:
@@ -1847,22 +1843,16 @@ def _cross_task_probe_trainers(config: ExperimentConfig) -> Dict[str, TextPredic
     probes["pronoun_probe_pool"] = TextPredictionTrainer(
         model=config.model_name,
         run_id="pronoun_probe_pool",
-        data=str(training_path),
+        **_pronoun_training_kwargs(training_source),
         all_classes=PRONOUN_CLASSES,
         target_classes=("1SG", "1PL"),
         masked_col="masked",
         split_col="split",
-        eval_neutral_data=str(neutral_path),
+        eval_neutral_data=neutral_source,
         args=probe_args,
     )
-    sentiment_training_path, sentiment_neutral_path = _sentiment_data_paths()
+    sentiment_training_source, sentiment_neutral_source = _sentiment_data_paths()
     try:
-        from gradiend.examples.train_sentiment import load_and_split_sentiment_training_data
-
-        sentiment_df = load_and_split_sentiment_training_data(
-            sentiment_training_path,
-            seed=int(config.args.seed or 0),
-        )
         sentiment_args = problem_args(config, experiment_dir=None, use_cache=False)
         sentiment_objective = prediction_objective_for_problem(config, "sentiment")
         if sentiment_objective is not None:
@@ -1870,12 +1860,12 @@ def _cross_task_probe_trainers(config: ExperimentConfig) -> Dict[str, TextPredic
         probes["sentiment_probe_pool"] = TextPredictionTrainer(
             model=config.model_name,
             run_id="sentiment_probe_pool",
-            data=sentiment_df,
+            **_sentiment_training_kwargs(sentiment_training_source),
             all_classes=SENTIMENT_CLASSES,
             target_classes=("positive", "negative"),
             masked_col="masked",
             split_col="split",
-            eval_neutral_data=str(sentiment_neutral_path),
+            eval_neutral_data=sentiment_neutral_source,
             args=sentiment_args,
         )
     except Exception as exc:
@@ -1950,7 +1940,11 @@ def plot_cross_encoding(
         build_demo_trainer_label_mapping,
         build_demo_transition_label_mapping,
         demo_encoding_heatmap_normalized_style_kwargs,
+        demo_encoding_std_heatmap_style_kwargs,
         demo_encoding_heatmap_style_kwargs,
+    )
+    from gradiend.visualizer.heatmaps.encoding import (
+        resolve_oriented_cross_encoding_alignment,
     )
 
     eval_rows = None
@@ -2123,11 +2117,24 @@ def plot_cross_encoding(
             row_label_mapping=trainer_labels,
             column_label_mapping=transition_labels,
             title="GRADIEND × input transition (pre-anchor, seed std)",
-            **style,
+            **demo_encoding_std_heatmap_style_kwargs(style),
         )
 
     feature_labels = build_demo_feature_label_mapping(feature_order)
-
+    default_alignment, _ = resolve_oriented_cross_encoding_alignment(
+        trainers_by_id,
+        "auto",
+    )
+    oriented_common_plot_kwargs = {
+        "order": feature_order,
+        "pretty_groups": feature_pretty_groups,
+        "row_label_mapping": feature_labels,
+        "column_label_mapping": feature_labels,
+        "title": False,
+        "show": True,
+        "xlabel": "Probe feature",
+        "ylabel": "Orienting feature",
+    }
 
     normalized_style = demo_encoding_heatmap_normalized_style_kwargs(
         group_label_fontsize=25,
@@ -2154,13 +2161,8 @@ def plot_cross_encoding(
             split="test",
             max_size=config.args.encoder_eval_max_size,
             aggregate="mean",
-            order=feature_order,
-            pretty_groups=feature_pretty_groups,
-            row_label_mapping=feature_labels,
-            column_label_mapping=feature_labels,
             output_path=cross_encoding_output,
-            title=False,
-            show=True,
+            **oriented_common_plot_kwargs,
             **style,
         )
         print(f"Oriented cross-encoding heatmap saved to {cross_encoding_output}")
@@ -2187,21 +2189,25 @@ def plot_cross_encoding(
                     config.args.experiment_dir,
                     f"cross_encoding_oriented_{s}_std_heatmap.pdf",
                 )
-                std_style = dict(style)
-                std_style["cbar_label"] = "Encoding std"
+                std_style = demo_encoding_std_heatmap_style_kwargs(style)
                 plot_comparison_heatmap(
                     oriented_std,
-                    order=feature_order,
-                    pretty_groups=feature_pretty_groups,
-                    row_label_mapping=feature_labels,
-                    column_label_mapping=feature_labels,
                     output_path=std_output,
-                    title=False,
-                    show=True,
                     models=trainers_by_id,
+                    **oriented_common_plot_kwargs,
                     **filter_comparison_heatmap_plot_kwargs(std_style),
                 )
                 print(f"Oriented cross-encoding std heatmap saved to {std_output}")
+                if s == default_alignment:
+                    default_std_output = os.path.join(
+                        config.args.experiment_dir,
+                        "cross_encoding_oriented_default_std_heatmap.pdf",
+                    )
+                    shutil.copyfile(std_output, default_std_output)
+                    print(
+                        "Default source-aligned cross-encoding std heatmap "
+                        f"({default_alignment}) saved to {default_std_output}"
+                    )
         normalized_output = os.path.join(
             config.args.experiment_dir,
             f"cross_encoding_oriented_{s}_row_normalized_heatmap.pdf",
@@ -2216,13 +2222,8 @@ def plot_cross_encoding(
             max_size=config.args.encoder_eval_max_size,
             aggregate="mean",
             normalize=True,
-            order=feature_order,
-            pretty_groups=feature_pretty_groups,
-            row_label_mapping=feature_labels,
-            column_label_mapping=feature_labels,
             output_path=normalized_output,
-            title=False,
-            show=True,
+            **oriented_common_plot_kwargs,
             **normalized_style,
         )
         print(f"Row-normalized oriented cross-encoding heatmap saved to {normalized_output}")
@@ -2239,15 +2240,8 @@ def plot_cross_encoding(
         split="test",
         max_size=config.args.encoder_eval_max_size,
         aggregate="mean",
-        order=feature_order,
-        pretty_groups=feature_pretty_groups,
-        row_label_mapping=feature_labels,
-        column_label_mapping=feature_labels,
         output_path=default_output,
-        title=False,
-        show=True,
-        xlabel="Probe feature",
-        ylabel="Orienting feature",
+        **oriented_common_plot_kwargs,
         **style,
     )
     print(f"Default oriented cross-encoding heatmap saved to {default_output}")
@@ -2266,15 +2260,8 @@ def plot_cross_encoding(
         max_size=config.args.encoder_eval_max_size,
         aggregate="mean",
         normalize=True,
-        order=feature_order,
-        pretty_groups=feature_pretty_groups,
-        row_label_mapping=feature_labels,
-        column_label_mapping=feature_labels,
         output_path=default_normalized_output,
-        title=False,
-        show=True,
-        xlabel="Probe feature",
-        ylabel="Orienting feature",
+        **oriented_common_plot_kwargs,
         **normalized_style,
     )
     print(

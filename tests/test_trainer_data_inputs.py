@@ -3,6 +3,7 @@
 
 import pandas as pd
 import pytest
+from unittest.mock import patch
 
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
@@ -15,6 +16,7 @@ from gradiend.trainer.core.unified_data import (
     resolve_dataframe,
     transition_id,
 )
+from tests.testing_mocks import MockTokenizer
 
 
 def _merged_factual_df(rows=None):
@@ -114,6 +116,35 @@ class TestTrainerDataAsPath:
         assert trainer._combined_data is not None
         assert len(trainer._combined_data) >= 1
 
+    def test_data_as_path_reports_configured_missing_columns_early(self, tmp_path):
+        path = tmp_path / "training.csv"
+        pd.DataFrame(
+            {
+                "masked": ["[MASK] here"],
+                "split": ["train"],
+                "label": ["M"],
+                "name": ["Alex"],
+            }
+        ).to_csv(path, index=False)
+        config = TextPredictionConfig(
+            data=path,
+            target_classes=["M", "F"],
+            masked_col="training_masked",
+            label_col="target",
+            label_class_col="label",
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        with pytest.raises(ValueError) as exc:
+            trainer._ensure_data()
+
+        message = str(exc.value)
+        assert "training data" in message
+        assert "required column(s) ['training_masked', 'target']" in message
+        assert "Available columns: ['masked', 'split', 'label', 'name']" in message
+        assert "'masked_col': 'training_masked'" in message
+        assert "'label_col': 'target'" in message
+
     def test_data_as_directory_loads_training_csv(self, tmp_path):
         _merged_factual_df().to_csv(tmp_path / "training.csv", index=False)
         config = TextPredictionConfig(data=tmp_path, target_classes=["3SG", "3PL"])
@@ -162,6 +193,37 @@ class TestTrainerDataAsPath:
             trainer._ensure_data()
 
 
+class TestTrainerHfDatasetInput:
+    def test_hf_dataset_reports_configured_missing_columns_early(self):
+        raw = pd.DataFrame(
+            {
+                "masked": ["[MASK] here"],
+                "split": ["train"],
+                "label": ["M"],
+                "name": ["Alex"],
+            }
+        )
+        config = TextPredictionConfig(
+            hf_dataset="org/dataset",
+            target_classes=["M", "F"],
+            masked_col="training_masked",
+            label_col="target",
+            label_class_col="label",
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        with patch.object(TextPredictionTrainer, "_load_hf_dataset", return_value=raw):
+            with pytest.raises(ValueError) as exc:
+                trainer._ensure_data()
+
+        message = str(exc.value)
+        assert "HF dataset 'org/dataset'" in message
+        assert "required column(s) ['training_masked', 'target']" in message
+        assert "Available columns: ['masked', 'split', 'label', 'name']" in message
+        assert "'masked_col': 'training_masked'" in message
+        assert "'label_col': 'target'" in message
+
+
 class TestTrainerDataAsDataFrame:
     """data=DataFrame (merged) builds unified data."""
 
@@ -173,6 +235,55 @@ class TestTrainerDataAsDataFrame:
         assert trainer._combined_data is not None
         assert UNIFIED_FACTUAL in trainer._combined_data.columns
         assert UNIFIED_ALTERNATIVE in trainer._combined_data.columns
+
+    def test_training_args_custom_mask_placeholder_reaches_training_dataset(self):
+        df = pd.DataFrame(
+            [
+                {"masked": "[PRONOUN] is here", "split": "train", "label_class": "3SG", "label": "he"},
+                {"masked": "[PRONOUN] are here", "split": "train", "label_class": "3PL", "label": "they"},
+            ]
+        )
+        config = TextPredictionConfig(data=df, target_classes=["3SG", "3PL"])
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(
+                mask_placeholder="[PRONOUN]",
+                add_neutral_identity_transitions=False,
+            ),
+        )
+
+        training_data = trainer.create_training_data(MockTokenizer(), split="train", batch_size=1)
+        item = training_data[0]
+
+        assert training_data.mask_placeholder == "[PRONOUN]"
+        assert item["input_text"].startswith("[MASK]")
+        assert item["text"].startswith("he") or item["text"].startswith("they")
+
+    def test_config_custom_mask_placeholder_reaches_training_dataset(self):
+        df = pd.DataFrame(
+            [
+                {"masked": "[PRONOUN] is here", "split": "train", "label_class": "3SG", "label": "he"},
+                {"masked": "[PRONOUN] are here", "split": "train", "label_class": "3PL", "label": "they"},
+            ]
+        )
+        config = TextPredictionConfig(
+            data=df,
+            target_classes=["3SG", "3PL"],
+            mask_placeholder="[PRONOUN]",
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=False),
+        )
+
+        training_data = trainer.create_training_data(MockTokenizer(), split="train", batch_size=1)
+        item = training_data[0]
+
+        assert training_data.mask_placeholder == "[PRONOUN]"
+        assert item["input_text"].startswith("[MASK]")
+        assert item["text"].startswith("he") or item["text"].startswith("they")
 
     def test_feature_class_ids_follow_target_class_order_not_row_order(self):
         df = pd.DataFrame(
@@ -196,15 +307,148 @@ class TestTrainerDataAsDataFrame:
             ]
         )
         config = TextPredictionConfig(data=df, target_classes=["positive", "negative"])
-        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            args=TrainingArguments(
+                source="alternative",
+                target="diff",
+                add_neutral_identity_transitions=False,
+            ),
+        )
 
         dataset = trainer.create_training_data(_DummyPredictionTokenizer(), split="train")
         by_source = dataset.data.set_index("factual_id")
 
         assert by_source.loc["positive", "label"] == 1
-        assert by_source.loc["positive", "feature_class_id"] == 0
+        assert by_source.loc["positive", "feature_pole"] == "pos"
+        assert by_source.loc["positive", "feature_class_id"] == 0  # deprecated mirror
         assert by_source.loc["negative", "label"] == -1
-        assert by_source.loc["negative", "feature_class_id"] == 1
+        assert by_source.loc["negative", "feature_pole"] == "neg"
+        assert by_source.loc["negative", "feature_class_id"] == 1  # deprecated mirror
+
+    def test_one_pole_keeps_full_factual_coverage_for_decoder_evaluation(self):
+        """Training selects its transitions without destructively narrowing eval data.
+
+        Decoder plots score the selected feature on every factual class.  A
+        one-pole trainer trains only target-factual→counterfactual transitions, but
+        its unified frame must still retain reverse-CF factual rows so those
+        probability panels can be evaluated.
+        """
+        df = pd.DataFrame(
+            [
+                {"masked": "[MASK] chapel", "split": "train", "label_class": "christian", "label": "christian", "alternative_class": "muslim", "alternative": "muslim"},
+                {"masked": "[MASK] mosque", "split": "train", "label_class": "muslim", "label": "muslim", "alternative_class": "christian", "alternative": "christian"},
+                {"masked": "[MASK] synagogue", "split": "train", "label_class": "jewish", "label": "jewish", "alternative_class": "christian", "alternative": "christian"},
+            ]
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=TextPredictionConfig(
+                data=df,
+                target_classes=["christian"],
+                all_classes=["christian", "muslim", "jewish"],
+                counterfactual_classes="all",
+            ),
+            training_args=TrainingArguments(add_neutral_identity_transitions=False),
+        )
+
+        trainer._ensure_data()
+        assert set(trainer.combined_data[UNIFIED_FACTUAL_CLASS]) == {
+            "christian", "muslim", "jewish"
+        }
+
+        training_data = trainer.create_training_data(_DummyPredictionTokenizer(), split="train")
+        assert set(training_data.data["factual_id"]) == {"christian"}
+        assert set(training_data.data["alternative_id"]) == {"muslim"}
+        assert set(training_data.data["label"]) == {1}
+
+        decoder_df, _ = trainer._get_decoder_eval_dataframe(
+            _DummyPredictionTokenizer(), split="train"
+        )
+        assert set(decoder_df["factual_id"]) == {"christian", "muslim", "jewish"}
+
+    def test_binary_one_pole_decoder_evaluation_keeps_both_factual_classes(self):
+        """``include_other_classes`` also applies to binary one-pole data."""
+        df = pd.DataFrame(
+            [
+                {
+                    "masked": "The nurse said [MASK] arrived.",
+                    "split": "test",
+                    "label_class": "F",
+                    "label": "she",
+                    "alternative_class": "M",
+                    "alternative": "he",
+                },
+                {
+                    "masked": "The doctor said [MASK] arrived.",
+                    "split": "test",
+                    "label_class": "M",
+                    "label": "he",
+                    "alternative_class": "F",
+                    "alternative": "she",
+                },
+            ]
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=TextPredictionConfig(
+                data=df,
+                target_classes=["F"],
+                all_classes=["F", "M"],
+                counterfactual_classes="all",
+            ),
+            training_args=TrainingArguments(add_neutral_identity_transitions=False),
+        )
+
+        decoder_df, _ = trainer._get_decoder_eval_dataframe(
+            _DummyPredictionTokenizer(), split="test"
+        )
+
+        assert set(decoder_df["factual_id"]) == {"F", "M"}
+
+
+class TestAllClassesFromConfigAtConstruction:
+    """config.all_classes must be visible on the trainer before any data loading.
+
+    A checkpoint-reload trainer built purely for eval (e.g. decoder eval on a
+    skip-existing one-pole trainer) calls trainer.get_model(load_directory=...)
+    and never calls _ensure_data()/create_training_data()/.train() -- so
+    _all_classes must not depend on that lazy data-loading path running first,
+    or an explicitly configured all_classes silently reverts to target_classes
+    (just the trainer's own pole for one-pole configs), and CF-class resolution
+    for e.g. counterfactual_classes="all" finds nothing to resolve against.
+    """
+
+    def test_all_classes_visible_immediately_without_ensure_data(self):
+        config = TextPredictionConfig(
+            data=_merged_with_alternative_df(),
+            label_col="label",
+            label_class_col="label_class",
+            alternative_col="alternative",
+            alternative_class_col="alternative_class",
+            target_classes=["3SG"],
+            all_classes=["3SG", "3PL"],
+            counterfactual_classes="all",
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        # No _ensure_data()/create_training_data()/get_model() call here --
+        # mirrors a reload-only trainer built for eval on an existing checkpoint.
+        assert set(trainer.all_classes) == {"3SG", "3PL"}
+        assert set(trainer.get_target_feature_classes()) == {"3SG", "3PL"}
+
+    def test_all_classes_still_lazily_inferred_when_not_configured(self):
+        """Unset all_classes keeps the existing data-inference behavior."""
+        class_dfs = _per_class_dict()
+        config = TextPredictionConfig(
+            data=class_dfs,
+            target_classes=["3SG", "3PL"],
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+        assert trainer._all_classes is None
+        trainer._ensure_data()
+        assert set(trainer._all_classes) == {"3SG", "3PL"}
 
 
 class TestTrainerDataAsDict:
@@ -315,7 +559,10 @@ class TestTrainerDataAsDict:
         trainer = TextPredictionTrainer(
             model="bert-base-uncased",
             config=config,
-            training_args=TrainingArguments(include_other_classes=True),
+            training_args=TrainingArguments(
+                include_other_classes=True,
+                add_neutral_identity_transitions=False,
+            ),
         )
 
         trainer._ensure_data()
@@ -519,7 +766,10 @@ class TestAddIdentityForOtherClasses:
             all_classes=["3SG", "3PL"],
             use_class_names_as_columns=True,
         )
-        training_args = TrainingArguments(add_identity_for_other_classes=True)
+        training_args = TrainingArguments(
+            add_identity_for_other_classes=True,
+            add_neutral_identity_transitions=False,
+        )
         trainer = TextPredictionTrainer(
             model="bert-base-uncased",
             config=config,
@@ -540,7 +790,10 @@ class TestAddIdentityForOtherClasses:
             target_classes=["3SG", "3PL"],
             use_class_names_as_columns=True,
         )
-        training_args = TrainingArguments(add_identity_for_other_classes=True)
+        training_args = TrainingArguments(
+            add_identity_for_other_classes=True,
+            add_neutral_identity_transitions=False,
+        )
         trainer = TextPredictionTrainer(
             model="bert-base-uncased",
             config=config,
@@ -557,3 +810,150 @@ class TestAddIdentityForOtherClasses:
             assert row["factual_id"] in non_target, (
                 f"Identity row should be for non-target class only, got factual_id={row['factual_id']!r}"
             )
+
+
+class TestAddNeutralIdentityTransitions:
+    """Neutral identity transitions add zero-labeled training rows from neutral_data."""
+
+    def test_add_neutral_identity_requires_neutral_data(self):
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        with pytest.raises(ValueError, match="neutral_data"):
+            trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+
+    def test_add_neutral_identity_rows_from_train_split(self):
+        neutral = pd.DataFrame(
+            [
+                {"masked": "quiet [MASK]", "label": "stone", "split": "train"},
+                {"masked": "bright [MASK]", "label": "cloud", "split": "test"},
+            ]
+        )
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        training_data = trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+        df = training_data.data
+        neutral_rows = df[df["neutral_variant"] == "neutral_identity"]
+
+        assert len(neutral_rows) == 1
+        row = neutral_rows.iloc[0]
+        assert row["factual"] == "stone"
+        assert row["alternative"] == "stone"
+        assert row["factual_id"] == "neutral"
+        assert row["alternative_id"] == "neutral"
+        assert row["label"] == 0
+        assert bool(row["is_identity_transition"]) is True
+
+    def test_add_neutral_identity_rows_from_split_mapping(self):
+        neutral = {
+            "train": pd.DataFrame([{"masked": "quiet [MASK]", "label": "stone"}]),
+            "test": pd.DataFrame([{"masked": "bright [MASK]", "label": "cloud"}]),
+        }
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        training_data = trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+        neutral_rows = training_data.data[training_data.data["neutral_variant"] == "neutral_identity"]
+
+        assert neutral_rows["factual"].tolist() == ["stone"]
+        assert neutral_rows["split"].tolist() == ["train"]
+
+    def test_add_neutral_identity_requires_requested_split_in_mapping(self):
+        neutral = {
+            "test": pd.DataFrame([{"masked": "bright [MASK]", "label": "cloud"}]),
+        }
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(
+            model="bert-base-uncased",
+            config=config,
+            training_args=TrainingArguments(add_neutral_identity_transitions=True),
+        )
+
+        with pytest.raises(ValueError, match="available splits"):
+            trainer.create_training_data(_DummyPredictionTokenizer(), split="train", batch_size=1)
+
+    def test_neutral_data_is_eval_fallback_with_requested_split(self):
+        neutral = pd.DataFrame(
+            [
+                {"text": "train neutral", "split": "train"},
+                {"text": "test neutral", "split": "test"},
+            ]
+        )
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        resolved = trainer._resolve_eval_neutral_dataframe(split="test")
+
+        assert resolved is not None
+        assert resolved["text"].tolist() == ["test neutral"]
+
+    def test_neutral_data_split_mapping_is_eval_fallback(self):
+        neutral = {
+            "train": pd.DataFrame([{"text": "train neutral"}]),
+            "test": pd.DataFrame([{"text": "test neutral"}]),
+        }
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data=neutral,
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        resolved = trainer._resolve_eval_neutral_dataframe(split="test")
+
+        assert resolved is not None
+        assert resolved["text"].tolist() == ["test neutral"]
+        assert resolved["split"].tolist() == ["test"]
+
+    def test_eval_neutral_data_overrides_shared_split_mapping(self):
+        config = TextPredictionConfig(
+            data=_per_class_dict(),
+            target_classes=["3SG", "3PL"],
+            neutral_data={"test": pd.DataFrame([{"text": "shared neutral"}])},
+            eval_neutral_data={"test": pd.DataFrame([{"text": "eval neutral"}])},
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        resolved = trainer._resolve_eval_neutral_dataframe(split="test")
+
+        assert resolved is not None
+        assert resolved["text"].tolist() == ["eval neutral"]

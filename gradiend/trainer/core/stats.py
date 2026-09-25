@@ -6,6 +6,7 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 from gradiend.util.logging import get_logger
+from gradiend.trainer.core.metric_names import AUC_METRICS, normalize_metric_name
 from gradiend.util.util import to_jsonable
 from gradiend.util.paths import is_under_temp_dir
 
@@ -33,6 +34,37 @@ def _normalize_training_stats_step_dicts(training_stats: Dict[str, Any]) -> Dict
         if key in training_stats:
             training_stats[key] = _normalize_step_value_dict(training_stats.get(key))
     return training_stats
+
+
+def _collapse_legacy_stitched_component_stats(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize transitional stitched-component files to the canonical run layout.
+
+    Early component stitching wrote selected component histories under
+    ``convergence_info.component_stitching.selected_component_training``.  The
+    canonical layout stores those histories directly as ``training_stats`` and
+    leaves ``component_stitching`` as provenance metadata only.
+    """
+    if not isinstance(data, dict):
+        return data
+    convergence_info = data.get("convergence_info")
+    if not isinstance(convergence_info, dict):
+        return data
+    stitching = convergence_info.get("component_stitching")
+    if not isinstance(stitching, dict) or not bool(stitching.get("applied")):
+        return data
+    selected = stitching.get("selected_component_training")
+    if not isinstance(selected, dict) or not isinstance(selected.get("training_stats"), dict):
+        return data
+
+    data["training_stats"] = selected["training_stats"]
+    if isinstance(selected.get("best_score_checkpoint"), dict):
+        data["best_score_checkpoint"] = selected["best_score_checkpoint"]
+    stitching = dict(stitching)
+    stitching.pop("selected_component_training", None)
+    stitching["selected_component_training_collapsed"] = True
+    convergence_info["component_stitching"] = stitching
+    return data
 
 
 def _best_step_abs_mean_by_type(
@@ -114,6 +146,164 @@ def _nonzero_target_class_abs_means(mean_by_class: Dict[Any, float]) -> List[flo
     return abs_means
 
 
+def _positive_target_class_mean(mean_by_class: Any) -> Optional[float]:
+    """Return the encoded mean for the semantic positive target class (label ``+1``)."""
+    if not isinstance(mean_by_class, dict):
+        return None
+    for label, mean_value in mean_by_class.items():
+        if not isinstance(mean_value, (int, float)):
+            continue
+        try:
+            numeric_label = float(label)
+        except (TypeError, ValueError):
+            continue
+        if numeric_label == 1.0:
+            return float(mean_value)
+    return None
+
+
+def _target_class_mean_stats(
+    mean_by_class: Any,
+    mean_threshold: Any = None,
+) -> tuple[bool, Optional[float], Optional[float]]:
+    """Return ``(means_ok, product, min_abs)`` for the two non-neutral target classes.
+
+    ``means_ok`` requires exactly two non-zero label means with opposite signs, and when
+    ``mean_threshold`` is set also ``min(|mean|) >= mean_threshold``.
+    """
+    if not isinstance(mean_by_class, dict):
+        return False, None, None
+    target_means: List[float] = []
+    for label, mean_value in mean_by_class.items():
+        if not isinstance(mean_value, (int, float)):
+            continue
+        try:
+            numeric_label = float(label)
+        except (TypeError, ValueError):
+            continue
+        if numeric_label == 0.0:
+            continue
+        target_means.append(float(mean_value))
+    if len(target_means) != 2:
+        return False, None, None
+    product = target_means[0] * target_means[1]
+    min_abs = min(abs(value) for value in target_means)
+    mean_ok = mean_threshold is None or min_abs >= float(mean_threshold)
+    return product < 0 and mean_ok, product, min_abs
+
+
+def correlation_checkpoint_rank(
+    *,
+    step: int,
+    correlation: Optional[float],
+    mean_by_class: Any = None,
+    score_threshold: Optional[float] = None,
+    mean_threshold: Optional[float] = None,
+    prefer_convergent: bool = False,
+) -> tuple:
+    """Rank for correlation-based best-checkpoint selection (higher is better).
+
+    By default (``prefer_convergent=False``), rank by ``|correlation|`` then later step.
+
+    When ``prefer_convergent=True``, prefer steps that meet the same convergence criteria used
+    at end of training (``step > 0``, ``|corr|`` threshold, opposite-sign target means and
+    optional min ``|mean|``), then higher ``|correlation|``, then larger min ``|mean|``,
+    then later step.
+    """
+    return metric_checkpoint_rank(
+        step=step,
+        score=correlation,
+        metric="correlation",
+        mean_by_class=mean_by_class,
+        score_threshold=score_threshold,
+        mean_threshold=mean_threshold,
+        prefer_convergent=prefer_convergent,
+    )
+
+
+def metric_checkpoint_rank(
+    *,
+    step: int,
+    score: Optional[float],
+    metric: str = "correlation",
+    mean_by_class: Any = None,
+    score_threshold: Optional[float] = None,
+    mean_threshold: Optional[float] = None,
+    prefer_convergent: bool = False,
+) -> tuple:
+    """Rank for best-checkpoint selection (higher is better).
+
+    ``metric``:
+
+      - ``correlation``: compare ``|score|`` (bipolar)
+      - ``roc_auc`` / ``auroc``: compare raw ``score`` (one-vs-rest; higher better)
+      - ``min_auc_n_o`` / ``min_auc``: compare raw ``min(auc_n, auc_o)`` (higher better)
+      - ``encoding_e`` / ``E``: compare the fair validation bottleneck (higher better)
+    """
+    name = normalize_metric_name(metric)
+    raw = float(score) if isinstance(score, (int, float)) else None
+    is_auc_metric = name in AUC_METRICS
+    positive_target_mean = _positive_target_class_mean(mean_by_class) if is_auc_metric else None
+    positive_target_ok = (
+        isinstance(positive_target_mean, (int, float)) and positive_target_mean > 0.0
+    ) if is_auc_metric else True
+    if is_auc_metric:
+        # AUC is self-orienting, but the learned encoding has a semantic orientation:
+        # label +1 must encode positively.  An invalid/missing orientation must never
+        # beat an eligible checkpoint merely because its AUC is higher.
+        rank_score = raw if raw is not None and positive_target_ok else float("-inf")
+        score_ok = score_threshold is None or (raw is not None and raw >= float(score_threshold))
+    else:
+        rank_score = abs(raw) if raw is not None else float("-inf")
+        score_ok = score_threshold is None or (raw is not None and abs(raw) >= float(score_threshold))
+    means_ok, _product, min_abs = _target_class_mean_stats(mean_by_class, mean_threshold)
+    # AUROC-family metrics do not require opposite-sign bipolar means unless a mean
+    # threshold is explicitly set (prefer_convergent + mean_threshold).
+    if is_auc_metric and mean_threshold is None:
+        means_ok = True
+        min_abs = None
+    converged = bool(
+        prefer_convergent
+        and (score_threshold is not None or mean_threshold is not None)
+        and step > 0
+        and raw is not None
+        and score_ok
+        and positive_target_ok
+        and means_ok
+    )
+    try:
+        step_int = int(step)
+    except (TypeError, ValueError):
+        step_int = -1
+    return (
+        1 if converged else 0,
+        float(rank_score),
+        float(min_abs) if isinstance(min_abs, (int, float)) else float("-inf"),
+        step_int,
+    )
+
+
+def _mean_by_class_for_step(
+    training_stats: Dict[str, Any],
+    step: Any,
+    eval_result: Optional[Dict[str, Any]] = None,
+) -> Dict[Any, float]:
+    """Resolve mean_by_class for a step from eval_result or training_stats history."""
+    if isinstance(eval_result, dict):
+        current = eval_result.get("mean_by_class")
+        if isinstance(current, dict) and current:
+            return {k: float(v) for k, v in current.items() if isinstance(v, (int, float))}
+    mean_hist = training_stats.get("mean_by_class") if isinstance(training_stats, dict) else None
+    if not isinstance(mean_hist, dict):
+        return {}
+    at_step = mean_hist.get(step)
+    if at_step is None:
+        at_step = mean_hist.get(str(step))
+    if isinstance(at_step, dict):
+        return {k: float(v) for k, v in at_step.items() if isinstance(v, (int, float))}
+    return {}
+
+
 def _best_step_min_target_class_abs_mean(
     training_stats: Dict[str, Any],
     best_score_checkpoint: Dict[str, Any],
@@ -127,6 +317,9 @@ def _best_step_min_target_class_abs_mean(
     mean_by_class = _best_step_mean_by_class(training_stats, best_score_checkpoint)
     if not mean_by_class:
         return None
+    _means_ok, _product, min_abs = _target_class_mean_stats(mean_by_class, mean_threshold=None)
+    if min_abs is not None:
+        return float(min_abs)
     abs_means = _nonzero_target_class_abs_means(mean_by_class)
     if not abs_means:
         return None
@@ -146,20 +339,18 @@ def _best_step_target_class_mean_product(
     mean_by_class = _best_step_mean_by_class(training_stats, best_score_checkpoint)
     if not mean_by_class:
         return None
+    _means_ok, product, _min_abs = _target_class_mean_stats(mean_by_class, mean_threshold=None)
+    return product
 
-    target_means = []
-    for label, mean_value in mean_by_class.items():
-        try:
-            numeric_label = float(label)
-        except (TypeError, ValueError):
-            continue
-        if numeric_label == 0.0:
-            continue
-        target_means.append(float(mean_value))
 
-    if len(target_means) != 2:
-        return None
-    return target_means[0] * target_means[1]
+def _best_step_positive_target_class_mean(
+    training_stats: Dict[str, Any],
+    best_score_checkpoint: Dict[str, Any],
+) -> Optional[float]:
+    """Return the label-``+1`` mean encoded value at the best checkpoint."""
+    return _positive_target_class_mean(
+        _best_step_mean_by_class(training_stats, best_score_checkpoint)
+    )
 
 
 def summarize_topk_stability(
@@ -387,6 +578,7 @@ def load_training_stats(model_path: str) -> Optional[dict]:
     except Exception as e:
         logger.warning(f"Could not load training stats from {training_path}: {e}")
         return None
+    data = _collapse_legacy_stitched_component_stats(data)
     if isinstance(data.get("training_stats"), dict):
         _normalize_training_stats_step_dicts(data["training_stats"])
     # Ensure stats["abs_mean_by_type"] is the best-step snapshot (type -> value) for convenience

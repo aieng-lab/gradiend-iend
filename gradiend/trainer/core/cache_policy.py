@@ -174,6 +174,62 @@ def _normalize_post_prune_config(cfg: Any) -> Optional[dict]:
     return None
 
 
+def _normalize_signal_config(value: Any) -> Optional[list]:
+    if value is None:
+        return None
+    if hasattr(value, "to_list"):
+        return list(value.to_list())
+    if hasattr(value, "to_dict"):
+        return [value.to_dict()]
+    if isinstance(value, dict):
+        return [dict(value)]
+    if isinstance(value, (list, tuple)):
+        normalized = []
+        for item in value:
+            if hasattr(item, "to_dict"):
+                normalized.append(item.to_dict())
+            elif isinstance(item, dict):
+                normalized.append(dict(item))
+            else:
+                normalized.append(item)
+        return normalized
+    return [value]
+
+
+def _normalize_signal_scope_config(value: Any) -> Optional[dict]:
+    if value is None:
+        return None
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return dict(value)
+    return None
+
+
+def _normalize_gradiend_split_config(value: Any) -> Optional[dict]:
+    if value is None:
+        return None
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        return {"mode": value.strip().lower()}
+    return None
+
+
+def _is_implicit_gradient_signal_config(value: list) -> bool:
+    return value == [{"kind": "gradient", "name": None, "options": {}}]
+
+
+def _fingerprint_values_match(key: str, expected_value: Any, saved_value: Any) -> bool:
+    if expected_value == saved_value:
+        return True
+    if key == "signals" and saved_value is None:
+        return isinstance(expected_value, list) and _is_implicit_gradient_signal_config(expected_value)
+    return False
+
+
 def build_training_cache_fingerprint(training_args: Any) -> dict:
     """Build a stable fingerprint for training-cache reuse checks."""
     if hasattr(training_args, "to_dict"):
@@ -190,6 +246,19 @@ def build_training_cache_fingerprint(training_args: Any) -> dict:
     post_cfg = _normalize_post_prune_config(args_dict.get("post_prune_config"))
     if post_cfg is not None:
         fingerprint["post_prune_config"] = post_cfg
+    signals_cfg = _normalize_signal_config(args_dict.get("signals") or args_dict.get("signal"))
+    if signals_cfg is not None:
+        fingerprint["signals"] = signals_cfg
+    signal_scope_cfg = _normalize_signal_scope_config(args_dict.get("signal_scope"))
+    if signal_scope_cfg is not None:
+        fingerprint["signal_scope"] = signal_scope_cfg
+    gradiend_split_cfg = _normalize_gradiend_split_config(args_dict.get("gradiend_split"))
+    if gradiend_split_cfg is not None:
+        fingerprint["gradiend_split"] = gradiend_split_cfg
+    if args_dict.get("init_fan_in_floor") is not None:
+        fingerprint["init_fan_in_floor"] = args_dict["init_fan_in_floor"]
+    if args_dict.get("add_neutral_identity_transitions"):
+        fingerprint["add_neutral_identity_transitions"] = True
     for key in ("source", "target"):
         if args_dict.get(key) is not None:
             fingerprint[key] = args_dict[key]
@@ -275,8 +344,16 @@ def checkpoint_matches_training_fingerprint(
             return False
         return True
 
-    for key in ("pre_prune_config", "post_prune_config", "source", "target"):
-        if expected.get(key) != saved.get(key):
+    for key in (
+        "pre_prune_config",
+        "post_prune_config",
+        "signals",
+        "signal_scope",
+        "gradiend_split",
+        "source",
+        "target",
+    ):
+        if not _fingerprint_values_match(key, expected.get(key), saved.get(key)):
             if log_reason:
                 logger.warning(
                     "Rejecting training cache at %s: fingerprint mismatch on %r "

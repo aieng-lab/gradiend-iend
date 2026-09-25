@@ -4,10 +4,15 @@ import pytest
 
 from gradiend import TrainingArguments
 from gradiend.visualizer.labels import (
+    CORRELATION_LABEL,
+    ENCODED_VALUE_LABEL,
+    MEAN_ENCODED_VALUE_LABEL,
     NON_CONVERGENCE_MARKER,
     NON_CONVERGENCE_MARKER_TEX,
     converged_for_trainer,
     converged_from_run_info,
+    escape_matplotlib_usetex_text,
+    format_transition_label,
     format_plotly_label,
     format_label_with_convergence,
     format_model_labels_with_convergence,
@@ -70,6 +75,30 @@ def test_format_label_with_convergence_uses_tex_safe_marker(monkeypatch):
     assert format_label_with_convergence("run_a", converged=False) == f"run_a {NON_CONVERGENCE_MARKER_TEX}"
 
 
+def test_escape_matplotlib_usetex_text_escapes_plain_specials(monkeypatch):
+    import matplotlib as mpl
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", False)
+    assert escape_matplotlib_usetex_text("95% CI") == "95% CI"
+    assert escape_matplotlib_usetex_text("direction > 0.5") == "direction > 0.5"
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+    assert escape_matplotlib_usetex_text("95% CI") == r"95\% CI"
+    assert escape_matplotlib_usetex_text(r"95\% CI") == r"95\% CI"
+    assert escape_matplotlib_usetex_text("direction > 0.5") == r"direction \textgreater{} 0.5"
+    assert escape_matplotlib_usetex_text("a < b") == r"a \textless{} b"
+    assert escape_matplotlib_usetex_text(r"already \textgreater{} ok") == r"already \textgreater{} ok"
+    assert escape_matplotlib_usetex_text(r"keep $a>b$ math") == r"keep $a>b$ math"
+
+
+def test_shared_matplotlib_label_formatters_escape_percent_for_usetex(monkeypatch):
+    import matplotlib as mpl
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+    assert format_label_with_convergence("95% run", converged=True) == r"95\% run"
+    assert format_transition_label("A% -> B", use_latex=True) == r"A\%$\rightarrow$B"
+
+
 def test_converged_from_run_info():
     assert converged_from_run_info(None) is None
     assert converged_from_run_info({}) is None
@@ -100,8 +129,13 @@ def test_resolve_plot_title_with_convergence():
     assert resolve_plot_title_with_convergence(True, trainer=trainer, highlight_non_convergence=False) == "my_run"
     assert resolve_plot_title_with_convergence(False, trainer=trainer) is False
     assert resolve_plot_title_with_convergence(None, trainer=trainer) is False
+    assert resolve_plot_title_with_convergence(True, trainer=None, default=None) is False
+    assert resolve_plot_title_with_convergence(True, default=None) is False
+    assert format_label_with_convergence(None) == ""
     trainer_ok = _TrainerStub(run_id="ok", converged=True)
     assert resolve_plot_title_with_convergence(True, trainer=trainer_ok) == "ok"
+    trainer_no_id = _TrainerStub(run_id=None, converged=True)
+    assert resolve_plot_title_with_convergence(True, trainer=trainer_no_id, default=None) is False
 
 
 def test_converged_for_trainer_uses_current_seed_requirement_over_stale_report():
@@ -206,6 +240,13 @@ def test_format_plotly_label_hides_hover_helper_names():
     assert format_plotly_label("text_hover") == "Text"
     assert format_plotly_label("text_:hover") == "Text"
     assert format_plotly_label("data_split") == "Split"
+
+
+def test_common_plot_labels_are_shared_with_plotly_formatter():
+    assert ENCODED_VALUE_LABEL == "Encoded value"
+    assert MEAN_ENCODED_VALUE_LABEL == "Mean encoded value"
+    assert CORRELATION_LABEL == "Correlation"
+    assert format_plotly_label("encoded") == ENCODED_VALUE_LABEL
 
 
 def test_plot_functions_expose_highlight_non_convergence_param():

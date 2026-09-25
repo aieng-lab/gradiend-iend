@@ -16,7 +16,13 @@ from gradiend.visualizer.encoder_neutral import (
     build_multi_split_encoder_plot_frame,
     encoder_plot_xlabel,
 )
-from gradiend.visualizer.labels import resolve_highlight_non_convergence, resolve_plot_title_with_convergence, format_transition_label
+from gradiend.visualizer.labels import (
+    ENCODED_VALUE_LABEL,
+    escape_matplotlib_usetex_text,
+    format_transition_label,
+    resolve_highlight_non_convergence,
+    resolve_plot_title_with_convergence,
+)
 from gradiend.visualizer.plot_optional import _require_matplotlib, _require_seaborn
 from gradiend.util.logging import get_logger
 
@@ -53,7 +59,7 @@ def _plot_encoder_distributions_by_data_split(
     target_and_neutral_only: bool = True,
     training_pair: Optional[tuple] = None,
     show: bool = True,
-    title: Union[str, bool] = True,
+    title: Union[str, bool, None] = True,
     run_id: Optional[str] = None,
     output: Optional[str] = None,
     output_dir: Optional[str] = None,
@@ -62,6 +68,7 @@ def _plot_encoder_distributions_by_data_split(
     dpi: Optional[int] = None,
     cmap: str = "tab20",
     return_fig_ax: bool = False,
+    log_saved: bool = True,
     **kwargs: Any,
 ) -> Any:
     """Violin plot with feature classes on x-axis and train/val/test splits as facets."""
@@ -117,15 +124,17 @@ def _plot_encoder_distributions_by_data_split(
                 ax=ax,
                 cut=0,
             )
-            ax.set_title(str(sp))
+            ax.set_title(escape_matplotlib_usetex_text(sp))
             ax.set_xlabel("")
             ax.tick_params(axis="x", rotation=15 if len(panel_groups) > 3 else 0)
-        axes[0].set_ylabel("Encoded value")
+        axes[0].set_ylabel(ENCODED_VALUE_LABEL)
         axes[-1].set_xlabel(x_label)
-    if title is True and run_id:
-        plt.suptitle(str(run_id))
+    if title is False or title is None:
+        pass
+    elif title is True and run_id:
+        plt.suptitle(escape_matplotlib_usetex_text(run_id))
     elif isinstance(title, str):
-        plt.suptitle(title)
+        plt.suptitle(escape_matplotlib_usetex_text(title))
 
     out_path = output
     if not out_path:
@@ -140,7 +149,8 @@ def _plot_encoder_distributions_by_data_split(
         out_path = f"{base}.{img_format}"
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
         plt.savefig(out_path, format=img_format, dpi=dpi, bbox_inches="tight")
-        logger.info("Saved encoder distribution plot: %s", out_path)
+        if log_saved:
+            logger.info("Saved encoder distribution plot: %s", out_path)
     if show:
         plt.show()
     if return_fig_ax and fig is not None:
@@ -158,7 +168,7 @@ def plot_encoder_distributions(
     output: Optional[str] = None,
     output_dir: Optional[str] = None,
     show: bool = True,
-    title: Union[str, bool] = True,
+    title: Union[str, bool, None] = True,
     violin_order: Optional[List[str]] = None,
     paired_legend_labels: Optional[List[str]] = None,
     class_label_mapping: Optional[Dict[Any, str]] = None,
@@ -183,6 +193,7 @@ def plot_encoder_distributions(
     include_neutral: bool = False,
     highlight_non_convergence: Optional[bool] = None,
     return_fig_ax: bool = False,
+    log_saved: bool = True,
     **kwargs: Any,
 ) -> Any:
     """
@@ -198,7 +209,7 @@ def plot_encoder_distributions(
         output: Explicit path for saved PDF (overrides experiment_dir / output_dir).
         output_dir: Directory for saved PDF when output and experiment_dir are not set.
         show: If True, call plt.show() to display the plot.
-        title: True (default run_id), False, or custom string for the plot title.
+        title: True (default run_id), False/None (no title), or custom string for the plot title.
         target_and_neutral_only: If True (default), restrict the plot to the target (training)
                     transition(s) and neutral data only; other transitions are excluded. Uses
                     trainer.pair to determine the target transition(s). Set to False to show
@@ -249,6 +260,7 @@ def plot_encoder_distributions(
         figsize: Figure size (width, height) in inches. If None, uses (max(6, 1.5 * n_groups), 3).
         return_fig_ax: If True, return ``(fig, axes)`` and leave the figure open for
             caller-side customization.
+        log_saved: Whether to log the saved plot path at INFO.
         **kwargs: Forwarded to ``trainer.analyze_encoder`` when ``encoder_df`` is not supplied.
 
     Returns:
@@ -349,6 +361,7 @@ def plot_encoder_distributions(
             dpi=dpi,
             cmap=cmap,
             return_fig_ax=return_fig_ax,
+            log_saved=log_saved,
             **kwargs,
         )
 
@@ -717,15 +730,15 @@ def plot_encoder_distributions(
         lw = 2.5 if (g, side) in train_pair_half_set else 0.7
         coll.set_linewidth(lw)
 
-    if title is False:
+    if title is False or title is None:
         pass
     elif isinstance(title, str):
-        plt.title(title, fontsize=title_fontsize)
+        plt.title(escape_matplotlib_usetex_text(title), fontsize=title_fontsize)
     elif run_id:
-        plt.title(str(run_id), fontsize=title_fontsize)
+        plt.title(escape_matplotlib_usetex_text(run_id), fontsize=title_fontsize)
     ax.set_xticklabels([])
     plt.xlabel("", fontsize=axis_label_fontsize)
-    plt.ylabel("Encoded value", fontsize=axis_label_fontsize)
+    plt.ylabel(ENCODED_VALUE_LABEL, fontsize=axis_label_fontsize)
     if label_fontsize is not None:
         ax.tick_params(labelsize=label_fontsize)
 
@@ -800,7 +813,8 @@ def plot_encoder_distributions(
         if dpi is not None:
             save_kwargs["dpi"] = dpi
         plt.savefig(out_path, **save_kwargs)
-        logger.info("Saved encoder distribution plot: %s", out_path)
+        if log_saved:
+            logger.info("Saved encoder distribution plot: %s", out_path)
     elif not show and not return_fig_ax:
         plt.close()
         raise ValueError(

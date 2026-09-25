@@ -1,6 +1,8 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pandas as pd
+import pytest
 
 from gradiend import TextPredictionTrainer, TrainingArguments
 from gradiend.trainer.core.arguments import TrainingArguments as CoreTrainingArguments
@@ -49,6 +51,24 @@ def _prediction_data():
     }
 
 
+def _neutral_data():
+    """Shared neutral pool: add_neutral_identity_transitions defaults True whenever
+    TrainingArguments is present, and now hard-requires TextPredictionConfig.neutral_data
+    (see TextPredictionTrainer._resolve_shared_neutral_dataframe).
+
+    Pre-masked rows (masked + label) so _neutral_identity_rows uses them
+    directly instead of remasking raw text via tokenizer.tokenize(), which
+    _DummyPredictionTokenizer (used across this file) does not implement.
+    """
+    return pd.DataFrame(
+        {
+            "masked": ["[MASK] went home", "[MASK] is home", "[MASK] stayed home"],
+            "label": ["someone", "someone", "someone"],
+            "split": ["train", "validation", "test"],
+        }
+    )
+
+
 def _classification_data():
     return pd.DataFrame(
         [
@@ -73,6 +93,7 @@ def _make_prediction_trainer(experiment_dir: str) -> TextPredictionTrainer:
         target_classes=["3SG", "3PL"],
         args=args,
         use_class_names_as_columns=True,
+        neutral_data=_neutral_data(),
     )
 
 
@@ -220,45 +241,48 @@ def test_prediction_evaluate_decoder_uses_requested_split(monkeypatch):
     assert result["splits"] == ["validation"]
 
 
-def test_prediction_decoder_plotting_analysis_uses_training_argument_caps(monkeypatch):
+def test_analyze_decoder_for_plotting_with_existing_grid_is_inference_free():
+    """Existing plot data is consumed as-is; plotting never loads or runs a model."""
     trainer = _make_prediction_trainer("prediction-cache-exp")
-    trainer._training_args.decoder_eval_max_size_training_like = 7
-    trainer._training_args.decoder_eval_max_size_neutral = 11
-    trainer._training_args.eval_batch_size = 3
-    trainer.get_model = lambda: SimpleNamespace(
-        base_model=SimpleNamespace(),
-        tokenizer=_DummyPredictionTokenizer(),
+    trainer.get_model = Mock(side_effect=AssertionError("plotting loaded a model"))
+    trainer.evaluate_base_model = Mock(
+        side_effect=AssertionError("plotting ran decoder evaluation")
+    )
+    existing_panels = {"3SG": {"3SG": 0.5}}
+
+    result = trainer.analyze_decoder_for_plotting(
+        decoder_results={
+            "grid": {
+                "base": {"probs_by_dataset": {"3SG": {"3SG": 0.8}}},
+                (1.0, 10.0): {
+                    "id": {"feature_factor": 1.0, "learning_rate": 10.0},
+                    "probs_by_dataset": existing_panels,
+                },
+            },
+        },
+        class_ids=["3SG"],
     )
 
-    captured = {}
+    assert result["plotting_data"][(1.0, 10.0)]["probs_by_dataset"] is existing_panels
+    trainer.get_model.assert_not_called()
+    trainer.evaluate_base_model.assert_not_called()
 
-    def _fake_get_decoder_eval_dataframe(tokenizer, **kwargs):
-        captured["data_kwargs"] = kwargs
-        return (
-            pd.DataFrame({"masked": ["[MASK] went home"], "label_class": ["3SG"]}),
-            pd.DataFrame({"text": ["neutral"]}),
+
+def test_analyze_decoder_for_plotting_refuses_missing_panels_without_evaluation():
+    from gradiend.evaluator.decoder import DecoderPlotDataError
+
+    trainer = _make_prediction_trainer("prediction-cache-exp")
+    trainer.evaluate_base_model = Mock(
+        side_effect=AssertionError("plotting ran decoder evaluation")
+    )
+
+    with pytest.raises(DecoderPlotDataError, match="read-only"):
+        trainer.analyze_decoder_for_plotting(
+            decoder_results={"grid": {"base": {}}},
+            class_ids=["3SG"],
         )
 
-    def _fake_evaluate_base_model(model, tokenizer, **kwargs):
-        captured["base_kwargs"] = kwargs
-        return {"probs_by_dataset": {"3SG": {"3SG": 0.8}}}
-
-    trainer._get_decoder_eval_dataframe = _fake_get_decoder_eval_dataframe
-    trainer._resolve_decoder_eval_targets = lambda training_like_df=None: ({"3SG": ["he"]}, False)
-    trainer.evaluate_base_model = _fake_evaluate_base_model
-
-    trainer.analyze_decoder_for_plotting(
-        decoder_results={"grid": {"base": {}}},
-        class_ids=["3SG"],
-        use_cache=True,
-    )
-
-    assert captured["data_kwargs"]["split"] == "test"
-    assert captured["data_kwargs"]["max_size_training_like"] == 7
-    assert captured["data_kwargs"]["max_size_neutral"] == 11
-    assert captured["base_kwargs"]["max_size_training_like"] == 7
-    assert captured["base_kwargs"]["max_size_neutral"] == 11
-    assert captured["base_kwargs"]["eval_batch_size"] == 3
+    trainer.evaluate_base_model.assert_not_called()
 
 
 def test_classification_cached_train_defers_data_loading(monkeypatch):

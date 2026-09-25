@@ -69,6 +69,7 @@ def _rewrite_delta(model: _TinyMWG, nominal_lr: float, nominal_ff: float = 1.0) 
     [
         ("factual", 0.1, 0.1),
         ("diff", 0.05, 0.05),
+        ("both", 0.1, 0.1),
         ("alternative", 0.1, 0.1),
     ],
 )
@@ -115,6 +116,39 @@ def test_rewrite_base_model_feature_factor_not_negated_for_alternative_source():
     delta_pos = _rewrite_delta(model, 0.08, ff)
     delta_neg_ff = _rewrite_delta(model, 0.08, -ff)
     assert not torch.allclose(delta_pos, delta_neg_ff, atol=1e-6)
+
+
+def _make_bf16_tiny_mwg() -> _TinyMWG:
+    """A bfloat16 base model + decoder, matching a bf16-loaded large model.
+
+    Regression for the study's llama-3.1-8b AGIEND causal crash: the decoder
+    is correctly bf16 (torch_dtype threaded through construction), but the
+    feature_factor tensor fed into it at intervention time used to be
+    hardcoded ``dtype=torch.float`` -- "mat1 and mat2 must have the same
+    dtype, but got Float and BFloat16" the moment nn.Linear ran the matmul.
+    """
+    torch.manual_seed(0)
+    base = _TinyParamModel().to(torch.bfloat16)
+    gradiend = ParamMappedGradiendModel(
+        input_dim=4,
+        latent_dim=1,
+        param_map={"weight": {"shape": (2, 2), "repr": "all"}},
+        torch_dtype=torch.bfloat16,
+    )
+    with torch.no_grad():
+        gradiend.decoder[0].linear.weight.fill_(1.0)
+        gradiend.decoder[0].linear.bias.fill_(0.5)
+    return _TinyMWG(base, gradiend, source="alternative", target="diff")
+
+
+def test_rewrite_base_model_decoder_intervention_matches_bfloat16_decoder_dtype():
+    model = _make_bf16_tiny_mwg()
+    assert model.gradiend.decoder[0].linear.weight.dtype == torch.bfloat16
+
+    delta = _rewrite_delta(model, nominal_lr=0.05, nominal_ff=1.0)
+
+    assert delta.dtype == torch.bfloat16
+    assert not torch.allclose(delta, torch.zeros(2, 2, dtype=torch.bfloat16), atol=1e-3)
 
 
 class _DecoderTrainerForSignTest:

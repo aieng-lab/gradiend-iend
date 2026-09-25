@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import torch
 import torch.nn as nn
 
 from gradiend.evaluator.decoder import derive_default_feature_factor
@@ -135,6 +136,22 @@ def test_legacy_checkpoint_load_and_resave_repairs_context(tmp_path):
     assert repaired_context["source"] == "alternative"
 
 
+def test_checkpoint_load_accepts_an_explicit_encoder_device(tmp_path):
+    """A resolved device override must not be forwarded twice to _load_model."""
+    checkpoint = tmp_path / "checkpoint"
+    _tiny_checkpoint_model("alternative").save_pretrained(
+        str(checkpoint),
+        use_safetensors=False,
+    )
+
+    loaded = _TinyCheckpointModel.from_pretrained(
+        str(checkpoint),
+        device_encoder="cpu",
+    )
+
+    assert loaded.gradiend.device_encoder == torch.device("cpu")
+
+
 def test_checkpoint_without_training_metadata_keeps_context_source(tmp_path):
     """Manually saved/new checkpoints remain loadable without training.json."""
     checkpoint = tmp_path / "checkpoint"
@@ -185,3 +202,7 @@ def test_encoding_view_sign_for_source():
     assert encoding_view_sign_for_source("factual", "counterfactual") == -1.0
     assert encoding_view_sign_for_source("alternative", "counterfactual") == 1.0
     assert encoding_view_sign_for_source("alternative", "transition") == 1.0
+    assert encoding_view_sign_for_source("both", "factual") == 1.0
+    assert encoding_view_sign_for_source("both", "counterfactual") == -1.0
+    assert encoding_view_sign_for_source("both", "transition") == 1.0
+    assert encoding_view_sign_for_source("diff", "factual") == 1.0

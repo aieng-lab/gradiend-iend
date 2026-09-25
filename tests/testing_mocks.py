@@ -183,6 +183,13 @@ class MockTokenizer:
         """Join token strings back to a single string."""
         return " ".join(tokens) if isinstance(tokens, list) else str(tokens)
 
+    def convert_ids_to_tokens(self, ids):
+        """Convert ids back to token strings."""
+        reverse_vocab = {value: key for key, value in self.vocab.items()}
+        if isinstance(ids, int):
+            return reverse_vocab.get(ids, f"<unk_{ids}>")
+        return [reverse_vocab.get(int(i), f"<unk_{i}>") for i in ids]
+
     def encode(self, text, add_special_tokens=False, **kwargs):
         tokens = text.split()
         return [self.vocab.get(token, 1) for token in tokens]

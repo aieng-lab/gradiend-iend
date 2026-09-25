@@ -17,8 +17,9 @@ prediction objectives, and multi-seed analysis.
 |----------|---------|-------------|
 | **experiment_dir** | `None` | Root directory for this experiment. With `run_id`, trainer artifacts go under `experiment_dir/run_id/`. |
 | **output_dir** | `None` | Directory for the trained model. If omitted and `experiment_dir` is set, GRADIEND derives a model path under the experiment directory. |
-| **use_cache** | `False` | Training checkpoint reuse policy: `False`, `True`, `"always"`, or `"only_convergent"`. `True` and `"only_convergent"` require a matching `cache_fingerprint` in `training.json` (pruning config, `source`/`target`, `reuse_pre_prune`, `gradiend_input_dim`). `"always"` reuses any saved checkpoint without fingerprint checks. `"only_convergent"` additionally requires convergence metadata. Fingerprinting is **partial** — it does not compare most hyperparameters, data, or model-selection settings; see [Tutorial: Training](../tutorials/training.md#experiment-directory-and-caching-use_cache). Evaluator/visualizer cache arguments are separate. |
+| **use_cache** | `False` | Training checkpoint reuse policy: `False`, `True`, `"always"`, or `"only_convergent"`. `True` and `"only_convergent"` require a matching `cache_fingerprint` in `training.json` (pruning config, signal/scope/split settings, `source`/`target`, `init_fan_in_floor`, `add_neutral_identity_transitions`, `reuse_pre_prune`, `gradiend_input_dim`). `"always"` reuses any saved checkpoint without fingerprint checks. `"only_convergent"` additionally requires convergence metadata. Fingerprinting is **partial** — it does not compare most hyperparameters, data, or model-selection settings; see [Tutorial: Training](../tutorials/training.md#experiment-directory-and-caching-use_cache). Evaluator/visualizer cache arguments are separate. |
 | **add_identity_for_other_classes** | `False` | Add identity examples (`factual == alternative`) for non-target classes so they are not pushed arbitrarily. |
+| **add_neutral_identity_transitions** | `None` (auto) | Add zero-labeled neutral identity transitions from `TextPredictionConfig.neutral_data`. `None` enables them automatically when `neutral_data` is configured; `True` requires `neutral_data` (training fails otherwise); `False` never uses them. `neutral_data` may be a shared DataFrame/path/HF id or a split mapping such as `{"train": train_df, "test": test_df}`. With `target="diff"`, the decoded update is trained toward the zero vector for neutral rows. `eval_neutral_data` is evaluation-only and does not enable this. |
 | **metadata** | `{}` | Free-form metadata serialized with the training arguments. |
 
 ---
@@ -27,11 +28,14 @@ prediction objectives, and multi-seed analysis.
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| **source** | `"alternative"` | Which gradient feeds the encoder: `"factual"`, `"alternative"`, or `"diff"`. |
+| **source** | `"alternative"` | Which gradient feeds the encoder: `"factual"`, `"alternative"`, `"diff"`, or `"both"`. `"both"` alternates factual/alternative poles across balance-group **visits** (`batch_idx // n_groups`; orthogonal to balance-group cycling) and requires `target="diff"`. Internally each batch is compiled to the factual/`diff` path via optional fac↔alt swap so the reconstruction target is always `input − opposite`. For **encoder evaluation** (`target=None`), every source expands each example to both poles so correlation always sees `+1` and `-1` (including one-pole training data). |
 | **target** | `"diff"` | Which gradient quantity the decoder predicts: `"factual"`, `"alternative"`, or `"diff"`. |
 
 The common setting is `source="alternative", target="diff"`: the encoder sees
-the alternative gradient and the decoder learns the difference to apply.
+the alternative gradient and the decoder learns the difference to apply
+(`factual − alternative`). With `source="both"`, half the batches encode the
+factual pole and half the alternative pole, each with a signed `diff` relative
+to the opposite pole.
 
 ---
 
@@ -47,12 +51,54 @@ the alternative gradient and the decoder learns the difference to apply.
 | **gradient_timing_steps** | `0` | If `> 0`, log gradient-row timing every N rows. |
 | **train_max_size** | `None` | Cap training samples per feature class. `None` uses all data. |
 | **learning_rate** | `1e-5` | Peak learning rate. |
+| **learning_rate_decoder** | `"default"` | Decoder learning rate. `"default"` resolves to `"auto"` for activation signals (ACTIEND) and to `None` otherwise. `"auto"` starts at `learning_rate` and calibrates a model-local decoder rate at the first `eval_steps` boundary (training must run past that boundary); a positive float creates a decoder parameter group at that rate; `None` shares `learning_rate` exactly as in historical runs. |
 | **num_train_epochs** | `3` | Number of epochs. Ignored when `max_steps > 0`. |
 | **max_steps** | `-1` | Total training steps when `> 0`; overrides `num_train_epochs`. |
 | **weight_decay** | `1e-2` | Weight decay for the optimizer. |
 | **adam_epsilon** | `1e-8` | Epsilon for Adam/AdamW. |
-| **optim** | `"adamw"` | Optimizer: `"adamw"` or `"adam"`. |
+| **optim** | `"adamw"` | Optimizer: `"adamw"`, `"adam"`, or `"sgd"`. `"sgd"` is meant for optimizer ablations; it does not support `learning_rate_decoder="auto"`. |
+| **sgd_momentum** | `0.0` | Momentum for `optim="sgd"`. |
 | **criterion** | `None` | Loss function. `None` becomes `torch.nn.MSELoss()`. Advanced use only. |
+
+### Automatic decoder learning rate
+
+The default `learning_rate_decoder="default"` resolves to `"auto"` when the
+signal is an activation signal (ACTIEND) and to `None` (shared rate) for
+gradient signals, where the shared rate is the historical behavior. An
+encoder-tuned rate may leave the much larger decoder unable to reach its local
+optimum in the remaining update budget. Pass `learning_rate_decoder="auto"`
+explicitly to force the calibration for any signal. Note that `"default"` is
+resolved once when the arguments are created; when copying arguments with
+`dataclasses.replace(args, signal=...)`, pass `learning_rate_decoder="default"`
+again to re-resolve it for the new signal. The decoder uses the shared
+`learning_rate` during the warm-up. At the first `eval_steps` boundary, GRADIEND
+estimates the decoder's distance to its current linear least-squares optimum
+and selects
+
+`max(learning_rate, distance / (remaining_steps * sqrt(decoder_parameter_count)))`.
+
+This calibration does not run an additional forward, backward, or evaluation
+pass. Each ordinary training step contributes its already-computed latent
+encoding to a small Hessian EMA, and calibration reduces Adam's existing
+decoder first moment to latent-sized Gram matrices. Persistent extra state is
+on CPU and contains `components * (latent_dim + decoder_bias)^2` float64 values;
+it does not scale with the decoder output width. There is no additional
+decoder-sized tensor or persistent GPU allocation beyond Adam's normal state.
+
+The current implementation requires Adam or AdamW, MSE loss, and an identity
+(linear) decoder. The auto decoder group uses `weight_decay=0` because applying
+AdamW shrinkage at the newly selected rate would invalidate the unregularized
+least-squares reachability estimate; encoder weight decay is unchanged. If the
+latent Hessian is rank-deficient at the first boundary, training keeps the
+shared rate and retries at later boundaries. The status, estimated distance,
+chosen rate, ranks, and condition numbers are written to
+`training.json` under `training_stats.decoder_lr_auto`.
+
+Set `learning_rate_decoder=None` to recover the historical single optimizer
+group. Automatic calibration changes the optimization protocol, has the
+constraints above, and estimates a local
+decoder optimum while the encoder is still moving; it should be compared with
+the historical shared-rate baseline before becoming a study default.
 
 ---
 
@@ -79,7 +125,11 @@ At call time, [`evaluate_decoder(max_size=N)`][gradiend.trainer.trainer.Trainer.
 uses `N` as a shared convenience cap for both decoder datasets:
 `max_size_training_like=N` and `max_size_neutral=N`, unless either explicit
 decoder cap is passed. `split` selects the training-like decoder rows, just as
-for encoder evaluation; neutral data is still drawn from `eval_neutral_data`.
+for encoder evaluation. Neutral data comes from `eval_neutral_data` when set,
+otherwise from the requested split of shared `neutral_data`. For explicit split
+mappings, the mapping key selects the rows; otherwise split columns are honored
+and local/DataFrame `neutral_data` without split labels is split by the trainer's
+configured ratios and seed.
 
 ---
 
@@ -128,6 +178,8 @@ Device placement is automatic when these fields are omitted:
 | **decoder_mlm_head_batch_size** | `4` | Batch size for auxiliary decoder MLM-head training. |
 | **decoder_mlm_head_lr** | `1e-4` | Learning rate for auxiliary decoder MLM-head training. |
 | **decoder_mlm_head_max_size** | `None` | Optional per-label cap for auxiliary decoder MLM-head training data. |
+| **max_length** | `128` | Maximum token length of training/ACTIEND inputs. Longer inputs drop left context so the prediction slot stays inside the window. |
+| **mask_placeholder** | `"[MASK]"` | Dataset-level prediction-slot marker in masked templates (independent of `tokenizer.mask_token`). Prefer `TextPredictionConfig.mask_placeholder`; this value only takes effect while the config value is left at its default. |
 | **decoder_sequence_cloze_rhs_window** | `-1` | Right-context token window for `clm_sequence_cloze` and `seq2seq_decoder_sequence_cloze`. `-1` uses the full RHS. |
 
 Supported objectives are `auto`, `mlm_mask_token`, `clm_next_token`,
@@ -140,11 +192,18 @@ Supported objectives are `auto`, `mlm_mask_token`, `clm_next_token`,
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| **params** | `None` | Optional list of parameter names or wildcard patterns included in the GRADIEND parameter map. `None` includes all backbone parameters. |
+| **signal** | `None` | What is measured: `Signal.gradient()` (default), `Signal.activation(...)`, or `Signal.activation_gradient(...)`. Strings (`"gradient"`, `"activation"`) and dicts are coerced. See [Signals](signals.md) if available in your docs build, or the `Signal` API page. |
+| **signals** | `None` | `SignalSet`/sequence of signals. Reserved for multi-signal training; currently exactly one signal is supported. |
+| **signal_scope** | `None` | `SignalScope` describing *where* the signal is measured: `SignalScope.default()`/`.full()`, semantic shortcuts `.layers()`, `.layer(i)`, `.embeddings()`, `.word_embedding()`, or explicit `SignalScope.from_values(params=[...])` (gradient) / `SignalScope.from_values(activation_sites=[...])` (activation). |
+| **gradiend_split** | `None` | `GradiendSplit` that partitions the resolved signal space into virtual components: `GradiendSplit.none()` (default), `.single()`, or `.by_tensor()`. |
+| **gradiend_split_loss** | `"mean"` | Loss aggregation over components: `"mean"`, `"sum"`, `"size_weighted"`, or `"full"`. Ignored for unsplit models. |
+| **params** | `None` | Deprecated; use `signal_scope=SignalScope.from_values(params=[...])`. Optional list of parameter names or wildcard patterns included in the GRADIEND parameter map. `None` includes all backbone parameters. |
 | **activation_encoder** | `None` | Encoder activation, e.g. `"tanh"`, `"gelu"`, or `"relu"`. `None` uses the model default. |
 | **activation_decoder** | `None` | Decoder activation, e.g. `"id"` or `"tanh"`. `None` uses the model default. |
+| **bias_encoder** | `True` | Whether the encoder linear layer has a bias. `None` also uses the enabled model default. |
 | **bias_decoder** | `None` | Whether the decoder linear layer has a bias. `None` uses the model default. |
 | **latent_dim** | `None` | GRADIEND latent dimension. `None` uses the model default, normally one feature dimension. |
+| **init_fan_in_floor** | `10000` | Lower bound for the fan-in used to initialize fresh encoder weights and matching decoder rows. Small activation-space ACTIEND components can have far fewer dimensions than classic parameter-space GRADIEND inputs; the floor keeps their initial random scale conservative and has been empirically helpful for ACTIEND convergence. Large GRADIEND parameter spaces are above the floor, so their initialization is unchanged. Set `None` to use raw component/input fan-in. |
 | **normalize_gradiend** | `True` | Normalize encodings so the first target class maps toward `+1` and the second toward `-1`. |
 | **positive_class** | `None` | Optional canonical positive class for binary cross-encoding comparisons. Normal training usually leaves this unset. |
 
@@ -169,9 +228,11 @@ excluded by the model-loading logic.
 |----------|---------|-------------|
 | **max_seeds** | `3` | Maximum number of seeds to try. |
 | **min_convergent_seeds** | `1` | Stop once this many seeds have converged. `None` runs all `max_seeds`. |
-| **convergent_metric** | `None` | `"correlation"` or `"loss"`. `None` defaults to `"correlation"` unless `supervised_decoder=True`. |
-| **convergent_score_threshold** | `None` | Score threshold for convergence. `None` becomes `0.5` for correlation; required for loss. |
+| **convergent_metric** | `None` | Metric used to decide convergence: `"correlation"`, `"roc_auc"` (alias `"auroc"`), `"min_auc_n_o"` (alias `"min_auc"`; `min(auc_neutral, auc_other)` for one-pole runs), or `"loss"`. `None` defaults to `"correlation"` unless `supervised_decoder=True`. |
+| **selection_metric** | `None` | Metric for best-checkpoint and best-seed selection: `"correlation"`, `"roc_auc"`, `"min_auc_n_o"`, `"encoding_e"` (alias `"E"`), or `"loss"`. `None` reuses `convergent_metric`. Rival-aware metrics (`roc_auc`, `min_auc_n_o`, `encoding_e`) make in-training validation encode the one-pole rival classes as well. |
+| **convergent_score_threshold** | `None` | Score threshold for convergence. `None` becomes `0.5` for correlation, `0.9` for roc_auc / min_auc_n_o; required for loss. |
 | **convergent_mean_by_class_threshold** | `None` | Additional convergence threshold: every non-zero target class must have \|mean encoded\| ≥ this value at the best step. For correlation mode, `None` becomes `0.5`. |
+| **prefer_convergent_checkpoint** | `False` | If `True`, best-checkpoint selection prefers steps that meet convergence criteria over a higher-\|correlation\| step that fails them. Default keeps max \|correlation\|; convergence is still checked at that best step. |
 | **split_resplit_per_seed** | `False` | For trainer-assigned splits (`split_col="heldout"` or `None`), redraw them per training seed. |
 | **split_resplit_strategy** | `"random"` | Strategy for per-seed resplitting: `"random"` or `"balanced_cycle"`. |
 | **seed** | `0` | Base seed. Multi-seed runs use `seed+i`; `None` requests non-deterministic runs. |

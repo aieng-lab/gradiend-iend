@@ -10,6 +10,12 @@ The following guide explains how to compute the matrix and how to interpret it.
 **Computation details:** [Oriented cross-encoding: computation](cross-encoding-matrix-computation.md)  
 **Formal notation:** [Oriented cross-encoding matrix (paper Appendix D)](https://arxiv.org/abs/2602.23993)
 
+!!! note "Planned null controls"
+    Cross-encoding currently provides descriptive matrices and seed-level
+    dispersion, but no permutation or matched null analysis. The planned
+    controls and expected result schema are documented under
+    [Null controls (planned)](cross-encoding-matrix-computation.md#null-controls-planned).
+
 ---
 
 ## Computation

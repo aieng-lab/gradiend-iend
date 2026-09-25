@@ -10,7 +10,10 @@ matplotlib is also optional; if missing, plotting raises ImportError with instal
 from typing import Dict, List, Optional, Tuple, Union
 
 from gradiend.visualizer.plot_optional import _require_matplotlib
-from gradiend.visualizer.labels import format_model_labels_with_convergence
+from gradiend.visualizer.labels import (
+    escape_matplotlib_usetex_text,
+    format_model_labels_with_convergence,
+)
 
 
 def _require_matplotlib_venn() -> None:
@@ -210,11 +213,11 @@ def plot_topk_venn(
                     converged = converged_by_id.get(mid)
                     if converged is None:
                         converged = converged_by_id.get(key)
-                label_map[key] = format_label_with_convergence(
+                label_map[key] = escape_matplotlib_usetex_text(format_label_with_convergence(
                     base_map[key],
                     converged=converged,
                     highlight_non_convergence=highlight_non_convergence,
-                )
+                ))
     display_labels = [label_map[mid] for mid in model_ids]
 
     if figsize is None:
@@ -292,7 +295,7 @@ def plot_topk_venn(
                     txt.set_fontsize(circle_names_fontsize)
 
     if title:
-        plt.title(title)
+        plt.title(escape_matplotlib_usetex_text(title))
     plt.tight_layout()
     if output_path:
         plt.savefig(output_path, bbox_inches="tight")

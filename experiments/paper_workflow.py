@@ -1,24 +1,20 @@
-from gradiend import TextFilterConfig, TextPredictionDataCreator, TrainingArguments, TextPredictionTrainer, \
-    PrePruneConfig, PostPruneConfig, check_plot_environment
+from gradiend import (
+    PostPruneConfig,
+    PrePruneConfig,
+    TextPredictionTrainer,
+    TrainingArguments,
+    check_plot_environment,
+)
+from gradiend.examples.english_pronoun_datasets import (
+    EN_PRONOUN_HF_SPLITS,
+    EN_PRONOUNS_HF_DATASET,
+    load_english_pronoun_neutral_data,
+)
 
 check_plot_environment()
 
 
-creator = TextPredictionDataCreator(
-    base_data='wikimedia/wikipedia',
-    hf_config='20231101.en',
-    feature_targets=[
-        TextFilterConfig(targets=["he", "she", "it"], id="3SG"),
-        TextFilterConfig(targets=["they"], id="3PL"),
-    ],
-    min_left_context_words=10,
-    use_cache=True,
-)
-training_data = creator.generate_training_data(max_size_per_class=1000)
-neutral_data = creator.generate_neutral_data(
-    additional_excluded_words=["i", "we", "you"],
-    max_size=1000,
-)
+neutral_data = load_english_pronoun_neutral_data()
 
 model="bert-base-cased"
 
@@ -34,7 +30,9 @@ args = TrainingArguments(
 )
 trainer = TextPredictionTrainer(
     model=model,
-    data=training_data,
+    hf_dataset=EN_PRONOUNS_HF_DATASET,
+    hf_splits=EN_PRONOUN_HF_SPLITS,
+    target_classes=["3SG", "3PL"],
     eval_neutral_data=neutral_data,
     img_format="pdf", # different from paper script, to persist the figures
     args=args,

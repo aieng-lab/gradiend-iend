@@ -5,11 +5,11 @@ TextPredictionDataCreator: build training and neutral datasets for text predicti
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, Iterable, List, Literal, Optional, Union
 
 import pandas as pd
 
-from gradiend.data.core.base_loader import resolve_base_data
+from gradiend.data.core.base_loader import iter_resolved_base_data, resolve_base_data
 from gradiend.data.core import (
     SplitGroupKey,
     normalize_split_group_key,
@@ -270,6 +270,35 @@ class TextPredictionDataCreator:
         self._texts_cache = texts
         return texts
 
+    def _iter_texts(
+        self, base_override: Optional[Union[str, pd.DataFrame, List[str]]] = None
+    ) -> Iterable[str]:
+        """Return text rows for generation, streaming HF sources when possible."""
+        if base_override is not None:
+            is_hf_str = isinstance(base_override, str) and Path(base_override).suffix.lower() != ".csv"
+            return iter_resolved_base_data(
+                base_override,
+                text_column=self.text_column,
+                max_size=self.base_max_size,
+                split=self.split,
+                seed=self.seed,
+                hf_config=self.hf_config if is_hf_str else None,
+                trust_remote_code=self.trust_remote_code if is_hf_str else None,
+            )
+        if self._texts_cache is not None:
+            return iter(self._texts_cache)
+        if isinstance(self.base_data, str) and Path(self.base_data).suffix.lower() != ".csv":
+            return iter_resolved_base_data(
+                self.base_data,
+                text_column=self.text_column,
+                max_size=self.base_max_size,
+                split=self.split,
+                seed=self.seed,
+                hf_config=self.hf_config,
+                trust_remote_code=self.trust_remote_code,
+            )
+        return iter(self._get_texts())
+
     def generate_training_data(
         self,
         max_size_per_class: Optional[int] = None,
@@ -285,6 +314,8 @@ class TextPredictionDataCreator:
         raise_on_incomplete_classes: bool = False,
         split_group_col: Optional[str] = None,
         split_group_key: SplitGroupKey = None,
+        deduplicate: bool = True,
+        drop_ambiguous_masked: bool = True,
     ) -> Union[Dict[str, pd.DataFrame], pd.DataFrame]:
         """Generate masked training data by filtering configured target tokens.
 
@@ -321,6 +352,12 @@ class TextPredictionDataCreator:
             split_group_col: Override instance ``split_group_col`` for this call. When set (e.g. ``"label"``),
                 each unique target token is confined to a single train/validation/test split.
             split_group_key: Override instance ``split_group_key`` (e.g. ``[str.strip, str.casefold]``).
+            deduplicate: Ignore exact repeated sentence/target matches while scanning (default True).
+                Repeated corpus rows therefore do not consume ``max_size_per_class`` and cannot be
+                assigned to multiple splits.
+            drop_ambiguous_masked: Remove every masked prompt that maps to more than one
+                ``(feature class, label)`` pair (default True). Such a prompt does not identify a
+                unique supervised target and is label noise for text prediction.
 
         Returns:
             Per format: dict of DataFrames, or single DataFrame.
@@ -335,6 +372,13 @@ class TextPredictionDataCreator:
         """
         if abs((train_ratio + val_ratio + test_ratio) - 1.0) > 1e-6:
             raise ValueError("train_ratio, val_ratio, test_ratio must sum to 1.0")
+        if not isinstance(deduplicate, bool):
+            raise TypeError(f"deduplicate must be bool, got {type(deduplicate).__name__}")
+        if not isinstance(drop_ambiguous_masked, bool):
+            raise TypeError(
+                "drop_ambiguous_masked must be bool, got "
+                f"{type(drop_ambiguous_masked).__name__}"
+            )
         if self.use_cache and self.output_dir is not None:
             out_path = output or self._resolve_output_path("training", None)
             if out_path is not None:
@@ -342,7 +386,7 @@ class TextPredictionDataCreator:
                 if cached is not None:
                     logger.info("Using cached training data from %s", out_path)
                     return cached
-        texts = self._get_texts()
+        texts = self._iter_texts()
         configs_with_ids = [
             (_class_id(cfg, i), cfg) for i, cfg in enumerate(self.feature_targets)
         ]
@@ -368,6 +412,7 @@ class TextPredictionDataCreator:
             total_target_overall=total_target,
             stats=filter_stats,
             min_left_context_words_default=self.min_left_context_words,
+            deduplicate_matches=deduplicate,
         )
         interrupted = bool(filter_stats.get("interrupted"))
         n_processed = filter_stats.get("sentences_processed", 0)
@@ -408,6 +453,27 @@ class TextPredictionDataCreator:
             df["split"] = split_name
             df[class_id] = df["label"]
             class_dfs[class_id] = df
+
+        if drop_ambiguous_masked and class_dfs:
+            assignments: Dict[str, set] = {}
+            for class_id, df in class_dfs.items():
+                for masked, label in df[["masked", "label"]].itertuples(index=False, name=None):
+                    assignments.setdefault(str(masked), set()).add((str(class_id), str(label)))
+            ambiguous_masked = {
+                masked for masked, targets in assignments.items() if len(targets) > 1
+            }
+            if ambiguous_masked:
+                removed = 0
+                for class_id in list(class_dfs):
+                    df = class_dfs[class_id]
+                    keep = ~df["masked"].astype(str).isin(ambiguous_masked)
+                    removed += int((~keep).sum())
+                    class_dfs[class_id] = df.loc[keep].reset_index(drop=True)
+                logger.warning(
+                    "Removed %s rows across %s masked prompts with conflicting class/label targets.",
+                    removed,
+                    len(ambiguous_masked),
+                )
 
         if stats_per_group:
             if total_target is not None and total_target > 0:
@@ -571,6 +637,7 @@ class TextPredictionDataCreator:
         max_size: Optional[int] = None,
         format: str = "minimal",
         output: Optional[str] = None,
+        deduplicate: bool = True,
     ) -> pd.DataFrame:
         """Generate neutral data by excluding sentences with target tokens.
 
@@ -592,6 +659,7 @@ class TextPredictionDataCreator:
             format: Return format ("minimal" = text column for eval).
             output: If set, save neutral data to this path. When output_dir is set on the
                 creator and output is None, uses output_dir/neutral_basename + extension.
+            deduplicate: Drop repeated text rows before saving (default True).
 
         Returns:
             DataFrame with at least "text" column.
@@ -607,7 +675,7 @@ class TextPredictionDataCreator:
                 if cached is not None:
                     logger.info("Using cached neutral data from %s", out_path)
                     return cached
-        texts = self._get_texts(base_override=base_data)
+        texts = self._iter_texts(base_override=base_data)
         sentence_stream = iter_sentences_from_texts(
             texts,
             self.preprocess,
@@ -655,6 +723,11 @@ class TextPredictionDataCreator:
         # Keep a valid CSV/Parquet schema even when filtering is interrupted
         # before the first row or legitimately produces no neutral sentences.
         df = pd.DataFrame(rows, columns=["text"])
+        if deduplicate and not df.empty:
+            before = len(df)
+            df = df.drop_duplicates(["text"], keep="first").reset_index(drop=True)
+            if len(df) != before:
+                logger.info("Removed %s duplicate neutral rows.", before - len(df))
 
         out_path = output or self._resolve_output_path("neutral", None)
         if out_path is not None:

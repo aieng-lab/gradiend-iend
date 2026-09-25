@@ -3,18 +3,21 @@ Evaluator bound to a trainer; orchestrates encoder/decoder evaluation and
 optionally delegates plotting to a Visualizer.
 
 This module provides the high-level entry points to:
-1) run encoder evaluation (gradient encodings + correlation metrics),
+1) run encoder evaluation (signal encodings + correlation metrics),
 2) run decoder evaluation (grid search over feature_factor/lr + summaries),
 3) merge results for convenience, and
 4) produce evaluation-related plots if a Visualizer is configured.
 """
 
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Type, Union
 
 import pandas as pd
 
 from gradiend.evaluator.encoder import EncoderEvaluator
-from gradiend.evaluator.decoder import DecoderEvaluator
+from gradiend.evaluator.decoder import (
+    DEFAULT_DECODER_REFINE_POINTS,
+    DecoderEvaluator,
+)
 from gradiend.util.logging import get_logger
 from gradiend.visualizer.plot_delegation import see_implementation
 
@@ -87,7 +90,7 @@ class Evaluator:
             encoder_df: Optional DataFrame or dict with "encoder_df" key. If provided,
                 skips encoding and computes metrics from this data. Use
                 evaluate_encoder(return_df=True) to get such a dict.
-            eval_data: Optional pre-computed GradientTrainingDataset. If None and
+            eval_data: Optional pre-computed SignalTrainingDatasetBase. If None and
                 encoder_df is None, the trainer creates eval data via create_eval_data.
             use_cache: If True, reuse cached JSON result under experiment_dir when
                 available. If None, defaults come from trainer training args.
@@ -118,6 +121,16 @@ class Evaluator:
         model_with_gradiend: Any = None,
         feature_factors: Optional[list] = None,
         lrs: Optional[list] = None,
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Any] = None,
+        threshold: Optional[float] = None,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: Optional[float] = None,
+        intervention_kwargs: Optional[Mapping[str, Any]] = None,
+        output_path: Optional[str] = None,
+        raw_output_path: Optional[str] = None,
         use_cache: Optional[bool] = None,
         split: Optional[Any] = "test",
         max_size: Optional[int] = None,
@@ -134,6 +147,7 @@ class Evaluator:
         plot: bool = False,
         show: Optional[bool] = None,
         plot_kwargs: Optional[Dict[str, Any]] = None,
+        refine_points: int = DEFAULT_DECODER_REFINE_POINTS,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation and return summary + grid for one direction (strengthen or weaken).
@@ -147,6 +161,18 @@ class Evaluator:
             feature_factors: Optional list of feature factors to test. If None,
                 derived from direction and target classes.
             lrs: Optional list of learning rates to test. If None, defaults are used.
+            token_selector: Optional intervention token selector forwarded to
+                ``ModelWithGradiend.intervene``.
+            activation_gate: Optional ACTIEND encoder gate composed with the token selector.
+            activation_modules: Optional ACTIEND activation module filter.
+            threshold: Optional encoder selector threshold.
+            direction: Optional encoder-direction value.
+            target_encoding: Optional encoder-range target value.
+            tolerance: Optional encoder-range tolerance.
+            intervention_kwargs: Additional low-level intervention kwargs.
+            output_path: Optional explicit decoder-grid cache path.
+            raw_output_path: Optional CSV path for per-sample decoder probabilities
+                for every evaluated grid entry.
             use_cache: If True, cached decoder grid results are reused when
                 available under the trainer's experiment_dir. If None, defaults
                 come from trainer training args.
@@ -168,9 +194,13 @@ class Evaluator:
                 Restricts feature factors and datasets for efficiency. When None, evaluates for all target classes.
             increase_target_probabilities: If True (default), compute strengthen summaries only (keys e.g. "3SG").
                 If False, compute weaken summaries only (keys e.g. "3SG_weaken"). Only required combinations are evaluated.
-            plot: If True, after selection run any missing dataset evaluations for plotting, update cache, then plot.
+            plot: If True, render the probabilities already present in the
+                decoder grid. Plotting never initiates decoder evaluation.
             show: If True, display the plot; if False, only save. When None and plot=True, defaults to True.
             plot_kwargs: Optional dict of options forwarded to plot_probability_shifts when plot=True.
+            refine_points: Number of extra LMS-boundary bisection points per target class
+                (default ``DEFAULT_DECODER_REFINE_POINTS`` = 0, i.e. the requested grid is used
+                as is). Forwarded to the underlying ``DecoderEvaluator``.
 
         Returns:
             Flat dict: for strengthen, keys like result['3SG']; for weaken, keys like result['3SG_weaken'].
@@ -186,6 +216,16 @@ class Evaluator:
             model_with_gradiend=model_with_gradiend,
             feature_factors=feature_factors,
             lrs=lrs,
+            token_selector=token_selector,
+            activation_gate=activation_gate,
+            activation_modules=activation_modules,
+            threshold=threshold,
+            direction=direction,
+            target_encoding=target_encoding,
+            tolerance=tolerance,
+            intervention_kwargs=intervention_kwargs,
+            output_path=output_path,
+            raw_output_path=raw_output_path,
             use_cache=use_cache,
             split=split,
             max_size=max_size,
@@ -200,6 +240,7 @@ class Evaluator:
             plot=plot,
             show=show if show is not None else plot,
             plot_kwargs=plot_kwargs,
+            refine_points=refine_points,
         )
         if selector is not None:
             kwargs["selector"] = selector
@@ -554,6 +595,9 @@ class Evaluator:
         figsize: Optional[Tuple[float, float]] = None,
         highlight_non_convergence: Optional[bool] = None,
         return_fig_ax: bool = False,
+        split: Optional[Any] = None,
+        training_like_df: Optional[Any] = None,
+        neutral_df: Optional[Any] = None,
         **kwargs: Any,
     ) -> Any:
         """
@@ -572,6 +616,12 @@ class Evaluator:
             figsize: Optional Matplotlib figure size.
             highlight_non_convergence: Override non-convergence markers in title.
             return_fig_ax: If True, return Matplotlib ``(fig, ax)``.
+            split: Split used only when decoder results are omitted and must
+                first be evaluated.
+            training_like_df: Optional caller-supplied evaluation frame used
+                only when decoder results are omitted.
+            neutral_df: Optional caller-supplied neutral frame, paired with
+                ``training_like_df``.
             **kwargs: Additional keyword arguments forwarded to the visualizer.
 
         Returns:
@@ -589,6 +639,9 @@ class Evaluator:
             figsize=figsize,
             highlight_non_convergence=highlight_non_convergence,
             return_fig_ax=return_fig_ax,
+            split=split,
+            training_like_df=training_like_df,
+            neutral_df=neutral_df,
             **kwargs,
         )
     plot_probability_shifts.__doc__ = (

@@ -6,13 +6,14 @@ Tests GradiendModel, ParamMappedGradiendModel, and ModelWithGradiend with toy ne
 
 import os
 import sys
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 import torch.nn as nn
 
-from gradiend.model import GradiendModel, ParamMappedGradiendModel
+from gradiend.model import GradiendComponent, GradiendModel, ParamMappedGradiendModel
 
 
 class TestGradiendModel:
@@ -24,6 +25,8 @@ class TestGradiendModel:
         model1 = GradiendModel(input_dim=100, latent_dim=1)
         assert model1.input_dim == 100
         assert model1.latent_dim == 1
+        assert model1.bias_encoder is True
+        assert model1.encoder[0].bias is not None
         
         model2 = GradiendModel(input_dim=500, latent_dim=2, activation_encoder="relu")
         assert model2.input_dim == 500
@@ -70,6 +73,41 @@ class TestGradiendModel:
         x = torch.randn(100)
         encoded = model.forward_encoder(x)
         assert encoded.shape == (1,)
+
+    def test_gradiend_model_default_init_uses_fan_in_floor_for_small_inputs(self, set_seed):
+        set_seed(42)
+        model = GradiendModel(input_dim=100, latent_dim=4, device=torch.device("cpu"))
+
+        expected_bound = 1.0 / (10_000 ** 0.5)
+
+        assert model.init_fan_in_floor == 10_000
+        assert model._init_bound_for_fan_in(100) == pytest.approx(expected_bound)
+        assert model.encoder[0].linear.weight.abs().max().item() <= expected_bound + 1e-7
+        assert model.decoder[0].linear.weight.abs().max().item() <= expected_bound + 1e-7
+        assert model.decoder[0].linear.bias.abs().max().item() <= expected_bound + 1e-7
+
+    def test_gradiend_model_component_init_uses_component_fan_in(self, set_seed):
+        set_seed(42)
+        model = GradiendModel(
+            input_dim=12,
+            latent_dim=8,
+            init_fan_in_floor=None,
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 4},
+                {"id": "right", "start": 4, "end": 12},
+            ],
+        )
+
+        left_bound = 1.0 / (4 ** 0.5)
+        right_bound = 1.0 / (8 ** 0.5)
+
+        assert model._init_bound_for_fan_in(4) == pytest.approx(left_bound)
+        assert model._init_bound_for_fan_in(8) == pytest.approx(right_bound)
+        assert model.encoder[0].linear.weight[:, :4].abs().max().item() <= left_bound + 1e-7
+        assert model.encoder[0].linear.weight[:, 4:].abs().max().item() <= right_bound + 1e-7
+        assert model.decoder[0].linear.weight[:4, :].abs().max().item() <= left_bound + 1e-7
+        assert model.decoder[0].linear.weight[4:, :].abs().max().item() <= right_bound + 1e-7
     
     def test_gradiend_model_save_load(self, temp_dir):
         """Test saving and loading GradiendModel."""
@@ -81,6 +119,9 @@ class TestGradiendModel:
         
         # Verify files exist
         assert os.path.exists(os.path.join(save_path, "config.json"))
+        with open(os.path.join(save_path, "config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        assert config["architecture"]["init_fan_in_floor"] == 10_000
         # Check for either safetensors or bin file
         has_weights = (
             os.path.exists(os.path.join(save_path, "model.safetensors")) or
@@ -92,12 +133,326 @@ class TestGradiendModel:
         loaded = GradiendModel.from_pretrained(save_path)
         assert loaded.input_dim == model.input_dim
         assert loaded.latent_dim == model.latent_dim
+        assert loaded.init_fan_in_floor == model.init_fan_in_floor
         
         # Verify forward pass works
         x = torch.randn(100)
         original_output = model.forward(x)
         loaded_output = loaded.forward(x)
         torch.testing.assert_close(original_output, loaded_output, rtol=1e-5, atol=1e-5)
+
+    def test_gradiend_model_loads_legacy_checkpoint_without_init_fan_in_floor(self, temp_dir):
+        model = GradiendModel(input_dim=8, latent_dim=2, device=torch.device("cpu"))
+        save_path = os.path.join(temp_dir, "legacy_init_model")
+        model.save_pretrained(save_path)
+
+        config_path = os.path.join(save_path, "config.json")
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        del config["architecture"]["init_fan_in_floor"]
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+
+        loaded = GradiendModel.from_pretrained(save_path)
+
+        assert loaded.init_fan_in_floor is None
+        x = torch.randn(3, 8)
+        torch.testing.assert_close(model(x), loaded(x), rtol=1e-5, atol=1e-5)
+
+    def test_gradiend_model_can_disable_encoder_bias_and_roundtrip(self, temp_dir):
+        model = GradiendModel(
+            input_dim=8,
+            latent_dim=2,
+            bias_encoder=False,
+            bias_decoder=False,
+            device=torch.device("cpu"),
+        )
+
+        assert model.bias_encoder is False
+        assert model.bias_decoder is False
+        assert model.encoder[0].bias is None
+        assert model.decoder[0].bias is None
+
+        save_path = os.path.join(temp_dir, "no_bias_model")
+        model.save_pretrained(save_path)
+
+        loaded = GradiendModel.from_pretrained(save_path)
+
+        assert loaded.bias_encoder is False
+        assert loaded.bias_decoder is False
+        assert loaded.encoder[0].bias is None
+        assert loaded.decoder[0].bias is None
+        x = torch.randn(3, 8)
+        torch.testing.assert_close(model(x), loaded(x), rtol=1e-5, atol=1e-5)
+
+    def test_gradiend_model_loads_old_checkpoint_encoder_bias_from_state_dict(self, temp_dir):
+        model = GradiendModel(
+            input_dim=8,
+            latent_dim=2,
+            bias_encoder=True,
+            device=torch.device("cpu"),
+        )
+        save_path = os.path.join(temp_dir, "old_bias_model")
+        model.save_pretrained(save_path)
+
+        config_path = os.path.join(save_path, "config.json")
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        del config["architecture"]["bias_encoder"]
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        loaded = GradiendModel.from_pretrained(save_path)
+
+        assert loaded.bias_encoder is True
+        assert loaded.encoder[0].bias is not None
+        x = torch.randn(3, 8)
+        torch.testing.assert_close(model(x), loaded(x), rtol=1e-5, atol=1e-5)
+
+    def test_gradiend_model_loads_old_checkpoint_without_encoder_bias_from_state_dict(self, temp_dir):
+        model = GradiendModel(
+            input_dim=8,
+            latent_dim=2,
+            bias_encoder=False,
+            device=torch.device("cpu"),
+        )
+        save_path = os.path.join(temp_dir, "old_no_bias_model")
+        model.save_pretrained(save_path)
+
+        config_path = os.path.join(save_path, "config.json")
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        del config["architecture"]["bias_encoder"]
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        loaded = GradiendModel.from_pretrained(save_path)
+
+        assert loaded.bias_encoder is False
+        assert loaded.encoder[0].bias is None
+        x = torch.randn(3, 8)
+        torch.testing.assert_close(model(x), loaded(x), rtol=1e-5, atol=1e-5)
+
+    def test_gradiend_model_virtual_component_encoders_use_weight_views(self):
+        model = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            activation_encoder="tanh",
+            activation_decoder="id",
+            bias_encoder=False,
+            bias_decoder=True,
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 2},
+                {"id": "right", "start": 2, "end": 4},
+            ],
+        )
+        with torch.no_grad():
+            model.encoder[0].linear.weight.copy_(torch.tensor([[1.0, 2.0, 3.0, 4.0]]))
+            model.decoder[0].linear.weight.copy_(torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+            model.decoder[0].linear.bias.copy_(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+
+        x = torch.tensor([10.0, 20.0, 30.0, 40.0])
+
+        left = model._component_encoders[0](x)
+        right = model._component_encoders["right"](x)
+        component_encodings = model._encode_components(x)
+
+        torch.testing.assert_close(left, torch.tanh(torch.tensor([50.0])))
+        torch.testing.assert_close(right, torch.tanh(torch.tensor([250.0])))
+        torch.testing.assert_close(component_encodings, torch.stack([left, right], dim=0))
+        assert model._component_encoders["left"].weight.shape == (1, 2)
+        assert model._component_encoders["left"].weight.data_ptr() == model.encoder[0].linear.weight[:, :2].data_ptr()
+
+    def test_gradiend_model_reports_nontrivial_component_split(self):
+        full = GradiendModel(input_dim=4, latent_dim=1, device=torch.device("cpu"))
+        single_partition = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            device=torch.device("cpu"),
+            component_slices=[{"id": "full", "start": 0, "end": 4}],
+            component_split_mode="single",
+        )
+        split = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 2},
+                {"id": "right", "start": 2, "end": 4},
+            ],
+        )
+
+        assert full.component_count == 0
+        assert full.component_slices == ()
+        assert [component.to_dict() for component in full._virtual_component_slices] == [
+            {"id": "full", "start": 0, "end": 4},
+        ]
+        assert full.has_component_split is False
+        assert single_partition.component_count == 1
+        assert single_partition.has_component_split is True
+        assert [component.to_dict() for component in single_partition.component_slices] == [
+            {"id": "full", "start": 0, "end": 4},
+        ]
+        assert split.component_count == 2
+        assert split.has_component_split is True
+
+    def test_gradiend_model_split_reconstruction_loss_aggregates_component_losses(self):
+        model = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            activation_encoder="id",
+            activation_decoder="id",
+            bias_encoder=False,
+            bias_decoder=False,
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 1},
+                {"id": "right", "start": 1, "end": 4},
+            ],
+        )
+        with torch.no_grad():
+            model.encoder[0].linear.weight.fill_(1.0)
+            model.decoder[0].linear.weight.fill_(1.0)
+
+        source = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        target = torch.tensor([0.5, 1.0, 1.0, 1.0])
+        criterion = torch.nn.MSELoss()
+
+        decoded_components, encoded_components = model._forward_components(source, return_encoded=True)
+        component_targets = model._component_target_slices(target)
+        component_losses = torch.stack([
+            criterion(decoded, expected)
+            for decoded, expected in zip(decoded_components, component_targets)
+        ])
+        weights = torch.tensor([1.0, 3.0])
+
+        torch.testing.assert_close(
+            model.reconstruction_loss(source, target, criterion=criterion, aggregation="mean"),
+            component_losses.mean(),
+        )
+        torch.testing.assert_close(
+            model.reconstruction_loss(source, target, criterion=criterion, aggregation="sum"),
+            component_losses.sum(),
+        )
+        torch.testing.assert_close(
+            model.reconstruction_loss(source, target, criterion=criterion, aggregation="size_weighted"),
+            (component_losses * (weights / weights.sum())).sum(),
+        )
+        assert encoded_components.shape == (2, 1)
+
+    def test_gradiend_model_full_reconstruction_loss_matches_forward_loss(self):
+        model = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            activation_encoder="id",
+            activation_decoder="id",
+            bias_encoder=False,
+            bias_decoder=False,
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 2},
+                {"id": "right", "start": 2, "end": 4},
+            ],
+        )
+        source = torch.randn(4)
+        target = torch.randn(4)
+        criterion = torch.nn.MSELoss()
+
+        decoded, encoded = model(source, return_encoded=True)
+        loss, loss_encoded = model.reconstruction_loss(
+            source,
+            target,
+            criterion=criterion,
+            aggregation="full",
+            return_encoded=True,
+        )
+
+        torch.testing.assert_close(loss, criterion(decoded, target.to(decoded.device)))
+        torch.testing.assert_close(loss_encoded, encoded)
+
+    def test_gradiend_model_virtual_component_decoders_use_weight_views(self):
+        model = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            activation_decoder="id",
+            bias_decoder=True,
+            device=torch.device("cpu"),
+            component_slices=[
+                GradiendComponent("left", 0, 2),
+                GradiendComponent("right", 2, 4),
+            ],
+        )
+        with torch.no_grad():
+            model.decoder[0].linear.weight.copy_(torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+            model.decoder[0].linear.bias.copy_(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+
+        z = torch.tensor([2.0])
+
+        torch.testing.assert_close(model._component_decoders[0](z), torch.tensor([2.1, 4.2]))
+        torch.testing.assert_close(model._component_decoders["right"](z), torch.tensor([6.3, 8.4]))
+        assert model._component_decoders["right"].weight.shape == (2, 1)
+        assert model._component_decoders["right"].weight.data_ptr() == model.decoder[0].linear.weight[2:, :].data_ptr()
+
+    def test_gradiend_model_component_metadata_roundtrips_checkpoint(self, temp_dir):
+        model = GradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 2},
+                {"id": "right", "start": 2, "end": 4},
+            ],
+        )
+
+        save_path = os.path.join(temp_dir, "component_model")
+        model.save_pretrained(save_path)
+        loaded = GradiendModel.from_pretrained(save_path)
+
+        assert [component.to_dict() for component in loaded.component_slices] == [
+            {"id": "left", "start": 0, "end": 2},
+            {"id": "right", "start": 2, "end": 4},
+        ]
+        x = torch.randn(4)
+        torch.testing.assert_close(model._encode_components(x), loaded._encode_components(x), rtol=1e-5, atol=1e-5)
+
+    def test_gradiend_model_with_components_returns_weight_sharing_view(self):
+        model = GradiendModel(input_dim=4, latent_dim=1, device=torch.device("cpu"))
+
+        view = model._with_components([
+            {"id": "left", "start": 0, "end": 2},
+            {"id": "right", "start": 2, "end": 4},
+        ])
+
+        assert view is not model
+        assert view.encoder is model.encoder
+        assert view.decoder is model.decoder
+        assert [component.id for component in view.component_slices] == ["left", "right"]
+        assert model.component_slices == ()
+        assert [component.id for component in model._virtual_component_slices] == ["full"]
+
+    def test_param_mapped_gradiend_model_component_metadata_roundtrips_checkpoint(self, temp_dir):
+        model = ParamMappedGradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            param_map={"p": {"shape": (4,), "repr": "all"}},
+            device=torch.device("cpu"),
+            component_slices=[
+                {"id": "left", "start": 0, "end": 2},
+                {"id": "right", "start": 2, "end": 4},
+            ],
+        )
+
+        save_path = os.path.join(temp_dir, "mapped_component_model")
+        model.save_pretrained(save_path)
+        loaded = ParamMappedGradiendModel.from_pretrained(save_path)
+
+        assert [component.to_dict() for component in loaded.component_slices] == [
+            {"id": "left", "start": 0, "end": 2},
+            {"id": "right", "start": 2, "end": 4},
+        ]
+        x = torch.randn(4)
+        torch.testing.assert_close(model._encode_components(x), loaded._encode_components(x), rtol=1e-5, atol=1e-5)
     
     def test_gradiend_model_get_weight_importance(self):
         """Test weight importance computation."""
@@ -204,6 +559,27 @@ class TestParamMappedGradiendModel:
         assert model.input_dim == input_dim
         assert model.latent_dim == 1
         assert len(model.param_map) == 2
+
+    def test_param_mapped_model_signal_flags(self):
+        gradient_model = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"w": {"shape": (2,), "repr": "all"}},
+        )
+        assert gradient_model.signal_kind == "gradient"
+        assert gradient_model.uses_gradients is True
+        assert gradient_model.uses_activations is False
+
+        activation_model = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={"kind": "activation", "signal_id": "activation"},
+        )
+        assert activation_model.signal_kind == "activation"
+        assert activation_model.uses_gradients is False
+        assert activation_model.uses_activations is True
     
     def test_param_mapped_model_flatten_gradient_dict(self):
         """Test flattening gradient dict to tensor."""
@@ -267,6 +643,97 @@ class TestParamMappedGradiendModel:
         torch.testing.assert_close(actual, expected)
         assert base_stream.weight.grad is None
         assert base_stream.bias.grad is None
+
+    def test_param_mapped_streaming_cosine_matches_flat_cosine_for_sparse_selectors(self, set_seed):
+        """Mask and index selections must match flattening without retaining grads."""
+        set_seed(7)
+        base = nn.Linear(4, 3)
+        base_stream = nn.Linear(4, 3)
+        base_stream.load_state_dict(base.state_dict())
+        mask = torch.tensor(
+            [[True, False, True, False], [False, True, False, True], [True, True, False, False]]
+        )
+        indices = torch.tensor([0, 2])
+        param_map = {
+            "weight": {"shape": tuple(base.weight.shape), "repr": "mask", "mask": mask},
+            "bias": {"shape": tuple(base.bias.shape), "repr": "indices", "indices": indices},
+        }
+        input_dim = int(mask.sum().item() + indices.numel())
+        gradiend = ParamMappedGradiendModel(input_dim=input_dim, latent_dim=1, param_map=param_map)
+        direction = torch.randn(input_dim)
+        x = torch.randn(5, 4)
+
+        base.zero_grad(set_to_none=True)
+        base(x).pow(2).sum().backward()
+        flat = gradiend.extract_gradients(base)
+        expected = float(torch.nn.functional.cosine_similarity(flat, direction, dim=0))
+        base.zero_grad(set_to_none=True)
+
+        actual = gradiend.gradient_cosine_streaming(
+            base_stream,
+            lambda: base_stream(x).pow(2).sum().backward(),
+            direction,
+        )
+        assert actual == pytest.approx(expected, rel=1e-6, abs=1e-7)
+        assert base_stream.weight.grad is None
+        assert base_stream.bias.grad is None
+
+    def test_param_mapped_streaming_cosine_matches_flat_cosine(self, set_seed):
+        """Streaming reduction must equal the historical flattened readout."""
+        set_seed(43)
+        base = nn.Linear(4, 3)
+        base_stream = nn.Linear(4, 3)
+        base_stream.load_state_dict(base.state_dict())
+        param_map = {
+            "weight": {"shape": tuple(base.weight.shape), "repr": "all"},
+            "bias": {"shape": tuple(base.bias.shape), "repr": "all"},
+        }
+        gradiend = ParamMappedGradiendModel(input_dim=15, latent_dim=1, param_map=param_map)
+        x = torch.randn(5, 4)
+        direction = torch.randn(15)
+
+        base.zero_grad(set_to_none=True)
+        base(x).pow(2).sum().backward()
+        flat = gradiend.extract_gradients(base)
+        expected = float(torch.nn.functional.cosine_similarity(flat, direction, dim=0))
+
+        actual = gradiend.gradient_cosine_streaming(
+            base_stream,
+            lambda: base_stream(x).pow(2).sum().backward(),
+            direction,
+        )
+        assert actual == pytest.approx(expected, abs=1e-6)
+        assert base_stream.weight.grad is None
+        assert base_stream.bias.grad is None
+
+    def test_param_mapped_streaming_cosine_recomputes_norm_after_direction_changes(self):
+        """An in-place direction update must invalidate the cached norm."""
+        base = nn.Linear(2, 1, bias=False)
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"weight": {"shape": (1, 2), "repr": "all"}},
+        )
+        direction = torch.tensor([1.0, 1.0])
+        input_ = torch.tensor([[1.0, 2.0]])
+
+        def backward():
+            base(input_).sum().backward()
+
+        first = gradiend.gradient_cosine_streaming(base, backward, direction)
+        expected_first = torch.nn.functional.cosine_similarity(
+            input_.flatten(), direction, dim=0
+        ).item()
+        assert first == pytest.approx(expected_first)
+
+        direction[0] = 4.0
+        second = gradiend.gradient_cosine_streaming(base, backward, direction)
+        expected_second = torch.nn.functional.cosine_similarity(
+            input_.flatten(), direction, dim=0
+        ).item()
+        assert second == pytest.approx(expected_second)
+        assert second != pytest.approx(first)
+        assert base.weight.grad is None
 
     def test_param_mapped_select_from_param_grad_matches_select_flat(self, set_seed):
         """Sparse selection should match flat indexing without cloning the full gradient."""
@@ -404,7 +871,66 @@ class TestModelWithGradiend:
             "1.weight": True,
             "1.bias": True,
         }
-    
+
+    def test_model_with_gradiend_signal_properties_and_capabilities(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        gradient_base = nn.Linear(2, 1, bias=False)
+        gradient_gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"weight": {"shape": tuple(gradient_base.weight.shape), "repr": "all"}},
+        )
+        gradient_model = TinyModelWithGradiend(gradient_base, gradient_gradiend)
+        assert gradient_model.signal_kind == "gradient"
+        assert gradient_model.uses_gradients is True
+        assert gradient_model.uses_activations is False
+        assert gradient_model.capabilities.gradient_rewrite is True
+        assert gradient_model.capabilities.activation_interventions is False
+        assert gradient_model.capabilities.activation_selector_coverage is False
+        assert gradient_model.capabilities.activation_module_ablation is False
+        assert gradient_model.activation_site_modules == []
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        activation_base = TinyActivationBase()
+        activation_gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={"kind": "activation", "signal_id": "activation"},
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        activation_model = TinyModelWithGradiend(activation_base, activation_gradiend)
+        assert activation_model.signal_kind == "activation"
+        assert activation_model.uses_gradients is False
+        assert activation_model.uses_activations is True
+        assert activation_model.capabilities.gradient_rewrite is False
+        assert activation_model.capabilities.activation_interventions is True
+        assert activation_model.capabilities.activation_selector_coverage is True
+        assert activation_model.capabilities.activation_module_ablation is True
+        assert activation_model.activation_site_modules == ["emb"]
+
+
     def test_model_with_gradiend_creation(self, mock_model):
         """Test ModelWithGradiend wrapper creation."""
         from gradiend.trainer.text.prediction.model_with_gradiend import TextPredictionModelWithGradiend
@@ -619,6 +1145,1205 @@ class TestModelWithGradiend:
             before + 0.5,
         )
         assert torch.allclose(base_model.model.embed_tokens.weight, before)
+
+    def test_modify_model_for_activation_gradiend_adds_hook_steering(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": 1}},
+            },
+            bias_encoder=False,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.encoder[0].linear.weight.copy_(torch.tensor([[1.0, 0.0]]))
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[2.0], [-1.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[[0.1, 2.0], [3.0, 4.0]]])
+        before = base_model(input_ids=inputs)
+
+        modified = model_with_gradiend.modify_model(
+            learning_rate=0.5,
+            feature_factor=1.0,
+            part="decoder",
+        )
+        after = modified(input_ids=inputs)
+
+        expected = before.clone()
+        expected[:, 1, :] += torch.tensor([1.0, -0.5])
+        assert torch.allclose(after, expected)
+        assert torch.allclose(base_model(input_ids=inputs), before)
+        config = modified._gradiend_modified_config
+        application = config["interventions"][0]["application"]
+        assert application["token_selector"] == "encoder_direction"
+        assert application["threshold"] == 0.5
+        assert application["direction"] == 1.0
+        assert "encoder_weight_0" in modified._gradiend_modified_tensors
+
+    def test_save_and_load_modified_activation_model_owns_steering_vector(self, tmp_path):
+        from gradiend.model.modified import load_modified_model
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+            def save_pretrained(self, save_directory, **kwargs):
+                os.makedirs(save_directory, exist_ok=True)
+                torch.save(self.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
+
+            @classmethod
+            def from_pretrained(cls, load_directory):
+                model = cls()
+                model.load_state_dict(torch.load(os.path.join(load_directory, "pytorch_model.bin"), weights_only=True))
+                return model
+
+        from gradiend.model.modified import apply_activation_steering
+
+        model = apply_activation_steering(
+            TinyActivationBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {"axis": "last_dim", "token_selector": "all"},
+                }
+            ],
+            tensors={"steering_0": torch.tensor([0.25, -0.75])},
+        )
+        inputs = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+        expected = model(input_ids=inputs)
+        model.save_pretrained_modified(str(tmp_path))
+
+        loaded = load_modified_model(
+            str(tmp_path),
+            model_loader=lambda path: TinyActivationBase.from_pretrained(path),
+        )
+
+        assert torch.allclose(loaded(input_ids=inputs), expected)
+        config_path = os.path.join(tmp_path, "gradiend_modified_config.json")
+        assert os.path.isfile(config_path)
+        assert os.path.isfile(os.path.join(tmp_path, "gradiend_modified_tensors.pt"))
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        assert config["format_version"] == 1
+        assert config["interventions"][0]["tensor_key"] == "steering_0"
+
+        legacy_config = dict(config)
+        legacy_config["version"] = legacy_config.pop("format_version")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump(legacy_config, handle)
+        legacy_loaded = load_modified_model(
+            str(tmp_path),
+            model_loader=lambda path: TinyActivationBase.from_pretrained(path),
+        )
+        assert torch.allclose(legacy_loaded(input_ids=inputs), expected)
+        assert legacy_loaded._gradiend_modified_config["format_version"] == 1
+
+    def test_save_and_load_modified_activation_model_with_encoder_abs_selector(self, tmp_path):
+        from gradiend.model.modified import apply_activation_steering, load_modified_model
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+            def save_pretrained(self, save_directory, **kwargs):
+                os.makedirs(save_directory, exist_ok=True)
+                torch.save(self.state_dict(), os.path.join(save_directory, "pytorch_model.bin"))
+
+            @classmethod
+            def from_pretrained(cls, load_directory):
+                model = cls()
+                model.load_state_dict(torch.load(os.path.join(load_directory, "pytorch_model.bin"), weights_only=True))
+                return model
+
+        model = apply_activation_steering(
+            TinyActivationBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {
+                        "axis": "last_dim",
+                        "token_selector": "encoder_abs",
+                        "threshold": 0.5,
+                        "encoder_weight_key": "encoder_weight_0",
+                    },
+                }
+            ],
+            tensors={
+                "steering_0": torch.tensor([0.25, -0.75]),
+                "encoder_weight_0": torch.tensor([[1.0, 0.0]]),
+            },
+        )
+        inputs = torch.tensor([[[0.1, 2.0], [3.0, 4.0]]])
+        expected = inputs.clone()
+        expected[:, 1, :] += torch.tensor([0.25, -0.75])
+
+        torch.testing.assert_close(model(input_ids=inputs), expected)
+        model.save_pretrained_modified(str(tmp_path))
+
+        loaded = load_modified_model(
+            str(tmp_path),
+            model_loader=lambda path: TinyActivationBase.from_pretrained(path),
+        )
+
+        torch.testing.assert_close(loaded(input_ids=inputs), expected)
+        assert "encoder_weight_0" in loaded._gradiend_modified_tensors
+
+    def test_activation_clamp_mode_forces_feature_to_target(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        model = apply_activation_steering(
+            TinyActivationBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {
+                        "axis": "last_dim",
+                        "token_selector": "all",
+                        "mode": "clamp",
+                        "target_activation": 5.0,
+                        "clamp_encoder_weight_key": "clamp_enc_w",
+                        "clamp_encoder_bias_key": "clamp_enc_b",
+                    },
+                }
+            ],
+            tensors={
+                # Direction and encoder both read off feature 0, so the
+                # clamp correction lands entirely on that axis and the
+                # post-hook encoder readout should equal the target exactly.
+                "steering_0": torch.tensor([1.0, 0.0]),
+                "clamp_enc_w": torch.tensor([[1.0, 0.0]]),
+                "clamp_enc_b": torch.tensor([0.0]),
+            },
+        )
+        inputs = torch.tensor([[[3.0, 4.0]]])
+        out = model(input_ids=inputs)
+        torch.testing.assert_close(out, torch.tensor([[[5.0, 4.0]]]))
+
+    def test_activation_clamp_mode_respects_prediction_token_selector(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyPredictionBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Embedding(200, 2)
+                with torch.no_grad():
+                    self.emb.weight.zero_()
+                    self.emb.weight[10] = torch.tensor([3.0, 4.0])
+
+            def forward(self, input_ids=None, attention_mask=None):
+                return self.emb(input_ids)
+
+        model = apply_activation_steering(
+            TinyPredictionBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {
+                        "axis": "last_dim",
+                        "token_selector": "prediction",
+                        "mask_token_id": 103,
+                        "mode": "clamp",
+                        "target_activation": 5.0,
+                        "clamp_encoder_weight_key": "clamp_enc_w",
+                        "clamp_encoder_bias_key": "clamp_enc_b",
+                    },
+                }
+            ],
+            tensors={
+                "steering_0": torch.tensor([1.0, 0.0]),
+                "clamp_enc_w": torch.tensor([[1.0, 0.0]]),
+                "clamp_enc_b": torch.tensor([0.0]),
+            },
+        )
+        masked_ids = torch.tensor([[101, 103, 10]])
+        out = model(input_ids=masked_ids)
+        # Position 1 (mask token) reads embedding row 0 -> feature score 0,
+        # clamped to 5.0; position 2 (outside the selector) is untouched.
+        torch.testing.assert_close(out[:, 1, :], torch.tensor([[5.0, 0.0]]))
+        torch.testing.assert_close(out[:, 2, :], torch.tensor([[3.0, 4.0]]))
+
+    def test_activation_encoder_direction_selector_is_not_symmetric(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        model = apply_activation_steering(
+            TinyActivationBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {
+                        "axis": "last_dim",
+                        "token_selector": "encoder_direction",
+                        "threshold": 0.5,
+                        "direction": -1.0,
+                        "encoder_weight_key": "encoder_weight_0",
+                    },
+                }
+            ],
+            tensors={
+                "steering_0": torch.tensor([0.25, -0.75]),
+                "encoder_weight_0": torch.tensor([[1.0, 0.0]]),
+            },
+        )
+        inputs = torch.tensor([[[3.0, 0.0], [-3.0, 0.0]]])
+        expected = inputs.clone()
+        expected[:, 1, :] += torch.tensor([0.25, -0.75])
+
+        torch.testing.assert_close(model(input_ids=inputs), expected)
+
+    def test_activation_last_token_selector_is_removed_with_migration_hint(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        model = apply_activation_steering(
+            TinyActivationBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {"axis": "last_dim", "token_selector": "last_token"},
+                }
+            ],
+            tensors={"steering_0": torch.tensor([0.25, -0.75])},
+        )
+        inputs = torch.tensor([[[0.0, 0.0], [1.0, 1.0], [9.0, 9.0]]])
+        attention_mask = torch.tensor([[1, 1, 0]])
+
+        with pytest.raises(ValueError, match="token_selector='prediction'"):
+            model(input_ids=inputs, attention_mask=attention_mask)
+
+    def test_activation_prediction_selector_uses_clm_prediction_position(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        model = apply_activation_steering(
+            TinyActivationBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {"axis": "last_dim", "token_selector": "prediction"},
+                }
+            ],
+            tensors={"steering_0": torch.tensor([0.25, -0.75])},
+        )
+        inputs = torch.tensor([[[0.0, 0.0], [1.0, 1.0], [9.0, 9.0]]])
+        attention_mask = torch.tensor([[1, 1, 0]])
+        expected = inputs.clone()
+        expected[:, 1, :] += torch.tensor([0.25, -0.75])
+
+        torch.testing.assert_close(model(input_ids=inputs, attention_mask=attention_mask), expected)
+
+    def test_activation_prediction_selector_uses_hook_only_prediction_mask(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyPredictionBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Embedding(200, 2)
+                with torch.no_grad():
+                    self.emb.weight.zero_()
+
+            def forward(self, input_ids=None, attention_mask=None):
+                return self.emb(input_ids)
+
+        input_ids = torch.tensor([[101, 10, 11]])
+        prediction_mask = torch.tensor([[False, False, True]])
+        model = apply_activation_steering(
+            TinyPredictionBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {"axis": "last_dim", "token_selector": "prediction"},
+                }
+            ],
+            tensors={"steering_0": torch.tensor([0.25, -0.75])},
+        )
+        expected = torch.zeros(1, 3, 2)
+        expected[:, 2, :] += torch.tensor([0.25, -0.75])
+
+        # prediction_mask is for the ACTIEND hook resolver; the pre-hook strips
+        # it before forwarding into TinyPredictionBase.forward().
+        torch.testing.assert_close(
+            model(input_ids=input_ids, prediction_mask=prediction_mask),
+            expected,
+        )
+
+    def test_activation_prediction_selector_falls_back_to_mlm_mask_token(self):
+        from gradiend.model.modified import apply_activation_steering
+
+        class TinyPredictionBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Embedding(200, 2)
+                with torch.no_grad():
+                    self.emb.weight.zero_()
+
+            def forward(self, input_ids=None, attention_mask=None):
+                return self.emb(input_ids)
+
+        model = apply_activation_steering(
+            TinyPredictionBase(),
+            interventions=[
+                {
+                    "module": "emb",
+                    "tensor_key": "steering_0",
+                    "application": {
+                        "axis": "last_dim",
+                        "token_selector": "prediction",
+                        "mask_token_id": 103,
+                    },
+                }
+            ],
+            tensors={"steering_0": torch.tensor([0.25, -0.75])},
+        )
+        masked_ids = torch.tensor([[101, 103, 11]])
+        neutral_ids = torch.tensor([[101, 10, 11]])
+        expected_masked = torch.zeros(1, 3, 2)
+        expected_masked[:, 1, :] += torch.tensor([0.25, -0.75])
+
+        torch.testing.assert_close(model(input_ids=masked_ids), expected_masked)
+        torch.testing.assert_close(model(input_ids=neutral_ids), torch.zeros(1, 3, 2))
+
+    def test_activation_encoder_selector_single_site_uses_global_encoder_bias(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_encoder=True,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.encoder[0].linear.weight.zero_()
+            gradiend.encoder[0].linear.bias.fill_(1.0)
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[0.25], [-0.75]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        interventions, tensors = model_with_gradiend._activation_intervention_specs(
+            torch.tensor([0.25, -0.75]),
+            feature_factor=1.0,
+            token_selector="encoder_direction",
+            threshold=0.7,
+        )
+
+        application = interventions[0]["application"]
+        assert application["encoder_activation"] == "tanh"
+        assert "encoder_bias_0" in tensors
+
+        inputs = torch.tensor([[[0.0, 0.0], [2.0, 3.0]]])
+        before = base_model(input_ids=inputs)
+        with model_with_gradiend.intervene(
+            value=1.0,
+            signal="activation",
+            feature_factor=1.0,
+            token_selector="encoder_direction",
+            threshold=0.7,
+        ):
+            after = base_model(input_ids=inputs)
+
+        expected = before + torch.tensor([0.25, -0.75])
+        torch.testing.assert_close(after, expected)
+
+    def test_activation_encoder_selector_slices_unsplit_bias_free_multi_site_encoder(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TwoSiteActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.left = torch.nn.Linear(2, 2, bias=False)
+                self.right = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.left.weight.copy_(torch.eye(2))
+                    self.right.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                x = input_ids.float()
+                return self.left(x[..., :2]) + self.right(x[..., 2:])
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TwoSiteActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            param_map={
+                "activation:left": {"shape": (2,), "repr": "all"},
+                "activation:right": {"shape": (2,), "repr": "all"},
+            },
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_encoder=False,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.encoder[0].linear.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, -1.0]]))
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        interventions, tensors = model_with_gradiend._activation_intervention_specs(
+            torch.tensor([1.0, 2.0, 3.0, 4.0]),
+            feature_factor=1.0,
+            token_selector="encoder_direction",
+            threshold=0.7,
+        )
+
+        assert [item["module"] for item in interventions] == ["left", "right"]
+        torch.testing.assert_close(tensors["encoder_weight_0"], torch.tensor([[1.0, 0.0]]))
+        torch.testing.assert_close(tensors["encoder_weight_1"], torch.tensor([[0.0, -1.0]]))
+        assert interventions[0]["application"]["encoder_activation"] == "tanh"
+        assert interventions[1]["application"]["encoder_activation"] == "tanh"
+
+        inputs = torch.tensor([[[1.0, 0.0, 0.0, -1.0], [0.5, 0.0, 0.0, -0.5]]])
+        before = base_model(input_ids=inputs)
+        with model_with_gradiend.intervene(
+            value=1.0,
+            signal="activation",
+            feature_factor=1.0,
+            token_selector="encoder_direction",
+            threshold=0.7,
+        ):
+            after = base_model(input_ids=inputs)
+
+        expected = before.clone()
+        expected[:, 0, :] += torch.tensor([4.0, 6.0])
+        torch.testing.assert_close(after, expected)
+
+    def test_activation_encoder_selector_uses_tanh_score_for_thresholds(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TwoSiteActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.left = torch.nn.Linear(2, 2, bias=False)
+                self.right = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.left.weight.copy_(torch.eye(2))
+                    self.right.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                x = input_ids.float()
+                return self.left(x[..., :2]) + self.right(x[..., 2:])
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TwoSiteActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            param_map={
+                "activation:left": {"shape": (2,), "repr": "all"},
+                "activation:right": {"shape": (2,), "repr": "all"},
+            },
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_encoder=False,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.encoder[0].linear.weight.copy_(torch.tensor([[1.0, 0.0, 0.0, -1.0]]))
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[[1.0, 0.0, 0.0, -1.0]]])
+        before = base_model(input_ids=inputs)
+
+        with model_with_gradiend.intervene(
+            value=1.0,
+            signal="activation",
+            feature_factor=1.0,
+            token_selector="encoder_direction",
+            threshold=0.8,
+        ):
+            after = base_model(input_ids=inputs)
+
+        # The raw linear site score is 1.0, but the ACTIEND encoder score is tanh(1.0) < 0.8.
+        torch.testing.assert_close(after, before)
+
+    def test_activation_selector_coverage_uses_direction_selector_and_cleans_up(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyActivationBase()
+        base_model.train()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_encoder=False,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.encoder[0].linear.weight.copy_(torch.tensor([[1.0, 0.0]]))
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[1.0], [0.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[[3.0, 0.0], [-3.0, 0.0]]])
+
+        summary = model_with_gradiend.activation_selector_coverage(
+            input_ids=inputs,
+            feature_factor=-1.0,
+            token_selector="encoder_direction",
+            threshold=0.5,
+        )
+
+        assert summary["selected_positions"] == 1
+        assert summary["candidate_positions"] == 2
+        assert summary["total_positions"] == 2
+        assert summary["coverage"] == 0.5
+        assert summary["scope_coverage"] == 0.5
+        assert summary["modules"][0]["module"] == "emb"
+        assert summary["modules"][0]["coverage"] == 0.5
+        assert summary["modules"][0]["scope_coverage"] == 0.5
+        assert base_model.training is True
+        assert len(base_model.emb._forward_hooks) == 0
+        assert len(base_model._forward_pre_hooks) == 0
+
+    def test_activation_gate_composes_with_position_selector(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_encoder=False,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.encoder[0].linear.weight.copy_(torch.tensor([[1.0, 0.0]]))
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[0.5], [-0.25]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[[3.0, 0.0], [-3.0, 0.0]]])
+        before = base_model(input_ids=inputs)
+
+        with model_with_gradiend.intervene(
+            value=1.0,
+            signal="activation",
+            feature_factor=-1.0,
+            token_selector="prediction",
+            activation_gate="encoder_direction",
+            threshold=0.5,
+        ) as meta:
+            after = base_model(input_ids=inputs)
+
+        expected = before.clone()
+        expected[:, 1, :] += torch.tensor([-0.5, 0.25])
+        torch.testing.assert_close(after, expected)
+        assert meta["activation_gate"] == "encoder_direction"
+        assert len(base_model.emb._forward_hooks) == 0
+        assert len(base_model._forward_pre_hooks) == 0
+
+        coverage = model_with_gradiend.activation_selector_coverage(
+            input_ids=inputs,
+            feature_factor=-1.0,
+            token_selector="prediction",
+            activation_gate="encoder_direction",
+            threshold=0.5,
+        )
+        assert coverage["selected_positions"] == 1
+        assert coverage["candidate_positions"] == 1
+        assert coverage["total_positions"] == 2
+        assert coverage["coverage"] == 0.5
+        assert coverage["scope_coverage"] == 1.0
+
+    def test_activation_modules_filters_single_site_intervention(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TwoSiteActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.left = torch.nn.Linear(2, 2, bias=False)
+                self.right = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.left.weight.copy_(torch.eye(2))
+                    self.right.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                x = input_ids.float()
+                return self.left(x[..., :2]) + self.right(x[..., 2:])
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TwoSiteActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=4,
+            latent_dim=1,
+            param_map={
+                "activation:left": {"shape": (2,), "repr": "all"},
+                "activation:right": {"shape": (2,), "repr": "all"},
+            },
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_encoder=False,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[[1.0, 1.0, 10.0, 10.0]]])
+        before = base_model(input_ids=inputs)
+
+        with model_with_gradiend.intervene(
+            value=1.0,
+            signal="activation",
+            feature_factor=1.0,
+            token_selector="all",
+            activation_modules="left",
+        ) as meta:
+            after = base_model(input_ids=inputs)
+
+        expected = before + torch.tensor([1.0, 2.0])
+        torch.testing.assert_close(after, expected)
+        assert meta["resolved_modules"] == ["left"]
+
+        with pytest.raises(ValueError, match="No ACTIEND activation modules matched"):
+            model_with_gradiend.activation_selector_coverage(
+                input_ids=inputs,
+                feature_factor=1.0,
+                token_selector="all",
+                activation_modules="missing",
+            )
+
+    def test_intervene_gradient_value_zero_is_noop_and_restores_weights(self):
+        from types import SimpleNamespace
+
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyGradientBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 1, bias=False)
+                with torch.no_grad():
+                    self.linear.weight.copy_(torch.tensor([[1.0, 2.0]]))
+
+            def forward(self, input_ids=None, **kwargs):
+                return SimpleNamespace(logits=self.linear(input_ids.float()))
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyGradientBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"linear.weight": {"shape": (1, 2), "repr": "all"}},
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[3.0], [-2.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[2.0, 4.0]])
+        before_weight = base_model.linear.weight.detach().clone()
+        before_logits = model_with_gradiend(input_ids=inputs).logits.detach().clone()
+
+        with model_with_gradiend.intervene(value=0.0) as meta:
+            during_logits = model_with_gradiend(input_ids=inputs).logits
+
+        assert meta["signal"] == "gradient"
+        assert meta["active"] is False
+        assert torch.allclose(during_logits, before_logits, atol=1e-7)
+        assert torch.allclose(base_model.linear.weight, before_weight)
+
+    def test_intervene_gradient_applies_temporarily_and_cleans_up_after_exception(self):
+        from types import SimpleNamespace
+
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyGradientBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = torch.nn.Linear(2, 1, bias=False)
+                with torch.no_grad():
+                    self.linear.weight.copy_(torch.tensor([[1.0, 2.0]]))
+
+            def forward(self, input_ids=None, **kwargs):
+                return SimpleNamespace(logits=self.linear(input_ids.float()))
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyGradientBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"linear.weight": {"shape": (1, 2), "repr": "all"}},
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[1.0], [-1.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[2.0, 4.0]])
+        before_weight = base_model.linear.weight.detach().clone()
+        before_logits = model_with_gradiend(input_ids=inputs).logits.detach().clone()
+
+        with pytest.raises(RuntimeError, match="study failure"):
+            with model_with_gradiend.intervene(value=0.5, signal="gradient") as meta:
+                during_logits = model_with_gradiend(input_ids=inputs).logits.detach()
+                assert meta["active"] is True
+                assert meta["resolved_params"][0]["name"] == "linear.weight"
+                raise RuntimeError("study failure")
+
+        assert not torch.allclose(during_logits, before_logits)
+        assert torch.allclose(base_model.linear.weight, before_weight)
+        assert not hasattr(model_with_gradiend, "active_intervention_metadata")
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_intervene_gradient_restores_half_precision_weights_bit_exactly(self, dtype):
+        """``(w + d) - d != w`` in bf16/fp16; a strength sweep must not drift the base model."""
+        from types import SimpleNamespace
+
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        n = 4096
+
+        class TinyBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.lin = torch.nn.Linear(n, 1, bias=False)
+                self.fp32 = torch.nn.Linear(4, 1, bias=False)
+
+            def forward(self, input_ids=None, **kwargs):
+                return SimpleNamespace(logits=self.lin(input_ids.to(self.lin.weight.dtype)))
+
+        class TinyMWG(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        torch.manual_seed(0)
+        base = TinyBase()
+        with torch.no_grad():
+            base.lin.weight.copy_(torch.randn(1, n) * 0.02)
+        base.lin.to(dtype)  # fp32 sibling stays fp32: mixed-dtype maps must also restore
+        gradiend = ParamMappedGradiendModel(
+            input_dim=n + 4,
+            latent_dim=1,
+            param_map={
+                "lin.weight": {"shape": (1, n), "repr": "all"},
+                "fp32.weight": {"shape": (1, 4), "repr": "all"},
+            },
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        direction = torch.randn(n + 4)
+        direction = direction / direction.norm()
+        with torch.no_grad():
+            gradiend.decoder[0].linear.weight.copy_(direction.unsqueeze(1))
+        mwg = TinyMWG(base, gradiend)
+
+        before_half = base.lin.weight.detach().clone()
+        before_fp32 = base.fp32.weight.detach().clone()
+
+        # Sanity: the naive add/subtract round trip really is lossy at this scale.
+        update = (direction[:n] * 50.0).to(dtype)
+        naive = before_half.clone()
+        naive.add_(update.reshape_as(naive))
+        naive.sub_(update.reshape_as(naive))
+        assert not torch.equal(naive, before_half)
+
+        for lr in (0.5, 5.0, 50.0):  # sweep several strengths back to back
+            with mwg.intervene(value=lr, signal="gradient"):
+                assert not torch.equal(base.lin.weight, before_half)
+            assert torch.equal(base.lin.weight, before_half)
+            assert torch.allclose(base.fp32.weight, before_fp32, atol=1e-6)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with mwg.intervene(value=50.0, signal="gradient"):
+                raise RuntimeError("boom")
+        assert torch.equal(base.lin.weight, before_half)
+
+    def test_intervene_activation_hooks_only_inside_context(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_encoder=False,
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.encoder[0].linear.weight.copy_(torch.tensor([[1.0, 0.0]]))
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[2.0], [-1.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[[0.1, 2.0], [3.0, 4.0]]])
+        before = model_with_gradiend(input_ids=inputs)
+        assert len(base_model.emb._forward_hooks) == 0
+
+        with model_with_gradiend.intervene(value=0.5, signal="activation") as meta:
+            assert len(base_model.emb._forward_hooks) == 1
+            after = model_with_gradiend(input_ids=inputs)
+            assert meta["resolved_modules"] == ["emb"]
+            assert meta["num_dimensions"] == 2
+
+        expected = before.clone()
+        expected[:, 1, :] += torch.tensor([1.0, -0.5])
+        assert torch.allclose(after, expected)
+        assert torch.allclose(model_with_gradiend(input_ids=inputs), before)
+        assert len(base_model.emb._forward_hooks) == 0
+
+    def test_intervene_activation_value_zero_is_noop_and_installs_no_hooks(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+                with torch.no_grad():
+                    self.emb.weight.copy_(torch.eye(2))
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        with torch.no_grad():
+            gradiend.decoder[0].linear.weight.copy_(torch.tensor([[2.0], [-1.0]]))
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+        inputs = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+        before = model_with_gradiend(input_ids=inputs).detach().clone()
+
+        with model_with_gradiend.intervene(value=0.0, signal="activation") as meta:
+            during = model_with_gradiend(input_ids=inputs)
+            assert meta["signal"] == "activation"
+            assert meta["active"] is False
+            assert len(base_model.emb._forward_hooks) == 0
+
+        assert torch.allclose(during, before, atol=1e-7)
+        assert torch.allclose(model_with_gradiend(input_ids=inputs), before, atol=1e-7)
+        assert len(base_model.emb._forward_hooks) == 0
+        assert len(base_model._forward_pre_hooks) == 0
+
+    def test_intervene_activation_removes_hooks_after_exception(self):
+        from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
+
+        class TinyActivationBase(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.emb = torch.nn.Linear(2, 2, bias=False)
+
+            def forward(self, input_ids=None, **kwargs):
+                return self.emb(input_ids.float())
+
+        class TinyModelWithGradiend(ModelWithGradiend):
+            def create_gradients(self, *args, **kwargs):
+                raise NotImplementedError
+
+            def _save_model(self, save_directory, **kwargs):
+                raise NotImplementedError
+
+            @classmethod
+            def _load_model(cls, *args, **kwargs):
+                raise NotImplementedError
+
+        base_model = TinyActivationBase()
+        gradiend = ParamMappedGradiendModel(
+            input_dim=2,
+            latent_dim=1,
+            param_map={"activation:emb": {"shape": (2,), "repr": "all"}},
+            mapping_kind="activation",
+            signal_space={
+                "kind": "activation",
+                "signal_id": "activation",
+                "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
+            },
+            bias_decoder=False,
+            activation_decoder="id",
+        )
+        model_with_gradiend = TinyModelWithGradiend(base_model, gradiend)
+
+        with pytest.raises(RuntimeError, match="study failure"):
+            with model_with_gradiend.intervene(value=-0.5, signal="activation"):
+                assert len(base_model.emb._forward_hooks) == 1
+                raise RuntimeError("study failure")
+
+        assert len(base_model.emb._forward_hooks) == 0
+        assert len(base_model._forward_pre_hooks) == 0
     
     def test_model_with_gradiend_rewrite_base_model_with_different_parts(self, mock_model):
         """Test rewrite_base_model with different part options."""

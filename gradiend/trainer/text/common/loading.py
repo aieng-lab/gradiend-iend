@@ -6,6 +6,8 @@ lazily when loading a path with config_mlm_head.json to avoid circular imports.
 """
 
 import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import transformers
@@ -74,8 +76,68 @@ def _is_unknown_transformers_architecture_error(error: Exception) -> bool:
     )
 
 
+def _describe_local_checkpoint(path) -> str:
+    """Describe what a local checkpoint directory actually contains.
+
+    Hugging Face reports a config without a usable ``model_type`` as
+    "Unrecognized model in <path>", which is indistinguishable from a genuinely
+    too-new architecture. For a directory this repo wrote itself, the real cause
+    is almost always an incomplete artifact -- e.g. a checkpoint promoted after
+    zero seeds converged -- and blaming the Transformers version sends the reader
+    somewhere unrelated.
+    """
+    import json
+    import os
+
+    directory = Path(path)
+    config_path = directory / "config.json"
+    if not config_path.exists():
+        present = sorted(p.name for p in directory.iterdir())[:12]
+        return (
+            f"the directory has no config.json (contains: {present or 'nothing'}), "
+            "so it is not a loadable model checkpoint"
+        )
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - report, do not mask
+        return f"config.json could not be parsed ({exc})"
+    if not isinstance(config, dict) or not config:
+        return "config.json is empty"
+    if not config.get("model_type"):
+        keys = sorted(config)[:10]
+        return (
+            "config.json has no 'model_type' key "
+            f"(keys present: {keys}), which is what Transformers reports as an "
+            "unrecognized architecture"
+        )
+    weights = [
+        name
+        for name in os.listdir(directory)
+        if name.endswith((".safetensors", ".bin", ".pt"))
+    ]
+    if not weights:
+        return (
+            f"config.json declares model_type={config['model_type']!r} but the "
+            "directory contains no weight files"
+        )
+    return (
+        f"config.json declares model_type={config['model_type']!r}, which this "
+        "Transformers version does not support"
+    )
+
+
 def _raise_unknown_transformers_architecture_error(name_or_path, error: Exception) -> None:
     version = getattr(transformers, "__version__", "unknown")
+    if Path(str(name_or_path)).is_dir():
+        detail = _describe_local_checkpoint(name_or_path)
+        raise ValueError(
+            f"Could not load the local checkpoint {str(name_or_path)!r}: {detail}. "
+            "A local directory that fails to load is usually an incomplete or "
+            "partially written artifact rather than a Transformers version "
+            "problem -- check whether the run that produced it actually "
+            "converged and finished saving. "
+            f"(Installed Transformers: {version}.)"
+        ) from error
     raise ValueError(
         f"Could not load {name_or_path!r} because Transformers {version} does not "
         "recognize the checkpoint architecture. This usually means the model was "

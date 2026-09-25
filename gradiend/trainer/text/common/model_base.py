@@ -25,6 +25,31 @@ from gradiend.model.utils import is_decoder_only_model, is_seq2seq_model
 logger = get_logger(__name__)
 
 
+def _log_base_model_dtype(base_model: Any, requested: Any) -> None:
+    """Record the dtype the backbone actually loaded with.
+
+    A requested dtype can be lost on the way here (it was, silently, for every
+    run: ``TrainingArguments.to_dict()`` wrote "torch.bfloat16" and
+    ``from_dict()`` resolved that to float32), and the only visible symptom is
+    twice the expected memory much later, usually as an OOM in an unrelated
+    phase. Log the effective dtype at the one point that knows both values.
+    """
+    try:
+        actual = next(base_model.parameters()).dtype
+    except (StopIteration, AttributeError):
+        return
+    name = getattr(base_model, "name_or_path", "<model>")
+    if requested is not None and actual != requested:
+        logger.warning(
+            "Base model %s loaded as %s although %s was requested.",
+            name,
+            actual,
+            requested,
+        )
+    else:
+        logger.info("Base model %s loaded with dtype %s.", name, actual)
+
+
 _MODEL_SIZE_B_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*b(?!\w)", re.IGNORECASE)
 
 
@@ -158,6 +183,7 @@ class TextModelWithGradiend(ModelWithGradiend):
 
         if base_model_id is not None:
             base_model = AutoModelForLM.from_pretrained(load_path, **load_kwargs)
+            _log_base_model_dtype(base_model, torch_dtype)
             if base_model_device is not None and base_model_device_map is None:
                 base_model = base_model.to(base_model_device)
             if tokenizer is not None:
@@ -171,6 +197,9 @@ class TextModelWithGradiend(ModelWithGradiend):
 
         if isinstance(load_directory, str):
             base_model = AutoModelForLM.from_pretrained(load_directory, **load_kwargs)
+            # Only when this call loaded the backbone: a caller-supplied model
+            # carries its own dtype and is not this call's to report on.
+            _log_base_model_dtype(base_model, torch_dtype)
         else:
             base_model = load_directory
 

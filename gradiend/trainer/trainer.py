@@ -13,7 +13,7 @@ import shutil
 import random
 import numpy as np
 import json
-from typing import Any, Dict, List, Literal, Optional, Sequence, Type, Union, Tuple
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Type, Union, Tuple
 
 import pandas as pd
 import torch
@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 
 from gradiend import ModelWithGradiend
 from gradiend.model._source_target import sync_model_source_target_from_training_args
-from gradiend.model.model_with_gradiend import _is_gradiend_checkpoint
+from gradiend.model.model_with_gradiend import _checkpoint_gradiend_method_name, _is_gradiend_checkpoint
 from gradiend.util.paths import resolve_encoder_plot_path
 from gradiend.trainer.core.feature_definition import FeatureLearningDefinition, _resolve_encoder_df
 from gradiend.util.paths import (
@@ -37,14 +37,48 @@ from gradiend.util.paths import (
     remove_pre_prune_cache,
 )
 from gradiend.evaluator.decoder_eval_utils import read_decoder_stats_file
+from gradiend.evaluator.decoder import DEFAULT_DECODER_REFINE_POINTS
 from gradiend.util.logging import get_logger
+
+
+def _gradiend_training_collate(batch: List[dict]) -> dict:
+    """Collate GRADIEND signal rows without forcing string metadata through tensor conversion.
+
+    Each dataset item already contains batched tensors when ``train_batch_size>1``.
+    ``default_collate`` breaks on list/string fields (e.g. ``factual_token``) once
+    ``gradiend_batch_size>1``; stack tensors only and keep other keys as lists.
+    """
+    if not batch:
+        raise ValueError("Empty GRADIEND training batch")
+    if len(batch) == 1:
+        return batch[0]
+    out: Dict[str, Any] = {}
+    for key in batch[0]:
+        values = [row[key] for row in batch]
+        first = values[0]
+        if torch.is_tensor(first):
+            out[key] = torch.stack(values)
+        else:
+            out[key] = values
+    return out
+
+
 from gradiend.util.deprecation import resolve_include_other_classes
 from gradiend.trainer.core.dataset import PreComputedTrainingDataset
 from gradiend.trainer.core.annotation import TrainerAnnotationMixin
 from gradiend.trainer.core.training import format_non_convergence_error, train as core_train
 from gradiend.trainer.factory import create_model_with_gradiend
 from gradiend.trainer.core.arguments import TrainingArguments
+from gradiend.trainer.core.component_seed import (
+    build_stitched_component_training_run,
+    component_run_from_training_stats,
+    load_component_best_states,
+    stitch_gradiend_components,
+    stitch_gradiend_component_states,
+    summarize_component_seed_runs,
+)
 from gradiend.trainer.core.config import validate_source_target
+from gradiend.trainer.core.metric_names import metric_needs_rivals, normalize_metric_name
 from gradiend.trainer.core.cache_policy import (
     is_unconditional_training_cache,
     should_reuse_seed_training_cache,
@@ -52,7 +86,14 @@ from gradiend.trainer.core.cache_policy import (
 )
 from gradiend.trainer.core.multi_seed import MultiSeedTrainerView, resolve_seed_run_entries
 from gradiend.evaluator import Evaluator
+from gradiend.visualizer.components import plot_encoder_component_artifacts
 from gradiend.visualizer.plot_delegation import see_implementation
+from gradiend.util.component_logging import (
+    format_component_convergence_fragment,
+    format_component_seed_summary_fragment,
+    format_component_stitching_fragment,
+    strip_component_prefix,
+)
 from gradiend.trainer.core.pruning import post_prune as _post_prune, pre_prune_with_cache
 import gradiend.trainer.core.stats as trainer_stats
 from gradiend.util.encoder_splits import EncoderSplit, encoder_split_cache_key
@@ -65,6 +106,13 @@ _ANALYZE_SEED_STABILITY_MIN_ONE_WARNING = (
     "available for stability analysis, so variance statistics (std, dispersion) are not meaningful. "
     "Set min_convergent_seeds>=2 to study seed stability across multiple convergent runs."
 )
+
+
+def _selection_eval_source(*, one_pole: bool, training_source: Any, metric: Any) -> Any:
+    """Use the minimal source population needed by the active selector."""
+    if one_pole and not metric_needs_rivals(metric):
+        return "factual"
+    return training_source
 
 
 def set_seed(seed: int) -> None:
@@ -225,7 +273,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
     The trainer provides convenient methods for encoder and decoder evaluation:
     
     ```python
-    # Encoder evaluation: analyze gradient encodings
+    # Encoder evaluation: analyze signal encodings
     enc_results = trainer.evaluate_encoder(split="test", max_size=1000)
     # Returns: correlation, encoded values, mean_by_class, etc.
     
@@ -427,6 +475,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 path = "model"
         return path.rstrip("/\\")
 
+    @property
+    def tokenizer(self) -> Optional[Any]:
+        """Tokenizer from the in-memory model, or None when no model is loaded."""
+        model = self._model_instance
+        if model is None:
+            return None
+        return getattr(model, "tokenizer", None)
+
     def load_model(
         self,
         load_directory: str,
@@ -500,7 +556,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             if "trust_remote_code" not in kwargs:
                 kwargs.setdefault("trust_remote_code", getattr(self._training_args, "trust_remote_code", False))
         load_directory = load_directory if load_directory is not None else self.model_path
-        model = super().create_model_with_gradiend(load_directory, **kwargs)
+        model = self.create_model_with_gradiend(load_directory, **kwargs)
         # Always cache in memory; use_cache elsewhere is for disk/output only
         self._model_instance = model
         self._model_manually_unloaded = False
@@ -868,6 +924,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         pair: Any = None,
         output_dir: Optional[str] = None,
         seed_report: Optional[Sequence[dict]] = None,
+        component_seed_summary: Optional[dict] = None,
         convergence_metric: Optional[str] = None,
         threshold: Optional[float] = None,
     ) -> None:
@@ -887,6 +944,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     pair=pair,
                     output_dir=output_dir,
                     seed_report=seed_report,
+                    component_seed_summary=component_seed_summary,
                     convergence_metric=convergence_metric,
                     threshold=threshold,
                 )
@@ -937,6 +995,17 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             cls = self._evaluator_class if self._evaluator_class is not None else Evaluator
             self._evaluator = cls(self)
         return self._evaluator
+
+    @property
+    def visualizer(self) -> Any:
+        """Lazy-init Visualizer(trainer) for single-model plots and token highlighting."""
+        from gradiend.visualizer.visualizer import Visualizer
+
+        visualizer = getattr(self, "_visualizer", None)
+        if visualizer is None:
+            visualizer = Visualizer(self)
+            self._visualizer = visualizer
+        return visualizer
 
     def plot_training_convergence(
         self,
@@ -1060,10 +1129,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             from_gradiend_checkpoint = bool(
                 load_path_str and _is_gradiend_checkpoint(load_path_str)
             )
-            model_with_gradiend = create_model_with_gradiend(
+            model_with_gradiend = self.create_model_with_gradiend(
                 load_path,
                 feature_definition=self,
-                model_class=model_with_gradiend_cls,
+                model_with_gradiend_cls=model_with_gradiend_cls,
                 training_args=config,
                 trust_remote_code=getattr(config, "trust_remote_code", False),
             )
@@ -1111,6 +1180,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             device=model_with_gradiend.gradiend.device_encoder,
             timing_steps=config.gradient_timing_steps,
             timing_label="train-gradient",
+            signal=config.signal,
+            signals=config.signals,
         )
         if runtime_monitor is not None:
             runtime_monitor.mark("trainer:create_gradient_dataset:done", size=len(gradient_dataset))
@@ -1136,7 +1207,11 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 gradient_dataset,
                 buffer_size=config.precompute_gradient_buffer_size,
             )
-        dl_kwargs = {"batch_size": config.gradiend_batch_size, "shuffle": False}
+        dl_kwargs = {
+            "batch_size": config.gradiend_batch_size,
+            "shuffle": False,
+            "collate_fn": _gradiend_training_collate,
+        }
         if getattr(config, "seed", None) is not None:
             g = torch.Generator()
             g.manual_seed(int(config.seed))
@@ -1154,6 +1229,28 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             include_other = self._default_from_training_args(
                 None, "include_other_classes", fallback=False
             )
+            # Expand one-pole validation only when the active selector needs
+            # rivals. Correlation selection stays pair-local and avoids the
+            # repeated rival encodings; final encoder reporting can still ask
+            # for include_other_classes=True once after training.
+            selection_name = normalize_metric_name(
+                getattr(config, "selection_metric", None) or getattr(config, "convergent_metric", None)
+            )
+            selection_needs_rivals = metric_needs_rivals(selection_name)
+            if self._is_one_pole_config():
+                # source=both already supplies target and configured rival
+                # poles for E. Do not add reverse/full-class factual contexts
+                # to periodic selection evaluation; those belong to the one-off
+                # final report.
+                include_other = False
+            # Correlation selection for one-pole is target-vs-neutral. Do not
+            # encode the counterfactual source pole merely because optimization
+            # itself uses source=both.
+            eval_source = _selection_eval_source(
+                one_pole=self._is_one_pole_config(),
+                training_source=config.source,
+                metric=selection_name,
+            )
             # Use dedicated train-time encoder eval cap when set, otherwise fall back to encoder_eval_max_size
             train_eval_max_size = getattr(config, "encoder_eval_train_max_size", None)
             if train_eval_max_size is None:
@@ -1161,7 +1258,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             eval_dataset = self.create_eval_data(
                 model_with_gradiend,
                 split=self.resolve_split_for_role("eval"),
-                source=config.source,
+                source=eval_source,
                 max_size=train_eval_max_size,
                 include_other_classes=include_other,
             )
@@ -1181,6 +1278,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 return self.evaluator.evaluate_encoder(
                     eval_data=eval_dataset,
                     use_cache=False,
+                    compute_rival_metrics=selection_needs_rivals,
                 )
             config.evaluate_fn = _default_evaluate
             installed_default_evaluate = True
@@ -1207,6 +1305,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             logger.info("Promoting best checkpoint selected during training from %s to %s", best_output_dir, output_dir)
         elif getattr(config, "save_only_best", False) and has_saved_model(output_dir):
             logger.info("Using best checkpoint selected during training at %s", output_dir)
+        elif has_saved_model(output_dir):
+            logger.debug("Final model checkpoint already saved at %s", output_dir)
         else:
             model_with_gradiend.save_pretrained(output_dir)
             logger.info(f"Saved trained model to {output_dir}")
@@ -1302,13 +1402,21 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
 
         # Merge TrainingArguments: start with stored args, then apply overrides
         args: Optional[TrainingArguments] = self._training_args
+        overrides = dict(training_args_overrides)
         if args is not None:
-            args = TrainingArguments.from_dict({**args.to_dict(), **training_args_overrides})
-        elif training_args_overrides:
-            args = TrainingArguments.from_dict(training_args_overrides)
+            base_args = args.to_dict()
+            if "signal" in overrides and "signals" not in overrides:
+                base_args["signals"] = None
+            if "signals" in overrides and "signal" not in overrides:
+                base_args["signal"] = None
+            args = TrainingArguments.from_dict({**base_args, **overrides})
+        elif overrides:
+            args = TrainingArguments.from_dict(overrides)
         else:
             args = TrainingArguments()
         args.__post_init__()  # validate e.g. not both supervised_encoder and supervised_decoder
+        # Pin the auto (None) neutral-identity flag so cache fingerprints and data assembly agree.
+        args.add_neutral_identity_transitions = self.neutral_identity_transitions_enabled(args)
 
         # Apply seed early so data loading, model init, and training are deterministic when seed is set
         if getattr(args, "seed", None) is not None:
@@ -1390,11 +1498,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 val = bsc.get("loss")
                 if isinstance(val, (int, float)):
                     return -float(val)
-            val = bsc.get("correlation")
+            selection_name = normalize_metric_name(
+                getattr(args, "selection_metric", None) or getattr(args, "convergent_metric", None)
+            )
+            val = bsc.get(selection_name)
             if isinstance(val, (int, float)):
                 return float(val)
             ts = stats.get("training_stats") or {}
-            val = ts.get("correlation")
+            val = ts.get(selection_name)
             return float(val) if isinstance(val, (int, float)) else None
 
         def _numeric_or_none(value: Any) -> Optional[float]:
@@ -1542,6 +1653,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         )
 
                 convergent_metric = (args.convergent_metric or ("loss" if args.supervised_decoder else "correlation")).lower()
+                selection_metric = normalize_metric_name(
+                    getattr(args, "selection_metric", None) or convergent_metric
+                )
                 threshold = args.convergent_score_threshold
                 min_convergent = args.min_convergent_seeds
                 convergent_count = 0
@@ -1551,9 +1665,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     seed_selection_eval_max_size = getattr(args, "encoder_eval_max_size", None)
 
                 if not isinstance(model, str):
-                    model_path = getattr(model, "name_or_path", None)
+                    model_path = getattr(model, "name_or_path", None) or getattr(
+                        getattr(model, "base_model", None), "name_or_path", None
+                    )
                     if not model_path:
-                        raise ValueError("Multi-seed training requires a model path (string) or a model with name_or_path.")
+                        raise ValueError(
+                            "Multi-seed training requires a model path (string), a model with "
+                            "name_or_path, or a model whose base_model has name_or_path."
+                        )
                     model_for_runs = model_path
                 else:
                     model_for_runs = model
@@ -1621,10 +1740,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                     runtime_monitor.mark("trainer:seed:pre_prune:start", seed=seed_value)
                                     getattr(self, "_ensure_data_for_training", lambda: None)()
                                     runtime_monitor.mark("trainer:seed:create_model_with_gradiend:start", seed=seed_value)
-                                    model_instance = create_model_with_gradiend(
+                                    model_instance = self.create_model_with_gradiend(
                                         load_model_path,
                                         feature_definition=self,
-                                        model_class=model_with_gradiend_cls,
+                                        model_with_gradiend_cls=model_with_gradiend_cls,
                                         training_args=args,
                                         trust_remote_code=getattr(args, "trust_remote_code", False),
                                     )
@@ -1689,8 +1808,11 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         trained = True
                         if args.post_prune_config is not None:
                             logger.info("Seed %s: running post-prune after training ...", seed_value)
-                            seed_model = self.get_model(load_directory=out_path, use_cache=False)
+                            seed_model = self._model_instance
+                            if seed_model is None:
+                                seed_model = self.get_model(load_directory=out_path, use_cache=False)
                             seed_model = _post_prune(seed_model, args.post_prune_config)
+                            self._model_instance = seed_model
                             seed_model.save_pretrained(out_path)
                             logger.info("Seed %s: saved post-pruned model to %s", seed_value, out_path)
                             seed_model = None
@@ -1710,16 +1832,18 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     # Optionally skip expensive full validation eval:
                     # - never needed for loss-based convergence (convergent_metric == "loss")
                     # - can be skipped when training_score (score) is clearly below threshold
-                    # - skip when we already have a convergent seed (no need to recompute encoder analysis)
+                    # Every seed that remains eligible is evaluated on the same
+                    # validation population; otherwise best-seed selection would
+                    # compare full-eval scores for early seeds with smaller
+                    # training-callback scores for later seeds.
                     run_full_eval = convergent_metric != "loss"
                     if (
                         run_full_eval
+                        and selection_metric == convergent_metric
                         and threshold is not None
                         and isinstance(score, (int, float))
                         and score < threshold
                     ):
-                        run_full_eval = False
-                    if run_full_eval and seed_value != seeds[0] and convergent_count >= 1:
                         run_full_eval = False
                     try:
                         self._model_arg = out_path
@@ -1729,6 +1853,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                 split=self.resolve_split_for_role("eval"),
                                 max_size=seed_selection_eval_max_size,
                                 use_cache=False,
+                                source=(
+                                    _selection_eval_source(
+                                        one_pole=self._is_one_pole_config(),
+                                        training_source=None,
+                                        metric=selection_metric,
+                                    )
+                                ),
+                                include_other_classes=False,
                             )
                             if isinstance(eval_result, dict):
                                 eval_corr = eval_result.get("correlation")
@@ -1748,15 +1880,48 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         prev_model_instance = None
                         _clear_seed_gpu_state()
 
-                    selection_score = eval_corr if eval_corr is not None else score
+                    eval_selection_score = (
+                        eval_result.get(selection_metric)
+                        if isinstance(eval_result, dict)
+                        else None
+                    )
+                    if not isinstance(eval_selection_score, (int, float)):
+                        eval_selection_score = eval_corr if selection_metric == "correlation" else None
+                    selection_score = (
+                        float(eval_selection_score)
+                        if isinstance(eval_selection_score, (int, float))
+                        else score
+                    )
 
                     metric_val = None
+                    bsc = {}
+                    component_run = component_run_from_training_stats(
+                        stats,
+                        threshold=threshold,
+                        mean_threshold=args.convergent_mean_by_class_threshold,
+                        selection_metric=selection_metric,
+                    ) if convergent_metric != "loss" else None
+                    component_summary = (
+                        component_run.get("summary")
+                        if isinstance(component_run, dict) and isinstance(component_run.get("summary"), dict)
+                        else None
+                    )
                     if stats:
                         bsc = stats.get("best_score_checkpoint") or {}
                         if convergent_metric == "loss":
                             metric_val = bsc.get("loss")
                             if metric_val is None:
                                 metric_val = (stats.get("training_stats") or {}).get("loss")
+                        elif isinstance(component_summary, dict):
+                            metric_val = component_summary.get("correlation_mean")
+                        elif convergent_metric in {"roc_auc", "min_auc_n_o"}:
+                            # best_score_checkpoint[selection_metric] is the scalar best-step
+                            # value for AUC-based metrics (callbacks.py sets it directly as
+                            # self.best_score) — bsc["correlation"] here is an unrelated,
+                            # non-best-step snapshot and must not be used for this comparison.
+                            metric_val = bsc.get(convergent_metric)
+                            if metric_val is None:
+                                metric_val = (stats.get("training_stats") or {}).get(convergent_metric)
                         else:
                             metric_val = bsc.get("correlation")
                             if metric_val is None:
@@ -1765,22 +1930,54 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     converged = False
                     best_step_ok = trainer_stats._best_checkpoint_step_is_after_initial(bsc if stats else {})
                     sign_ok = True
+                    mean_ok = True
                     target_mean_product = None
                     min_target_class_abs_mean = None
+                    positive_target_class_mean = None
+                    positive_target_class_mean_ok = True
+                    auc_positive_target_required = convergent_metric in {"roc_auc", "min_auc_n_o"}
                     if isinstance(metric_val, (int, float)):
                         if convergent_metric == "loss":
                             if best_step_ok and metric_val <= threshold:
                                 convergent_count += 1
                                 converged = True
-                        else:
-                            target_mean_product = trainer_stats._best_step_target_class_mean_product(
-                                (stats or {}).get("training_stats") or {},
-                                (stats or {}).get("best_score_checkpoint") or {},
+                        elif isinstance(component_summary, dict):
+                            min_target_class_abs_mean = component_summary.get("min_target_class_abs_mean")
+                            mean_ok = (
+                                args.convergent_mean_by_class_threshold is None
+                                or (
+                                    isinstance(min_target_class_abs_mean, (int, float))
+                                    and min_target_class_abs_mean >= args.convergent_mean_by_class_threshold
+                                )
                             )
+                            converged = bool(component_summary.get("converged"))
+                            if converged:
+                                convergent_count += 1
+                        else:
+                            stats_history = (stats or {}).get("training_stats") or {}
+                            stats_best_checkpoint = (stats or {}).get("best_score_checkpoint") or {}
+                            if auc_positive_target_required:
+                                positive_target_class_mean = trainer_stats._best_step_positive_target_class_mean(
+                                    stats_history,
+                                    stats_best_checkpoint,
+                                )
+                                positive_target_class_mean_ok = (
+                                    isinstance(positive_target_class_mean, (int, float))
+                                    and positive_target_class_mean > 0.0
+                                )
+                            else:
+                                target_mean_product = trainer_stats._best_step_target_class_mean_product(
+                                    stats_history,
+                                    stats_best_checkpoint,
+                                )
                             if args.convergent_mean_by_class_threshold is not None:
+                                target_mean_product = trainer_stats._best_step_target_class_mean_product(
+                                    stats_history,
+                                    stats_best_checkpoint,
+                                )
                                 min_target_class_abs_mean = trainer_stats._best_step_min_target_class_abs_mean(
-                                    (stats or {}).get("training_stats") or {},
-                                    (stats or {}).get("best_score_checkpoint") or {},
+                                    stats_history,
+                                    stats_best_checkpoint,
                                 )
                             mean_ok = (
                                 args.convergent_mean_by_class_threshold is None
@@ -1789,8 +1986,19 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                     and min_target_class_abs_mean >= args.convergent_mean_by_class_threshold
                                 )
                             )
-                            sign_ok = isinstance(target_mean_product, (int, float)) and target_mean_product < 0
-                            if best_step_ok and metric_val >= threshold and mean_ok and sign_ok:
+                            sign_ok = (
+                                isinstance(target_mean_product, (int, float)) and target_mean_product < 0
+                            ) if (
+                                not auc_positive_target_required
+                                or args.convergent_mean_by_class_threshold is not None
+                            ) else True
+                            if (
+                                best_step_ok
+                                and metric_val >= threshold
+                                and positive_target_class_mean_ok
+                                and mean_ok
+                                and sign_ok
+                            ):
                                 convergent_count += 1
                                 converged = True
 
@@ -1802,6 +2010,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                             "used_cache": used_cache,
                             "training_score": score,
                             "eval_correlation": eval_corr,
+                            "selection_metric": selection_metric,
                             "selection_score": selection_score,
                             "convergence_metric": convergent_metric,
                             "convergence_metric_value": metric_val,
@@ -1809,16 +2018,33 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                             "threshold": threshold,
                             "convergent_mean_by_class_threshold": args.convergent_mean_by_class_threshold,
                             "convergent_min_target_class_abs_mean": min_target_class_abs_mean,
+                            "auc_positive_target_mean_required": auc_positive_target_required,
+                            "convergent_positive_target_class_mean": positive_target_class_mean,
+                            "convergent_positive_target_class_mean_ok": positive_target_class_mean_ok,
                             "converged": converged,
                             "split_cycle_index": split_cycle_index,
                             "split_cycle_length": split_cycle_length,
                         }
                     )
+                    if component_run is not None:
+                        seed_report[-1]["component_summary"] = component_run.get("summary")
+                        seed_report[-1]["component_convergence"] = component_run.get("convergence_by_component")
+                        seed_report[-1]["component_metrics"] = component_run.get("metrics_by_component")
                     if (
                         split_cycle_queue is not None
                         and split_cycle_index is not None
                         and not converged
-                        and (min_convergent is None or convergent_count < min_convergent)
+                        and (
+                            min_convergent is None
+                            or (
+                                summarize_component_seed_runs(
+                                    seed_report,
+                                    min_convergent_seeds=min_convergent,
+                                    selection_metric=selection_metric,
+                                )
+                                or {"min_convergent_runs_per_component": convergent_count}
+                            ).get("min_convergent_runs_per_component", convergent_count) < min_convergent
+                        )
                     ):
                         split_cycle_queue.append(split_cycle_index)
                     # Per-seed summary: path, converged, reason, convergent count / min required, max seeds
@@ -1833,6 +2059,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                 reason += f" (best checkpoint global_step={bsc.get('global_step')}; requires > 0)"
                             elif metric_val < threshold:
                                 reason += f" (below threshold {threshold:.4f})"
+                            elif auc_positive_target_required and not positive_target_class_mean_ok:
+                                if isinstance(positive_target_class_mean, (int, float)):
+                                    reason += (
+                                        " (label +1 mean encoding="
+                                        f"{positive_target_class_mean:.4f}; requires > 0)"
+                                    )
+                                else:
+                                    reason += " (label +1 mean encoding unavailable; requires > 0)"
                             elif not sign_ok:
                                 if isinstance(target_mean_product, (int, float)):
                                     reason += f" (target-class mean sign criterion not met; product={target_mean_product:.4f})"
@@ -1846,6 +2080,16 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                     )
                                 else:
                                     reason += " (per-class mean criterion not met)"
+                    if not converged and component_run is not None:
+                        component_fragment = format_component_convergence_fragment(
+                            {
+                                "summary": component_run.get("summary"),
+                                "convergence_by_component": component_run.get("convergence_by_component"),
+                            },
+                            show_blockers=True,
+                        )
+                        if component_fragment:
+                            reason += f"; component-split: {strip_component_prefix(component_fragment)}"
                     min_req = min_convergent if min_convergent is not None else "—"
                     logger.info(
                         "Finished seed %s (%s). Converged: %s (%s). Convergent: %s / min_required: %s, max_seeds: %s.",
@@ -1858,12 +2102,43 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         args.max_seeds,
                     )
 
-                    if min_convergent is not None and convergent_count >= min_convergent:
+                    component_seed_summary = summarize_component_seed_runs(
+                        seed_report,
+                        min_convergent_seeds=min_convergent,
+                        selection_metric=selection_metric,
+                    ) if convergent_metric != "loss" and min_convergent is not None else None
+                    component_stop = bool(
+                        component_seed_summary is not None
+                        and component_seed_summary.get("converged")
+                    )
+                    seed_stop = bool(min_convergent is not None and convergent_count >= min_convergent)
+                    if min_convergent is not None and (seed_stop or component_stop):
+                        if component_seed_summary is None:
+                            component_seed_summary = summarize_component_seed_runs(
+                                seed_report,
+                                min_convergent_seeds=min_convergent,
+                                selection_metric=selection_metric,
+                            ) if convergent_metric != "loss" else None
+                        if (
+                            component_seed_summary is not None
+                            and not bool(component_seed_summary.get("converged"))
+                        ):
+                            eval_result = None
+                            _clear_seed_gpu_state()
+                            continue
                         if convergent_metric == "loss":
                             logger.info(
                                 "Convergence reached: %s seeds meet loss threshold %.4f.",
                                 convergent_count,
                                 float(threshold),
+                            )
+                        elif component_seed_summary is not None:
+                            convergent_count = int(component_seed_summary.get("min_convergent_runs_per_component") or 0)
+                            logger.info(
+                                "Component convergence reached: %s/%s components have at least %s convergent seed(s).",
+                                component_seed_summary.get("n_satisfied_components"),
+                                component_seed_summary.get("n_components"),
+                                min_convergent,
                             )
                         else:
                             mean_thr = args.convergent_mean_by_class_threshold
@@ -1881,10 +2156,17 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                     convergent_count,
                                     float(threshold),
                                 )
-                        early_stop_reason = (
-                            f"min_convergent_seeds reached: {convergent_count} >= {min_convergent} "
-                            f"with metric={convergent_metric} threshold={threshold}"
-                        )
+                        if component_seed_summary is not None:
+                            early_stop_reason = (
+                                "min_convergent_seeds reached per component: "
+                                f"{component_seed_summary.get('min_convergent_runs_per_component')} >= {min_convergent} "
+                                f"with metric={convergent_metric} threshold={threshold}"
+                            )
+                        else:
+                            early_stop_reason = (
+                                f"min_convergent_seeds reached: {convergent_count} >= {min_convergent} "
+                                f"with metric={convergent_metric} threshold={threshold}"
+                            )
                         eval_result = None
                         _clear_seed_gpu_state()
                         break
@@ -1892,6 +2174,14 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     # Release GPU memory before loading next seed to avoid accumulation
                     eval_result = None
                     _clear_seed_gpu_state()
+
+                component_seed_summary = summarize_component_seed_runs(
+                    seed_report,
+                    min_convergent_seeds=min_convergent,
+                    selection_metric=selection_metric,
+                ) if convergent_metric != "loss" and min_convergent is not None else None
+                if component_seed_summary is not None:
+                    convergent_count = int(component_seed_summary.get("min_convergent_runs_per_component") or 0)
 
                 selected_run, selected_score, selection_strategy = _select_best_seed_run(
                     seed_report,
@@ -1934,23 +2224,61 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
 
                 report = {
                     "convergence_metric": convergent_metric,
+                    "selection_metric": selection_metric,
                     "threshold": threshold,
                     "convergent_mean_by_class_threshold": args.convergent_mean_by_class_threshold,
+                    "auc_positive_target_mean_required": convergent_metric in {"roc_auc", "min_auc_n_o"},
                     "min_convergent_seeds": min_convergent,
                     "max_seeds": args.max_seeds,
                     "seeds_tried": [r.get("seed") for r in seed_report],
                     "convergent_count": convergent_count,
                     "convergent_seeds": convergent_seeds,
                     "best_seed": best_seed,
+                    "base_seed": best_seed,
+                    "final_model_source": "best_seed",
                     "best_selection_score": best_score,
                     "best_seed_selection_strategy": selection_strategy,
                     "early_stop_reason": early_stop_reason,
                     "runs": seed_report,
                 }
+                if component_seed_summary is not None:
+                    component_seed_fragment = strip_component_prefix(
+                        format_component_seed_summary_fragment(
+                            component_seed_summary,
+                            show_blockers=True,
+                        )
+                    )
+                    stitching_reason = (
+                        "component convergence policy not satisfied"
+                        if not bool(component_seed_summary.get("converged"))
+                        else "no selected component sources available"
+                    )
+                    if component_seed_summary.get("selected_components"):
+                        component_stitching = {
+                            "applied": False,
+                            "status": "pending",
+                            "reason": "component convergence policy satisfied; stitching will be attempted",
+                            "component_convergence": component_seed_fragment,
+                        }
+                        component_seed_summary["stitched"] = False
+                        component_seed_summary["stitching_status"] = "pending"
+                    else:
+                        component_stitching = {
+                            "applied": False,
+                            "status": "skipped",
+                            "reason": stitching_reason,
+                            "component_convergence": component_seed_fragment,
+                            "missing_component_ids": list(component_seed_summary.get("missing_component_ids") or []),
+                        }
+                        component_seed_summary["stitched"] = False
+                        component_seed_summary["stitching_status"] = "skipped"
+                        component_seed_summary["stitching_reason"] = stitching_reason
+                    report["component_seed_summary"] = component_seed_summary
+                    report["component_stitching"] = component_stitching
                 if seed_stability is not None:
                     report["topk_stability"] = seed_stability
+                report_path = os.path.join(seed_runs_dir, "seed_report.json")
                 try:
-                    report_path = os.path.join(seed_runs_dir, "seed_report.json")
                     with open(report_path, "w") as f:
                         json.dump(report, f, indent=2)
                     if not is_under_temp_dir(report_path):
@@ -1965,17 +2293,195 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 if not is_under_temp_dir(output_dir):
                     logger.info("Selected best seed=%s -> %s", best_seed, output_dir)
 
+                canonical_stitched_run_info: Optional[Dict[str, Any]] = None
+                if component_seed_summary is not None and component_seed_summary.get("selected_components"):
+                    try:
+                        component_sources: Dict[str, Any] = {}
+                        component_state_sources: Dict[str, Any] = {}
+                        loaded_source_models: Dict[str, Any] = {}
+                        source_seed_by_component: Dict[str, Any] = {}
+                        source_step_by_component: Dict[str, Any] = {}
+                        source_run_infos_by_component: Dict[str, Dict[str, Any]] = {}
+                        component_best_payloads: Dict[str, Optional[Dict[str, Any]]] = {}
+                        self._model_instance = None
+                        target_model = self.load_model(output_dir, use_cache=False)
+                        for component_id, selection in component_seed_summary["selected_components"].items():
+                            component_key = str(component_id)
+                            source_path = selection.get("output_dir")
+                            if not isinstance(source_path, str):
+                                raise ValueError(
+                                    f"Component {component_id!r} has no source output_dir for stitching"
+                                )
+                            source_run_info = trainer_stats.load_training_stats(source_path)
+                            if isinstance(source_run_info, dict):
+                                source_run_infos_by_component[component_key] = source_run_info
+                            selected_step = (
+                                selection.get("global_step")
+                                or selection.get("best_component_global_step")
+                            )
+                            source_seed_by_component[component_key] = selection.get("seed")
+                            source_step_by_component[component_key] = selected_step
+
+                            payload = component_best_payloads.get(source_path)
+                            if source_path not in component_best_payloads:
+                                payload = load_component_best_states(source_path)
+                                component_best_payloads[source_path] = payload
+                            entry = None
+                            if isinstance(payload, dict):
+                                components = payload.get("components")
+                                if isinstance(components, dict):
+                                    entry = components.get(component_key)
+                            if isinstance(entry, dict):
+                                entry_step = entry.get("global_step")
+                                if selected_step is not None and entry_step != selected_step:
+                                    raise ValueError(
+                                        f"Component {component_key!r} selected step {selected_step}, "
+                                        f"but component-best tensor state has step {entry_step}. "
+                                        "Retrain this seed with component-best state capture enabled."
+                                    )
+                                entry = dict(entry)
+                                entry["seed"] = selection.get("seed")
+                                entry["output_dir"] = source_path
+                                component_state_sources[component_key] = entry
+                                continue
+
+                            aggregate_best_step = (
+                                (source_run_info or {}).get("best_score_checkpoint") or {}
+                            ).get("global_step")
+                            if selected_step != aggregate_best_step:
+                                raise ValueError(
+                                    f"Component {component_key!r} selected step {selected_step}, "
+                                    f"but {source_path} only has aggregate best checkpoint step "
+                                    f"{aggregate_best_step}. Retrain with use_cache=False so "
+                                    "component-best tensor states are written."
+                                )
+                            source_model = loaded_source_models.get(source_path)
+                            if source_model is None:
+                                source_model = (
+                                    target_model
+                                    if os.path.normpath(source_path) == os.path.normpath(best_path)
+                                    else self.load_model(source_path, use_cache=False)
+                                )
+                                loaded_source_models[source_path] = source_model
+                            component_sources[component_key] = source_model
+                        stitch_rows = []
+                        if component_sources:
+                            stitch_rows.extend(stitch_gradiend_components(target_model, component_sources))
+                        if component_state_sources:
+                            stitch_rows.extend(stitch_gradiend_component_states(target_model, component_state_sources))
+                        base_run_info = trainer_stats.load_training_stats(best_path)
+                        selected_component_training = build_stitched_component_training_run(
+                            component_seed_summary["selected_components"],
+                            source_run_infos_by_component,
+                            base_run_info=base_run_info,
+                        )
+                        canonical_stitched_run_info = selected_component_training
+                        target_model.save_pretrained(output_dir)
+                        report["component_stitching"] = {
+                            "applied": True,
+                            "status": "applied",
+                            "reason": None,
+                            "n_components": len(stitch_rows),
+                            "component_convergence": strip_component_prefix(
+                                format_component_seed_summary_fragment(
+                                    component_seed_summary,
+                                    show_blockers=True,
+                                )
+                            ),
+                            "source_seed_by_component": source_seed_by_component,
+                            "source_step_by_component": source_step_by_component,
+                            "rows": stitch_rows,
+                        }
+                        report["component_seed_summary"]["stitched"] = True
+                        report["component_seed_summary"]["stitching_status"] = "applied"
+                        report["component_seed_summary"].pop("stitching_reason", None)
+                        report["component_seed_summary"]["stitch_rows"] = stitch_rows
+                        report["final_model_source"] = "component_stitched"
+                        with open(report_path, "w") as f:
+                            json.dump(report, f, indent=2)
+                        stitched_method_name = getattr(
+                            getattr(target_model, "gradiend", None),
+                            "method_name",
+                            "GRADIEND",
+                        )
+                        logger.info(
+                            "Component stitching applied: stitched %s %s component(s) into selected multi-seed model at %s.",
+                            len(stitch_rows),
+                            stitched_method_name,
+                            output_dir,
+                        )
+                    except Exception as e:
+                        report["component_stitching"] = {
+                            "applied": False,
+                            "status": "failed",
+                            "reason": str(e),
+                            "component_convergence": strip_component_prefix(
+                                format_component_seed_summary_fragment(
+                                    component_seed_summary,
+                                    show_blockers=True,
+                                )
+                            ),
+                        }
+                        report["component_seed_summary"]["stitched"] = False
+                        report["component_seed_summary"]["stitching_status"] = "failed"
+                        report["component_seed_summary"]["stitching_reason"] = str(e)
+                        try:
+                            with open(report_path, "w") as f:
+                                json.dump(report, f, indent=2)
+                        except Exception as write_error:
+                            logger.debug("Could not write failed component stitching status: %s", write_error)
+                        logger.warning("Component stitching failed; keeping selected best seed model: %s", e)
+                    finally:
+                        self._model_instance = None
+                        _clear_seed_gpu_state()
+                elif component_seed_summary is not None:
+                    logger.info(
+                        "Component stitching skipped: %s.",
+                        report.get("component_stitching", {}).get("component_convergence")
+                        or report.get("component_stitching", {}).get("reason"),
+                    )
+
                 # Clear cached model so the next get_model() loads from output_dir (the selected best seed).
                 # That first load is then cached; subsequent get_model() calls reuse the same instance.
                 self._model_arg = output_dir
                 self._model_instance = None
+                method_name = _checkpoint_gradiend_method_name(output_dir)
 
                 # Check convergence and warn if non-convergent
-                if convergent_count == 0 and min_convergent is not None and min_convergent > 0:
+                component_seed_fragment = format_component_seed_summary_fragment(
+                    component_seed_summary,
+                    show_blockers=True,
+                )
+                stitching_fragment = format_component_stitching_fragment(report.get("component_stitching"))
+                stitching_suffix = f" Stitching status: {stitching_fragment}." if stitching_fragment else ""
+                if (
+                    component_seed_summary is not None
+                    and component_seed_fragment
+                    and not bool(component_seed_summary.get("converged"))
+                    and min_convergent is not None
+                    and min_convergent > 0
+                ):
                     logger.warning(
-                        "Multi-seed training completed but no seeds converged: "
-                        "convergent_count=0 (required: %s) for metric=%s threshold=%.4f. "
+                        "Multi-seed component-split %s did not converge: "
+                        "%s; convergence policy requires at least %s convergent seed(s) for every component "
+                        "for metric=%s threshold=%.4f.%s",
+                        method_name,
+                        strip_component_prefix(component_seed_fragment),
+                        min_convergent,
+                        convergent_metric,
+                        threshold if threshold is not None else 0.0,
+                        stitching_suffix,
+                    )
+                elif (
+                    min_convergent is not None
+                    and min_convergent > 0
+                    and convergent_count < min_convergent
+                ):
+                    logger.warning(
+                        "Multi-seed training completed but too few seeds converged: "
+                        "convergent_count=%s (required: %s) for metric=%s threshold=%.4f. "
                         "Model may not have reached the convergence threshold during training.",
+                        convergent_count,
                         min_convergent,
                         convergent_metric,
                         threshold if threshold is not None else 0.0,
@@ -1990,6 +2496,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     pair=getattr(self, "pair", None),
                     output_dir=output_dir,
                     seed_report=seed_report,
+                    component_seed_summary=component_seed_summary,
                     convergence_metric=convergent_metric,
                     threshold=threshold,
                 )
@@ -2011,7 +2518,11 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     None,
                 )
                 convergence_info = {
-                    "converged": convergent_count > 0 if min_convergent is not None and min_convergent > 0 else True,
+                    "converged": (
+                        convergent_count >= min_convergent
+                        if min_convergent is not None and min_convergent > 0
+                        else True
+                    ),
                     "convergent_count": convergent_count,
                     "min_convergent_seeds": min_convergent,
                     "convergence_metric": convergent_metric,
@@ -2020,16 +2531,51 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     "convergent_min_target_class_abs_mean": (
                         best_run.get("convergent_min_target_class_abs_mean") if isinstance(best_run, dict) else None
                     ),
+                    "auc_positive_target_mean_required": convergent_metric in {"roc_auc", "min_auc_n_o"},
+                    "convergent_positive_target_class_mean": (
+                        best_run.get("convergent_positive_target_class_mean")
+                        if isinstance(best_run, dict)
+                        else None
+                    ),
+                    "convergent_positive_target_class_mean_ok": (
+                        best_run.get("convergent_positive_target_class_mean_ok")
+                        if isinstance(best_run, dict)
+                        else True
+                    ),
                 }
+                if component_seed_summary is not None:
+                    convergence_info["convergence_unit"] = "component_seed"
+                    convergence_info["component_seed_summary"] = component_seed_summary
+                    if isinstance(report.get("component_stitching"), dict):
+                        convergence_info["component_stitching"] = report["component_stitching"]
                 if seed_stability is not None:
                     convergence_info["topk_stability"] = seed_stability
                 try:
                     stats = trainer_stats.load_training_stats(output_dir)
                     if stats:
+                        write_training_stats_payload = stats.get("training_stats", {})
+                        write_best_checkpoint = stats.get("best_score_checkpoint", {})
+                        component_stitching = report.get("component_stitching")
+                        if (
+                            isinstance(canonical_stitched_run_info, dict)
+                            and isinstance(canonical_stitched_run_info.get("training_stats"), dict)
+                        ):
+                            write_training_stats_payload = canonical_stitched_run_info["training_stats"]
+                            if isinstance(canonical_stitched_run_info.get("best_score_checkpoint"), dict):
+                                write_best_checkpoint = canonical_stitched_run_info["best_score_checkpoint"]
+                        elif isinstance(component_stitching, dict) and bool(component_stitching.get("applied")):
+                            write_training_stats_payload = {
+                                "component_stitching_note": (
+                                    "No merged component training history is available. "
+                                    "Copied seed aggregate stats were omitted because they do not describe "
+                                    "the stitched model."
+                                )
+                            }
+                            write_best_checkpoint = {}
                         trainer_stats.write_training_stats(
                             output_dir,
-                            training_stats=stats.get("training_stats", {}),
-                            best_score_checkpoint=stats.get("best_score_checkpoint", {}),
+                            training_stats=write_training_stats_payload,
+                            best_score_checkpoint=write_best_checkpoint,
                             training_args=stats.get("training_args", {}),
                             time_stats=stats.get("time"),
                             losses=stats.get("losses"),
@@ -2045,8 +2591,13 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     for seed_value, seed_path in seed_results.items():
                         _cleanup_seed_model_files(seed_path)
                 elif saved_seed_runs == "all_convergent":
+                    stitched_seed_set = {
+                        int(selection["seed"])
+                        for selection in (component_seed_summary or {}).get("selected_components", {}).values()
+                        if isinstance(selection, dict) and isinstance(selection.get("seed"), int)
+                    }
                     for seed_value, seed_path in seed_results.items():
-                        if int(seed_value) not in convergent_seed_set:
+                        if int(seed_value) not in convergent_seed_set and int(seed_value) not in stitched_seed_set:
                             _cleanup_seed_model_files(seed_path)
                 elif saved_seed_runs != "all_tried":
                     raise ValueError(
@@ -2397,6 +2948,16 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         self,
         lrs: Optional[Sequence[float]] = None,
         feature_factors: Optional[Sequence[float]] = None,
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Any] = None,
+        threshold: Optional[float] = None,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: Optional[float] = None,
+        intervention_kwargs: Optional[Mapping[str, Any]] = None,
+        output_path: Optional[str] = None,
+        raw_output_path: Optional[str] = None,
         use_cache: Optional[bool] = None,
         split: EncoderSplit = "test",
         max_size: Optional[int] = None,
@@ -2415,6 +2976,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         plot_kwargs: Optional[Dict[str, Any]] = None,
         decoder_lms_mode: Optional[str] = None,
         device: Optional[Any] = None,
+        refine_points: int = DEFAULT_DECODER_REFINE_POINTS,
     ) -> Dict[str, Any]:
         """
         Run decoder grid evaluation for one direction (strengthen or weaken).
@@ -2428,6 +2990,24 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 `TrainingArguments.decoder_eval_lrs`.
             feature_factors: Optional sequence of feature factors to evaluate. If None, defaults are taken
                 from `TrainingArguments.decoder_eval_feature_factors`.
+            token_selector: Optional intervention token selector forwarded to
+                :meth:`ModelWithGradiend.intervene`. Defaults to the historical
+                decoder-eval selector ``"encoder_direction"``.
+            activation_gate: Optional ACTIEND encoder gate composed with the token selector.
+            activation_modules: Optional ACTIEND activation module filter.
+            threshold: Optional encoder selector threshold.
+            direction: Optional encoder-direction value.
+            target_encoding: Optional encoder-range target value.
+            tolerance: Optional encoder-range tolerance.
+            intervention_kwargs: Additional low-level intervention kwargs. Direct
+                parameters above override matching keys in this mapping.
+            output_path: Optional explicit decoder-grid cache path. Useful when
+                evaluating several intervention application policies that should
+                not share one cache file.
+            raw_output_path: Optional CSV path for per-sample decoder probabilities
+                for every evaluated grid entry. When omitted and
+                `decoder_eval_export_row_wise_csv=True`, a path is derived from
+                `output_path`/the decoder grid cache path.
             use_cache: If True, reuse cached decoder grid results when available under experiment_dir.
                 If None, defaults are taken from `TrainingArguments.use_cache` (default: False).
             split: Dataset split used for training-like decoder evaluation rows. A single name
@@ -2473,6 +3053,10 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 :meth:`cpu`) or released via :meth:`unload_model`, call :meth:`cuda` /
                 :meth:`get_model` yourself or pass an explicit device; a warning is logged
                 when evaluation runs on CPU while CUDA is available.
+            refine_points: Number of extra LMS-boundary bisection points per target class
+                (default ``DEFAULT_DECODER_REFINE_POINTS`` = 0, i.e. the requested grid is used
+                as is). See ``Evaluator.evaluate_decoder``'s ``refine_points`` docstring for the
+                algorithm and its assumptions/skip conditions.
 
         Returns:
             Dict with flattened decoder summaries. For strengthen, keys like dec["3SG"]; for weaken,
@@ -2538,6 +3122,16 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     result = self.evaluator.evaluate_decoder(
                         lrs=lrs,
                         feature_factors=feature_factors,
+                        token_selector=token_selector,
+                        activation_gate=activation_gate,
+                        activation_modules=activation_modules,
+                        threshold=threshold,
+                        direction=direction,
+                        target_encoding=target_encoding,
+                        tolerance=tolerance,
+                        intervention_kwargs=intervention_kwargs,
+                        output_path=output_path,
+                        raw_output_path=raw_output_path,
                         use_cache=use_cache,
                         split=split,
                         max_size=max_size,
@@ -2555,6 +3149,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         show=show,
                         plot_kwargs=plot_kwargs,
                         model_with_gradiend=eval_model,
+                        refine_points=refine_points,
                     )
                     runtime_monitor.mark("trainer:evaluate_decoder:done")
                     return result
@@ -2668,6 +3263,15 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             validate_source_target("source", source)
 
         resolved_encoder_df = _resolve_encoder_df(encoder_df)
+        component_df_out: Optional[pd.DataFrame] = None
+        if isinstance(encoder_df, dict) and "component_df" in encoder_df:
+            raw_component_df = encoder_df["component_df"]
+            if raw_component_df is not None and not isinstance(raw_component_df, pd.DataFrame):
+                raise TypeError(
+                    "evaluate_encoder(encoder_df=...): dict key 'component_df' must be a DataFrame or None, "
+                    f"got {type(raw_component_df).__name__}"
+                )
+            component_df_out = raw_component_df
         if resolved_encoder_df is not None:
             encoder_df_out = resolved_encoder_df
         else:
@@ -2703,6 +3307,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                         plot=False,
                         **kwargs,
                     )
+                    component_df_out = getattr(self, "_last_encoder_component_df", None)
                     runtime_monitor.mark("trainer:evaluate_encoder:analyze:done", split=split, max_size=max_size)
                 except BaseException as exc:
                     if is_cuda_oom_error(exc):
@@ -2714,6 +3319,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             try:
                 result = self.evaluator.evaluate_encoder(
                     encoder_df=encoder_df_out,
+                    component_df=component_df_out,
                     use_cache=use_cache,
                     split=split,
                     max_size=max_size,
@@ -2727,6 +3333,8 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 raise
         if return_df:
             result["encoder_df"] = encoder_df_out
+            if component_df_out is not None:
+                result["component_df"] = component_df_out
         if plot:
             try:
                 plot_args = dict(plot_kwargs or {})
@@ -2752,10 +3360,91 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                     plot_args["show"] = True
                 if hasattr(self, "config") and getattr(self.config, "img_format", None) is not None:
                     plot_args.setdefault("img_format", self.config.img_format)
-                self.plot_encoder_distributions(encoder_df=encoder_df_out, **plot_args)
+                plot_path = self.plot_encoder_distributions(encoder_df=encoder_df_out, **plot_args)
+                component_plot_paths = plot_encoder_component_artifacts(
+                    trainer=self,
+                    component_df=component_df_out,
+                    components=result.get("components") if isinstance(result, dict) else None,
+                    output=plot_path or plot_args.get("output"),
+                    show=False,
+                    img_format=plot_args.get("img_format", "png"),
+                    dpi=plot_args.get("dpi"),
+                    plot_kwargs=plot_args,
+                )
+                if component_plot_paths:
+                    result["component_plot_paths"] = component_plot_paths
             except ImportError as e:
                 logger.warning("Skipping encoder distribution plot: %s", e)
         return result
+
+    def resolve_neutral_encoding_baseline(
+        self,
+        *,
+        encoder_stats: Optional[Dict[str, Any]] = None,
+        encoder_df: Optional[pd.DataFrame] = None,
+        component_df: Optional[pd.DataFrame] = None,
+        component: Optional[Union[str, int]] = None,
+        split: EncoderSplit = "test",
+        max_size: Optional[int] = None,
+        use_cache: Optional[bool] = True,
+        **kwargs: Any,
+    ) -> float:
+        """
+        Resolve the encoded value that should receive the neutral color.
+
+        Neutral centering is trainer-owned because the trainer knows how neutral
+        encoder rows are produced, cached, and represented. For component-split
+        models, passing ``component`` selects the matching component rows before
+        averaging neutral encodings.
+        """
+        if encoder_df is None:
+            if encoder_stats is None:
+                encoder_stats = self.evaluate_encoder(
+                    split=split,
+                    max_size=max_size,
+                    use_cache=use_cache,
+                    return_df=True,
+                    plot=False,
+                    **kwargs,
+                )
+            if isinstance(encoder_stats, dict):
+                maybe_df = encoder_stats.get("encoder_df")
+                if isinstance(maybe_df, pd.DataFrame):
+                    encoder_df = maybe_df
+                maybe_component_df = encoder_stats.get("component_df")
+                if isinstance(maybe_component_df, pd.DataFrame):
+                    component_df = maybe_component_df
+
+        selected_df = encoder_df
+        if component is not None and component_df is not None and not component_df.empty:
+            selected_df = component_df
+            if isinstance(component, int):
+                selected_df = selected_df[selected_df.get("component_index") == int(component)]
+            else:
+                key = str(component)
+                component_id = selected_df.get("component_id")
+                component_label = selected_df.get("component_label")
+                mask = pd.Series(False, index=selected_df.index)
+                if component_id is not None:
+                    mask = mask | (component_id.astype(str) == key)
+                if component_label is not None:
+                    mask = mask | (component_label.astype(str) == key)
+                selected_df = selected_df[mask]
+
+        if selected_df is not None and not selected_df.empty and "encoded" in selected_df.columns:
+            row_type = selected_df["type"].astype(str) if "type" in selected_df.columns else pd.Series("", index=selected_df.index)
+            neutral_rows = selected_df[row_type.str.startswith("neutral")]
+            if not neutral_rows.empty:
+                return float(neutral_rows["encoded"].astype(float).mean())
+
+        if isinstance(encoder_stats, dict):
+            neutral_means = encoder_stats.get("neutral_mean_by_type") or {}
+            if neutral_means:
+                values = [float(value) for value in neutral_means.values()]
+                return float(sum(values) / len(values))
+
+        logger.warning("Could not resolve neutral encoder baseline; falling back to 0.0.")
+        return 0.0
 
     def get_training_stats(self, model_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Load training stats; default model_path to current trainer model path."""
@@ -2796,6 +3485,123 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         path = model_path if model_path is not None else self.model_path
         return super().get_encoder_metrics(path, encoder_df=encoder_df, **kwargs)
 
+    def _select_decoder_summaries(
+        self,
+        decoder_results: Optional[Dict[str, Any]],
+        target_class: Optional[Union[str, List[str]]],
+        increase_target_probabilities: bool,
+        decoder_stats_metric_name: Optional[str],
+        decoder_stats_kwargs: Dict[str, Any],
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return ``(summary_key, summary)`` per requested target class.
+
+        Loads ``decoder_results`` from the decoder cache under ``experiment_dir``
+        when omitted, then picks the strengthen (or ``*_weaken``) summary of each
+        requested class. Each summary carries the selected ``learning_rate`` and
+        ``feature_factor``.
+        """
+        if decoder_results is None:
+            experiment_dir = self.experiment_dir
+            if not experiment_dir:
+                raise ValueError(
+                    "decoder_results is required when experiment_dir is not set. "
+                    "Run evaluate_decoder() first or set experiment_dir on TrainingArguments."
+                )
+            load_metric = (
+                decoder_stats_metric_name
+                or (target_class[0] if isinstance(target_class, list) and target_class else target_class)
+                or "combined_score"
+            )
+            stats_file = resolve_decoder_stats_path(
+                experiment_dir,
+                metric_name=load_metric,
+                feature_factors=decoder_stats_kwargs.get("feature_factors"),
+                lrs=decoder_stats_kwargs.get("lrs"),
+                topk=decoder_stats_kwargs.get("topk"),
+                part=decoder_stats_kwargs.get("part"),
+                topk_part=decoder_stats_kwargs.get("topk_part"),
+            )
+            if not (stats_file and os.path.isfile(stats_file)):
+                raise ValueError(
+                    f"No decoder results cache found at {stats_file}. "
+                    "Run evaluate_decoder() first or provide decoder_results explicitly."
+                )
+            try:
+                decoder_results = read_decoder_stats_file(stats_file)
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load decoder results from cache at {stats_file}: {e}. "
+                    "Run evaluate_decoder() first or provide decoder_results explicitly."
+                ) from e
+
+        reserved = {"grid", "plot_path", "plot_paths"}
+        # Prefer the nested "summary" dict (evaluate_decoder format), fall back to top-level keys.
+        if isinstance(decoder_results.get("summary"), dict):
+            summary_source = decoder_results["summary"]
+        else:
+            summary_source = {k: v for k, v in decoder_results.items() if k not in reserved}
+        raw_keys: List[str] = [target_class] if isinstance(target_class, str) else (target_class or [])
+        if not raw_keys:
+            raise ValueError(
+                "target_class must be a non-empty string or list of strings present in decoder results. "
+                f"Available keys: {list(summary_source.keys())}"
+            )
+
+        selected: List[Tuple[str, Dict[str, Any]]] = []
+        for raw_key in raw_keys:
+            key = raw_key if increase_target_probabilities else f"{raw_key}_weaken"
+            summary = summary_source.get(key)
+            if not summary or "feature_factor" not in summary or "learning_rate" not in summary:
+                hint = ""
+                if not increase_target_probabilities and not key.endswith("_weaken"):
+                    hint = " evaluate_decoder currently only produces strengthen summaries."
+                raise ValueError(
+                    f"Decoder results do not contain summary for metric '{key}'. "
+                    f"Available keys: {list(summary_source.keys())}.{hint}"
+                )
+            selected.append((key, summary))
+        return selected
+
+    def _check_model_output_target(self, output_dir: Optional[str], n_models: int, *, verb: str) -> bool:
+        """Validate the save target; return whether the produced models should be saved."""
+        if output_dir is not None and not str(output_dir).strip():
+            raise ValueError(
+                f"Cannot save {verb} model: no output path. "
+                "Set experiment_dir on TrainingArguments or pass a non-empty output_dir."
+            )
+        should_save = output_dir is not None
+        if should_save and n_models > 1 and not (self.experiment_dir and str(self.experiment_dir).strip()):
+            raise ValueError(
+                f"Cannot save multiple {verb} models without experiment_dir. "
+                "Set experiment_dir on TrainingArguments (output_dir is only used for a single target_class)."
+            )
+        return should_save
+
+    def _save_produced_models(
+        self,
+        models: Sequence[Any],
+        selected: Sequence[Tuple[str, Dict[str, Any]]],
+        output_dir: Optional[str],
+        *,
+        verb: str,
+        prefer_modified_saver: bool,
+    ) -> Union[str, List[str]]:
+        saved_paths: List[str] = []
+        for model, (key, summary) in zip(models, selected):
+            explicit = output_dir if len(selected) == 1 else None
+            key_output_dir = require_output_path(
+                self.experiment_dir, explicit, ARTIFACT_MODEL_CHANGED, target_class=key
+            )
+            os.makedirs(key_output_dir, exist_ok=True)
+            saver = getattr(model, "save_pretrained_modified", None) if prefer_modified_saver else None
+            (saver or model.save_pretrained)(key_output_dir)
+            logger.info(
+                "Saved %s model to %s (feature_factor=%s, lr=%s, metric=%s)",
+                verb, key_output_dir, summary["feature_factor"], summary["learning_rate"], key,
+            )
+            saved_paths.append(key_output_dir)
+        return saved_paths[0] if len(saved_paths) == 1 else saved_paths
+
     def rewrite_base_model(
         self,
         decoder_results: Optional[Dict[str, Any]] = None,
@@ -2808,6 +3614,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
     ) -> Union[Any, List[Any], str, List[str]]:
         """
         Rewrite the base model by applying GRADIEND decoder updates based on decoder evaluation results.
+
+        This is the weight-space (gradient-signal) path. Use :meth:`modify_model` for
+        activation-signal (ACTIEND) models or to control the intervention application policy.
 
         The decoder evaluation selects a feature factor and learning rate per target class and direction
         (strengthening vs weakening). This method applies the selected config: by default it strengthens
@@ -2858,121 +3667,90 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 "Base model is required to rewrite base model. "
                 "Provide a ModelWithGradiend instance or ensure the trainer has a valid model path."
             )
-
-        if decoder_results is None:
-            experiment_dir = self.experiment_dir
-            if not experiment_dir:
-                raise ValueError(
-                    "decoder_results is required when experiment_dir is not set. "
-                    "Run evaluate_decoder() first or set experiment_dir on TrainingArguments."
-                )
-            load_metric = (
-                decoder_stats_metric_name
-                or (target_class[0] if isinstance(target_class, list) and target_class else target_class)
-                or "combined_score"
-            )
-            stats_file = resolve_decoder_stats_path(
-                experiment_dir,
-                metric_name=load_metric,
-                feature_factors=decoder_stats_kwargs.get("feature_factors"),
-                lrs=decoder_stats_kwargs.get("lrs"),
-                topk=decoder_stats_kwargs.get("topk"),
-                part=decoder_stats_kwargs.get("part"),
-                topk_part=decoder_stats_kwargs.get("topk_part"),
-            )
-            if stats_file and os.path.isfile(stats_file):
-                try:
-                    decoder_results = read_decoder_stats_file(stats_file)
-                except Exception as e:
-                    raise ValueError(
-                        f"Failed to load decoder results from cache at {stats_file}: {e}. "
-                        "Run evaluate_decoder() first or provide decoder_results explicitly."
-                    )
-            else:
-                raise ValueError(
-                    f"No decoder results cache found at {stats_file}. "
-                    "Run evaluate_decoder() first or provide decoder_results explicitly."
-                )
-
-        _reserved = {"grid", "plot_path", "plot_paths"}
-        # Prefer nested \"summary\" dict (evaluate_decoder typical format), fall back to top-level keys.
-        if isinstance(decoder_results.get("summary"), dict):
-            summary_source = decoder_results["summary"]
-        else:
-            summary_source = {k: v for k, v in decoder_results.items() if k not in _reserved}
-        raw_keys: List[str] = (
-            [target_class] if isinstance(target_class, str) else (target_class or [])
+        selected = self._select_decoder_summaries(
+            decoder_results,
+            target_class,
+            increase_target_probabilities,
+            decoder_stats_metric_name,
+            decoder_stats_kwargs,
         )
-        if not raw_keys:
-            raise ValueError(
-                "target_class must be a non-empty string or list of strings present in decoder results. "
-                f"Available keys: {list(summary_source.keys())}"
+        should_save = self._check_model_output_target(output_dir, len(selected), verb="rewritten")
+        rewritten_models = [
+            base_model.rewrite_base_model(
+                learning_rate=summary["learning_rate"],
+                feature_factor=summary["feature_factor"],
             )
-        keys_to_process: List[str] = [
-            k if increase_target_probabilities else f"{k}_weaken" for k in raw_keys
+            for _key, summary in selected
         ]
-
-        # When output_dir is passed but empty, user intended to save but gave no path
-        if output_dir is not None and not str(output_dir).strip():
-            raise ValueError(
-                "Cannot save rewritten model: no output path. "
-                "Set experiment_dir on TrainingArguments or pass a non-empty output_dir to rewrite_base_model."
-            )
-
-        # Check if we need to save
-        should_save = output_dir is not None and str(output_dir).strip()
         if should_save:
-            has_experiment_dir = bool(self.experiment_dir and str(self.experiment_dir).strip())
-            has_output_dir = bool(output_dir is not None and str(output_dir).strip())
-            if not has_experiment_dir and not has_output_dir:
-                raise ValueError(
-                    "Cannot save rewritten model: no output path. "
-                    "Set experiment_dir on TrainingArguments or pass output_dir to rewrite_base_model."
-                )
-            if len(keys_to_process) > 1 and not has_experiment_dir:
-                raise ValueError(
-                    "Cannot save multiple rewritten models without experiment_dir. "
-                    "Set experiment_dir on TrainingArguments (output_dir is only used for a single target_class)."
-                )
-
-        rewritten_models: List[Any] = []
-        for key in keys_to_process:
-            summary = summary_source.get(key)
-            if not summary or "feature_factor" not in summary or "learning_rate" not in summary:
-                hint = ""
-                if not increase_target_probabilities and not key.endswith("_weaken"):
-                    hint = " evaluate_decoder currently only produces strengthen summaries."
-                raise ValueError(
-                    f"Decoder results do not contain summary for metric '{key}'. "
-                    f"Available keys: {list(summary_source.keys())}.{hint}"
-                )
-            feature_factor = summary["feature_factor"]
-            lr = summary["learning_rate"]
-            rewritten = base_model.rewrite_base_model(
-                learning_rate=lr,
-                feature_factor=feature_factor,
+            return self._save_produced_models(
+                rewritten_models, selected, output_dir, verb="rewritten", prefer_modified_saver=False
             )
-            rewritten_models.append(rewritten)
-
-        # Save if output_dir was provided
-        if should_save:
-            saved_paths: List[str] = []
-            for i, key in enumerate(keys_to_process):
-                summary = summary_source.get(key)
-                feature_factor = summary["feature_factor"]
-                lr = summary["learning_rate"]
-                explicit = output_dir if len(keys_to_process) == 1 else None
-                key_output_dir = require_output_path(
-                    self.experiment_dir, explicit, ARTIFACT_MODEL_CHANGED, target_class=key
-                )
-                os.makedirs(key_output_dir, exist_ok=True)
-                rewritten_models[i].save_pretrained(key_output_dir)
-                logger.info(
-                    f"Saved rewritten model to {key_output_dir} "
-                    f"(feature_factor={feature_factor}, lr={lr}, metric={key})"
-                )
-                saved_paths.append(key_output_dir)
-            return saved_paths[0] if len(saved_paths) == 1 else saved_paths
-
-        # Return models in memory
         return rewritten_models[0] if len(rewritten_models) == 1 else rewritten_models
+
+    def modify_model(
+        self,
+        decoder_results: Optional[Dict[str, Any]] = None,
+        target_class: Optional[Union[str, List[str]]] = None,
+        increase_target_probabilities: bool = True,
+        output_dir: Optional[str] = None,
+        base_model: Optional[Any] = None,
+        decoder_stats_metric_name: Optional[str] = None,
+        token_selector: Optional[Any] = None,
+        activation_gate: Optional[Any] = None,
+        activation_modules: Optional[Any] = None,
+        threshold: float = 0.5,
+        direction: Optional[Any] = None,
+        target_encoding: Optional[Any] = None,
+        tolerance: float = 0.2,
+        **decoder_stats_kwargs: Any,
+    ) -> Union[Any, List[Any], str, List[str]]:
+        """
+        Preferred name for producing GRADIEND/ACTIEND-modified models.
+
+        This mirrors ``rewrite_base_model`` for decoder-result selection, but
+        dispatches to ``ModelWithGradiend.modify_model`` when available. The
+        intervention application parameters (for example ``token_selector``,
+        ``activation_gate``, and ``activation_modules``) are forwarded to that
+        modifier, so a model persisted here uses the same hook policy that was
+        evaluated by ``evaluate_decoder``. Hooked ACTIEND models are saved with
+        ``save_pretrained_modified`` so their fixed steering vectors and hook
+        wiring can be loaded independently of the GRADIEND checkpoint.
+        """
+        if base_model is None:
+            base_model = self.get_model()
+        if base_model is None:
+            raise ValueError(
+                "Base model is required to modify model. "
+                "Provide a ModelWithGradiend instance or ensure the trainer has a valid model path."
+            )
+        selected = self._select_decoder_summaries(
+            decoder_results,
+            target_class,
+            increase_target_probabilities,
+            decoder_stats_metric_name,
+            decoder_stats_kwargs,
+        )
+        should_save = self._check_model_output_target(output_dir, len(selected), verb="modified")
+        modifier = getattr(base_model, "modify_model", None) or getattr(base_model, "rewrite_base_model")
+        modified_models: List[Any] = []
+        for _key, summary in selected:
+            modify_kwargs = dict(
+                learning_rate=summary["learning_rate"],
+                feature_factor=summary["feature_factor"],
+                token_selector=token_selector,
+                threshold=threshold,
+                direction=direction,
+                target_encoding=target_encoding,
+                tolerance=tolerance,
+            )
+            if activation_gate is not None:
+                modify_kwargs["activation_gate"] = activation_gate
+            if activation_modules is not None:
+                modify_kwargs["activation_modules"] = activation_modules
+            modified_models.append(modifier(**modify_kwargs))
+        if should_save:
+            return self._save_produced_models(
+                modified_models, selected, output_dir, verb="modified", prefer_modified_saver=True
+            )
+        return modified_models[0] if len(modified_models) == 1 else modified_models

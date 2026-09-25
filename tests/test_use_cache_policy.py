@@ -21,6 +21,8 @@ from gradiend.trainer.core.cache_policy import (
     should_reuse_training_cache,
 )
 from gradiend.trainer.core.feature_definition import FeatureLearningDefinition
+from gradiend.trainer.core.signals import Signal, SignalScope
+from gradiend.gradiend_split import GradiendSplit
 from gradiend.util.paths import has_saved_model, should_use_cached
 
 _WORKSPACE_TMP = os.path.join(os.path.dirname(__file__), "..", ".pytest_tmp_use_cache_policy")
@@ -69,6 +71,29 @@ def _matching_source_args(*, use_cache) -> tuple[TrainingArguments, dict]:
     fingerprint = build_training_cache_fingerprint(args)
     fingerprint["gradiend_input_dim"] = 64
     return args, fingerprint
+
+
+def test_training_cache_fingerprint_includes_init_fan_in_floor():
+    args = TrainingArguments(init_fan_in_floor=10_000)
+
+    fingerprint = build_training_cache_fingerprint(args)
+    legacy_fingerprint = build_training_cache_fingerprint({
+        "source": "alternative",
+        "target": "diff",
+    })
+
+    assert fingerprint["init_fan_in_floor"] == 10_000
+    assert "init_fan_in_floor" not in legacy_fingerprint
+
+
+def test_training_cache_fingerprint_includes_neutral_identity_toggle_only_when_enabled():
+    default_fp = build_training_cache_fingerprint(TrainingArguments())
+    disabled_fp = build_training_cache_fingerprint(
+        TrainingArguments(add_neutral_identity_transitions=False)
+    )
+
+    assert default_fp["add_neutral_identity_transitions"] is True
+    assert "add_neutral_identity_transitions" not in disabled_fp
 
 
 @pytest.mark.parametrize(
@@ -162,6 +187,125 @@ def test_should_reuse_seed_training_cache_policy_matrix(use_cache, fp_matches, c
         should_reuse_seed_training_cache(use_cache, seed_dir, training_args=args)
         is expected
     )
+
+
+def test_training_cache_fingerprint_includes_non_default_signal_and_scope():
+    args = TrainingArguments(
+        use_cache=True,
+        signal=Signal.activation(token_selector="prediction"),
+        signal_scope=SignalScope.from_values(activation_sites=["embeddings", "encoder.layer.*"]),
+    )
+
+    fingerprint = build_training_cache_fingerprint(args)
+
+    assert fingerprint["signals"] == [
+        {
+            "kind": "activation",
+            "name": None,
+            "options": {"token_selector": "prediction"},
+        }
+    ]
+    assert fingerprint["signal_scope"] == {
+        "params": None,
+        "activation_sites": ["embeddings", "encoder.layer.*"],
+    }
+
+
+def test_training_cache_fingerprint_includes_gradiend_split():
+    args = TrainingArguments(
+        use_cache=True,
+        gradiend_split=GradiendSplit.by_tensor(),
+    )
+
+    fingerprint = build_training_cache_fingerprint(args)
+
+    assert fingerprint["gradiend_split"] == {"mode": "tensors"}
+
+
+def test_training_cache_fingerprint_includes_implicit_gradient_signal_for_new_runs():
+    fingerprint = build_training_cache_fingerprint(TrainingArguments(use_cache=True))
+
+    assert fingerprint["signals"] == [
+        {
+            "kind": "gradient",
+            "name": None,
+            "options": {},
+        }
+    ]
+    assert "signal_scope" not in fingerprint
+
+
+def test_legacy_cache_without_signal_matches_default_gradient_signal():
+    temp = _temp_dir("legacy_gradient_signal")
+    model_dir = os.path.join(temp, "model")
+    args = TrainingArguments(use_cache=True)
+    legacy_fingerprint = build_training_cache_fingerprint(args)
+    legacy_fingerprint.pop("signals")
+    _write_saved_checkpoint(model_dir, input_dim=64, cache_fingerprint=legacy_fingerprint)
+
+    assert should_reuse_training_cache(True, model_dir, training_args=args)
+
+
+def test_activation_signal_cache_rejects_different_token_selector():
+    temp = _temp_dir("activation_signal")
+    model_dir = os.path.join(temp, "model")
+    saved_args = TrainingArguments(
+        use_cache=True,
+        signal=Signal.activation(token_selector="mask"),
+        signal_scope=SignalScope.from_values(activation_sites=["embeddings"]),
+    )
+    current_args = TrainingArguments(
+        use_cache=True,
+        signal=Signal.activation(token_selector="prediction"),
+        signal_scope=SignalScope.from_values(activation_sites=["embeddings"]),
+    )
+    _write_saved_checkpoint(
+        model_dir,
+        input_dim=64,
+        cache_fingerprint=build_training_cache_fingerprint(saved_args),
+    )
+
+    assert not should_reuse_training_cache(True, model_dir, training_args=current_args)
+
+
+def test_signal_scope_cache_rejects_different_params_scope():
+    temp = _temp_dir("params_scope")
+    model_dir = os.path.join(temp, "model")
+    saved_args = TrainingArguments(
+        use_cache=True,
+        signal_scope=SignalScope.from_values(params=["encoder.layer.0.*"]),
+    )
+    current_args = TrainingArguments(
+        use_cache=True,
+        signal_scope=SignalScope.from_values(params=["encoder.layer.1.*"]),
+    )
+    _write_saved_checkpoint(
+        model_dir,
+        input_dim=64,
+        cache_fingerprint=build_training_cache_fingerprint(saved_args),
+    )
+
+    assert not should_reuse_training_cache(True, model_dir, training_args=current_args)
+
+
+def test_gradiend_split_cache_rejects_different_split_mode():
+    temp = _temp_dir("gradiend_split")
+    model_dir = os.path.join(temp, "model")
+    saved_args = TrainingArguments(
+        use_cache=True,
+        gradiend_split=GradiendSplit.single(),
+    )
+    current_args = TrainingArguments(
+        use_cache=True,
+        gradiend_split=GradiendSplit.by_tensor(),
+    )
+    _write_saved_checkpoint(
+        model_dir,
+        input_dim=64,
+        cache_fingerprint=build_training_cache_fingerprint(saved_args),
+    )
+
+    assert not should_reuse_training_cache(True, model_dir, training_args=current_args)
 
 
 @pytest.mark.parametrize("use_cache", [True, USE_CACHE_ALWAYS, USE_CACHE_ONLY_CONVERGENT])

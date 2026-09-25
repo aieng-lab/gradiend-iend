@@ -341,6 +341,27 @@ def demo_encoding_heatmap_style_kwargs(**overrides: object) -> Dict[str, object]
     return style
 
 
+def demo_encoding_std_heatmap_style_kwargs(
+    plot_style: Dict[str, object],
+) -> Dict[str, object]:
+    """Adapt a signed encoding style for non-negative seed dispersion values."""
+    std_style = dict(plot_style)
+    # Mean-matrix styles may carry explicit signed bounds and annotation formats.
+    # Let the heatmap resolve a zero-anchored upper bound from the dispersion data.
+    std_style.pop("vmin", None)
+    std_style.pop("vmax", None)
+    std_style.pop("fmt", None)
+    std_style.pop("annot_fmt", None)
+    std_style.update(
+        {
+            "percentages": True,
+            "cmap": "Reds",
+            "cbar_label": "Seed std. (%)",
+        }
+    )
+    return std_style
+
+
 def demo_encoding_heatmap_normalized_style_kwargs(**overrides: object) -> Dict[str, object]:
     """Row-normalized cross-encoding heatmaps: auto color scale (diagonal fixed at 100)."""
     style = demo_encoding_heatmap_style_kwargs(

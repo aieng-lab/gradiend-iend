@@ -46,7 +46,15 @@ def test_apply_vocabulary_held_out_split_assigns_all_splits():
     assert {"train", "validation", "test"}.issubset(splits)
 
 
-def test_train_sentiment_seed_controls_manual_split_seed(monkeypatch):
+def test_train_sentiment_seed_controls_training_args_seed(monkeypatch):
+    """``train()``'s ``seed`` must flow into the ``TrainingArguments`` used for the run.
+
+    ``train()`` now sources data from the published HF datasets (fixed
+    vocabulary-held-out ``split`` subset) rather than a local, seed-resplit
+    CSV, so ``seed`` no longer controls the train/validation/test split here
+    (that manual-split flow lives in ``train_multi_seed_heldout_targets``
+    instead). This only verifies the seed still reaches the trainer's args.
+    """
     captured = {}
 
     class DummyTrainer:
@@ -72,25 +80,21 @@ def test_train_sentiment_seed_controls_manual_split_seed(monkeypatch):
             captured["metrics_use_cache"] = use_cache
             return {}
 
-    def fake_load(_path, *, seed=0, **kwargs):
-        captured["split_seed"] = seed
-        return train_sentiment.apply_vocabulary_held_out_split(
-            _minimal_sentiment_merged(),
-            seed=seed,
-        )
-
     monkeypatch.setattr(train_sentiment, "TextPredictionTrainer", DummyTrainer)
-    monkeypatch.setattr(train_sentiment, "load_and_split_sentiment_training_data", fake_load)
+    monkeypatch.setattr(
+        train_sentiment,
+        "load_english_sentiment_neutral_data",
+        lambda *args, **kwargs: pd.DataFrame({"text": ["a neutral sentence"]}),
+    )
     monkeypatch.setattr(train_sentiment, "_evaluate_split_stability", lambda trainer, experiment_dir: None)
 
     train_sentiment.train(
-        training_path=Path("unused-test-path/training.csv"),
-        neutral_path=Path("unused-test-path/neutral.csv"),
         experiment_dir=Path("unused-test-path/runs"),
         seed=123,
+        max_steps=1,
+        train_batch_size=1,
     )
 
     assert captured["args"].seed == 123
-    assert captured["split_seed"] == 123
     assert captured["config"].split_col == "split"
     assert captured["trained"] is True

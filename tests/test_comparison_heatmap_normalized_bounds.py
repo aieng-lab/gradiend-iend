@@ -95,6 +95,34 @@ def test_anchor_aligned_encoding_uses_signed_bounds_and_coolwarm():
         plt.close("all")
 
 
+def test_anchor_aligned_seed_std_uses_zero_to_max_sequential_scale():
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("seaborn")
+    import matplotlib.pyplot as plt
+
+    try:
+        plot_comparison_heatmap(
+            {
+                "measure": "anchor_aligned_encoding_factual_seed_std",
+                "model_ids": ["A", "B"],
+                "column_ids": ["A", "B"],
+                "matrix": [[0.02, 0.08], [0.04, 0.06]],
+            },
+            percentages=True,
+            show=False,
+            return_data=True,
+        )
+        mesh = plt.gcf().axes[0].collections[0]
+        assert mesh.norm.vmin == pytest.approx(0.0)
+        assert mesh.norm.vmax == pytest.approx(8.0)
+        assert mesh.cmap.name == "viridis"
+        cbar_ticks = plt.gcf().axes[1].get_yticks()
+        assert cbar_ticks.min() == pytest.approx(0.0)
+        assert cbar_ticks.max() == pytest.approx(8.0)
+    finally:
+        plt.close("all")
+
+
 def test_plot_comparison_heatmap_sets_axis_labels():
     pytest.importorskip("matplotlib")
     pytest.importorskip("seaborn")
@@ -116,6 +144,33 @@ def test_plot_comparison_heatmap_sets_axis_labels():
         ax = plt.gcf().axes[0]
         assert ax.get_xlabel() == "Probe feature"
         assert ax.get_ylabel() == "Orienting feature"
+    finally:
+        plt.close("all")
+
+
+def test_plot_comparison_heatmap_percent_axis_labels_survive_usetex(monkeypatch):
+    pytest.importorskip("matplotlib")
+    pytest.importorskip("seaborn")
+    import matplotlib as mpl
+    import matplotlib.pyplot as plt
+
+    monkeypatch.setitem(mpl.rcParams, "text.usetex", True)
+    try:
+        plot_comparison_heatmap(
+            {
+                "measure": "anchor_aligned_encoding_factual_mean",
+                "model_ids": ["A", "B"],
+                "column_ids": ["A", "B"],
+                "matrix": [[0.74, -0.23], [0.50, 0.86]],
+            },
+            xlabel="Probe (%)",
+            ylabel="Orienting (%)",
+            show=False,
+            return_data=True,
+        )
+        ax = plt.gcf().axes[0]
+        assert ax.get_xlabel() == r"Probe (\%)"
+        assert ax.get_ylabel() == r"Orienting (\%)"
     finally:
         plt.close("all")
 

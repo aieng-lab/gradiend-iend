@@ -41,10 +41,10 @@ def _make_trainer(**config_overrides) -> TextPredictionTrainer:
     trainer.config = cfg
     trainer.run_id = "test"
     trainer._ensure_data = lambda: None
-    trainer._infer_decoder_eval_targets = lambda: (
-        {"3SG": ["he", "she", "it"], "3PL": ["they"]},
-        False,
-    )
+    trainer._collect_class_tokens_from_data = lambda: {
+        "3SG": ["he", "she", "it"],
+        "3PL": ["they"],
+    }
     return trainer
 
 
@@ -56,6 +56,48 @@ def test_resolve_encoder_neutral_excluded_tokens_includes_targets_and_additional
     assert "they" in lowered
     assert "you" in lowered
     assert "we" in lowered
+
+
+def test_resolve_encoder_neutral_excluded_tokens_ignores_decoder_eval_targets():
+    """decoder_eval_targets are for scoring only; they must not expand neutral exclusions."""
+    trainer = _make_trainer(
+        decoder_eval_targets={
+            "3SG": ["he", "short", "ship", "sand"],
+            "3PL": ["they", "apple", "banana"],
+        }
+    )
+    excluded = trainer._resolve_encoder_neutral_excluded_tokens()
+    lowered = {w.lower() for w in excluded}
+    assert "he" in lowered
+    assert "they" in lowered
+    assert "short" not in lowered
+    assert "apple" not in lowered
+
+
+def test_get_decoder_eval_targets_honors_explicit_config_without_infer(caplog):
+    import logging
+
+    trainer = _make_trainer(
+        decoder_eval_targets={"3SG": ["he", "He"], "3PL": ["they", "They"]},
+    )
+    trainer._target_classes = ["3SG", "3PL"]
+    trainer._all_classes = ["3SG", "3PL"]
+    trainer._combined_data = None
+    infer_calls = {"n": 0}
+
+    def _boom():
+        infer_calls["n"] += 1
+        raise AssertionError("_infer_decoder_eval_targets must not run when targets are explicit")
+
+    trainer._infer_decoder_eval_targets = _boom
+    trainer._collect_class_tokens_from_data = lambda: (_ for _ in ()).throw(
+        AssertionError("collect must not run when explicit static targets resolve")
+    )
+    with caplog.at_level(logging.INFO):
+        got = trainer._get_decoder_eval_targets()
+    assert got == {"3SG": ["he", "He"], "3PL": ["they", "They"]}
+    assert infer_calls["n"] == 0
+    assert "Inferred decoder eval targets" not in caplog.text
 
 
 def test_create_masked_pair_from_text_skips_excluded_tokens():

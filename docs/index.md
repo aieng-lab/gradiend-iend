@@ -16,7 +16,7 @@ The method is described in detail in the paper: **[GRADIEND: Feature Learning wi
 > While GRADIEND is methodologically defined to work with any *gradient-learned* and *weight-based* model, this library currently documents and supports **text prediction** as the primary workflow. Preliminary TextClassification code exists, but it is experimental in this release and not recommended as the starting point for new users.
 
 Example use cases ([gradiend/examples](https://github.com/aieng-lab/gradiend/tree/main/gradiend/examples) on GitHub):
-- **[English pronouns](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.ipynb)** — notebook; [script](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.py)
+- **[English pronouns](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.ipynb)** — notebook; [script](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_english_pronouns.py); data on HF: [`en-pronouns`](https://huggingface.co/datasets/aieng-lab/en-pronouns), [`en-pronoun-neutral`](https://huggingface.co/datasets/aieng-lab/en-pronoun-neutral)
 - **[German gender–case](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_gender_de_detailed.py)**
 - **[Sentiment](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_sentiment.py)**
 - **[Multi-seed stability](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_multi_seed_stability.py)**

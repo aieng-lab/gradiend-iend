@@ -1,17 +1,20 @@
 """
-Sentiment GRADIEND workflow: positive vs negative via masked emotion words.
+Sentiment GRADIEND workflow: positive vs negative via masked emotion adjectives.
 
-Single script: generates tweet_eval-based training/neutral CSVs and trains a
-TextPredictionTrainer for positive <-> negative.
+Loads the published Hugging Face datasets and trains a TextPredictionTrainer
+for positive <-> negative:
 
-Mask targets come from the NRC Emotion Lexicon (Mohammad & Turney, 2013), loaded
-from Hugging Face (``vladinc/nrc``), filtered to **adjectives** attested in tweet_eval
-(canonical lemma per inflection).
+- ``aieng-lab/en-sentiment-nrc`` (config ``split``: vocabulary-held-out)
+- ``aieng-lab/en-sentiment-nrc-neutral``
+
+Mask targets are top-10 NRC polarity adjectives attested in tweet_eval
+(Mohammad & Turney, 2013). To regenerate local CSVs from tweet_eval + NRC,
+run ``create_english_sentiment_data.py``.
 
 Requires: pip install gradiend[data]
 
 On minimal Linux/HPC images without system CA certs, install certifi and set
-before running (or use scripts/prefetch_hf_datasets.py to warm the cache)::
+before running (or use scripts/prefetch_example_assets.py to warm the cache)::
 
     export HF_HUB_DISABLE_XET=1
     export SSL_CERT_FILE=$(python -c "import certifi; print(certifi.where())")
@@ -21,14 +24,8 @@ before running (or use scripts/prefetch_hf_datasets.py to warm the cache)::
 Run:
     python -m gradiend.examples.train_sentiment
 
-To reuse vocabulary-held-out splits elsewhere (e.g. before MLM-head training)::
-
-    from gradiend.examples.train_sentiment import load_and_split_sentiment_training_data
-    training_df = load_and_split_sentiment_training_data("data/sentiment_tweets/training.csv", seed=0)
-    # pass training_df to TextPredictionConfig(..., data=training_df, split_col="split")
-
 After training, the script evaluates encoder stability across train/validation/test
-splits (vocabulary-held-out by emotion word) and saves target-grouped strip/box
+splits (vocabulary-held-out by adjective) and saves target-grouped strip/box
 plots plus a labeled class-level strip overview.
 """
 
@@ -65,6 +62,14 @@ from gradiend.trainer.core.unified_data import (
     UNIFIED_SPLIT,
     merged_to_unified,
 )
+from gradiend.examples.english_sentiment_datasets import (
+    EN_SENTIMENT_HF_SPLITS,
+    EN_SENTIMENT_NRC_HF_DATASET,
+    EN_SENTIMENT_NRC_HF_SUBSET_DEFAULT,
+    EN_SENTIMENT_NRC_HF_SUBSET_SPLIT,
+    english_sentiment_hf_training_kwargs,
+    load_english_sentiment_neutral_data,
+)
 from gradiend.examples.nrc_sentiment_lexicon import (
     NRC_CITATION,
     build_sentiment_lexicon_for_corpus,
@@ -80,7 +85,9 @@ DEFAULT_MODEL = "bert-base-cased"
 DEFAULT_EXPERIMENT_DIR = PROJECT_ROOT / "runs" / "examples" / "sentiment" / DEFAULT_MODEL.split("/")[-1]
 TARGET_CLASSES = ("positive", "negative")
 DEFAULT_LEXICON_WORDS_PER_CLASS = 10
-DEFAULT_MAX_SIZE_PER_CLASS = 3000
+# Cap = floor × adjectives/class: rarest top-10 ADJs in tweet_eval have ~50–60
+# unique maskable hits; strict balance yields ~50 rows/adjective (500/class).
+DEFAULT_MAX_SIZE_PER_CLASS = 500
 DEFAULT_MIN_OCCURRENCES_PER_TARGET = 50
 DEFAULT_SEED = 0
 DEFAULT_MULTI_SEED_MAX_SEEDS = 10
@@ -225,6 +232,12 @@ def generate_data(
     min_occurrences_per_target: int = DEFAULT_MIN_OCCURRENCES_PER_TARGET,
     seed: int = DEFAULT_SEED,
 ) -> Tuple[Path, Path]:
+    """Build local training/neutral CSVs from tweet_eval + NRC (generation showcase).
+
+    Prefer the published HF datasets for training
+    (``aieng-lab/en-sentiment-nrc`` / ``en-sentiment-nrc-neutral``). Entry point:
+    ``python -m gradiend.examples.create_english_sentiment_data``.
+    """
     from gradiend import TextPredictionDataCreator
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -467,8 +480,6 @@ def sentiment_training_arguments(
 
 def train(
     *,
-    training_path: Path,
-    neutral_path: Path,
     model: str = DEFAULT_MODEL,
     experiment_dir: Path = DEFAULT_EXPERIMENT_DIR,
     max_steps: int = 500,
@@ -477,12 +488,11 @@ def train(
     use_cache: bool = True,
     seed: int = DEFAULT_SEED,
 ) -> TextPredictionTrainer:
-    training_df = load_and_split_sentiment_training_data(training_path, seed=seed)
     config = TextPredictionConfig(
         run_id="sentiment_positive_negative",
-        data=training_df,
+        **english_sentiment_hf_training_kwargs(subset=EN_SENTIMENT_NRC_HF_SUBSET_SPLIT),
         target_classes=list(TARGET_CLASSES),
-        eval_neutral_data=neutral_path,
+        eval_neutral_data=load_english_sentiment_neutral_data(),
         split_col="split",
         img_format="pdf",
     )
@@ -521,8 +531,6 @@ def train(
 
 def train_multi_seed_heldout_targets(
     *,
-    training_path: Path,
-    neutral_path: Path,
     model: str = DEFAULT_MODEL,
     experiment_dir: Path = DEFAULT_EXPERIMENT_DIR,
     max_steps: int = 150,
@@ -533,11 +541,13 @@ def train_multi_seed_heldout_targets(
     max_seeds: int = DEFAULT_MULTI_SEED_MAX_SEEDS,
     min_convergent_seeds: int = DEFAULT_MULTI_SEED_MIN_CONVERGENT,
 ) -> TextPredictionTrainer:
+    # Config ``default`` keeps generate_data splits so the trainer can re-holdout
+    # adjectives per seed; config ``split`` is frozen for the single-seed paper path.
     config = TextPredictionConfig(
         run_id="sentiment_positive_negative",
-        data=training_path,
+        **english_sentiment_hf_training_kwargs(subset=EN_SENTIMENT_NRC_HF_SUBSET_DEFAULT),
         target_classes=list(TARGET_CLASSES),
-        eval_neutral_data=neutral_path,
+        eval_neutral_data=load_english_sentiment_neutral_data(),
         split_col="heldout",
         split_group_key=[str.strip, str.casefold],
         split_ratios=(0.6, 0.2, 0.2),
@@ -622,29 +632,12 @@ def train_multi_seed_heldout_targets(
 
 
 if __name__ == "__main__":
-    training_path = DEFAULT_DATA_DIR / "training.csv"
-    neutral_path = DEFAULT_DATA_DIR / "neutral.csv"
-
-    if not (training_path.is_file() and neutral_path.is_file()):
-        training_path, neutral_path = generate_data(
-            output_dir=DEFAULT_DATA_DIR,
-            max_size_per_class=DEFAULT_MAX_SIZE_PER_CLASS,
-            neutral_max_size=1000,
-            lexicon_words_per_class=DEFAULT_LEXICON_WORDS_PER_CLASS,
-            min_occurrences_per_target=DEFAULT_MIN_OCCURRENCES_PER_TARGET,
-            seed=DEFAULT_SEED,
-        )
-    else:
-        print(f"=== Sentiment data: using existing CSVs in {DEFAULT_DATA_DIR} ===")
-        print(f"  {training_path}")
-        print(f"  {neutral_path}")
-        cached = _normalize_training_labels(pd.read_csv(training_path))
-        cached.to_csv(training_path, index=False)
-
+    print(
+        f"=== Sentiment data: {EN_SENTIMENT_NRC_HF_DATASET} "
+        f"(subset={EN_SENTIMENT_NRC_HF_SUBSET_SPLIT!r}, splits={EN_SENTIMENT_HF_SPLITS}) ==="
+    )
     if RUN_MODE == "multi_seed_heldout":
         train_multi_seed_heldout_targets(
-            training_path=training_path,
-            neutral_path=neutral_path,
             model=DEFAULT_MODEL,
             experiment_dir=DEFAULT_EXPERIMENT_DIR,
             max_steps=150,
@@ -654,8 +647,6 @@ if __name__ == "__main__":
         )
     else:
         train(
-            training_path=training_path,
-            neutral_path=neutral_path,
             model=DEFAULT_MODEL,
             experiment_dir=DEFAULT_EXPERIMENT_DIR,
             max_steps=150,

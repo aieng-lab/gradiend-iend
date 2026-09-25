@@ -3,14 +3,60 @@ Training arguments for GRADIEND Trainer (HF-like API).
 """
 
 import dataclasses
+import warnings
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Callable, Union, Any, List, Dict
 
 import torch
 import torch.nn as nn
 
-from gradiend.trainer.core.config import validate_source_target
+from gradiend.trainer.core.cache_policy import normalize_use_cache
+from gradiend.trainer.core.metric_names import normalize_metric_name
+from gradiend.trainer.core.config import validate_source_target, validate_source_target_combination
 from gradiend.trainer.core.pruning import PostPruneConfig, PrePruneConfig, _validate_topk
+from gradiend.trainer.core.signals import (
+    Signal,
+    SignalScope,
+    SignalSet,
+    coerce_signal,
+    coerce_signal_scope,
+    coerce_signal_set,
+    normalize_signal_arguments,
+)
+from gradiend.gradiend_split import GradiendSplit, coerce_gradiend_split
+
+
+def dtype_to_name(dtype: torch.dtype) -> str:
+    """Serialize a torch dtype as its bare name ("bfloat16", not "torch.bfloat16").
+
+    ``str(torch.bfloat16)`` returns ``"torch.bfloat16"``, which no longer
+    resolves through ``getattr(torch, name)``.  Writing the prefixed form and
+    reading it back silently produced ``float32``, so a configured
+    ``torch_dtype=bfloat16`` was lost on every ``to_dict()``/``from_dict()``
+    round trip -- and :class:`TextPredictionTrainer` round-trips its arguments
+    on construction, so no trainer ever saw the requested dtype.
+    """
+    if not isinstance(dtype, torch.dtype):
+        raise TypeError(f"dtype_to_name expects a torch.dtype, got {type(dtype).__name__}")
+    return str(dtype).split(".")[-1]
+
+
+def dtype_from_name(name: Any) -> torch.dtype:
+    """Resolve a serialized dtype name back to the torch dtype.
+
+    Accepts both the bare name and the legacy ``"torch."``-prefixed form so
+    configs and caches written before :func:`dtype_to_name` still load.  An
+    unknown name raises instead of falling back to ``float32``: a silent
+    fallback is what hid the round-trip loss described above.
+    """
+    if isinstance(name, torch.dtype):
+        return name
+    if not isinstance(name, str):
+        raise TypeError(f"dtype_from_name expects a str or torch.dtype, got {type(name).__name__}")
+    resolved = getattr(torch, name.split(".")[-1], None)
+    if not isinstance(resolved, torch.dtype):
+        raise ValueError(f"Unknown torch dtype name {name!r}")
+    return resolved
 
 
 @dataclass
@@ -43,9 +89,27 @@ class TrainingArguments:
     add_identity_for_other_classes: bool = False
     """If True, add identity (factual==alternative) examples for classes not in the target classes used for training."""
 
+    add_neutral_identity_transitions: Optional[bool] = None
+    """Whether to add neutral identity transitions from ``TextPredictionConfig.neutral_data``.
+
+    These rows have factual==alternative and label 0. For target='diff' they
+    train the decoded GRADIEND/ACTIEND update toward the zero vector on neutral
+    examples without adding a separate neutral-specific loss.
+
+    - ``None`` (default): enabled automatically when ``neutral_data`` is configured,
+      otherwise disabled.
+    - ``True``: always enabled; training fails if no ``neutral_data`` is configured.
+    - ``False``: never used, even if ``neutral_data`` is configured.
+    """
+
     # ----- GRADIEND interpretation -----
     source: str = "alternative"
-    """Source for GRADIEND input: 'factual', 'alternative', or 'diff'."""
+    """Source for GRADIEND input: 'factual', 'alternative', 'diff', or 'both'.
+
+    ``both`` alternates factual/alternative poles across balance-group *visits*
+    (orthogonal to ``feature_class_id`` / neutral balance cycling) and requires
+    ``target='diff'``.
+    """
 
     target: str = "diff"
     """Target for GRADIEND output: 'factual', 'alternative', or 'diff'."""
@@ -91,6 +155,34 @@ class TrainingArguments:
     learning_rate: float = 1e-5
     """Peak learning rate."""
 
+    learning_rate_decoder: Optional[Union[float, Literal["auto", "default"]]] = "default"
+    """Optional separate learning rate for the decoder.
+
+    - ``"default"`` (the default) resolves per signal kind at construction:
+      ``"auto"`` for pure activation signals (ACTIEND) and ``None`` otherwise.
+    - ``None``: encoder and decoder share ``learning_rate`` in one optimizer group
+      (the classic GRADIEND behavior).
+    - a float: the decoder gets its own parameter group with this rate.
+    - ``"auto"``: the decoder starts at ``learning_rate``; at the first
+      ``eval_steps`` boundary it is raised to a model-local reachability floor.
+      This needs training to run *past* the first ``eval_steps`` boundary, an
+      Adam/AdamW optimizer, an identity decoder and an ``MSELoss`` criterion, and
+      it sets the decoder weight decay to 0. The estimate reuses Adam's decoder
+      first moments and stores only latent-sized statistics, so it adds no
+      decoder-sized memory and no extra pass.
+
+    Why a separate decoder rate exists: Adam-family updates are scale-free, so the
+    decoder can move at most about ``lr * steps * sqrt(output_dim)``. When the
+    decoder optimum is far larger than the encoder's (ACTIEND reconstructs raw
+    activation differences), an encoder-tuned rate cannot reach it. Raising only
+    the decoder rate removes that limit without changing encoder optimization.
+
+    Incompatible with ``supervised_encoder=True`` (no decoder parameter is trained).
+    Note that ``"default"`` is resolved once in ``__post_init__``; when copying
+    arguments with ``dataclasses.replace(args, signal=...)`` pass
+    ``learning_rate_decoder="default"`` again to re-resolve it for the new signal.
+    """
+
     num_train_epochs: int = 3
     """Number of training epochs."""
 
@@ -104,7 +196,20 @@ class TrainingArguments:
     """Epsilon for Adam/AdamW."""
 
     optim: str = "adamw"
-    """Optimizer: 'adamw' or 'adam'."""
+    """Optimizer: 'adamw', 'adam', or 'sgd'.
+
+    'sgd' exists to test whether a decoder-reachability shortfall is specific to
+    Adam-family updates. Adam's per-coordinate step is scale-free (bounded by
+    approximately ``learning_rate`` regardless of gradient magnitude), so total
+    displacement over training is bounded by ``lr * steps * sqrt(dim)``. Plain
+    SGD has no such bound -- its displacement scales with the gradients
+    themselves -- so the two optimizers make different predictions about whether
+    a large-norm decoder optimum is reachable within a fixed budget.
+    """
+
+    sgd_momentum: float = 0.0
+    """Momentum for ``optim='sgd'``. Defaults to 0.0, i.e. plain gradient
+    descent, which is the case the reachability analysis actually covers."""
 
     criterion: Optional[Union[nn.Module, Any]] = field(default=None, repr=False)
     """Loss function; None = MSELoss()."""
@@ -146,6 +251,14 @@ class TrainingArguments:
     eval_batch_size: int = 32
     """Batch size for evaluation."""
 
+    max_length: int = 128
+    """Max token length for text training / ACTIEND filled templates.
+
+    Longer inputs are truncated to keep ``[MASK]`` inside this window (left context
+    dropped so the mask sits near the end). Lower values are cheaper; raise for
+    long-context tasks if needed.
+    """
+
     do_eval: bool = True
     """Whether to run evaluation during training."""
 
@@ -176,6 +289,24 @@ class TrainingArguments:
     """When False (default), pass use_cache=False to decoder model forward during training (KV cache disabled).
     Use True only for inference/generation. Decoder-only MLM head training respects this via train_decoder_only_mlm_head."""
 
+    label_token_protocol: str = "canonical"
+    """Which token id a decoder-only *training* item labels the prediction with.
+
+    ``"canonical"`` (default for new runs): the leading-space variant of the label
+    (``▁she`` / ``Ġshe``), i.e. ``tokenizer(" " + label)`` -- the rule
+    :meth:`TextPredictionModelWithGradiend.create_inputs` always used, so training
+    items and single-row scoring agree. The label is written onto the last prefix
+    token (the template's trailing space) and predicted from the token before it,
+    so the natural next token is the leading-space variant.
+
+    ``"legacy"``: the pre-2026-09-25 dataset rule, ``vocab[label]`` i.e. the
+    no-space variant (``she``), which the model almost never predicts after a
+    word boundary and which disagrees with ``create_inputs``.
+
+    Checkpoints/argument dicts that do not carry this key deserialize as
+    ``"legacy"`` (see :meth:`from_dict`), so already trained artifacts are never
+    silently re-interpreted."""
+
     prediction_objective: str = "auto"
     """Prediction objective for text-gradient training and decoder probability scoring.
     Supported: ``auto``, ``mlm_mask_token``, ``clm_next_token``, ``clm_mlm_head``,
@@ -183,6 +314,15 @@ class TrainingArguments:
     ``seq2seq_encoder_mlm``.
     ``auto``: seq2seq models → ``seq2seq_encoder_mlm``; decoder-only → ``clm_next_token`` (or cached
     ``clm_mlm_head`` when a saved head exists); else ``mlm_mask_token``."""
+
+    mask_placeholder: str = "[MASK]"
+    """Dataset-level prediction placeholder used inside masked text templates.
+
+    This is independent of ``tokenizer.mask_token``. Prefer setting
+    ``TextPredictionConfig.mask_placeholder`` with the data schema (e.g.
+    ``mask_placeholder=\"[PRONOUN]\"``). A non-default value here still overrides
+    when the config field is left at its default.
+    """
 
     decoder_mlm_head_epochs: int = 5
     """Epochs used when prediction_objective="clm_mlm_head" has to train the auxiliary head."""
@@ -202,17 +342,60 @@ class TrainingArguments:
     params: Optional[List[str]] = None
     """If set, only these parameter names or wildcards are included in the GRADIEND param map when building from a base model. None = include all backbone parameters (default). Enables future params selection processes."""
 
+    signal: Optional[Union[Signal, str, Dict[str, Any]]] = None
+    """What is measured from the base model (``Signal.gradient()`` by default; also ``Signal.activation(...)``
+    and ``Signal.activation_gradient(...)``). *Where* it is measured is ``signal_scope``; how the resolved
+    space is partitioned is ``gradiend_split``. Strings (``"gradient"``, ``"activation"``) and dicts are coerced."""
+
+    signals: Optional[Union[SignalSet, Signal, List[Any], Dict[str, Any]]] = None
+    """Optional ``SignalSet`` / sequence of signals. Reserved for multi-signal training (currently exactly one signal is
+    supported). Passing both ``signal`` and ``signals`` is only allowed when they describe the same single signal."""
+
+    signal_scope: Optional[Union[SignalScope, Dict[str, Any]]] = None
+    """Optional ``SignalScope`` describing where the signal is measured (parameters for gradient signals, module
+    sites for activation signals). ``None`` uses the default backbone scope."""
+
+    gradiend_split: Optional[Union[GradiendSplit, str, Dict[str, Any]]] = None
+    """Optional GradiendSplit describing component partitioning over the resolved signal space.
+
+    ``signal`` defines what is measured and ``signal_scope`` defines where it is
+    measured. ``gradiend_split`` is the separate axis that decides whether the
+    flattened eligible signal space is trained as one model or partitioned into
+    virtual component models. ``None``/``GradiendSplit.none()`` keeps the ordinary
+    unpartitioned ``GradiendModel`` behavior; ``GradiendSplit.single()`` uses the
+    partitioned code path with one full-space component; ``GradiendSplit.by_tensor()``
+    creates one component per resolved signal-space tensor entry.
+    """
+
+    gradiend_split_loss: str = "mean"
+    """Loss aggregation for component-split GRADIEND training: 'mean', 'sum', 'size_weighted', or 'full'. Non-split models always use the classic full-vector objective."""
+
     activation_encoder: Optional[str] = None
     """Encoder activation name (e.g. 'tanh', 'gelu', 'relu'). None = model default ('tanh')."""
 
     activation_decoder: Optional[str] = None
     """Decoder activation name (e.g. 'id', 'tanh'). None = model default ('id')."""
 
+    bias_encoder: Optional[bool] = True
+    """Whether the encoder linear layer uses a bias term. Enabled by default; None also defers to the enabled model default."""
+
     bias_decoder: Optional[bool] = None
     """Whether the decoder linear layer uses a bias term. None = model default (True)."""
 
     latent_dim: Optional[int] = None
     """GRADIEND latent dimension (number of features). None = model default (1)."""
+
+    init_fan_in_floor: Optional[int] = 10_000
+    """Optional lower bound for fresh GRADIEND/ACTIEND initialization fan-in.
+
+    Encoder weights use ``1 / sqrt(max(init_fan_in_floor, component_fan_in))``
+    and decoder rows are initialized on the matching component scale. The
+    default keeps small activation-space ACTIEND components from starting with
+    much larger random weights than classic parameter-space GRADIENDs; this was
+    empirically helpful for ACTIEND convergence. Large GRADIEND parameter spaces
+    are already above the floor, so their scale is unchanged. Set to ``None``
+    for raw component fan-in initialization.
+    """
 
     normalize_gradiend: bool = True
     """Whether to normalize GRADIEND encodings during training, i.e., first target class is encoded to +1 and second to -1. This is recommended for enhanced comparability between runs."""
@@ -247,10 +430,23 @@ class TrainingArguments:
     """Stop once this many seeds have converged. None = run max_seeds. 0 is invalid."""
 
     convergent_metric: Optional[str] = None
-    """Metric for convergence: "correlation" or "loss". Defaults to correlation unless supervised_decoder."""
+    """Metric used to decide convergence: "correlation", "roc_auc"/"auroc",
+    "min_auc_n_o"/"min_auc", or "loss".
+
+    Defaults to correlation unless supervised_decoder (then loss). Use ``min_auc_n_o`` for
+    one-pole runs (``min(auc_n, auc_o)`` so neutrals alone cannot carry selection). Legacy
+    ``roc_auc`` is pooled one-vs-rest (rivals ∪ neutrals as negatives)."""
+
+    selection_metric: Optional[str] = None
+    """Metric used for best-checkpoint and best-seed selection.
+
+    ``None`` preserves the historical behavior by using ``convergent_metric``.
+    Set ``"encoding_e"``/``"E"`` to select by the encoding-E validation bottleneck
+    (see the evaluation guide) while leaving convergence semantics unchanged. For one-pole data this includes ``auc_rival`` and class
+    exclusivity whenever rival factual rows exist."""
 
     convergent_score_threshold: Optional[float] = None
-    """Threshold for convergence. Defaults to 0.6 for correlation; required for loss."""
+    """Threshold for convergence. Defaults: 0.5 (correlation), 0.9 (roc_auc / min_auc_n_o); required for loss."""
 
     convergent_mean_by_class_threshold: Optional[float] = None
     """Optional additional convergence criterion: minimum absolute mean encoded value per target class.
@@ -259,7 +455,20 @@ class TrainingArguments:
     convergent_score_threshold. When set, convergence requires BOTH |correlation| >= convergent_score_threshold AND
     min(|mean|) over non-zero target classes >= convergent_mean_by_class_threshold at the best checkpoint step. For
     correlation-based convergence, the two non-zero target classes must also have opposite-sign mean encodings
-    at the best checkpoint step (their product must be negative)."""
+    at the best checkpoint step (their product must be negative).
+
+    For ``roc_auc`` / ``min_auc_n_o``, the mean-based opposite-sign check is off unless this threshold is set explicitly.
+
+    This flag only defines the end-of-training convergence check unless
+    ``prefer_convergent_checkpoint=True`` (see that argument)."""
+
+    prefer_convergent_checkpoint: bool = False
+    """If True, best-checkpoint selection prefers steps that meet the convergence
+    criteria (score threshold, and for correlation: opposite-sign target means / optional mean threshold)
+    over a higher-score step that fails them.
+
+    If False (default), the best checkpoint is selected by the selection score alone
+    (``|correlation|``, ``roc_auc``, or ``min_auc_n_o``); convergence is still evaluated afterward at that best step."""
 
     split_resplit_per_seed: bool = False
     """When ``split_col`` is ``\"heldout\"`` or ``None``, re-draw splits per training seed.
@@ -324,15 +533,124 @@ class TrainingArguments:
     # ----- Extra -----
     metadata: dict = field(default_factory=dict)
 
+    @staticmethod
+    def _coerce_signal(value: Any) -> Any:
+        return coerce_signal(value)
+
+    @staticmethod
+    def _coerce_signal_set(value: Any) -> Any:
+        return coerce_signal_set(value)
+
+    def _signal_default_decoder_lr_is_auto(self) -> bool:
+        """Whether the ``"default"`` decoder learning rate resolves to ``"auto"``.
+
+        True only when every configured signal is ``activation``. Reads the kinds
+        directly because it runs before ``_normalize_signal_arguments``.
+        """
+        kinds = set()
+        if self.signal is not None:
+            kinds.add(getattr(self.signal, "kind", None))
+        if self.signals is not None:
+            try:
+                for s in self.signals:
+                    kinds.add(getattr(s, "kind", None))
+            except TypeError:
+                pass
+        kinds.discard(None)
+        return kinds == {"activation"}
+
+    def _normalize_signal_arguments(self) -> None:
+        signal, signals = normalize_signal_arguments(signal=self.signal, signals=self.signals)
+        self.signal = signal
+        self.signals = signals
+        self.signal_scope = coerce_signal_scope(self.signal_scope)
+        if (
+            self.signal_scope is not None
+            and self.signal is not None
+            and self.signal.kind == "gradient"
+            and self.signal_scope.activation_sites is not None
+        ):
+            # Semantic shortcuts (SignalScope.layers()/.embeddings()/...) resolve to weight
+            # parameters for gradient signals (see signal_space.gradient_params_from_selector).
+            # A raw module-path include-list cannot be translated to parameter names
+            # unambiguously, so reject it instead of silently matching nothing.
+            raise ValueError(
+                "signal_scope.activation_sites has no effect on a gradient signal "
+                "(Signal.gradient()) -- it is only resolved for Signal.activation(). "
+                "SignalScope.layers()/.layer()/.embeddings()/.word_embedding() (the "
+                "activation_selector shortcuts) DO work for gradient signals; only a "
+                "raw activation_sites=[...] include-list does not. For a gradient "
+                "signal's weight-parameter scope, use SignalScope.from_values(params=[...]) "
+                "(or .default()/.full() for the built-in mode presets) instead."
+            )
+        self.gradiend_split = coerce_gradiend_split(self.gradiend_split)
+        if self.params is not None:
+            warnings.warn(
+                "TrainingArguments.params is deprecated; use "
+                "TrainingArguments.signal_scope=SignalScope.from_values(params=...) instead.",
+                DeprecationWarning,
+                stacklevel=4,
+            )
+            params_tuple = tuple(self.params)
+            if self.signal_scope is None:
+                self.signal_scope = SignalScope.from_values(params=params_tuple)
+            elif self.signal_scope.params is None:
+                self.signal_scope = SignalScope.from_values(
+                    params=params_tuple,
+                    activation_sites=self.signal_scope.activation_sites,
+                    mode=self.signal_scope.mode,
+                )
+            elif self.signal_scope.params != params_tuple:
+                raise ValueError(
+                    "TrainingArguments.params conflicts with signal_scope.params. "
+                    "Use only signal_scope.params."
+                )
+
     def __post_init__(self) -> None:
         # Type checks for key scalar parameters
         if self.experiment_dir is not None and not isinstance(self.experiment_dir, str):
             raise TypeError(f"experiment_dir must be str or None, got {type(self.experiment_dir).__name__}")
         if self.output_dir is not None and not isinstance(self.output_dir, str):
             raise TypeError(f"output_dir must be str or None, got {type(self.output_dir).__name__}")
-        from gradiend.trainer.core.cache_policy import normalize_use_cache
-
         normalize_use_cache(self.use_cache)
+        if self.label_token_protocol not in ("canonical", "legacy"):
+            raise ValueError(
+                f"label_token_protocol must be 'canonical' or 'legacy', got {self.label_token_protocol!r}"
+            )
+        if self.learning_rate_decoder == "default":
+            # Signal-kind-aware default: 'auto' only for pure activation signals (see the
+            # field documentation); explicit 'auto'/None/float bypass this.
+            self.learning_rate_decoder = (
+                "auto" if self._signal_default_decoder_lr_is_auto() else None
+            )
+        if self.learning_rate_decoder is not None:
+            if isinstance(self.learning_rate_decoder, str):
+                normalized_decoder_lr = self.learning_rate_decoder.strip().lower()
+                if normalized_decoder_lr != "auto":
+                    raise ValueError(
+                        "learning_rate_decoder string value must be 'auto', got "
+                        f"{self.learning_rate_decoder!r}"
+                    )
+                self.learning_rate_decoder = normalized_decoder_lr
+            elif isinstance(self.learning_rate_decoder, bool) or not isinstance(
+                self.learning_rate_decoder, (int, float)
+            ):
+                raise TypeError(
+                    "learning_rate_decoder must be a number, 'auto', or None, got "
+                    f"{type(self.learning_rate_decoder).__name__}"
+                )
+            elif not self.learning_rate_decoder > 0:
+                raise ValueError(
+                    f"learning_rate_decoder must be positive, got {self.learning_rate_decoder}"
+                )
+            if self.supervised_encoder:
+                raise ValueError(
+                    "learning_rate_decoder is incompatible with supervised_encoder=True: "
+                    "no decoder parameter is trained, so the decoder learning rate "
+                    "would have no effect."
+                )
+            if self.learning_rate_decoder != "auto":
+                self.learning_rate_decoder = float(self.learning_rate_decoder)
         if not isinstance(self.reuse_pre_prune, bool):
             raise TypeError(f"reuse_pre_prune must be bool, got {type(self.reuse_pre_prune).__name__}")
         if not isinstance(self.fail_on_non_convergence, bool):
@@ -421,19 +739,62 @@ class TrainingArguments:
             raise TypeError(f"max_steps must be int, got {type(self.max_steps).__name__}")
         if not isinstance(self.eval_steps, int):
             raise TypeError(f"eval_steps must be int, got {type(self.eval_steps).__name__}")
+        if self.learning_rate_decoder == "auto" and self.eval_steps < 1:
+            raise ValueError(
+                "learning_rate_decoder='auto' requires eval_steps >= 1 because "
+                "the first evaluation boundary is the calibration boundary"
+            )
         if not isinstance(self.eval_batch_size, int):
             raise TypeError(f"eval_batch_size must be int, got {type(self.eval_batch_size).__name__}")
         if self.eval_batch_size < 1:
             raise ValueError(f"eval_batch_size must be >= 1, got {self.eval_batch_size}")
+        if not isinstance(self.max_length, int):
+            raise TypeError(f"max_length must be int, got {type(self.max_length).__name__}")
+        if self.max_length < 8:
+            raise ValueError(f"max_length must be >= 8, got {self.max_length}")
         if not isinstance(self.do_eval, bool):
             raise TypeError(f"do_eval must be bool, got {type(self.do_eval).__name__}")
+        if self.add_neutral_identity_transitions is not None and not isinstance(
+            self.add_neutral_identity_transitions, bool
+        ):
+            raise TypeError(
+                "add_neutral_identity_transitions must be bool or None, got "
+                f"{type(self.add_neutral_identity_transitions).__name__}"
+            )
         if self.seed is not None and not isinstance(self.seed, int):
             raise TypeError(f"seed must be int or None, got {type(self.seed).__name__}")
+        if not isinstance(self.gradiend_split_loss, str):
+            raise TypeError(f"gradiend_split_loss must be str, got {type(self.gradiend_split_loss).__name__}")
+        self.gradiend_split_loss = self.gradiend_split_loss.strip().lower()
+        if self.gradiend_split_loss not in {"mean", "sum", "size_weighted", "full"}:
+            raise ValueError(
+                "gradiend_split_loss must be 'mean', 'sum', 'size_weighted', or 'full', "
+                f"got {self.gradiend_split_loss!r}"
+            )
+        if not isinstance(self.mask_placeholder, str):
+            raise TypeError(
+                f"mask_placeholder must be a non-empty str, got {type(self.mask_placeholder).__name__}"
+            )
+        if not self.mask_placeholder:
+            raise ValueError("mask_placeholder must be a non-empty str")
+
+        self._normalize_signal_arguments()
 
         validate_source_target("source", self.source)
         validate_source_target("target", self.target)
+        validate_source_target_combination(self.source, self.target)
         if self.torch_dtype is None:
             self.torch_dtype = torch.float32
+        if self.init_fan_in_floor is not None:
+            if isinstance(self.init_fan_in_floor, bool) or not isinstance(self.init_fan_in_floor, int):
+                raise TypeError(
+                    "init_fan_in_floor must be a positive int or None, "
+                    f"got {type(self.init_fan_in_floor).__name__}"
+                )
+            if self.init_fan_in_floor < 1:
+                raise ValueError(
+                    f"init_fan_in_floor must be >= 1 or None, got {self.init_fan_in_floor}"
+                )
         if self.base_model_device_map is not None and self.base_model_device_map is not False and not isinstance(self.base_model_device_map, (str, dict)):
             raise TypeError(
                 "base_model_device_map must be None, False, a string such as 'auto', or a device-map dict; "
@@ -482,15 +843,36 @@ class TrainingArguments:
         if not isinstance(self.seed_stability_part, str) or not self.seed_stability_part.strip():
             raise ValueError("seed_stability_part must be a non-empty string.")
 
-        metric = (self.convergent_metric or ("loss" if self.supervised_decoder else "correlation")).lower()
-        if metric not in ("correlation", "loss"):
-            raise ValueError(f"convergent_metric must be 'correlation' or 'loss', got {metric!r}")
+        metric = normalize_metric_name(
+            self.convergent_metric or ("loss" if self.supervised_decoder else "correlation")
+        )
+        if self.convergent_metric is not None:
+            self.convergent_metric = metric
+        if metric not in ("correlation", "loss", "roc_auc", "min_auc_n_o"):
+            raise ValueError(
+                "convergent_metric must be 'correlation', 'roc_auc'/'auroc', "
+                "'min_auc_n_o'/'min_auc', or 'loss', "
+                f"got {metric!r}"
+            )
         if metric == "correlation" and self.convergent_score_threshold is None:
             self.convergent_score_threshold = 0.5
         if metric == "correlation" and self.convergent_mean_by_class_threshold is None:
             self.convergent_mean_by_class_threshold = 0.5
+        if metric in {"roc_auc", "min_auc_n_o"} and self.convergent_score_threshold is None:
+            self.convergent_score_threshold = 0.9
+        # roc_auc / min_auc_n_o: do not auto-enable bipolar mean threshold
+        # (identity/neutral at ≤0 is fine).
         if metric == "loss" and self.convergent_score_threshold is None:
             raise ValueError("convergent_score_threshold is required when convergent_metric='loss'.")
+
+        if self.selection_metric is not None:
+            selection = normalize_metric_name(self.selection_metric)
+            if selection not in {"correlation", "loss", "roc_auc", "min_auc_n_o", "encoding_e"}:
+                raise ValueError(
+                    "selection_metric must be 'correlation', 'roc_auc', 'min_auc_n_o', "
+                    f"'encoding_e'/'E', or 'loss', got {selection!r}"
+                )
+            self.selection_metric = selection
 
     def to_dict(self) -> dict:
         """Dict for serialization (excludes callables and nn.Module). Canonical keys only."""
@@ -502,7 +884,13 @@ class TrainingArguments:
             v = getattr(self, k, None)
             if callable(v):
                 continue
-            if isinstance(v, (nn.Module, torch.dtype)):
+            if isinstance(v, torch.dtype):
+                # ``str(torch.bfloat16)`` is "torch.bfloat16"; ``from_dict``
+                # resolves the name via ``getattr(torch, name)``, which cannot
+                # see through that prefix.  Serialize the bare name so the
+                # round-trip is lossless (see ``dtype_from_name``).
+                result[k] = dtype_to_name(v)
+            elif isinstance(v, nn.Module):
                 result[k] = str(v) if v is not None else None
             elif k == "pre_prune_config" and v is not None:
                 cfg = dataclasses.asdict(v)
@@ -512,6 +900,14 @@ class TrainingArguments:
                 cfg = dataclasses.asdict(v)
                 cfg["mask"] = None  # do not serialize tensor
                 result[k] = cfg
+            elif k == "signal":
+                result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
+            elif k == "signals":
+                result[k] = list(v.to_list()) if v is not None and hasattr(v, "to_list") else v
+            elif k == "signal_scope":
+                result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
+            elif k == "gradiend_split":
+                result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
             else:
                 result[k] = v
         return result
@@ -520,8 +916,19 @@ class TrainingArguments:
     def from_dict(cls, d: dict) -> "TrainingArguments":
         """Create from dict (e.g. loaded from JSON). Canonical keys only."""
         d = dict(d)
+        # A serialized dict without the key was written before the protocol existed:
+        # it must keep the old label convention, not silently pick up the new default.
+        d.setdefault("label_token_protocol", "legacy")
+        if "signal" in d and isinstance(d.get("signal"), dict):
+            d["signal"] = Signal.from_dict(d["signal"])
+        if "signals" in d and isinstance(d.get("signals"), list):
+            d["signals"] = SignalSet.from_list(d["signals"])
+        if "signal_scope" in d and isinstance(d.get("signal_scope"), dict):
+            d["signal_scope"] = SignalScope.from_dict(d["signal_scope"])
+        if "gradiend_split" in d and isinstance(d.get("gradiend_split"), dict):
+            d["gradiend_split"] = GradiendSplit.from_dict(d["gradiend_split"])
         if "torch_dtype" in d and isinstance(d.get("torch_dtype"), str):
-            d["torch_dtype"] = getattr(torch, d["torch_dtype"], torch.float32)
+            d["torch_dtype"] = dtype_from_name(d["torch_dtype"])
         if "pre_prune_config" in d and isinstance(d.get("pre_prune_config"), dict):
             d["pre_prune_config"] = PrePruneConfig(**d["pre_prune_config"])
         if "post_prune_config" in d and isinstance(d.get("post_prune_config"), dict):

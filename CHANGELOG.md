@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `gradiend.trainer.core.lr_search`: automatic learning-rate search (`tune_learning_rate`, `LRSearch`). Short probe runs are classified (converged / frozen / slow / degrading / collapsed / diverged) and the class of the run, not just its score, sets the next LR: expand by x10 until one LR is too low and another too high, then bisect on a readable 1/2/5 (or `resolution="fine"`: 1/1.5/2/3/5/7) grid until no untried grid value remains inside the bracket. A converged run is confirmed at the full step budget and the LR at the centre of the convergent window is returned. The search ends with `no_convergent_lr` (plus the trace in `lr_search.json`) when the bracket closes without a convergent run. Each probe trains from the original base model, and `ProbeStopCallback` ends a probe as soon as it is decisively collapsed or diverged. `assert_signal_diverse` is a guard for training inputs that carry no within-class information.
+- The training loop honours `control["should_stop"]` set by a callback after any step (previously only checked at epoch end); the epoch-end hooks still run so checkpoint and `training.json` are written.
+- `TrainingArguments.label_token_protocol` (`"canonical"` default, `"legacy"`): which token id is supervised for a decoder-only label. `canonical` uses the leading-space variant, the same one `create_inputs` uses. Serialized arguments without the key load as `legacy`, so already-trained artifacts are read under the rule they were trained with.
+- `gradiend.util.positions` (`last_real_token_positions`, `first_real_token_positions`, `assert_labels_on_real_tokens`): the single implementation of "which token is the last real one" for left- and right-padded batches.
+
+### Fixed
+
+- Decoder-only training items put the supervised label at `attention_mask.sum() - 1`, which is the last real token only for right padding. Tokenizers that pad on the left (Gemma-2/3) therefore had the label inside the padding block: every gradient/activation signal of a class was bit-identical across sentences, so GRADIEND/AGIEND/CGA/CAGA trained on class-constant inputs without any error. The label position, the prediction-token mask used for steering (`modified._clm_prediction_position_mask`), the decoder-eval prefix positions and CAA's last-token readout all use `last_real_token_positions` now, and dataset construction raises if a label lands on padding.
+- `SignalTrainingDatasetBase.__getitem__` (and its subclasses, incl. gradient and text-activation datasets) now raises `IndexError` for an out-of-range index instead of silently resolving to an empty slice. An out-of-range index previously produced an empty merged batch, which surfaced far downstream as a confusing `Masked template does not contain mask_placeholder='[MASK]'. Got template='None'.` (activation-gradient) or `KeyError: 'factual'` (gradient). This makes a caller that iterates past `len(dataset)` fail clearly at the source.
+
+### Changed
+
+- GRADIEND encoders use a trainable linear bias by default (`bias_encoder=True`). Existing checkpoints that lack `architecture.bias_encoder` remain loadable: loading infers whether the encoder bias exists from the saved state dict.
+- `GradiendModel` now supports default split metadata via `GradiendComponent` and exposes virtual component views through `gradiend.encoders[...]`, `gradiend.decoders[...]`, `encode_components(...)`, `with_components(...)`, and `without_split()`. These views slice the normal GRADIEND weights and do not create separate submodels.
+
 ## [0.2.1] - 2026-07-16
 
 ### Changed
