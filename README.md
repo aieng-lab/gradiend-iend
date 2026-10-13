@@ -250,6 +250,19 @@ the saved path.
 
 ## Citation
 
+The IEND extension (this fork):
+```bibtex
+@misc{drechsel2026gradientsinterventionsactivationsdetection,
+      title={Gradients for Interventions and Activations for Detection: Targeted Feature Learning in Language Models}, 
+      author={Jonathan Drechsel and Steffen Herbold},
+      year={2026},
+      eprint={2609.32355},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2609.32355}, 
+}
+```
+
 The [Python package paper](https://arxiv.org/html/2602.23993):
 ```bibtex
 @misc{drechsel2026gradiendpythonpackage,
