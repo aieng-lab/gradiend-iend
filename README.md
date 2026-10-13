@@ -1,6 +1,7 @@
 # GRADIEND
 
 [![PyPI](https://img.shields.io/pypi/v/gradiend.svg)](https://pypi.org/project/gradiend/)
+[![arXiv:2609.32355](https://img.shields.io/badge/arXiv-2609.32355-blue.svg)](https://arxiv.org/abs/2609.32355)
 [![arXiv:2602.23993](https://img.shields.io/badge/arXiv-2602.23993-blue.svg)](https://arxiv.org/abs/2602.23993)
 [![arXiv:2502.01406](https://img.shields.io/badge/arXiv-2502.01406-blue.svg)](https://arxiv.org/abs/2502.01406)
 [![arXiv:2601.09313](https://img.shields.io/badge/arXiv-2601.09313-blue.svg)](https://arxiv.org/abs/2601.09313)
