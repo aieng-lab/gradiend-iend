@@ -87,13 +87,20 @@ def test_training_cache_fingerprint_includes_init_fan_in_floor():
 
 
 def test_training_cache_fingerprint_includes_neutral_identity_toggle_only_when_enabled():
-    default_fp = build_training_cache_fingerprint(TrainingArguments())
+    enabled_fp = build_training_cache_fingerprint(
+        TrainingArguments(add_neutral_identity_transitions=True)
+    )
     disabled_fp = build_training_cache_fingerprint(
         TrainingArguments(add_neutral_identity_transitions=False)
     )
+    # ``None`` means "auto": the trainer resolves it (follows ``neutral_data``) and pins the result
+    # into the args BEFORE fingerprinting (see ``Trainer.train``). An unresolved ``None`` carries no
+    # information and must not be recorded as enabled.
+    auto_fp = build_training_cache_fingerprint(TrainingArguments())
 
-    assert default_fp["add_neutral_identity_transitions"] is True
+    assert enabled_fp["add_neutral_identity_transitions"] is True
     assert "add_neutral_identity_transitions" not in disabled_fp
+    assert "add_neutral_identity_transitions" not in auto_fp
 
 
 @pytest.mark.parametrize(

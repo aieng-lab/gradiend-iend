@@ -60,7 +60,8 @@ def _list_item_indent(lines: list[str], idx: int) -> int | None:
     """Indent of the list marker owning line ``idx`` (None if it is not in a list item)."""
     for j in range(idx, -1, -1):
         stripped = lines[j].lstrip()
-        if not stripped:
+        if not stripped or stripped.startswith("```"):
+            # A blank line or a code fence ends any list ownership; never look into fenced code.
             return None
         if _is_list_start(stripped):
             return len(lines[j]) - len(stripped)
@@ -82,7 +83,8 @@ def fix_docstring_content_lines(content_lines: list[str]) -> list[str]:
     for line in content_lines:
         stripped = line.lstrip()
 
-        if stripped.startswith("```"):
+        is_fence_line = stripped.startswith("```")
+        if is_fence_line:
             in_fence = not in_fence
 
         if not in_fence and _is_list_start(stripped):
@@ -99,7 +101,7 @@ def fix_docstring_content_lines(content_lines: list[str]) -> list[str]:
 
         out.append(line)
 
-        if not in_fence and stripped and not _is_list_start(stripped):
+        if not in_fence and not is_fence_line and stripped and not _is_list_start(stripped):
             prev_idx = _last_nonblank_index(out[:-1])
             if prev_idx is not None and not _has_blank_since(out[:-1], prev_idx):
                 marker_indent = _list_item_indent(out[:-1], prev_idx)
