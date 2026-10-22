@@ -1174,6 +1174,8 @@ def test_activation_gradiend_toy_workflow_learns_counterfactual_direction():
         input_dim=extractor.infer_input_dim_static(),
         latent_dim=1,
         activation_encoder="tanh",
+        device_encoder=torch.device("cpu"),  # the toy signals are CPU tensors
+        device_decoder=torch.device("cpu"),
         activation_decoder="id",
     )
     optimizer = torch.optim.Adam(gradiend.parameters(), lr=0.05)

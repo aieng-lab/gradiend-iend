@@ -252,6 +252,11 @@ class TextPredictionConfig(TrainerConfig):
     """
     label_col: str = "label"
     label_class_col: str = "label_class"
+    mask_placeholder: str = "[MASK]"
+    """Prediction-slot marker inside the masked column of your data (default ``"[MASK]"``).
+    It is a dataset-schema marker, independent of ``tokenizer.mask_token``: if your data uses
+    ``[PRONOUN]`` in the masked column, set ``mask_placeholder=\"[PRONOUN]\"``.
+    ``TrainingArguments.mask_placeholder`` may override when this stays at the default."""
     split_col: Optional[str] = "split"
     """Dataset split column. ``\"split\"`` (default) uses row-level splits from the data.
     ``None`` assigns random row-level train/validation/test splits (reshuffled when
@@ -2339,12 +2344,25 @@ class TextPredictionTrainer(Trainer):
             )
 
         is_hf_id = self._is_hf_dataframe_source(source)
-        df = resolve_dataframe(
-            source,
-            split=self._neutral_hf_split_name(split),
-            max_rows=max_rows if is_hf_id else None,
-            dataset_trust_remote_code=getattr(self.config, "dataset_trust_remote_code", None),
-        )
+        hf_split = self._neutral_hf_split_name(split)
+
+        def _load(hf_split_name: str):
+            return resolve_dataframe(
+                source,
+                split=hf_split_name,
+                max_rows=max_rows if is_hf_id else None,
+                dataset_trust_remote_code=getattr(self.config, "dataset_trust_remote_code", None),
+            )
+
+        try:
+            df = _load(hf_split)
+        except ValueError as exc:
+            # Neutral text is not split per class: a published neutral dataset often has only "train". Fall back for
+            # exactly that case; every other loading error is raised as before.
+            if not (is_hf_id and hf_split != "train" and "Unknown split" in str(exc)):
+                raise
+            logger.info("%s %r has no %r split; using its 'train' split.", field_name, source, hf_split)
+            df = _load("train")
         if df is None:
             if required:
                 raise ValueError(f"{field_name} resolved to None.")
@@ -2534,7 +2552,7 @@ class TextPredictionTrainer(Trainer):
             use_all_transitions: bool = False,
             transition_selection: Optional[List[Union[TransitionSpec, Tuple[str, str]]]] = None,
             balance_column: Optional[str] = "feature_pole",
-            **kwargs,
+            **kwargs: Any,
     ) -> Any:
         """
         Create training dataset from unified data.
@@ -2901,7 +2919,7 @@ class TextPredictionTrainer(Trainer):
         *,
         cache_dir: Optional[str] = None,
         use_cached_gradients: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> Any:
         """Wrap raw training data into TextGradientTrainingDataset for gradient creation (text modality).
         source and target are resolved from TrainingArguments (override via kwargs if needed).
@@ -3557,6 +3575,7 @@ class TextPredictionTrainer(Trainer):
                 "source_token": r.get("source_token"),
                 "factual_token": r.get("factual_token"),
                 "alternative_token": r.get("alternative_token"),
+                "template": r.get("template"),
                 "data_split": r.get("data_split"),
                 "neutral_variant": r.get("neutral_variant"),
                 "transition_type": r.get("transition_type"),
@@ -3728,6 +3747,7 @@ class TextPredictionTrainer(Trainer):
                 excluded_tokens=excluded_for_masked,
                 mask_token=mask_token,
                 min_prefix_tokens=5,
+                mask_placeholder=mask_placeholder,
             )
             if pair is None:
                 continue
@@ -3847,6 +3867,10 @@ class TextPredictionTrainer(Trainer):
         objective_name = self._prediction_objective(getattr(model_with_gradiend, "base_model", tokenizer)).name
         neutral_objective_name = self._neutral_encoder_prediction_objective(objective_name)
         rhs_window = getattr(getattr(self, "_training_args", None), "decoder_sequence_cloze_rhs_window", -1)
+        mask_placeholder = resolve_mask_placeholder(
+            config=self.config,
+            training_args=getattr(self, "_training_args", None),
+        )
 
         # Prepare neutral data: create masked texts with one mask per entry
         # Use provided text_col, or fall back to masked_col_name, or try common defaults
@@ -3891,6 +3915,7 @@ class TextPredictionTrainer(Trainer):
                 excluded_tokens=excluded_tokens,
                 mask_token=mask_token,
                 min_prefix_tokens=5,
+                mask_placeholder=mask_placeholder,
             )
             if pair is None:
                 continue

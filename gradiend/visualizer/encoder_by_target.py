@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 import hashlib
-from typing import Any, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,17 @@ def _encoded_scalar(value: Any) -> Optional[float]:
     return None
 
 
+def _merge_casing(tokens: pd.Series) -> pd.Series:
+    """Map tokens that differ only in casing to one spelling: the most frequent one (ties: the lower-case spelling)."""
+    folded = tokens.str.casefold()
+    spelling: Dict[str, str] = {}
+    for key, group in tokens.groupby(folded, sort=False):
+        counts = group.value_counts()
+        top = counts[counts == counts.max()].index
+        spelling[key] = key if key in top else sorted(top)[0]
+    return folded.map(spelling)
+
+
 def build_encoder_target_plot_frame(
     encoder_df: pd.DataFrame,
     *,
@@ -54,6 +65,7 @@ def build_encoder_target_plot_frame(
     class_order: Optional[Sequence[str]] = None,
     id2label: Optional[dict] = None,
     types: Sequence[str] = ("training",),
+    ignore_case: bool = True,
 ) -> Tuple[pd.DataFrame, List[str], List[str], dict, dict]:
     """Prepare training rows for target-token x-axis plots.
 
@@ -66,6 +78,8 @@ def build_encoder_target_plot_frame(
             ``id2label`` when available.
         id2label: Optional mapping from numeric/source ids to display labels.
         types: Encoder row types to include, by default training rows only.
+        ignore_case: If True (default), targets that differ only in casing (``Bad`` / ``bad``) are one target,
+            shown in its most frequent spelling.
 
     Returns:
         plot_df, target_order, split_hue_order, target_to_class_display, target_to_split
@@ -120,6 +134,8 @@ def build_encoder_target_plot_frame(
         if missing_token.any():
             plot_df.loc[missing_token, "target_token"] = plot_df.loc[missing_token, class_col].map(_display).astype(str)
 
+    if ignore_case:
+        plot_df["target_token"] = _merge_casing(plot_df["target_token"].astype(str))
     plot_df = plot_df[plot_df["target_token"].astype(str).str.len() > 0].copy()
     plot_df["encoded"] = plot_df["encoded"].map(_encoded_scalar)
     plot_df = plot_df.dropna(subset=["encoded"])
@@ -343,6 +359,46 @@ def _add_example_ids(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _interactive_hover(
+    df: pd.DataFrame,
+    *,
+    target_label: str,
+    leading: Sequence[str] = (),
+    seed_col: Optional[str] = None,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Hover columns and labels shared by the interactive by-target plots.
+
+    Adds ``text_hover`` to ``df``: the masked sentence when the rows carry one, else the original sentence.
+    The plotted token is the encoder input, which is not the word in the original sentence
+    (by default the alternative), so the factual and the alternative token are listed too.
+    """
+    text_col = _text_column(df)
+    if text_col is not None:
+        df["text_hover"] = df[text_col].map(_wrap_hover_text)
+    seed = [seed_col] if seed_col else []
+    hover_data = [
+        col
+        for col in [
+            *leading,
+            "text_hover",
+            "factual_token",
+            "alternative_token",
+            "target_token",
+            "feature_class",
+            *seed,
+            "plot_hue",
+            "encoded",
+        ]
+        if col in df.columns
+    ]
+    labels = plotly_labels_for(["target_token", "encoded", "plot_hue", *seed, *hover_data])
+    labels["target_token"] = target_label
+    labels["alternative_token"] = "Alternative token"
+    if text_col is not None and df[text_col].astype(str).str.contains("[MASK]", regex=False).any():
+        labels["text_hover"] = "Masked text"
+    return hover_data, labels
+
+
 def _plot_encoder_by_target_seed_grid_interactive(
     plot_df: pd.DataFrame,
     *,
@@ -353,6 +409,7 @@ def _plot_encoder_by_target_seed_grid_interactive(
     output: Optional[str],
     show: bool,
     height: int,
+    target_label: str = "Target token",
 ) -> Any:
     try:
         import plotly.express as px
@@ -361,21 +418,7 @@ def _plot_encoder_by_target_seed_grid_interactive(
         return None
 
     df = _add_example_ids(plot_df)
-    text_col = _text_column(df)
-    if text_col is not None:
-        df["text_hover"] = df[text_col].map(_wrap_hover_text)
-    hover_data = [
-        col for col in [
-            "example_id",
-            "text_hover",
-            "target_token",
-            "feature_class",
-            seed_col,
-            "plot_hue",
-            "encoded",
-        ]
-        if col in df.columns
-    ]
+    hover_data, plotly_labels = _interactive_hover(df, target_label=target_label, leading=("example_id",), seed_col=seed_col)
     fig = px.strip(
         df,
         x="target_token",
@@ -388,7 +431,7 @@ def _plot_encoder_by_target_seed_grid_interactive(
         },
         hover_data=hover_data or None,
         custom_data=["example_id"],
-        labels=plotly_labels_for(["target_token", "encoded", "plot_hue", seed_col, *hover_data]),
+        labels=plotly_labels,
         title=title,
         height=height,
     )
@@ -741,6 +784,7 @@ def plot_encoder_by_target_seed_grid(
     show_seed_points: bool = True,
     combine_seed_rows: bool = False,
     error_group_by_split: bool = True,
+    ignore_case: bool = True,
 ) -> Optional[str]:
     """Plot held-out target encodings as one shared-x row per seed."""
     if encoder_df is None or encoder_df.empty:
@@ -757,6 +801,7 @@ def plot_encoder_by_target_seed_grid(
             hue_col=hue_col,
             class_order=class_order,
             id2label=id2label,
+            ignore_case=ignore_case,
         )
     )
     if plot_df.empty or not target_order:
@@ -816,6 +861,7 @@ def plot_encoder_by_target_seed_grid(
             output=output,
             show=show,
             height=height,
+            target_label="Encoder input token" if target_col == "source_token" else "Target token",
         )
 
     plt = _require_matplotlib()
@@ -946,6 +992,7 @@ def _plot_encoder_by_target_interactive(
     output: Optional[str],
     show: bool,
     height: int,
+    target_label: str = "Target token",
 ) -> Any:
     try:
         import plotly.express as px
@@ -954,20 +1001,7 @@ def _plot_encoder_by_target_interactive(
         return None
 
     df = plot_df.copy()
-    text_col = _text_column(df)
-    if text_col is not None:
-        df["text_hover"] = df[text_col].map(_wrap_hover_text)
-    hover_data = [
-        col for col in [
-            "text_hover",
-            "target_token",
-            "feature_class",
-            "plot_hue",
-            "encoded",
-        ]
-        if col in df.columns
-    ]
-    plotly_labels = plotly_labels_for(["target_token", "encoded", "plot_hue", *hover_data])
+    hover_data, plotly_labels = _interactive_hover(df, target_label=target_label)
     fig = px.strip(
         df,
         x="target_token",
@@ -1024,6 +1058,7 @@ def plot_encoder_by_target(
     height: int = 520,
     legend_loc: str = "upper right",
     highlight_non_convergence: Optional[bool] = None,
+    ignore_case: bool = True,
     **kwargs: Any,
 ) -> Optional[str]:
     """
@@ -1039,6 +1074,7 @@ def plot_encoder_by_target(
         class_order: Optional feature-class display order.
         interactive: If True, create a Plotly strip plot with hover instead of a static Matplotlib plot.
         legend_loc: Matplotlib legend location for static plots.
+        ignore_case: If True (default), targets that differ only in casing (``Bad`` / ``bad``) are plotted as one target.
         point_size: Marker size for strip plot points (seaborn ``size``).
         title: Optional plot title. None (default) draws no title.
         output: Explicit output path. Interactive plots are written as HTML.
@@ -1099,6 +1135,7 @@ def plot_encoder_by_target(
         hue_col=hue_col,
         class_order=class_order,
         id2label=id2label or None,
+        ignore_case=ignore_case,
     )
     )
     if plot_df.empty or not target_order:
@@ -1132,6 +1169,7 @@ def plot_encoder_by_target(
             output=output,
             show=show,
             height=height,
+            target_label="Encoder input token" if target_col == "source_token" else "Target token",
         )
 
     plt = _require_matplotlib()

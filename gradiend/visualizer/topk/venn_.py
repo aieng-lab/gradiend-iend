@@ -111,20 +111,22 @@ def _topk_weights_for_venn_set(
     seed_group_policy: str = "primary",
 ) -> List[int]:
     """Resolve one top-k set for a Venn circle, including multi-seed groups."""
+    from gradiend.comparison.common import topk_base_indices
+
     seed_group_policy = str(seed_group_policy or "primary").lower()
     if seed_group_policy not in {"primary", "union", "intersection"}:
         raise ValueError("seed_group_policy must be one of 'primary', 'union', or 'intersection'")
 
     seed_models = _seed_models_for_venn(model)
     if seed_models is None:
-        return list(model.get_topk_weights(part=part, topk=topk))
+        return topk_base_indices(model, part, topk)
     if not seed_models:
         raise ValueError("Seed model group for Venn plot must contain at least one model")
 
     if seed_group_policy == "primary":
-        return list(seed_models[0].get_topk_weights(part=part, topk=topk))
+        return topk_base_indices(seed_models[0], part, topk)
 
-    seed_sets = [set(seed_model.get_topk_weights(part=part, topk=topk)) for seed_model in seed_models]
+    seed_sets = [set(topk_base_indices(seed_model, part, topk)) for seed_model in seed_models]
     if seed_group_policy == "union":
         return sorted(set.union(*seed_sets)) if seed_sets else []
     return sorted(set.intersection(*seed_sets)) if seed_sets else []

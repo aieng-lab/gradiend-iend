@@ -52,11 +52,15 @@ def missing_mask_placeholder_message(template: str, mask_placeholder: str) -> st
     )
 
 
-def require_mask_placeholder(template: str, mask_placeholder: str) -> str:
-    """Return ``template`` or raise if ``mask_placeholder`` is missing."""
+def require_mask_placeholder(template: str, mask_placeholder: str, *, mask_token: Optional[str] = None) -> str:
+    """Return ``template`` or raise if ``mask_placeholder`` is missing.
+
+    A template that already carries the tokenizer's own ``mask_token`` is accepted as well: it
+    needs no substitution before tokenization.
+    """
     text = str(template)
     placeholder = str(mask_placeholder)
-    if placeholder not in text:
+    if placeholder not in text and not (mask_token and str(mask_token) in text):
         raise ValueError(missing_mask_placeholder_message(text, placeholder))
     return text
 
@@ -66,6 +70,7 @@ def validate_masked_templates_in_dataframe(
     mask_placeholder: str,
     *,
     masked_col: str = UNIFIED_MASKED,
+    mask_token: Optional[str] = None,
 ) -> None:
     """Fail fast when masked templates omit the configured prediction slot."""
     if masked_col not in data.columns or len(data) == 0:
@@ -73,6 +78,8 @@ def validate_masked_templates_in_dataframe(
     masked = data[masked_col].astype(str)
     placeholder = str(mask_placeholder)
     missing = ~masked.str.contains(re.escape(placeholder), regex=True)
+    if mask_token:
+        missing &= ~masked.str.contains(re.escape(str(mask_token)), regex=True)
     if not bool(missing.any()):
         return
     first_bad = masked[missing].iloc[0]
@@ -208,6 +215,7 @@ def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "legacy"
 
     - ``"canonical"``: :func:`decoder_only_label_token_ids` (leading-space variant),
       first id for multi-token labels.
+
     - ``"legacy"``: ``vocab[label]`` (else the first id of ``tokenizer(label)``), the
       rule every artifact trained before 2026-09-25 used.
 
@@ -297,6 +305,37 @@ def _token_spans_covering_char_spans(
             continue
         token_spans.append((token_indices[0], token_indices[-1] + 1))
     return token_spans
+
+
+def _window_around_masks(tokenizer: Any, text: str, *, mask_token: str, max_length: int) -> str:
+    """Return the part of ``text`` that fits ``max_length`` tokens and keeps every ``mask_token``.
+
+    Naive ``truncation=True`` keeps the start of the text and cuts the masks off a long row, which then cannot be
+    trained on. This keeps a window of whole tokens around the masks, with as much left and right context as fits
+    (a masked LM needs both sides). Text that fits is returned unchanged, and so is text of a tokenizer without
+    offset support (the caller then fails with its usual message).
+    """
+    encoded, raw_offsets = tokenize_with_offsets(tokenizer, text, add_special_tokens=False, truncation=False)
+    if raw_offsets is None:
+        return text
+    ids = list(encoded["input_ids"])
+    budget = int(max_length) - int(getattr(tokenizer, "num_special_tokens_to_add", lambda pair=False: 2)(pair=False))
+    if len(ids) <= budget:
+        return text
+    mask_id = tokenizer.convert_tokens_to_ids(mask_token)
+    positions = [i for i, token_id in enumerate(ids) if token_id == mask_id]
+    if not positions:
+        return text
+    first, last = positions[0], positions[-1] + 1
+    spare = max(0, budget - (last - first))
+    start = max(0, first - spare // 2)
+    end = min(len(ids), last + (spare - spare // 2))
+    if start == 0:
+        end = min(len(ids), budget)  # no left context to spend: use the room on the right
+    elif end == len(ids):
+        start = max(0, len(ids) - budget)
+    offsets = offset_pairs(raw_offsets)
+    return text[offsets[start][0]:offsets[end - 1][1]]
 
 
 def _left_truncate_template_keeping_mask(
@@ -648,13 +687,13 @@ def create_masked_pair_from_text(
     """Create a single (masked_text, target_token) pair from raw text.
 
     For MLM models: masks one random non-special token. For decoder-only models:
-    uses prefix up to a random position, inserts [MASK], and uses the next token
+    uses prefix up to a random position, inserts the placeholder, and uses the next token
     as target.
 
     Args:
         text: Raw input text to create a masked example from.
         tokenizer: Tokenizer for encoding and decoding.
-        is_decoder_only_model: If True, uses prefix+[MASK] mode; else uses MLM mask mode.
+        is_decoder_only_model: If True, uses prefix+placeholder mode; else uses MLM mask mode.
         excluded_tokens: Tokens to avoid masking (e.g., target class tokens).
         mask_token: The tokenizer's MLM special, used only to decide whether the
             in-place masking branch applies and to detect already-masked input.
@@ -793,6 +832,7 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         )
         self.mask_token = getattr(tokenizer, "mask_token", None)
         self.mask_token_id = getattr(tokenizer, "mask_token_id", None)
+        self.mask_placeholder = DEFAULT_DATASET_MASK_PLACEHOLDER
 
     def _create_item(self, text: str, target: Union[str, Sequence[Any]]):
         """Create a single training item: input_ids, attention_mask, labels.
@@ -971,6 +1011,18 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         mask_positions = (input_ids == mask_token_id).nonzero(as_tuple=False)
         expected_masks = sum(len(site_tokens) for site_tokens in site_token_lists)
         if len(mask_positions) != expected_masks:
+            # a long row: truncation kept the start of the text and cut the masks off. Keep a window around them.
+            windowed = _window_around_masks(
+                self.tokenizer, expanded_text, mask_token=self.mask_token, max_length=self.max_length
+            )
+            if windowed != expanded_text:
+                with suppress_tokenizer_length_warning():
+                    encoded = self.tokenizer(windowed, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
+                input_ids = encoded["input_ids"]
+                attention_mask = encoded["attention_mask"]
+                labels = torch.full_like(input_ids, -100)
+                mask_positions = (input_ids == mask_token_id).nonzero(as_tuple=False)
+        if len(mask_positions) != expected_masks:
             raise ValueError(
                 "Classic MLM training expected "
                 f"{expected_masks} tokenized mask position(s) across {mask_count} site(s), "
@@ -1059,6 +1111,7 @@ class TextTrainingDataset(TextBatchedDataset):
             self.data,
             self.mask_placeholder,
             masked_col=UNIFIED_MASKED,
+            mask_token=self.mask_token,
         )
         if is_decoder_only_model and getattr(self.tokenizer, "pad_token", None) is None:
             eos_token = getattr(self.tokenizer, "eos_token", None)
@@ -1073,7 +1126,7 @@ class TextTrainingDataset(TextBatchedDataset):
         """
         entry = super().__getitem__(idx)
         mask_placeholder = self.mask_placeholder
-        template = require_mask_placeholder(entry[UNIFIED_MASKED], mask_placeholder)
+        template = require_mask_placeholder(entry[UNIFIED_MASKED], mask_placeholder, mask_token=self.mask_token)
         if self.prediction_objective == "clm_sequence_cloze":
             input_text = template
         elif self.prediction_objective == SEQ2SEQ_DECODER_SEQUENCE_CLOZE:

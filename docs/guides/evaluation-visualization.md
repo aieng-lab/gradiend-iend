@@ -99,7 +99,7 @@ Regenerate: gradiend/examples/start_workflow.py
 
 Grouped split violins showing the distribution of encoded values by transition/class. By default the plot shows only the **target (training) transition(s)** and **neutral** data; use `target_and_neutral_only=False` to include all transitions. Each group has left and right halves (e.g. masc→fem vs fem→masc in one split violin). When using [`trainer.evaluate_encoder()`][gradiend.trainer.trainer.Trainer.evaluate_encoder] with `plot=True`, any plot option can be forwarded via `plot_kwargs` (e.g. `plot_kwargs=dict(target_and_neutral_only=False, show=False)`).
 
-For explicit component-split runs, `evaluate_encoder(plot=True)` also writes component sidecars under `components/`: an encoder component correlation overview plus one encoder distribution plot per component. These plots reuse the already computed component encoder DataFrame and do not run the model again.
+For explicit component-split runs, [`evaluate_encoder(plot=True)`][gradiend.trainer.trainer.Trainer.evaluate_encoder] also writes component sidecars under `components/`: an encoder component correlation overview plus one encoder distribution plot per component. These plots reuse the already computed component encoder DataFrame and do not run the model again.
 
 ### Entry points
 
@@ -340,11 +340,12 @@ view.plot_encoder_by_target(split="test")
 | `hue_col` | `"data_split"` | Color by split — use for holdout verification |
 | `plot_style` | `"strip"` | `strip`, `box`, or `violin` |
 | `interactive` | `False` | Plotly strip with hover (Jupyter-friendly) |
+| `ignore_case` | `True` | Targets that differ only in casing (`Bad` / `bad`) are one target, shown in the most frequent spelling |
 
 ### Use cases
 
 - **Vocabulary holdout:** test targets should appear only in the test hue — see [Data splits](data-splits.md).
-- **Outliers:** set `interactive=True` and hover for masked context.
+- **Outliers:** set `interactive=True` and hover for the masked sentence and the factual, alternative and encoder input token (the plotted token is the encoder input, the alternative by default).
 - **Publication:** `plot_style="box"`, set `output`, `legend_loc`.
 
 <!-- DOC_PLOT: docs/img/data_splits_encoder_by_target_test.png

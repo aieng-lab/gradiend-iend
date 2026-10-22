@@ -226,7 +226,7 @@ class TestImgFormatVisualizerOutputPath:
                 class_spread="ci95",
                 plot_mean_by_feature_class=False,
             )
-            assert "95% CI" in axes[0].get_title()
+            assert "95% CI" in axes[0].get_title().replace("\\%", "%")  # LaTeX plot styles escape the percent sign
             collections = [
                 c for c in axes[0].collections if c.get_label() == "_collection0" or hasattr(c, "get_paths")
             ]

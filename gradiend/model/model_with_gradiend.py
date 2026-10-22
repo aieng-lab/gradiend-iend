@@ -1012,9 +1012,9 @@ class ModelWithGradiend(nn.Module, ABC):
 
     def modify_model(
         self,
-        learning_rate,
-        feature_factor,
-        part="decoder",
+        learning_rate: float,
+        feature_factor: Union[float, Sequence[float]],
+        part: str = "decoder",
         *,
         token_selector: Optional[Any] = None,
         activation_gate: Optional[Any] = None,
@@ -1023,7 +1023,7 @@ class ModelWithGradiend(nn.Module, ABC):
         direction: Optional[Any] = None,
         target_encoding: Optional[Any] = None,
         tolerance: float = 0.2,
-    ):
+    ) -> Any:
         """
         Return an in-memory base model with the selected GRADIEND/ACTIEND
         intervention made permanent for normal downstream inference.

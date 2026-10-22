@@ -1,4 +1,4 @@
-from typing import Optional, Dict, List, Union
+from typing import Any, Optional, Dict, List, Union
 
 from .pairwise_heatmap import plot_topk_overlap_heatmap
 from .naming import as_named_models
@@ -11,7 +11,7 @@ def plot_topk_overlap(
     part: str = "decoder-weight",
     output_path: Optional[str] = None,
     show: bool = False,
-    **kwargs
+    **kwargs: Any,
 ):
     """Plot top-k neuron overlap between models.
 

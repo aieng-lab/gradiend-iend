@@ -149,8 +149,11 @@ def _make_decoder_plot_data():
             "lms": {"lms": 0.56 - gain * 0.45},
         }
     decoder_results = {
-        "positive": {"learning_rate": 0.1, "feature_factor": -1.0, "value": 0.89},
-        "negative": {"learning_rate": 0.1, "feature_factor": -1.0, "value": 0.40},
+        # the plot renders what the evaluation selected: which class' metric on which dataset panel
+        "positive": {"learning_rate": 0.1, "feature_factor": -1.0, "value": 0.89,
+                     "selection_metric_class": "positive", "selection_dataset_class": "positive"},
+        "negative": {"learning_rate": 0.1, "feature_factor": -1.0, "value": 0.40,
+                     "selection_metric_class": "negative", "selection_dataset_class": "negative"},
         "grid": {},
     }
     return decoder_results, {"plotting_data": grid}

@@ -226,6 +226,14 @@ def test_plot_cross_encoding_plot_only_uses_cache_without_hf_pool(demo, monkeypa
     )
     monkeypatch.setattr(demo, "plot_gradiend_transition_cross_encoding_heatmap", lambda *a, **k: {})
     monkeypatch.setattr(demo, "plot_cross_encoding_heatmap", lambda *a, **k: {})
+    # seed stability is requested but there are no trainers: the std matrices need at least one, and
+    # computing them is not what this test is about
+    import gradiend.comparison as comparison
+
+    monkeypatch.setattr(
+        comparison, "compute_gradiend_transition_cross_encoding_matrix", lambda *a, **k: {}, raising=False
+    )
+    monkeypatch.setattr(demo, "_plot_std_heatmap_from_cell_stats", lambda *a, **k: None)
 
     config = demo.ExperimentConfig(
         model_name="google-bert/bert-base-multilingual-cased",
@@ -640,7 +648,9 @@ def test_plot_cross_encoding_plot_only_allows_partial_missing_cells_with_warning
         model_name="google-bert/bert-base-multilingual-cased",
         decoder_eval_mode=demo.DecoderEvalMode.NONE,
         mlm_head_scope=demo.MlmHeadScope.GLOBAL,
-        args=demo.TrainingArguments(experiment_dir=str(tmp_path), encoder_eval_max_size=50),
+        args=demo.TrainingArguments(
+            experiment_dir=str(tmp_path), encoder_eval_max_size=50, analyze_seed_stability=True
+        ),
         mlm_head_args={},
     )
 

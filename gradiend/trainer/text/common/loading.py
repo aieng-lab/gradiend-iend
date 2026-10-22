@@ -116,8 +116,6 @@ def _from_pretrained_checked(loader, name_or_path, **load_kwargs):
     raise _CatastrophicWeightLoad(message)
 
 
-
-
 def _load_causal_lm_for_config(name_or_path, config, load_kwargs):
     """
     Load a causal LM, preferring text-only wrappers for multimodal HF auto mappings.

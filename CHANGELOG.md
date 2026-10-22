@@ -7,24 +7,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-
-- `plot_topk_overlap`, `plot_topk_overlap_venn` and the top-k heatmaps accept a plain list of models, e.g. `plot_topk_overlap([t.get_model() for t in trainers], topk=1000)`. Models are labelled after their checkpoint folder (`runs/3SG_3PL/model` -> `3SG_3PL`; generic folders such as `model` or `seeds/seed_42` are skipped). When no unique label can be derived a `ValueError` asks for a `{label: model}` dict instead of inventing labels. Dicts work as before.
-- `gradiend.trainer.core.lr_search`: automatic learning-rate search (`tune_learning_rate`, `LRSearch`). Short probe runs are classified (converged / frozen / slow / degrading / collapsed / diverged) and the class of the run, not just its score, sets the next LR: expand by x10 until one LR is too low and another too high, then bisect on a readable 1/2/5 (or `resolution="fine"`: 1/1.5/2/3/5/7) grid until no untried grid value remains inside the bracket. A converged run is confirmed at the full step budget and the LR at the centre of the convergent window is returned. The search ends with `no_convergent_lr` (plus the trace in `lr_search.json`) when the bracket closes without a convergent run. Each probe trains from the original base model, and `ProbeStopCallback` ends a probe as soon as it is decisively collapsed or diverged. `assert_signal_diverse` is a guard for training inputs that carry no within-class information.
-- The training loop honours `control["should_stop"]` set by a callback after any step (previously only checked at epoch end); the epoch-end hooks still run so checkpoint and `training.json` are written.
+- `LRSearchConfig.probe_seeds`: a learning-rate probe that ends collapsed or degrading is repeated with the next seeds and the best run is kept (some regimes collapse for one seed and converge for another). Default `1`.
 - `TrainingArguments.label_token_protocol` (`"canonical"` default, `"legacy"`): which token id is supervised for a decoder-only label. `canonical` uses the leading-space variant, the same one `create_inputs` uses. Serialized arguments without the key load as `legacy`, so already-trained artifacts are read under the rule they were trained with.
-- `gradiend.util.positions` (`last_real_token_positions`, `first_real_token_positions`, `assert_labels_on_real_tokens`): the single implementation of "which token is the last real one" for left- and right-padded batches.
 
 ### Fixed
-
-- `TextPredictionTrainer.create_training_data` classified the model by passing the GRADIEND wrapper to `is_decoder_only_model`, which fell back to "`Model` in the class name -> decoder-only": every masked LM (BERT, RoBERTa, ...) trained through `train()` was cut off at `[MASK]` with the label on the last token instead of being trained as a masked LM (causal LMs were unaffected). `is_decoder_only_model` now reads the model configuration (`architectures`, `is_encoder_decoder`, `model_type`; wrapper -> wrapped model, tokenizer -> config of the same repository) and uses the tokenizer's mask token only as the last resort, so Gemma-3 (causal, but its tokenizer ships an unused mask token) is classified correctly without a name check.
+- Masked-LM training no longer fails on a long row whose mask lies beyond `max_length` ("Classic MLM training expected 1 tokenized mask position(s) ... got 0"). Such a row is cut to a window of whole tokens around the mask, with context on both sides; rows that fit are unchanged.
+- `evaluate_decoder`: with a custom `summary_extractor`, an explicit `summary_metrics` list is summarized as requested. It was reduced to the evaluated class names, which dropped derived metrics such as `_bpi` and failed with "Requested metrics not present". The default extractor still limits metrics to the evaluated classes.
+- A neutral evaluation dataset on the Hub that has only a `train` split is used for every encoder split (before: `Unknown split "test"`).
+- `TextPredictionDataCreator.generate_training_data` rejects `split_by_target` together with `split_group_col` before it scans the corpus.
 - `TextPredictionDataCreator` and `TextPredictionTrainer` now raise a class-specific error immediately when a configured feature class has no matches/rows, instead of silently dropping it or later failing with `per_class_dict_to_unified produced no rows`.
-- Decoder-only training items put the supervised label at `attention_mask.sum() - 1`, which is the last real token only for right padding. Tokenizers that pad on the left (Gemma-2/3) therefore had the label inside the padding block: every gradient/activation signal of a class was bit-identical across sentences, so GRADIEND/AGIEND/CGA/CAGA trained on class-constant inputs without any error. The label position, the prediction-token mask used for steering (`modified._clm_prediction_position_mask`), the decoder-eval prefix positions and CAA's last-token readout all use `last_real_token_positions` now, and dataset construction raises if a label lands on padding.
-- `SignalTrainingDatasetBase.__getitem__` (and its subclasses, incl. gradient and text-activation datasets) now raises `IndexError` for an out-of-range index instead of silently resolving to an empty slice. An out-of-range index previously produced an empty merged batch, which surfaced far downstream as a confusing `Masked template does not contain mask_placeholder='[MASK]'. Got template='None'.` (activation-gradient) or `KeyError: 'factual'` (gradient). This makes a caller that iterates past `len(dataset)` fail clearly at the source.
+- (Beyond the GRADIEND fix of 0.2.2, for the other signal methods too.) Decoder-only training items put the supervised label at `attention_mask.sum() - 1`, which is the last real token only for right padding. Tokenizers that pad on the left (Gemma-2/3) therefore had the label inside the padding block: every gradient/activation signal of a class was bit-identical across sentences, so GRADIEND/AGIEND/CGA/CAGA trained on class-constant inputs without any error. The label position, the prediction-token mask used for steering (`modified._clm_prediction_position_mask`), the decoder-eval prefix positions and CAA's last-token readout all use `last_real_token_positions` now, and dataset construction raises if a label lands on padding.
+- (Beyond the `GradientTrainingDataset` fix of 0.2.2.) `SignalTrainingDatasetBase.__getitem__` (and its subclasses, incl. gradient and text-activation datasets) now raises `IndexError` for an out-of-range index instead of silently resolving to an empty slice. An out-of-range index previously produced an empty merged batch, which surfaced far downstream as a confusing `Masked template does not contain mask_placeholder='[MASK]'. Got template='None'.` (activation-gradient) or `KeyError: 'factual'` (gradient). This makes a caller that iterates past `len(dataset)` fail clearly at the source.
+
+### Changed
+- GRADIEND encoders use a trainable linear bias by default (`bias_encoder=True`). Existing checkpoints that lack `architecture.bias_encoder` remain loadable: loading infers whether the encoder bias exists from the saved state dict.
+- `GradiendModel` now supports default split metadata via `GradiendComponent` and exposes virtual component views through `gradiend.encoders[...]`, `gradiend.decoders[...]`, `encode_components(...)`, `with_components(...)`, and `without_split()`. These views slice the normal GRADIEND weights and do not create separate submodels.
+
+## [0.2.2] - 2026-10-22
+
+Patch release. Training defaults and numerics are unchanged from 0.2.1.
+
+### Added
+
+- Automatic learning-rate search with short probe runs: `learning_rate="tune"` or `trainer.tune_learning_rate()`, options in `LRSearchConfig`, and `trainer.lr_search_result.plot()` shows what the search did ([guide](docs/guides/learning-rate-search.md)).
+- `PairedTextFilterConfig` for `TextPredictionDataCreator`: list 1:1 counterpart words once (e.g. British/American spelling) and every row carries its explicit alternative. `split_by_target=True` holds out whole target words (or pairs) for validation and test; the trainer's `split_col="heldout"` keeps such pairs and their alternatives intact.
+- Callbacks can stop training after any step by setting `control["should_stop"]`.
+- `plot_topk_overlap`, `plot_topk_overlap_venn` and the top-k heatmaps accept a list of models, labelled after their checkpoint folders.
+- `mask_placeholder` (`TextPredictionConfig` / `TrainingArguments`, default `"[MASK]"`) for data that marks the prediction slot differently, e.g. `"[PRONOUN]"`. Templates without the placeholder now fail early. Decoder evaluation still expects `[MASK]`.
+- `gradiend.comparison.load_saved_cross_encoding_inputs`: the class pairs, sources and cached encodings of saved run folders, so the oriented cross-encoding matrix can be computed without trainers or data (e.g. for the published multilingual models).
 
 ### Changed
 
-- GRADIEND encoders use a trainable linear bias by default (`bias_encoder=True`). Existing checkpoints that lack `architecture.bias_encoder` remain loadable: loading infers whether the encoder bias exists from the saved state dict.
-- `GradiendModel` now supports default split metadata via `GradiendComponent` and exposes virtual component views through `gradiend.encoders[...]`, `gradiend.decoders[...]`, `encode_components(...)`, `with_components(...)`, and `without_split()`. These views slice the normal GRADIEND weights and do not create separate submodels.
+- `plot_encoder_by_target` shows targets that differ only in casing as one target, in their most frequent spelling (`ignore_case=True`, the default).
+- The interactive by-target plot (`interactive=True`) shows the masked sentence on hover, together with the factual, alternative and encoder input token. Before, it showed the original sentence with the factual word, which did not contain the plotted token (the alternative is the encoder input by default). For this, the encoder rows of text training data keep their `template` column; encoder caches written by earlier versions lack it and fall back to the original sentence.
+- `multilingual_demo_labels` (labels and styles of the multilingual demo figures) moved from `gradiend.visualizer` to `gradiend.examples` and is no longer part of the installed package.
+
+### Fixed
+
+- `split_by_target=True` with plain `TextFilterConfig` targets treated `Bad` and `bad` as different targets, so a word could end up in several splits. Casing and surrounding whitespace are now ignored (override with `split_group_key`). Paired targets were not affected.
+- Tokenizers that pad on the left (Gemma-2/3): the supervised label landed in the padding, so all inputs of a class were identical and training "converged" without learning anything. Models trained with 0.2.1 or earlier on such tokenizers should be retrained.
+- Language-model score (LMS) of decoder-only models: the causal-LM perplexity compared each position's logits with the token at the same position instead of the next token, so it measured how well the model repeats the current token, not its language-model loss. It now uses the next-token shift and ignores targets predicted from padding. LMS values, and the update strength `evaluate_decoder` selects with them, can differ from 0.2.1 for decoder-only models; re-run their decoder evaluations. Masked language models are not affected.
+- Decoder-only detection reads the model config instead of the tokenizer's mask token. Gemma-3 is causal but ships an unused mask token and was trained as a masked LM.
+- Loading a base model fails loudly when nearly all weights come back uninitialised (seen with Gemma 3) instead of silently training on random weights. Incomplete local checkpoints get a clearer error.
+- CUDA out-of-memory (or other CUDA errors) during evaluation now abort training. Before, evaluation was skipped silently and no checkpoint was selected.
+- A stale decoder-grid cache (other direction or target, or missing metrics) is recomputed instead of reused.
+- Decoder evaluation no longer fails with `KeyError` when no candidate reaches the language-model score (LMS) threshold (seen in multi-seed runs). In that case the candidate with the smallest non-zero learning rate is selected, as before; the fallback only broke on the dict-style candidate ids of multi-seed grids.
+- `GradientTrainingDataset` raises `IndexError` for an out-of-range index (before: an empty batch and a confusing `KeyError` later).
 
 ## [0.2.1] - 2026-07-16
 

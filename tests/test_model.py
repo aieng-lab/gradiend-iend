@@ -16,6 +16,14 @@ import torch.nn as nn
 from gradiend.model import GradiendComponent, GradiendModel, ParamMappedGradiendModel
 
 
+@pytest.fixture
+def cpu_only(monkeypatch):
+    """For tests that build CPU tensors and plain ``GradiendModel``s: models default to CUDA when it is available, which on
+    a GPU machine puts them on another device than their inputs, so CUDA is hidden from the code under test. Not for tests
+    that build a ``ModelWithGradiend``: it refuses to run when CUDA is visible but reported unavailable."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+
 class TestGradiendModel:
     """Test GradiendModel (weights-only encoder-decoder)."""
     
@@ -143,6 +151,7 @@ class TestGradiendModel:
         loaded_output = loaded.forward(x)
         torch.testing.assert_close(original_output, loaded_output, rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_gradiend_model_loads_legacy_checkpoint_without_init_fan_in_floor(self, temp_dir):
         model = GradiendModel(input_dim=8, latent_dim=2, device=torch.device("cpu"))
         save_path = os.path.join(temp_dir, "legacy_init_model")
@@ -161,6 +170,7 @@ class TestGradiendModel:
         x = torch.randn(3, 8)
         torch.testing.assert_close(model(x), loaded(x), rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_gradiend_model_can_disable_encoder_bias_and_roundtrip(self, temp_dir):
         model = GradiendModel(
             input_dim=8,
@@ -187,6 +197,7 @@ class TestGradiendModel:
         x = torch.randn(3, 8)
         torch.testing.assert_close(model(x), loaded(x), rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_gradiend_model_loads_old_checkpoint_encoder_bias_from_state_dict(self, temp_dir):
         model = GradiendModel(
             input_dim=8,
@@ -211,6 +222,7 @@ class TestGradiendModel:
         x = torch.randn(3, 8)
         torch.testing.assert_close(model(x), loaded(x), rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_gradiend_model_loads_old_checkpoint_without_encoder_bias_from_state_dict(self, temp_dir):
         model = GradiendModel(
             input_dim=8,
@@ -396,6 +408,7 @@ class TestGradiendModel:
         assert model._component_decoders["right"].weight.shape == (2, 1)
         assert model._component_decoders["right"].weight.data_ptr() == model.decoder[0].linear.weight[2:, :].data_ptr()
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_gradiend_model_component_metadata_roundtrips_checkpoint(self, temp_dir):
         model = GradiendModel(
             input_dim=4,
@@ -433,6 +446,7 @@ class TestGradiendModel:
         assert model.component_slices == ()
         assert [component.id for component in model._virtual_component_slices] == ["full"]
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_param_mapped_gradiend_model_component_metadata_roundtrips_checkpoint(self, temp_dir):
         model = ParamMappedGradiendModel(
             input_dim=4,
@@ -1149,6 +1163,7 @@ class TestModelWithGradiend:
         )
         assert torch.allclose(base_model.model.embed_tokens.weight, before)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_modify_model_for_activation_gradiend_adds_hook_steering(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -1593,6 +1608,7 @@ class TestModelWithGradiend:
         torch.testing.assert_close(model(input_ids=masked_ids), expected_masked)
         torch.testing.assert_close(model(input_ids=neutral_ids), torch.zeros(1, 3, 2))
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_activation_encoder_selector_single_site_uses_global_encoder_bias(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -1662,6 +1678,7 @@ class TestModelWithGradiend:
         expected = before + torch.tensor([0.25, -0.75])
         torch.testing.assert_close(after, expected)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_activation_encoder_selector_slices_unsplit_bias_free_multi_site_encoder(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -1739,6 +1756,7 @@ class TestModelWithGradiend:
         expected[:, 0, :] += torch.tensor([4.0, 6.0])
         torch.testing.assert_close(after, expected)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_activation_encoder_selector_uses_tanh_score_for_thresholds(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -1803,6 +1821,7 @@ class TestModelWithGradiend:
         # The raw linear site score is 1.0, but the ACTIEND encoder score is tanh(1.0) < 0.8.
         torch.testing.assert_close(after, before)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_activation_selector_coverage_uses_direction_selector_and_cleans_up(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -1868,6 +1887,7 @@ class TestModelWithGradiend:
         assert len(base_model.emb._forward_hooks) == 0
         assert len(base_model._forward_pre_hooks) == 0
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_activation_gate_composes_with_position_selector(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -1944,6 +1964,7 @@ class TestModelWithGradiend:
         assert coverage["coverage"] == 0.5
         assert coverage["scope_coverage"] == 1.0
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_activation_modules_filters_single_site_intervention(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -2016,6 +2037,7 @@ class TestModelWithGradiend:
                 activation_modules="missing",
             )
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_intervene_gradient_value_zero_is_noop_and_restores_weights(self):
         from types import SimpleNamespace
 
@@ -2065,6 +2087,7 @@ class TestModelWithGradiend:
         assert torch.allclose(during_logits, before_logits, atol=1e-7)
         assert torch.allclose(base_model.linear.weight, before_weight)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_intervene_gradient_applies_temporarily_and_cleans_up_after_exception(self):
         from types import SimpleNamespace
 
@@ -2118,6 +2141,7 @@ class TestModelWithGradiend:
         assert not hasattr(model_with_gradiend, "active_intervention_metadata")
 
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.usefixtures("cpu_only")
     def test_intervene_gradient_restores_half_precision_weights_bit_exactly(self, dtype):
         """``(w + d) - d != w`` in bf16/fp16; a strength sweep must not drift the base model."""
         from types import SimpleNamespace
@@ -2188,6 +2212,7 @@ class TestModelWithGradiend:
                 raise RuntimeError("boom")
         assert torch.equal(base.lin.weight, before_half)
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_intervene_activation_hooks_only_inside_context(self):
         from gradiend.model import ModelWithGradiend, ParamMappedGradiendModel
 
@@ -2283,6 +2308,7 @@ class TestModelWithGradiend:
                 "signal": {"kind": "activation", "name": None, "options": {"token_selector": "all"}},
             },
             bias_decoder=False,
+            device=torch.device("cpu"),  # the tiny base model lives on the CPU
             activation_decoder="id",
         )
         with torch.no_grad():

@@ -1,6 +1,6 @@
 """Plot-style regression tests for multilingual cross-encoding seed dispersion."""
 
-from gradiend.visualizer.multilingual_demo_labels import (
+from gradiend.examples.multilingual_demo_labels import (
     demo_encoding_std_heatmap_style_kwargs,
 )
 

@@ -114,12 +114,10 @@ def test_resolve_highlight_non_convergence():
     assert resolve_highlight_non_convergence(None) is True
 
 
-def test_resolve_highlight_non_convergence():
-    trainer = _TrainerStub(highlight=False)
-    assert resolve_highlight_non_convergence(None, trainer=trainer) is False
-    assert resolve_highlight_non_convergence(True, trainer=trainer) is True
-    assert resolve_highlight_non_convergence(False, trainer=trainer) is False
-    assert resolve_highlight_non_convergence(None) is True
+def test_plot_title_is_omitted_without_run_id_or_default():
+    from types import SimpleNamespace
+
+    assert resolve_plot_title_with_convergence(True, trainer=SimpleNamespace(run_id=None), default=None) is False
 
 
 def test_resolve_plot_title_with_convergence():

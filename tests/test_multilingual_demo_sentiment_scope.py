@@ -130,9 +130,7 @@ def test_encoder_analysis_excludes_good_bad_auxiliary_sentiment(demo):
     ]
 
 
-def test_cross_task_probe_trainers_include_sentiment_pool(demo, monkeypatch):
-    import pandas as pd
-
+def test_cross_task_probe_trainers_include_sentiment_pool(demo, monkeypatch, tmp_path):
     created = {}
 
     class _ProbeTrainer:
@@ -140,22 +138,11 @@ def test_cross_task_probe_trainers_include_sentiment_pool(demo, monkeypatch):
             created[kwargs["run_id"]] = kwargs
 
     monkeypatch.setattr(demo, "TextPredictionTrainer", _ProbeTrainer)
-    monkeypatch.setattr(demo, "_pronoun_data_paths", lambda: ("pronoun.csv", "pronoun_neutral.csv"))
-    monkeypatch.setattr(demo, "_sentiment_data_paths", lambda: ("sentiment.csv", "sentiment_neutral.csv"))
-    monkeypatch.setattr(
-        "gradiend.examples.train_sentiment.load_and_split_sentiment_training_data",
-        lambda path, seed=0: pd.DataFrame(
-            {
-                "masked": ["[MASK] good", "[MASK] bad"],
-                "split": ["test", "test"],
-                "factual": ["good", "bad"],
-                "alternative": ["bad", "good"],
-                "factual_class": ["positive", "negative"],
-                "alternative_class": ["negative", "positive"],
-            }
-        ),
-    )
-
+    paths = {name: str(tmp_path / name) for name in ("pronoun.csv", "pronoun_neutral.csv", "sentiment.csv", "sentiment_neutral.csv")}
+    for path in paths.values():
+        open(path, "w").close()  # a training source that is a file is passed as ``data``
+    monkeypatch.setattr(demo, "_pronoun_data_paths", lambda: (paths["pronoun.csv"], paths["pronoun_neutral.csv"]))
+    monkeypatch.setattr(demo, "_sentiment_data_paths", lambda: (paths["sentiment.csv"], paths["sentiment_neutral.csv"]))
     config = demo.ExperimentConfig(
         model_name="Qwen/Qwen2.5-0.5B",
         decoder_eval_mode=demo.DecoderEvalMode.LEFT_CONTEXT,
@@ -169,7 +156,4 @@ def test_cross_task_probe_trainers_include_sentiment_pool(demo, monkeypatch):
     assert set(probes) == {"pronoun_probe_pool", "sentiment_probe_pool"}
     assert created["sentiment_probe_pool"]["all_classes"] == demo.SENTIMENT_CLASSES
     assert created["sentiment_probe_pool"]["target_classes"] == ("positive", "negative")
-    assert list(created["sentiment_probe_pool"]["data"]["factual_class"]) == [
-        "positive",
-        "negative",
-    ]
+    assert created["sentiment_probe_pool"]["data"] == paths["sentiment.csv"]  # a file source is passed as ``data``

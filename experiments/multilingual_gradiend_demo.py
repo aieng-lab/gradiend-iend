@@ -30,6 +30,7 @@ At the end, plots in the experiment directory root:
 Usage:
   python experiments/multilingual_gradiend_demo.py
   python experiments/multilingual_gradiend_demo.py --plot-only
+  python experiments/multilingual_gradiend_demo.py --plot-only --experiment-dir aieng-lab/gradiend-multilingual-bert-features
   python experiments/multilingual_gradiend_demo.py --decoder-eval-mode mlm_head
   python experiments/multilingual_gradiend_demo.py --decoder-eval-mode default \\
       --problem-learning-rate pronoun=5e-5 --problem-learning-rate sentiment=2e-5
@@ -100,6 +101,7 @@ from gradiend.trainer.text.prediction.decoder_only_mlm import train_mlm_head
 from gradiend.trainer.core.cache_policy import USE_CACHE_ALWAYS
 from gradiend.visualizer.labels import converged_for_trainer
 from gradiend.visualizer.plot_style_config import PlotStyleConfig
+from gradiend.util.logging import get_logger
 from gradiend.util.paths import (
     ARTIFACT_MODEL,
     has_saved_decoder_mlm_head,
@@ -269,6 +271,7 @@ religion_configs = [
 ]
 
 SENTIMENT_DATA_DIR = "data/sentiment_tweets"  # only for create_english_sentiment_data / good↔bad regen
+GENERATE_MISSING_DATA = True  # False (--no-data-generation): no probe data for the transition order, cached encoder evaluations only
 SENTIMENT_GOOD_BAD_DATA_DIR = "data/sentiment_nrc_good_bad"
 SENTIMENT_GOOD_BAD_PAIR = ("good", "bad")
 SENTIMENT_PRE_PRUNE_TOPK = 0.01
@@ -406,6 +409,16 @@ def parse_args() -> argparse.Namespace:
         help="Post-prune keep fraction after training. Default: 0.05 with pre-prune 0.01, else 0.01.",
     )
     parser.add_argument(
+        "--no-data-generation",
+        action="store_true",
+        help=(
+            "Do not load the probe data (published pronoun and sentiment datasets) that is used to derive the cross-task "
+            "transition order. With --plot-only the cached encoder evaluations are then used without validating them "
+            "against the probe data. "
+            "Implied when --experiment-dir is a Hugging Face repo id, which has no local data."
+        ),
+    )
+    parser.add_argument(
         "--plot-only",
         action="store_true",
         help=(
@@ -449,8 +462,9 @@ def parse_args() -> argparse.Namespace:
         "--experiment-dir",
         default=None,
         help=(
-            "Override the default runs/... experiment directory. "
-            "Useful with --plot-only to replot an existing run."
+            "Override the default runs/... experiment directory, or give a Hugging Face repo id with trained "
+            "models (e.g. aieng-lab/gradiend-multilingual-bert-features), which is downloaded to runs/<name> and "
+            "replotted from the cached encoder evaluations (--no-data-generation). Useful with --plot-only to replot an existing run."
         ),
     )
     parser.add_argument(
@@ -613,6 +627,21 @@ def _resolve_decoder_eval_mode(raw: str) -> DecoderEvalMode:
     return DecoderEvalMode(raw)
 
 
+def resolve_experiment_dir(value: str) -> str:
+    """Return ``value`` for a local folder; for a Hugging Face repo id (``org/name``) download it to ``runs/<name>``."""
+    if os.path.exists(value) or value.count("/") != 1:
+        return value
+    from huggingface_hub import HfApi, snapshot_download
+
+    try:
+        is_repo = HfApi().repo_exists(value, repo_type="model")
+    except Exception:  # offline: treat it as a (new) local folder
+        return value
+    if not is_repo:
+        return value
+    return snapshot_download(value, local_dir=os.path.join("runs", value.split("/")[-1]))
+
+
 def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
     decoder_eval_mode = _resolve_decoder_eval_mode(cli_args.decoder_eval_mode)
     repair_encoder_cache = bool(getattr(cli_args, "repair_encoder_cache", False))
@@ -648,7 +677,7 @@ def build_experiment_config(cli_args: argparse.Namespace) -> ExperimentConfig:
     pre_suffix = "" if pre_prune_topk == 0.01 else f"_pre{pre_prune_topk:g}"
     three_seed = bool(getattr(cli_args, "three_seed", False))
     seed_suffix = "_3seed" if three_seed else ""
-    experiment_dir = cli_args.experiment_dir or (
+    experiment_dir = resolve_experiment_dir(cli_args.experiment_dir) if cli_args.experiment_dir else (
         f"runs/multilingual_gradiend_demo_{model_name.split('/')[-1]}"
         f"{mode_suffix}{pre_suffix}{seed_suffix}_v42"
     )
@@ -1827,7 +1856,7 @@ def load_models_for_heatmap_from_cache(
 
 
 def _pretty_label(mid: str) -> str:
-    from gradiend.visualizer.multilingual_demo_labels import pretty_demo_trainer_id
+    from gradiend.examples.multilingual_demo_labels import pretty_demo_trainer_id
 
     return pretty_demo_trainer_id(mid)
 
@@ -1874,13 +1903,13 @@ def _cross_task_probe_trainers(config: ExperimentConfig) -> Dict[str, TextPredic
 
 
 def _build_plot_order_and_groups(all_ids: Sequence[str]) -> Tuple[List[str], Dict[str, List[str]]]:
-    from gradiend.visualizer.multilingual_demo_labels import build_demo_trainer_order_and_groups
+    from gradiend.examples.multilingual_demo_labels import build_demo_trainer_order_and_groups
 
     return build_demo_trainer_order_and_groups(all_ids)
 
 
 def _build_feature_plot_groups() -> Dict[str, List[str]]:
-    from gradiend.visualizer.multilingual_demo_labels import build_demo_feature_plot_groups
+    from gradiend.examples.multilingual_demo_labels import build_demo_feature_plot_groups
 
     return build_demo_feature_plot_groups(
         MULTILINGUAL_FEATURE_CLASSES,
@@ -1935,7 +1964,7 @@ def plot_cross_encoding(
         pair_by_id_from_trainers,
         source_by_id_from_trainers,
     )
-    from gradiend.visualizer.multilingual_demo_labels import (
+    from gradiend.examples.multilingual_demo_labels import (
         build_demo_feature_label_mapping,
         build_demo_trainer_label_mapping,
         build_demo_transition_label_mapping,
@@ -2041,7 +2070,7 @@ def plot_cross_encoding(
         )
         return
     supplemental_eval_rows = None
-    if cache_only and load_cross_task_transition_order(config.args.experiment_dir) is None:
+    if cache_only and GENERATE_MISSING_DATA and load_cross_task_transition_order(config.args.experiment_dir) is None:
         local_trainers = filter_trainers_without_hf_dataset(trainers_by_id)
         if local_trainers:
             supplemental_eval_rows = collect_unified_test_rows(
@@ -2320,7 +2349,7 @@ def plot_results(
     recompute_encoder_cache: bool = False,
     plot_incomplete_encoder_cache: bool = False,
 ) -> None:
-    from gradiend.visualizer.multilingual_demo_labels import demo_topk_overlap_style_kwargs
+    from gradiend.examples.multilingual_demo_labels import demo_topk_overlap_style_kwargs
 
     _validate_multiseed_plot_cache(config, trainers_by_id)
 
@@ -2440,9 +2469,21 @@ def plot_results(
         print("Skipping Venn plot: fewer than 3 pronoun GRADIENDs available.")
 
 
+def _is_hub_download(requested: Optional[str], resolved: str) -> bool:
+    """True when ``requested`` was a Hugging Face repo id that ``resolve_experiment_dir`` downloaded to ``resolved``."""
+    return bool(requested) and not os.path.exists(requested) and resolved != requested
+
+
 def main() -> None:
+    global GENERATE_MISSING_DATA
     cli_args = parse_args()
     config = build_experiment_config(cli_args)
+    if cli_args.no_data_generation or _is_hub_download(cli_args.experiment_dir, config.args.experiment_dir):
+        GENERATE_MISSING_DATA = False
+        print(
+            "--no-data-generation: probe data is not loaded; cached encoder "
+            "evaluations are used without validating them against the probe data."
+        )
     print(f"Model: {config.model_name}")
     print(f"Decoder eval mode: {config.decoder_eval_mode.value}")
     print(f"MLM head scope: {config.mlm_head_scope.value}")

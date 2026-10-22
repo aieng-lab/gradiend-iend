@@ -379,6 +379,7 @@ class TestCreatorOutputDirAndSave:
                 ],
                 output_dir=str(base),
                 output_format="csv",
+                min_left_context_words=0,  # the sentences are one or two words long
                 seed=42,
             )
             first = creator.generate_training_data(
@@ -393,6 +394,7 @@ class TestCreatorOutputDirAndSave:
                 ],
                 output_dir=str(base),
                 output_format="csv",
+                min_left_context_words=0,  # the sentences are one or two words long
                 seed=42,
                 use_cache=True,
             )
@@ -679,6 +681,56 @@ class TestSplitByTarget:
         for label in result["label"].dropna().unique():
             splits = result.loc[result["label"] == label, "split"].unique()
             assert len(splits) == 1
+
+    def test_split_by_target_confines_each_target_word_to_one_split(self):
+        base = [f"Sentence {i} says {w} is the point." for i in range(12) for w in ("love", "great", "amazing", "hate", "awful", "bad")]
+        creator = TextPredictionDataCreator(
+            base_data=base,
+            feature_targets=[
+                TextFilterConfig(id="positive", targets=["love", "amazing", "great"]),
+                TextFilterConfig(id="negative", targets=["hate", "awful", "bad"]),
+            ],
+            min_left_context_words=0,
+            seed=1,
+            split_by_target=True,
+        )
+        result = creator.generate_training_data(
+            max_size_per_class=50, format="unified", min_rows_per_class_for_split=0, drop_ambiguous_masked=False
+        )
+        assert set(result["split"]) == {"train", "validation", "test"}
+        for label in result["label"].unique():
+            assert result.loc[result["label"] == label, "split"].nunique() == 1
+
+    def test_split_by_target_ignores_casing(self):
+        positive = ["love", "great", "amazing", "happy", "good", "cool"]
+        negative = ["hate", "awful", "bad", "sad", "poor", "ugly"]
+        base = []
+        for i in range(10):
+            for w in positive + negative:
+                base += [f"Sentence {i} says {w} is the point of this text.", f"{w.capitalize()} is what sentence {i} says about it."]
+        creator = TextPredictionDataCreator(
+            base_data=base,
+            feature_targets=[TextFilterConfig(id="positive", targets=positive), TextFilterConfig(id="negative", targets=negative)],
+            min_left_context_words=0,
+            seed=3,
+            split_by_target=True,
+        )
+        result = creator.generate_training_data(
+            max_size_per_class=500, format="unified", min_rows_per_class_for_split=0, drop_ambiguous_masked=False
+        )
+        assert result["label"].nunique() > len(positive + negative)  # both "Bad" and "bad" occur
+        words = result["label"].str.casefold()
+        assert (result.groupby(words)["split"].nunique() == 1).all()
+
+    def test_split_by_target_can_be_set_per_call_and_excludes_split_group_col(self):
+        kwargs = dict(base_data=["He walks."] * 12, feature_targets=[TextFilterConfig(id="a", targets=["he"])])
+        with pytest.raises(ValueError, match="alternatives"):
+            TextPredictionDataCreator(**kwargs, split_by_target=True, split_group_col="label")
+        creator = TextPredictionDataCreator(**kwargs, split_group_col="label")
+        with pytest.raises(ValueError, match="alternatives"):
+            creator.generate_training_data(split_by_target=True)
+        with pytest.raises(TypeError):
+            TextPredictionDataCreator(**kwargs, split_by_target="yes")
 
     def test_split_group_key_casefold_collapses_variants(self):
         df = pd.DataFrame(

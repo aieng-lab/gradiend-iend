@@ -10,6 +10,7 @@ by memorising one vector per class. These checks turn that failure into an immed
   and judges the first evaluation, before training has changed anything: with a diverse signal the
   freshly initialised encoder already spreads the examples of a class, with identical inputs it
   cannot.
+
 * :func:`assert_signal_diverse` is the same test on an explicit matrix of inputs, for callers that
   already hold stacked training examples.
 """

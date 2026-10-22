@@ -9,8 +9,13 @@ import pytest
 from gradiend.trainer.core.signal_checks import SignalNotDiverseError, assert_signal_diverse
 from gradiend.trainer.core.lr_search import (
     LRSearch,
+    LRSearchConfig,
+    LRSearchResult,
+    NoConvergentLearningRate,
+    Probe,
     ProbeResult,
     RunState,
+    _format_lr,
     classify_probe,
     nice_lr_grid,
     snap_to_grid,
@@ -298,20 +303,29 @@ class _SeedDependentTrainer(_FakeTrainer):
 
 
 def test_a_collapsed_probe_is_retried_with_the_next_seed(tmp_path):
-    from gradiend.trainer.core.lr_search import RunState, tune_learning_rate
+    from gradiend.trainer.core.lr_search import LRSearchConfig, RunState, tune_learning_rate
 
     single = _SeedDependentTrainer(tmp_path)
-    one = tune_learning_rate(single, 1e-6, experiment_dir=str(tmp_path / "a"), probe_steps=100, confirm=False,
-                             max_probes=1)
+    one = tune_learning_rate(single, 1e-6, experiment_dir=str(tmp_path / "a"),
+                             config=LRSearchConfig(probe_steps=100, confirm=False, max_probes=1))
     assert one.probes[0].state is RunState.COLLAPSED and single.seeds == [0]
 
     multi = _SeedDependentTrainer(tmp_path)
-    three = tune_learning_rate(multi, 1e-6, experiment_dir=str(tmp_path / "b"), probe_steps=100, confirm=False,
-                               max_probes=1, probe_seeds=3)
+    three = tune_learning_rate(multi, 1e-6, experiment_dir=str(tmp_path / "b"),
+                               config=LRSearchConfig(probe_steps=100, confirm=False, max_probes=1, probe_seeds=3))
     assert three.probes[0].state is RunState.CONVERGED
     # the first probe: seed 0 collapsed, seed 1 converged, so the third seed never runs;
     # whatever probes follow (window centring) start again at seed 0
     assert multi.seeds[:2] == [0, 1] and 2 not in multi.seeds
+
+
+def test_probe_seeds_must_be_positive():
+    import pytest
+
+    from gradiend.trainer.core.lr_search import LRSearchConfig
+
+    with pytest.raises(ValueError, match="probe_seeds"):
+        LRSearchConfig(probe_seeds=0)
 
 
 def test_every_probe_starts_from_the_base_model_and_the_trainer_is_left_untouched(tmp_path):
@@ -319,7 +333,8 @@ def test_every_probe_starts_from_the_base_model_and_the_trainer_is_left_untouche
 
     trainer = _FakeTrainer(tmp_path)
     res = tune_learning_rate(
-        trainer, 1e-8, experiment_dir=str(tmp_path / "exp"), probe_steps=100, confirm=False, max_probes=6,
+        trainer, 1e-8, experiment_dir=str(tmp_path / "exp"),
+        config=LRSearchConfig(probe_steps=100, confirm=False, max_probes=6),
     )
     assert res.status == "converged" and res.best_lr >= 1e-6
     assert len(trainer.started_from) >= 2
@@ -343,8 +358,8 @@ def test_confirmation_reruns_at_the_full_budget(tmp_path):
 
     trainer.train = spy
     tune_learning_rate(
-        trainer, 1e-6, experiment_dir=str(tmp_path / "exp"), probe_steps=100, confirm=True,
-        center_window=False,
+        trainer, 1e-6, experiment_dir=str(tmp_path / "exp"),
+        config=LRSearchConfig(probe_steps=100, confirm=True, center_window=False),
     )
     assert seen == [100, 500]
 
@@ -357,12 +372,12 @@ def test_adapter_installs_the_guard_always_and_a_fresh_stop_callback_unless_disa
     trainer = _FakeTrainer(tmp_path)
     original = trainer.train
     trainer.train = lambda **kw: (seen.append(kw.get("callbacks")), original(**kw))[1]
-    tune_learning_rate(trainer, 1e-6, experiment_dir=str(tmp_path / "a"), probe_steps=100, confirm=False,
-                       center_window=False)
+    tune_learning_rate(trainer, 1e-6, experiment_dir=str(tmp_path / "a"),
+                       config=LRSearchConfig(probe_steps=100, confirm=False, center_window=False))
     assert [type(c) for c in seen[0]] == [SignalDiversityCallback, ProbeStopCallback]
     seen.clear()
-    tune_learning_rate(trainer, 1e-6, experiment_dir=str(tmp_path / "b"), probe_steps=100, confirm=False,
-                       center_window=False, early_stop=False)
+    tune_learning_rate(trainer, 1e-6, experiment_dir=str(tmp_path / "b"),
+                       config=LRSearchConfig(probe_steps=100, confirm=False, center_window=False, early_stop=False))
     assert [[type(c) for c in cbs] for cbs in seen] == [[SignalDiversityCallback]]
 
 
@@ -665,8 +680,8 @@ def test_probe_checkpoints_are_deleted_and_only_training_json_stays(tmp_path):
     from gradiend.trainer.core.lr_search import tune_learning_rate
 
     tune_learning_rate(
-        _FakeTrainer(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"), probe_steps=100, confirm=False,
-        center_window=False,
+        _FakeTrainer(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"),
+        config=LRSearchConfig(probe_steps=100, confirm=False, center_window=False),
     )
     files = [f for _r, _d, fs in __import__("os").walk(tmp_path / "exp" / "lr_search") for f in fs]
     assert files and set(files) == {"training.json"}
@@ -679,8 +694,8 @@ def test_probe_checkpoints_can_be_kept(tmp_path):
     from gradiend.trainer.core.lr_search import tune_learning_rate
 
     tune_learning_rate(
-        _FakeTrainer(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"), probe_steps=100, confirm=False,
-        center_window=False, keep_probe_artifacts=True,
+        _FakeTrainer(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"),
+        config=LRSearchConfig(probe_steps=100, confirm=False, center_window=False, keep_probe_artifacts=True),
     )
     files = {f for _r, _d, fs in os.walk(tmp_path / "exp" / "lr_search") for f in fs}
     assert "model.safetensors" in files
@@ -698,8 +713,9 @@ def test_search_context_is_stored_next_to_the_result(tmp_path):
     from gradiend.trainer.core.lr_search import tune_learning_rate
 
     tune_learning_rate(
-        _FakeTrainer(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"), probe_steps=100, confirm=False,
-        center_window=False, metadata={"backend": "gradiend", "probe_steps": 100},
+        _FakeTrainer(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"),
+        config=LRSearchConfig(probe_steps=100, confirm=False, center_window=False),
+        metadata={"backend": "gradiend", "probe_steps": 100},
     )
     saved = json.loads((tmp_path / "exp" / "lr_search.json").read_text())
     assert saved["backend"] == "gradiend" and saved["probe_steps"] == 100 and saved["initial_lr"] == 1e-6
@@ -795,3 +811,264 @@ def test_encoder_that_actually_moved_is_still_classified_by_its_correlation():
         mean_by_class=[{"1.0": a, "-1.0": b} for a, b in [(0.015, 0.011), (0.977, -0.918), (0.97, -0.99)]],
     )
     assert classify_probe(r) is RunState.DEGRADING
+
+
+class TestProbeLogging:
+    @staticmethod
+    def _logging_fake(tmp_path):
+        import logging
+
+        fake = _FakeTrainer(tmp_path)
+        original = fake.train
+
+        def train(**kw):
+            logging.getLogger("gradiend.trainer.core.training").info("probe step")
+            logging.getLogger("gradiend.trainer.core.training").warning("probe did not converge")
+            return original(**kw)
+
+        fake.train = train
+        return fake
+
+    @pytest.mark.parametrize("verbose", [False, True])
+    def test_probe_logs_are_quiet_unless_verbose(self, tmp_path, caplog, verbose):
+        import logging
+
+        from gradiend.trainer.core.lr_search import tune_learning_rate
+
+        before = logging.getLogger("gradiend").level
+        with caplog.at_level(logging.INFO, logger="gradiend"):
+            tune_learning_rate(
+                self._logging_fake(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"),
+                config=LRSearchConfig(probe_steps=100, confirm=False, center_window=False, verbose=verbose),
+            )
+        probe_logs = [r for r in caplog.records if r.name == "gradiend.trainer.core.training"]
+        assert bool(probe_logs) is verbose
+        assert any(r.name.endswith("lr_search") for r in caplog.records)  # the search still reports each probe
+        assert logging.getLogger("gradiend").level == before  # restored
+
+    def test_logging_is_restored_when_a_probe_fails(self, tmp_path):
+        import logging
+
+        from gradiend.trainer.core.lr_search import tune_learning_rate
+
+        fake = _FakeTrainer(tmp_path)
+        fake.train = lambda **kw: (_ for _ in ()).throw(RuntimeError("boom"))
+        before = logging.getLogger("gradiend").level
+        with pytest.raises(RuntimeError, match="boom"):
+            tune_learning_rate(fake, 1e-6, experiment_dir=str(tmp_path / "exp"), config=LRSearchConfig(probe_steps=100))
+        assert logging.getLogger("gradiend").level == before
+
+
+class TestLRSearchConfig:
+    def test_round_trips_through_training_arguments(self):
+        from gradiend.trainer.core.arguments import TrainingArguments
+
+        args = TrainingArguments(learning_rate="tune", lr_search_config=LRSearchConfig(probe_steps=40, lr_bounds=(1e-9, 1e-2)))
+        restored = TrainingArguments.from_dict(json.loads(json.dumps(args.to_dict())))
+        assert restored.learning_rate == "tune"
+        assert restored.lr_search_config == LRSearchConfig(probe_steps=40, lr_bounds=(1e-9, 1e-2))
+
+    @pytest.mark.parametrize("kwargs", [dict(resolution="medium"), dict(probe_steps=0)])
+    def test_invalid_options_are_rejected(self, kwargs):
+        with pytest.raises(ValueError):
+            LRSearchConfig(**kwargs)
+
+    def test_search_options_are_not_silently_forwarded_to_the_probes(self, tmp_path):
+        from gradiend.trainer.core.lr_search import tune_learning_rate
+
+        with pytest.raises(TypeError, match="LRSearchConfig"):
+            tune_learning_rate(_FakeTrainer(tmp_path), 1e-6, experiment_dir=str(tmp_path / "exp"), probe_steps=100)
+
+    def test_learning_rate_must_be_a_number_or_tune(self):
+        from gradiend.trainer.core.arguments import TrainingArguments
+
+        with pytest.raises(TypeError):
+            TrainingArguments(learning_rate="auto")
+        with pytest.raises(TypeError):
+            TrainingArguments(lr_search_config={"probe_steps": 10})
+
+    def test_search_result_round_trips(self, tmp_path):
+        res = LRSearch(lambda lr: _result(*GOOD, converged=lr >= 1e-6), 1e-8).search()
+        assert LRSearchResult.from_dict(json.loads(json.dumps(res.to_dict()))).to_dict() == res.to_dict()
+
+
+def _tunable_fake(tmp_path, **config):
+    """The fake trainer with the real tune_learning_rate() / learning_rate="tune" logic of Trainer bound to it."""
+    from gradiend.trainer.core.arguments import TrainingArguments
+    from gradiend.trainer.trainer import Trainer
+
+    class TunableFake(_FakeTrainer):
+        run_id = None
+        tune_learning_rate = Trainer.tune_learning_rate
+        _tune_learning_rate = Trainer._tune_learning_rate
+        _resolve_learning_rate = Trainer._resolve_learning_rate
+        _resolve_experiment_dir = Trainer._resolve_experiment_dir
+
+    fake = TunableFake(tmp_path)
+    cfg = dict(probe_steps=100, confirm=False, max_probes=6, center_window=False)
+    cfg.update(config)
+    fake._training_args = TrainingArguments(
+        experiment_dir=str(tmp_path / "exp"), learning_rate="tune", max_steps=500, eval_steps=50, use_cache=True,
+        lr_search_config=LRSearchConfig(**cfg),
+    )
+    fake._tuned_learning_rate = None
+    fake.lr_search_result = None
+    fake.trains = 0
+    original = fake.train
+
+    def counting_train(**kw):
+        fake.trains += 1
+        return original(**kw)
+
+    fake.train = counting_train
+    return fake
+
+
+class TestTrainerIntegration:
+    def test_tune_learning_rate_keeps_the_result_for_train(self, tmp_path):
+        fake = _tunable_fake(tmp_path)
+        res = fake.tune_learning_rate(1e-8)
+        assert res.status == "converged" and fake._tuned_learning_rate == res.best_lr >= 1e-6
+        assert fake.lr_search_result is res
+        assert (tmp_path / "exp" / "lr_search.json").exists()
+
+    def test_config_fields_can_be_overridden_per_call(self, tmp_path):
+        seen = []
+        fake = _tunable_fake(tmp_path)
+        original = fake.train
+        fake.train = lambda **kw: (seen.append(kw["max_steps"]), original(**kw))[1]
+        fake.tune_learning_rate(1e-6, probe_steps=60)
+        assert set(seen) == {60}
+        with pytest.raises(TypeError):
+            fake.tune_learning_rate(1e-6, not_an_option=1)
+
+    def test_a_failed_search_raises_with_the_trace(self, tmp_path):
+        fake = _tunable_fake(tmp_path, lr_bounds=(1e-12, 1e-8))
+        with pytest.raises(NoConvergentLearningRate) as err:
+            fake.tune_learning_rate(1e-9)
+        assert err.value.result.status == "no_convergent_lr" and fake._tuned_learning_rate is None
+
+    def test_a_finished_search_is_reused_unless_forced_or_changed(self, tmp_path):
+        fake = _tunable_fake(tmp_path)
+        fake.tune_learning_rate(1e-8)
+        trains = fake.trains
+        again = fake.tune_learning_rate(1e-8)
+        assert fake.trains == trains and again.status == "converged"
+        fake.tune_learning_rate(1e-8, force=True)
+        assert fake.trains > trains
+        trains = fake.trains
+        fake.tune_learning_rate(1e-8, probe_steps=80)  # different settings: the stored search no longer applies
+        assert fake.trains > trains
+
+    def test_use_cache_false_always_searches(self, tmp_path):
+        fake = _tunable_fake(tmp_path)
+        fake._training_args.use_cache = False
+        fake.tune_learning_rate(1e-8)
+        trains = fake.trains
+        fake.tune_learning_rate(1e-8)
+        assert fake.trains > trains
+
+    def test_search_needs_evaluation(self, tmp_path):
+        fake = _tunable_fake(tmp_path)
+        fake._training_args.do_eval = False
+        with pytest.raises(ValueError, match="needs evaluation"):
+            fake.tune_learning_rate(1e-8)
+
+    def test_train_resolves_tune_once_and_marks_the_arguments(self, tmp_path):
+        from gradiend.trainer.core.arguments import TrainingArguments
+
+        fake = _tunable_fake(tmp_path)
+        args = TrainingArguments.from_dict(fake._training_args.to_dict())
+        fake._resolve_learning_rate(args, str(tmp_path / "exp"), {})
+        assert isinstance(args.learning_rate, float) and args.learning_rate >= 1e-6
+        assert args.metadata["learning_rate_tuned"] is True
+        trains = fake.trains
+        again = TrainingArguments.from_dict(fake._training_args.to_dict())
+        fake._resolve_learning_rate(again, str(tmp_path / "exp"), {})  # already tuned: no second search
+        assert fake.trains == trains and again.learning_rate == args.learning_rate
+
+    def test_an_explicit_learning_rate_wins(self, tmp_path):
+        from gradiend.trainer.core.arguments import TrainingArguments
+
+        fake = _tunable_fake(tmp_path)
+        fake.tune_learning_rate(1e-8)
+        trains = fake.trains
+        args = TrainingArguments(learning_rate=3e-5)
+        fake._resolve_learning_rate(args, None, {"learning_rate": 3e-5})
+        assert args.learning_rate == 3e-5 and fake.trains == trains
+
+    def test_a_previous_tune_call_is_used_for_a_numeric_learning_rate(self, tmp_path):
+        from gradiend.trainer.core.arguments import TrainingArguments
+
+        fake = _tunable_fake(tmp_path)
+        res = fake.tune_learning_rate(1e-8)
+        args = TrainingArguments(learning_rate=1e-5)
+        fake._resolve_learning_rate(args, None, {})
+        assert args.learning_rate == res.best_lr
+
+
+def test_format_lr():
+    assert [_format_lr(v) for v in (2e-5, 1.5e-6, 1e-4, 0.1, 10.0)] == ["2e-5", "1.5e-6", "1e-4", "1e-1", "1e1"]
+
+
+def _example_script():
+    """The simulated search of the documentation figure (scripts/plot_lr_search_example.py)."""
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "plot_lr_search_example.py"
+    spec = importlib.util.spec_from_file_location("plot_lr_search_example", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_simulated_search_finds_the_window_between_slow_and_overshoot():
+    result = _example_script().simulated_search()
+    states = {probe.lr: probe.state for probe in result.probes}
+    assert states[1e-7] is RunState.FROZEN and states[2e-6] is RunState.SLOW and states[5e-5] is RunState.COLLAPSED
+    assert [probe.lr for probe in result.probes if probe.state is RunState.CONVERGED] == [1e-5, 2e-5, 5e-6]
+    assert result.status == "converged" and result.window == (5e-6, 2e-5) and result.best_lr == 1e-5
+
+
+def test_probes_record_what_the_plot_needs():
+    result = _example_script().simulated_search()
+    converged = next(probe for probe in result.probes if probe.lr == 1e-5)
+    slow = next(probe for probe in result.probes if probe.lr == 1e-6)
+    assert converged.metric == "correlation" and converged.threshold == 0.5 and converged.class_mean_threshold == 0.5
+    assert converged.min_class_mean >= 0.5 > slow.min_class_mean  # why the slow probe does not count: its class means are too small
+    restored = LRSearchResult.from_dict(json.loads(json.dumps(result.to_dict())))
+    assert [p.min_class_mean for p in restored.probes] == [p.min_class_mean for p in result.probes]
+
+
+def test_searches_stored_without_the_evidence_still_load():
+    old = {"status": "converged", "best_lr": 1e-5, "probes": [{"lr": 1e-5, "state": "converged", "final_score": 0.9, "best_score": 0.9}]}
+    probe = LRSearchResult.from_dict(old).probes[0]
+    assert probe.min_class_mean is None and probe.threshold is None
+
+
+def test_result_plot_shows_scores_class_means_thresholds_and_choice(tmp_path):
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    result = _example_script().simulated_search()
+    output = tmp_path / "docs" / "search.png"
+    fig = result.plot(output=str(output), show=False)
+    top, bottom = fig.axes
+    assert output.is_file() and top.get_xscale() == "log"
+    legend = {text.get_text() for text in top.get_legend().get_texts()}
+    assert {"convergent range", "frozen (too low)", "slow (too low)", "converged", "collapsed (too high)",
+            "re-run for the full max_steps"} <= legend
+    top_texts = [text.get_text() for text in top.texts]
+    assert [text for text in top_texts if text.isdigit()] == [str(i) for i in range(1, 8)]  # probe order
+    assert "convergence threshold" in top_texts and "class-mean threshold" in [text.get_text() for text in bottom.texts]
+    assert "chosen 1e-5" in [text.get_text() for text in bottom.texts] and "chosen 1e-5" in top.get_title()
+    assert "correlation" in top.get_ylabel() and "class mean" in bottom.get_ylabel()
+
+
+def test_result_plot_without_class_means_or_a_choice():
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    result = LRSearchResult("no_convergent_lr", None, [Probe(1e-6, RunState.FROZEN, 0.0, 0.05), Probe(1e-3, RunState.DIVERGED)])
+    fig = result.plot(show=False)
+    assert len(fig.axes) == 1 and "no_convergent_lr" in fig.axes[0].get_title()
+    assert not any(text.get_text().startswith("chosen") for text in fig.axes[0].texts)

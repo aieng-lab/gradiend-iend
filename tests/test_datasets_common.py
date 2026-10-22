@@ -626,3 +626,24 @@ class TestGradientTrainingDataset:
         batch = dataset[0]
         assert batch["target"] is None
         assert gradient_creator.call_count == 1
+
+    def test_dataset_out_of_range_index_raises_index_error(self):
+        """Past the end must fail clearly, not return an empty batch (``KeyError: 'factual'`` downstream)."""
+        training_data = MockTrainingData(
+            [{"factual": torch.randn(10), "alternative": torch.randn(10)} for _ in range(4)],
+            batch_size=2,
+        )
+        dataset = GradientTrainingDataset(
+            device=torch.device("cpu"),
+            training_data=training_data,
+            gradient_creator=MagicMock(return_value=torch.randn(100)),
+        )
+
+        assert len(dataset) == 2
+        for bad in (2, 5, -3):
+            with pytest.raises(IndexError, match="out of range"):
+                dataset[bad]
+        # in range, including negative indexing, still works and iteration stops at len()
+        dataset[1]
+        dataset[-1]
+        assert len(list(dataset)) == 2

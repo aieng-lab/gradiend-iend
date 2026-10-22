@@ -21,6 +21,14 @@ from gradiend.trainer.core.signals import ActivationSignalExtractor, Signal, Sig
 from tests.testing_mocks import MockTokenizer, SimpleMockModel
 
 
+@pytest.fixture
+def cpu_only(monkeypatch):
+    """For tests that build CPU tensors and plain ``GradiendModel``s: models default to CUDA when it is available, which on
+    a GPU machine puts them on another device than their inputs, so CUDA is hidden from the code under test. Not for tests
+    that build a ``ModelWithGradiend``: it refuses to run when CUDA is visible but reported unavailable."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+
 class TestTextGradientTrainingDataset:
     """Test TextGradientTrainingDataset (text-specific wrapper)."""
     
@@ -368,6 +376,7 @@ class TestTextGradientTrainingDataset:
             assert torch.equal(item["prediction_mask"], item["labels"].ne(-100))
             assert item["prediction_mask"].sum().item() == 1
 
+    @pytest.mark.usefixtures("cpu_only")
     def test_signal_dataset_mixed_site_uses_target_gather_for_diff(self):
         class OnePairRow:
             batch_size = 1

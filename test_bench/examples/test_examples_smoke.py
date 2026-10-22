@@ -3,13 +3,16 @@ Smoke tests: run configured gradiend.examples so they complete without verificat
 
 These tests execute the example scripts as they are (no result checks) to ensure
 the example workflows do not break. They use the examples' own iteration counts
-for quick demonstration; the test bench verified runs use more iterations.
+for quick demonstration; the test bench verified runs use more iterations. The
+examples that would take longer than the timeout on their full data get smaller data
+(PRONOUN_DATA_EXAMPLES, PUBLISHED_DATA_EXAMPLES).
 
 To avoid cache reuse across runs (e.g. same Docker, multiple test-bench runs),
 runs/examples/ is removed before each example run, so use_cache=True still
 exercises the full pipeline. Real user runs under runs/ (outside examples/) are not touched.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -47,11 +50,93 @@ EXAMPLE_MODULES = [
     #"gradiend.examples.train_gender_de_detailed", # we exclude detailed run as it takes very long (many features)
 ]
 
+# Examples that would take longer than the timeout on their full data get smaller data in the smoke test; the code path
+# stays the same (Hugging Face loading, spaCy filtering, splits, training, evaluation), only the amount of data differs.
+#
+# 1. Examples that generate the English pronoun data from a corpus. From the real source (all of English Wikipedia,
+#    spaCy over every segment) that takes hours, so they read 8,000 short reviews instead. The settings are the
+#    module constants of create_english_pronoun_data.
+PRONOUN_DATA_EXAMPLES = frozenset({
+    "gradiend.examples.create_english_pronoun_data",
+})
+SMALL_PRONOUN_DATA = {
+    "WIKIPEDIA_DATASET": "cornell-movie-review-data/rotten_tomatoes",  # 8.5k short reviews, many pronouns
+    "WIKIPEDIA_HF_CONFIG": None,
+    "WIKIPEDIA_BASE_MAX_SIZE": 8000,
+    "MAX_SIZE_PER_CLASS": 200,
+    "NEUTRAL_MAX_SIZE": 200,
+}
+# 2. Examples that train on a full published dataset (aieng-lab/en-pronouns, 10,000 rows per class, and its neutral
+#    texts) and evaluate on all of it. Their TrainingArguments get size caps unless the example sets them itself, and
+#    the neutral texts are cut to SMOKE_NEUTRAL_ROWS. The final evaluations keep their default size on purpose: the
+#    size is part of the cache file name that the examples read back.
+PUBLISHED_DATA_EXAMPLES = frozenset({
+    "gradiend.examples.train_english_pronouns",
+    "gradiend.examples.train_seq2seq_encoder_mlm",
+})
+SMOKE_TRAINING_CAPS = {
+    "train_max_size": 400,
+    "encoder_eval_train_max_size": 100,
+    "decoder_eval_max_size_training_like": 50,
+    "decoder_eval_max_size_neutral": 50,
+}
+SMOKE_NEUTRAL_ROWS = 200
+_SMOKE_RUNNER = """
+import dataclasses, json, runpy, sys
+
+module = sys.argv[1]
+constants, caps, neutral_rows = json.loads(sys.argv[2]), json.loads(sys.argv[3]), int(sys.argv[4])
+pronoun_data = None
+if constants:
+    import gradiend.examples.create_english_pronoun_data as pronoun_data
+    for name, value in constants.items():
+        if not hasattr(pronoun_data, name):
+            raise AttributeError(f"create_english_pronoun_data has no setting {name!r}")
+        setattr(pronoun_data, name, value)
+if caps:
+    from gradiend.trainer.core import arguments
+    known = {field.name for field in dataclasses.fields(arguments.TrainingArguments)}
+    unknown = sorted(set(caps) - known)
+    if unknown:
+        raise AttributeError(f"TrainingArguments has no field(s) {unknown}")
+    original_init = arguments.TrainingArguments.__init__
+
+    def capped_init(self, *args, **kwargs):
+        for name, value in caps.items():
+            kwargs.setdefault(name, value)
+        original_init(self, *args, **kwargs)
+
+    arguments.TrainingArguments.__init__ = capped_init
+if neutral_rows:
+    from gradiend.examples import english_pronoun_datasets as published
+    load_neutral = published.load_english_pronoun_neutral_data
+
+    def capped_neutral(*args, **kwargs):
+        return load_neutral(*args, **kwargs).head(neutral_rows)
+
+    capped_neutral.__wrapped__, capped_neutral.neutral_rows = load_neutral, neutral_rows
+    published.load_english_pronoun_neutral_data = capped_neutral
+if pronoun_data is not None and module == pronoun_data.__name__:
+    pronoun_data.main()
+else:
+    runpy.run_module(module, run_name="__main__", alter_sys=True)
+"""
+
+
+def _example_command(module_name: str) -> list:
+    """Command that runs an example's __main__ (as python -m module, on smaller data where it needs that)."""
+    constants = SMALL_PRONOUN_DATA if module_name in PRONOUN_DATA_EXAMPLES else {}
+    caps = SMOKE_TRAINING_CAPS if module_name in PUBLISHED_DATA_EXAMPLES else {}
+    if not constants and not caps:
+        return [sys.executable, "-m", module_name]
+    neutral_rows = SMOKE_NEUTRAL_ROWS if caps else 0
+    return [sys.executable, "-c", _SMOKE_RUNNER, module_name, json.dumps(constants), json.dumps(caps), str(neutral_rows)]
+
 
 def _run_example_module(module_name: str, timeout: int = 2000) -> subprocess.CompletedProcess:
     """Run an example module's __main__ (as python -m module)."""
     return subprocess.run(
-        [sys.executable, "-m", module_name],
+        _example_command(module_name),
         cwd=str(PROJECT_ROOT),
         capture_output=True,
         text=True,

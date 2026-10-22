@@ -19,7 +19,7 @@ prediction objectives, and multi-seed analysis.
 | **output_dir** | `None` | Directory for the trained model. If omitted and `experiment_dir` is set, GRADIEND derives a model path under the experiment directory. |
 | **use_cache** | `False` | Training checkpoint reuse policy: `False`, `True`, `"always"`, or `"only_convergent"`. `True` and `"only_convergent"` require a matching `cache_fingerprint` in `training.json` (pruning config, signal/scope/split settings, `source`/`target`, `init_fan_in_floor`, `add_neutral_identity_transitions`, `reuse_pre_prune`, `gradiend_input_dim`). `"always"` reuses any saved checkpoint without fingerprint checks. `"only_convergent"` additionally requires convergence metadata. Fingerprinting is **partial** — it does not compare most hyperparameters, data, or model-selection settings; see [Tutorial: Training](../tutorials/training.md#experiment-directory-and-caching-use_cache). Evaluator/visualizer cache arguments are separate. |
 | **add_identity_for_other_classes** | `False` | Add identity examples (`factual == alternative`) for non-target classes so they are not pushed arbitrarily. |
-| **add_neutral_identity_transitions** | `None` (auto) | Add zero-labeled neutral identity transitions from `TextPredictionConfig.neutral_data`. `None` enables them automatically when `neutral_data` is configured; `True` requires `neutral_data` (training fails otherwise); `False` never uses them. `neutral_data` may be a shared DataFrame/path/HF id or a split mapping such as `{"train": train_df, "test": test_df}`. With `target="diff"`, the decoded update is trained toward the zero vector for neutral rows. `eval_neutral_data` is evaluation-only and does not enable this. |
+| **add_neutral_identity_transitions** | `None` (auto) | Add zero-labeled neutral identity transitions from [`TextPredictionConfig`][gradiend.trainer.text.prediction.trainer.TextPredictionConfig].neutral_data. `None` enables them automatically when `neutral_data` is configured; `True` requires `neutral_data` (training fails otherwise); `False` never uses them. `neutral_data` may be a shared DataFrame/path/HF id or a split mapping such as `{"train": train_df, "test": test_df}`. With `target="diff"`, the decoded update is trained toward the zero vector for neutral rows. `eval_neutral_data` is evaluation-only and does not enable this. |
 | **metadata** | `{}` | Free-form metadata serialized with the training arguments. |
 
 ---
@@ -50,7 +50,8 @@ to the opposite pole.
 | **precompute_gradient_buffer_size** | `1` | Number of already-computed gradient rows kept in the async queue. |
 | **gradient_timing_steps** | `0` | If `> 0`, log gradient-row timing every N rows. |
 | **train_max_size** | `None` | Cap training samples per feature class. `None` uses all data. |
-| **learning_rate** | `1e-5` | Peak learning rate. |
+| **learning_rate** | `1e-5` | Peak learning rate. `"tune"` searches it first, see [Learning-rate search](learning-rate-search.md). |
+| **lr_search_config** | `None` | Options of that search ([`LRSearchConfig`][gradiend.trainer.core.lr_search.LRSearchConfig]). |
 | **learning_rate_decoder** | `"default"` | Decoder learning rate. `"default"` resolves to `"auto"` for activation signals (ACTIEND) and to `None` otherwise. `"auto"` starts at `learning_rate` and calibrates a model-local decoder rate at the first `eval_steps` boundary (training must run past that boundary); a positive float creates a decoder parameter group at that rate; `None` shares `learning_rate` exactly as in historical runs. |
 | **num_train_epochs** | `3` | Number of epochs. Ignored when `max_steps > 0`. |
 | **max_steps** | `-1` | Total training steps when `> 0`; overrides `num_train_epochs`. |
@@ -174,12 +175,13 @@ Device placement is automatic when these fields are omitted:
 | Argument | Default | Description |
 |----------|---------|-------------|
 | **prediction_objective** | `"auto"` | Token prediction objective for text-gradient training and decoder probability scoring. See [Token prediction methods](token-prediction-methods.md). |
+| **mask_placeholder** | `"[MASK]"` | Marker of the prediction slot in your masked data, if it is not `[MASK]` (e.g. `"[PRONOUN]"`). Independent of the tokenizer's mask token. |
 | **decoder_mlm_head_epochs** | `5` | Epochs for auxiliary decoder MLM-head training when `prediction_objective="clm_mlm_head"`. |
 | **decoder_mlm_head_batch_size** | `4` | Batch size for auxiliary decoder MLM-head training. |
 | **decoder_mlm_head_lr** | `1e-4` | Learning rate for auxiliary decoder MLM-head training. |
 | **decoder_mlm_head_max_size** | `None` | Optional per-label cap for auxiliary decoder MLM-head training data. |
 | **max_length** | `128` | Maximum token length of training/ACTIEND inputs. Longer inputs drop left context so the prediction slot stays inside the window. |
-| **mask_placeholder** | `"[MASK]"` | Dataset-level prediction-slot marker in masked templates (independent of `tokenizer.mask_token`). Prefer `TextPredictionConfig.mask_placeholder`; this value only takes effect while the config value is left at its default. |
+| **mask_placeholder** | `"[MASK]"` | Dataset-level prediction-slot marker in masked templates (independent of `tokenizer.mask_token`). Prefer [`TextPredictionConfig`][gradiend.trainer.text.prediction.trainer.TextPredictionConfig].mask_placeholder; this value only takes effect while the config value is left at its default. |
 | **decoder_sequence_cloze_rhs_window** | `-1` | Right-context token window for `clm_sequence_cloze` and `seq2seq_decoder_sequence_cloze`. `-1` uses the full RHS. |
 
 Supported objectives are `auto`, `mlm_mask_token`, `clm_next_token`,
@@ -192,10 +194,10 @@ Supported objectives are `auto`, `mlm_mask_token`, `clm_next_token`,
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| **signal** | `None` | What is measured: `Signal.gradient()` (default), `Signal.activation(...)`, or `Signal.activation_gradient(...)`. Strings (`"gradient"`, `"activation"`) and dicts are coerced. See [Signals](signals.md) if available in your docs build, or the `Signal` API page. |
+| **signal** | `None` | What is measured: [`Signal`][gradiend.trainer.core.signals.Signal].gradient() (default), `Signal.activation(...)`, or `Signal.activation_gradient(...)`. Strings (`"gradient"`, `"activation"`) and dicts are coerced. See [Signals](signals.md) if available in your docs build, or the [`Signal`][gradiend.trainer.core.signals.Signal] API page. |
 | **signals** | `None` | `SignalSet`/sequence of signals. Reserved for multi-signal training; currently exactly one signal is supported. |
-| **signal_scope** | `None` | `SignalScope` describing *where* the signal is measured: `SignalScope.default()`/`.full()`, semantic shortcuts `.layers()`, `.layer(i)`, `.embeddings()`, `.word_embedding()`, or explicit `SignalScope.from_values(params=[...])` (gradient) / `SignalScope.from_values(activation_sites=[...])` (activation). |
-| **gradiend_split** | `None` | `GradiendSplit` that partitions the resolved signal space into virtual components: `GradiendSplit.none()` (default), `.single()`, or `.by_tensor()`. |
+| **signal_scope** | `None` | [`SignalScope`][gradiend.trainer.core.signals.SignalScope] describing *where* the signal is measured: [`SignalScope`][gradiend.trainer.core.signals.SignalScope].default()/`.full()`, semantic shortcuts `.layers()`, `.layer(i)`, `.embeddings()`, `.word_embedding()`, or explicit `SignalScope.from_values(params=[...])` (gradient) / `SignalScope.from_values(activation_sites=[...])` (activation). |
+| **gradiend_split** | `None` | [`GradiendSplit`][gradiend.gradiend_split.GradiendSplit] that partitions the resolved signal space into virtual components: [`GradiendSplit`][gradiend.gradiend_split.GradiendSplit].none() (default), `.single()`, or `.by_tensor()`. |
 | **gradiend_split_loss** | `"mean"` | Loss aggregation over components: `"mean"`, `"sum"`, `"size_weighted"`, or `"full"`. Ignored for unsplit models. |
 | **params** | `None` | Deprecated; use `signal_scope=SignalScope.from_values(params=[...])`. Optional list of parameter names or wildcard patterns included in the GRADIEND parameter map. `None` includes all backbone parameters. |
 | **activation_encoder** | `None` | Encoder activation, e.g. `"tanh"`, `"gelu"`, or `"relu"`. `None` uses the model default. |

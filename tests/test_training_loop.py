@@ -237,6 +237,7 @@ class TestTrainingLoop:
             gradient_creator=gradient_creator,
             source="factual",
             target="diff",
+            device=torch.device("cpu"),  # the expected tensors below are CPU tensors
             signal=Signal.gradient(),
         )
 
@@ -309,6 +310,7 @@ class TestTrainingLoop:
         dataset = SignalTrainingDatasetBase(
             training_data=training_data,
             signal_extractor=extractor,
+            device=torch.device("cpu"),  # the expected tensors below are CPU tensors
             source="factual",
             target="diff",
         )

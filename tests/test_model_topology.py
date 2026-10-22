@@ -59,7 +59,9 @@ def test_family_topology(family):
     assert topology.layers[0] == first_layer
     assert topology.embeddings == embeddings
     assert topology.word_embedding == word_embedding
-    assert topology.prediction_heads == heads
+    # transformers 5 renamed the output layer of GPT-NeoX from ``embed_out`` to ``lm_head``
+    accepted = {heads, ("lm_head",)} if family == "gpt_neox" else {heads}
+    assert topology.prediction_heads in accepted
 
 
 @pytest.mark.parametrize("family", sorted(_BUILDERS))

@@ -71,10 +71,11 @@ def test_distance_matches_explicit_linear_decoder_optimum():
     result = controller.estimate(step=4, total_steps=40)
 
     assert result["status"] == "calibrated"
-    assert result["decoder_distance_to_local_optimum"] == pytest.approx(expected, rel=2e-5)
+    # float32 sums differ at the 1e-5 level between torch / BLAS builds
+    assert result["decoder_distance_to_local_optimum"] == pytest.approx(expected, rel=1e-4)
     expected_floor = expected / (36 * math.sqrt(7 * 3))
-    assert result["reachability_floor_lr"] == pytest.approx(expected_floor, rel=2e-5)
-    assert optimizer.param_groups[-1]["lr"] == pytest.approx(expected_floor, rel=2e-5)
+    assert result["reachability_floor_lr"] == pytest.approx(expected_floor, rel=1e-4)
+    assert optimizer.param_groups[-1]["lr"] == pytest.approx(expected_floor, rel=1e-4)
 
 
 @pytest.mark.parametrize("aggregation", ["mean", "sum", "size_weighted"])
@@ -128,7 +129,7 @@ def test_component_split_distance_matches_blockwise_optimum(aggregation):
     result = controller.estimate(step=4, total_steps=40)
 
     assert result["status"] == "calibrated"
-    assert result["decoder_distance_to_local_optimum"] == pytest.approx(expected, rel=3e-5)
+    assert result["decoder_distance_to_local_optimum"] == pytest.approx(expected, rel=1e-4)
 
 
 def test_rank_deficient_warmup_defers_without_changing_lr():

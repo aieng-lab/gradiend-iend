@@ -518,6 +518,16 @@ class SelectionPolicy(Protocol):
         ...
 
 
+def _id_feature_factor(cid: CandidateId) -> float:
+    """Feature factor of a grid candidate id: ``(ff, lr)`` tuple or ``{"feature_factor": ..., ...}`` dict."""
+    return cid["feature_factor"] if isinstance(cid, dict) else cid[0]
+
+
+def _id_learning_rate(cid: CandidateId) -> float:
+    """Learning rate of a grid candidate id: ``(ff, lr)`` tuple or ``{"learning_rate": ..., ...}`` dict."""
+    return cid["learning_rate"] if isinstance(cid, dict) else cid[1]
+
+
 @dataclass(frozen=True)
 class LMSThresholdPolicy:
     """
@@ -747,8 +757,8 @@ def compute_metric_summaries(
     *,
     selector: SelectionPolicy,
     extractor: Callable[[Mapping[Any, Mapping[str, Any]]], Tuple[List[Candidate], BaseContext]] = default_extract_candidates,
-    feature_factor_from_id: Callable[[CandidateId], float] = lambda cid: cid[0],
-    lr_from_id: Callable[[CandidateId], float] = lambda cid: cid[1],
+    feature_factor_from_id: Callable[[CandidateId], float] = _id_feature_factor,
+    lr_from_id: Callable[[CandidateId], float] = _id_learning_rate,
     empty_default_id: str = "base",
     class_to_ff: Optional[Mapping[str, float]] = None,
     explicit_feature_factors: bool = False,
@@ -1073,17 +1083,11 @@ class DecoderEvaluator:
         Returns:
             Flat dict with:
 
-              - For strengthen (increase_target_probabilities=True): one entry per target class (e.g. dec_result['3SG']).
-              - For weaken (increase_target_probabilities=False): one entry per target class with \"_weaken\" suffix
-
-                (e.g. dec_result['3SG_weaken']).
-
-              - Each summary entry contains selected metric `value`, `feature_factor`, `learning_rate`, `id`,
-
-                a `strengthen` flag, and LMS fields (`lms`, `base_lms`).
-
-              - 'grid': candidate id -> full evaluation results.
-              - When plot=True, also 'plot_paths' and 'plot_path'.
+            - For strengthen (increase_target_probabilities=True): one entry per target class (e.g. dec_result['3SG']).
+            - For weaken (increase_target_probabilities=False): one entry per target class with a \"_weaken\" suffix (e.g. dec_result['3SG_weaken']).
+            - Each summary entry contains selected metric `value`, `feature_factor`, `learning_rate`, `id`, a `strengthen` flag, and LMS fields (`lms`, `base_lms`).
+            - 'grid': candidate id -> full evaluation results.
+            - When plot=True, also 'plot_paths' and 'plot_path'.
         """
         logger.info(f"Starting decoder evaluation with part={part}")
         if not isinstance(refine_points, int) or isinstance(refine_points, bool):
@@ -1159,7 +1163,11 @@ class DecoderEvaluator:
         # fall through to the expanded CF list.
         claim_eval = [str(c) for c in classes_to_eval]
         claim_set = set(claim_eval)
-        if summary_metrics is not None:
+        if summary_metrics is not None and summary_extractor is not default_extract_candidates:
+            # A custom extractor defines its own metric names (e.g. derived ``_bpi``/``_fpi``): they are not class
+            # names, so they are summarized exactly as requested.
+            metrics_for_summary = [str(m) for m in summary_metrics]
+        elif summary_metrics is not None:
             metrics_for_summary = [
                 str(m)
                 for m in summary_metrics
@@ -1705,8 +1713,8 @@ class DecoderEvaluator:
             metrics: Optional[Sequence[str]] = None,
             extractor: Callable[
                 [Mapping[Any, Mapping[str, Any]]], Tuple[List[Candidate], BaseContext]] = default_extract_candidates,
-            feature_factor_from_id: Callable[[CandidateId], float] = lambda cid: cid[0],
-            lr_from_id: Callable[[CandidateId], float] = lambda cid: cid[1],
+            feature_factor_from_id: Callable[[CandidateId], float] = _id_feature_factor,
+            lr_from_id: Callable[[CandidateId], float] = _id_learning_rate,
             empty_default_id: str = "base",
             class_to_ff: Optional[Mapping[str, float]] = None,
             explicit_feature_factors: bool = False,

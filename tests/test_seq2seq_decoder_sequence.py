@@ -151,6 +151,7 @@ def test_dataset_routes_encoder_mlm_and_sequence_cloze():
                 "alternative_id": "B",
                 "label": "A",
                 "feature_class_id": 0,
+                "feature_pole": 0,
             }
         ]
     )

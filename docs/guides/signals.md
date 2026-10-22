@@ -5,7 +5,7 @@ independent choices define a training run:
 
 | Axis | Question | API |
 |------|----------|-----|
-| **Signal** | *What* is measured? | [`Signal`][gradiend.trainer.core.signals.Signal] |
+| **[`Signal`][gradiend.trainer.core.signals.Signal]** | *What* is measured? | [`Signal`][gradiend.trainer.core.signals.Signal] |
 | **Scope** | *Where* is it measured? | [`SignalScope`][gradiend.trainer.core.signals.SignalScope] |
 | **Split** | How is the resolved space partitioned into components? | [`GradiendSplit`][gradiend.gradiend_split.GradiendSplit] |
 
@@ -31,12 +31,12 @@ multi-seed training, decoder evaluation) works the same way.
 
 | Signal | Measures | Typical use |
 |--------|----------|-------------|
-| `Signal.gradient()` | Parameter gradient of the prediction loss (default) | GRADIEND, weight rewriting |
+| [`Signal`][gradiend.trainer.core.signals.Signal].gradient() | Parameter gradient of the prediction loss (default) | GRADIEND, weight rewriting |
 | `Signal.activation(token_selector=...)` | Hidden activation at the selected tokens | ACTIEND, activation steering |
 | `Signal.activation_gradient(token_selector=...)` | Loss gradient with respect to the activation | Attribution-style features |
 
 Strings (`"gradient"`, `"activation"`) and dictionaries are accepted wherever a
-`Signal` is expected. Exactly one signal per training run is currently supported.
+[`Signal`][gradiend.trainer.core.signals.Signal] is expected. Exactly one signal per training run is currently supported.
 
 ### Token selection (activation signals)
 
@@ -62,17 +62,17 @@ across sites and models.
 
 ## Scopes
 
-`SignalScope` selects the eligible parameters (gradient signals) or modules
+[`SignalScope`][gradiend.trainer.core.signals.SignalScope] selects the eligible parameters (gradient signals) or modules
 (activation signals):
 
 | Constructor | Meaning |
 |-------------|---------|
-| `SignalScope.default()` | Backbone / text tower without prediction heads |
-| `SignalScope.full()` | The full model including heads |
-| `SignalScope.layers()` / `SignalScope.layers(0, 3)` | Transformer-layer outputs (all, or the listed indices) |
+| [`SignalScope`][gradiend.trainer.core.signals.SignalScope].default() | Backbone / text tower without prediction heads |
+| [`SignalScope`][gradiend.trainer.core.signals.SignalScope].full() | The full model including heads |
+| [`SignalScope`][gradiend.trainer.core.signals.SignalScope].layers() / `SignalScope.layers(0, 3)` | Transformer-layer outputs (all, or the listed indices) |
 | `SignalScope.layer(9)` | One transformer-layer output |
-| `SignalScope.embeddings()` | The combined embedding stream |
-| `SignalScope.word_embedding()` | The token-embedding lookup |
+| [`SignalScope`][gradiend.trainer.core.signals.SignalScope].embeddings() | The combined embedding stream |
+| [`SignalScope`][gradiend.trainer.core.signals.SignalScope].word_embedding() | The token-embedding lookup |
 | `SignalScope.from_values(params=[...])` | Explicit parameter names/wildcards (gradient signals) |
 | `SignalScope.from_values(activation_sites=[...])` | Explicit module names/wildcards (activation signals) |
 
@@ -84,20 +84,20 @@ error message shows a ready-to-copy example).
 
 ## Component splits
 
-`GradiendSplit` partitions the *already resolved* input space into virtual
+[`GradiendSplit`][gradiend.gradiend_split.GradiendSplit] partitions the *already resolved* input space into virtual
 components. The components share one physical encoder/decoder matrix but are
 trained (and reported) separately:
 
 | Split | Components |
 |-------|-----------|
-| `GradiendSplit.none()` | No partition (default) |
-| `GradiendSplit.single()` | One component covering the full space |
-| `GradiendSplit.by_tensor()` | One component per resolved tensor (parameter tensor or activation site) |
+| [`GradiendSplit`][gradiend.gradiend_split.GradiendSplit].none() | No partition (default) |
+| [`GradiendSplit`][gradiend.gradiend_split.GradiendSplit].single() | One component covering the full space |
+| [`GradiendSplit`][gradiend.gradiend_split.GradiendSplit].by_tensor() | One component per resolved tensor (parameter tensor or activation site) |
 
-`TrainingArguments(gradiend_split_loss=...)` selects how component losses are
+[`TrainingArguments(gradiend_split_loss=...)`][gradiend.trainer.core.arguments.TrainingArguments] selects how component losses are
 aggregated (`"mean"`, `"sum"`, `"size_weighted"`, or `"full"`). Multi-seed runs
 select and stitch the best seed per component; encoder evaluation and the
-plots in [`plot_encoder_component_artifacts`][gradiend.visualizer.components.plot_encoder_component_artifacts]
+plots in `plot_encoder_component_artifacts`
 report each component.
 
 ## Interventions and saved models
@@ -126,7 +126,7 @@ saved with `modify_model` uses exactly the policy that was evaluated.
 ## Training on precomputed signal vectors
 
 [`SignalTrainer`][gradiend.trainer.signal_trainer.SignalTrainer] trains a
-`ModelWithGradiend` on signal vectors you extracted yourself. It inherits the full
+[`ModelWithGradiend`][gradiend.model.model_with_gradiend.ModelWithGradiend] on signal vectors you extracted yourself. It inherits the full
 training lifecycle (checkpointing, caching, multi-seed, convergence) and supports
 encoder evaluation; decoder evaluation is unavailable because it needs task inputs.
 
@@ -146,4 +146,3 @@ trainer.train()
 
 - [Training arguments](training-arguments.md) — all fields, including `signal`, `signal_scope`, `gradiend_split`
 - [Saving & loading](saving-loading.md)
-- [Cross-signal IEND plan](../design/cross-signal-iends.md) (design document)

@@ -22,10 +22,14 @@ The search logic (:class:`LRSearch`, :func:`classify_probe`) is pure and takes a
 is decisively collapsed or diverged instead of training the remaining steps.
 
 Notes:
+
     * Probes are short. GRADIEND is schedule-sensitive (equal ``lr * steps`` does not give an
+
       equal optimisation), so pass ``confirm=True`` to re-run a converged probe at the
       configured full budget before accepting it.
+
     * The classification uses the package's own convergence decision
+
       (``convergence_info['converged']``, which includes the class-mean check) as ground truth for
       "converged". A run can have a high correlation at initialisation without being converged.
 """
@@ -36,9 +40,10 @@ import contextlib
 import enum
 import gc
 import json
+import logging
 import math
 import os
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from gradiend.trainer.core.callbacks import TrainingCallback
@@ -52,6 +57,7 @@ __all__ = [
     "ProbeResult",
     "Probe",
     "LRSearchResult",
+    "LRSearchConfig",
     "NoConvergentLearningRate",
     "LRSearch",
     "classify_probe",
@@ -64,6 +70,12 @@ __all__ = [
 
 COARSE_GRID: Tuple[float, ...] = (1.0, 2.0, 5.0)
 FINE_GRID: Tuple[float, ...] = (1.0, 1.5, 2.0, 3.0, 5.0, 7.0)
+
+
+def _format_lr(value: float) -> str:
+    """Compact learning-rate label: ``2e-5``, ``1.5e-5``."""
+    mantissa, exponent = f"{value:.2e}".split("e")
+    return f"{mantissa.rstrip('0').rstrip('.')}e{int(exponent)}"
 
 
 class RunState(str, enum.Enum):
@@ -97,6 +109,7 @@ class ProbeResult:
     metric: Optional[str] = None
     mean_by_class: List[Dict[str, float]] = field(default_factory=list)  # per eval, {"-1.0": m, "1.0": m}
     losses: List[float] = field(default_factory=list)
+    class_mean_threshold: Optional[float] = None  # each class mean must reach this magnitude to converge
 
     @classmethod
     def from_training_stats(
@@ -107,6 +120,7 @@ class ProbeResult:
         threshold: Optional[float] = None,
         metric: Optional[str] = None,
         losses: Optional[Sequence[float]] = None,
+        class_mean_threshold: Optional[float] = None,
     ) -> "ProbeResult":
         """Build from a ``training_stats`` mapping (live in memory or loaded from ``training.json``).
 
@@ -127,6 +141,7 @@ class ProbeResult:
                 {str(k): float(v) for k, v in (means_by_step.get(s) or {}).items()} for s in steps
             ],
             losses=[float(x) for x in (losses or [])],
+            class_mean_threshold=class_mean_threshold,
         )
 
     @classmethod
@@ -140,6 +155,7 @@ class ProbeResult:
             threshold=info.get("threshold"),
             metric=info.get("convergence_metric"),
             losses=data.get("losses"),
+            class_mean_threshold=info.get("convergent_mean_by_class_threshold"),
         )
 
 
@@ -156,6 +172,18 @@ def _signed_pole_means(means: Mapping[str, float]) -> Tuple[Optional[float], Opt
         elif label < 0:
             neg = float(val)
     return pos, neg
+
+
+def _probe_evidence(result: ProbeResult) -> Dict[str, Any]:
+    """Metric, thresholds and the weaker class mean at the best evaluation of a probe (what the plot shows)."""
+    weaker = None
+    if result.scores and result.mean_by_class:
+        best = max(range(len(result.scores)), key=result.scores.__getitem__)
+        pos, neg = _signed_pole_means(result.mean_by_class[min(best, len(result.mean_by_class) - 1)])
+        if pos is not None and neg is not None:
+            weaker = min(abs(pos), abs(neg))
+    return {"metric": result.metric, "threshold": result.threshold, "min_class_mean": weaker,
+            "class_mean_threshold": result.class_mean_threshold}
 
 
 def classify_probe(
@@ -338,6 +366,10 @@ class Probe:
     confirmed: Optional[bool] = None
     steps_run: Optional[int] = None  # last evaluated step (shows early stops)
     note: str = ""
+    metric: Optional[str] = None  # convergence metric of ``best_score`` (e.g. "correlation")
+    threshold: Optional[float] = None  # ``best_score`` must reach this to converge
+    min_class_mean: Optional[float] = None  # weaker class mean (magnitude) at the best evaluation
+    class_mean_threshold: Optional[float] = None  # ... and this must reach ``class_mean_threshold``
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -361,6 +393,115 @@ class LRSearchResult:
             "window": list(self.window) if self.window else None,
             "probes": [p.to_dict() for p in self.probes],
         }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "LRSearchResult":
+        """Inverse of :meth:`to_dict` (e.g. for a stored ``lr_search.json``)."""
+        probes = [
+            Probe(
+                lr=p["lr"], state=RunState(p["state"]), final_score=p.get("final_score"), best_score=p.get("best_score"),
+                confirmed=p.get("confirmed"), steps_run=p.get("steps_run"), note=p.get("note", ""),
+                metric=p.get("metric"), threshold=p.get("threshold"), min_class_mean=p.get("min_class_mean"),
+                class_mean_threshold=p.get("class_mean_threshold"),
+            )
+            for p in d.get("probes", [])
+        ]
+        bracket, window = d.get("bracket"), d.get("window")
+        return cls(d["status"], d.get("best_lr"), probes, tuple(bracket) if bracket else None, tuple(window) if window else None)
+
+    def plot(self, *, output: Optional[str] = None, show: bool = True, title: Optional[str] = None) -> Any:
+        """Plot what the search did.
+
+        Every probe (a short training run) is one dot at its learning rate, numbered in the order it ran and coloured by
+        its state: blue too low, green converged, orange/red too high. The top panel shows the convergence score
+        (the correlation of the encoded value with the class) the probe reached; the bottom panel the weaker of the two
+        class means. A probe converges only if both reach their threshold (dotted lines). The green band is the
+        convergent range, the dashed line the chosen learning rate, and a ring marks a probe that was re-run for the full
+        ``max_steps``. Needs matplotlib.
+
+        Args:
+            output: Optional path to save the figure to.
+            show: Whether to call ``plt.show()``.
+            title: Optional title (default: the search status and the chosen learning rate).
+
+        Returns:
+            The matplotlib figure.
+        """
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib.ticker import FuncFormatter, LogLocator
+        except ImportError as exc:  # pragma: no cover - matplotlib is a dependency of the plotting extras
+            raise ImportError("LRSearchResult.plot needs matplotlib: pip install matplotlib") from exc
+
+        colors = {
+            RunState.FROZEN: ("#9ecae1", "frozen (too low)"),
+            RunState.SLOW: ("#1f77b4", "slow (too low)"),
+            RunState.CONVERGED: ("#2ca02c", "converged"),
+            RunState.DEGRADING: ("#fdae6b", "degrading (too high)"),
+            RunState.COLLAPSED: ("#e6550d", "collapsed (too high)"),
+            RunState.DIVERGED: ("#a50f15", "diverged (too high)"),
+        }
+
+        def first(values):
+            return next((v for v in values if v is not None), None)
+
+        metric = first(p.metric for p in self.probes) or "score"
+        threshold = first(p.threshold for p in self.probes)
+        mean_threshold = first(p.class_mean_threshold for p in self.probes)
+        with_means = any(p.min_class_mean is not None for p in self.probes)
+
+        scores = [p.best_score for p in self.probes if p.best_score is not None]
+        score_floor = min([0.5 if threshold is None else threshold - 0.1, *scores]) - 0.1
+        panels = [("best " + metric + " in the probe", lambda p: p.best_score, score_floor, 1.18, threshold,
+                   "convergence threshold")]
+        if with_means:
+            panels.append(("weaker class mean |m|\nat that evaluation", lambda p: p.min_class_mean, 0.0, 1.1, mean_threshold,
+                           "class-mean threshold"))
+        fig, axes = plt.subplots(len(panels), 1, sharex=True, squeeze=False, figsize=(8.8, 2.9 * len(panels) + 0.5),
+                                 gridspec_kw={"height_ratios": [3, 2][: len(panels)], "hspace": 0.12})
+        for row, (label, value, floor, top, line, line_label) in enumerate(panels):
+            ax = axes[row][0]
+            if self.window:
+                ax.axvspan(*self.window, color="#2ca02c", alpha=0.12, label="convergent range", zorder=0)
+            if line is not None:
+                ax.axhline(line, color="0.45", ls=":", lw=1.2, zorder=1)
+                ax.annotate(line_label, (0.005, line), xycoords=("axes fraction", "data"), textcoords="offset points",
+                            xytext=(3, 3), fontsize=8, color="0.35")
+            points = [(p, floor if value(p) is None else value(p)) for p in self.probes]
+            for state, (color, state_label) in colors.items():
+                xs = [(p.lr, y) for p, y in points if p.state == state and (value(p) is not None or row == 0)]
+                if xs:
+                    ax.scatter(*zip(*xs), s=70, color=color, edgecolor="white", label=state_label, zorder=3)
+            if row == 0:
+                confirmed = [(p.lr, y) for p, y in points if p.confirmed]
+                if confirmed:
+                    ax.scatter(*zip(*confirmed), s=190, facecolors="none", edgecolors="black", linewidths=1.2,
+                               label="re-run for the full max_steps", zorder=2)
+                for order, (p, y) in enumerate(points, start=1):
+                    ax.annotate(str(order), (p.lr, y), textcoords="offset points", xytext=(0, 9), ha="center", fontsize=9)
+            if self.best_lr is not None:
+                ax.axvline(self.best_lr, color="black", ls="--", lw=1, zorder=0)
+                if row == len(panels) - 1:
+                    ax.annotate(f"chosen {_format_lr(self.best_lr)}", (self.best_lr, 0.03), xycoords=("data", "axes fraction"),
+                                textcoords="offset points", xytext=(4, 0), ha="left", va="bottom", fontsize=9)
+            ax.set_ylim(floor, top)
+            ax.set_ylabel(label)
+            ax.grid(alpha=0.25)
+        ax = axes[-1][0]
+        ax.set_xscale("log")
+        ax.xaxis.set_major_locator(LogLocator(base=10, subs=(1.0, 2.0, 5.0)))  # the 1/2/5 grid of the search
+        ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: _format_lr(value)))
+        ax.tick_params(axis="x", labelsize=8)
+        ax.set_xlabel("learning rate")
+        axes[0][0].set_title(title or (f"Learning-rate search: {self.status}"
+                                       + (f", chosen {_format_lr(self.best_lr)}" if self.best_lr else "")))
+        axes[0][0].legend(loc="center left", bbox_to_anchor=(1.01, 0.0 if len(panels) > 1 else 0.5), fontsize=8, frameon=False)
+        if output:
+            os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
+            fig.savefig(output, dpi=200, bbox_inches="tight")
+        if show:
+            plt.show()
+        return fig
 
 
 class NoConvergentLearningRate(RuntimeError):
@@ -493,7 +634,7 @@ class LRSearch:
         final = result.scores[-1] if result.scores else None
         probe = Probe(
             lr=lr, state=state, final_score=final, best_score=best,
-            steps_run=result.steps[-1] if result.steps else None,
+            steps_run=result.steps[-1] if result.steps else None, **_probe_evidence(result),
         )
         if state is RunState.CONVERGED and self.confirm is not None:
             confirmed = self.confirm(lr)
@@ -504,6 +645,8 @@ class LRSearch:
                 probe.note = f"probe converged but the confirmation run was {cstate.value}"
                 probe.final_score = confirmed.scores[-1] if confirmed.scores else None
                 probe.best_score = max(confirmed.scores) if confirmed.scores else None
+                for name, value in _probe_evidence(confirmed).items():
+                    setattr(probe, name, value)
         logger.info(
             "lr_search: lr=%g -> %s (final=%s best=%s)%s",
             lr, probe.state.value, probe.final_score, probe.best_score,
@@ -606,48 +749,89 @@ class LRSearch:
 
 
 # --------------------------------------------------------------------- trainer adapter
+@dataclass
+class LRSearchConfig:
+    """Options of the learning-rate search.
+
+    Set it as ``TrainingArguments(learning_rate="tune", lr_search_config=LRSearchConfig(...))`` or pass single fields
+    to ``trainer.tune_learning_rate(...)``. ``factor``, ``min_ratio``, ``max_probes``, ``resolution``, ``lr_bounds``,
+    ``center_window`` and ``max_window_probes`` are those of :class:`LRSearch`.
+    """
+
+    probe_steps: Optional[int] = 150
+    """Steps of each short probe run. ``None`` trains every probe for the full ``max_steps``."""
+
+    probe_eval_steps: Optional[int] = None
+    """Evaluation interval inside a probe (default: ``probe_steps // 6``)."""
+
+    confirm: bool = True
+    """Re-run a converged probe at the full ``max_steps`` before accepting it (one extra full run)."""
+
+    early_stop: bool = True
+    """End a probe as soon as it is decisively collapsed or diverged."""
+
+    max_probes: int = 12
+    resolution: str = "coarse"
+    factor: float = 10.0
+    min_ratio: Optional[float] = None
+    lr_bounds: Tuple[float, float] = (1e-12, 10.0)
+    center_window: bool = True
+    max_window_probes: int = 4
+
+    probe_seeds: int = 1
+    """Seeds a probe may try. Some regimes (the GRADIEND pair) drift to a common pole for one seed and converge for
+    another, so a single-seed probe can report ``collapsed`` or ``degrading`` at a learning rate that multi-seed
+    training (``max_seeds`` > 1) converges at. With ``probe_seeds`` > 1 a probe that ends ``collapsed`` or ``degrading``
+    is repeated with the next seeds (``seed + 1``, ...) and the best run is kept (converged first, then the highest
+    score). ``frozen``, ``slow`` and ``diverged`` probes are not repeated: another seed does not change their verdict."""
+
+    keep_probe_artifacts: bool = False
+    """Keep the probe checkpoints (default: only each probe's ``training.json``)."""
+
+    verbose: bool = False
+    """Show the full training log of every probe. By default the search logs one line per probe."""
+
+    def __post_init__(self) -> None:
+        self.lr_bounds = (float(self.lr_bounds[0]), float(self.lr_bounds[1]))
+        if self.resolution not in ("coarse", "fine"):
+            raise ValueError(f"resolution must be 'coarse' or 'fine', got {self.resolution!r}")
+        if self.probe_steps is not None and self.probe_steps < 1:
+            raise ValueError(f"probe_steps must be >= 1 or None, got {self.probe_steps}")
+        if self.probe_seeds < 1:
+            raise ValueError(f"probe_seeds must be >= 1, got {self.probe_seeds}")
+
+
 def tune_learning_rate(
     trainer: Any,
     initial_lr: float,
     *,
     experiment_dir: str,
-    probe_steps: Optional[int] = 150,
-    probe_eval_steps: Optional[int] = None,
-    confirm: bool = True,
-    early_stop: bool = True,
-    max_probes: int = 12,
-    resolution: str = "coarse",
-    factor: float = 10.0,
-    min_ratio: Optional[float] = None,
-    lr_bounds: Tuple[float, float] = (1e-12, 10.0),
-    center_window: bool = True,
-    max_window_probes: int = 4,
+    config: Optional[LRSearchConfig] = None,
     precheck: Optional[Callable[[], None]] = None,
-    keep_probe_artifacts: bool = False,
     metadata: Optional[Mapping[str, Any]] = None,
-    probe_seeds: int = 1,
     **train_overrides: Any,
 ) -> LRSearchResult:
     """Search the learning rate of ``trainer`` and write ``lr_search.json`` into ``experiment_dir``.
 
-    Each probe trains one seed (``probe_seeds`` > 1: see below) into ``<experiment_dir>/lr_search/<probe|confirm>_<lr>`` (no cache
-    reuse), always from the trainer's original base model, with ``max_steps=probe_steps``. With
-    ``confirm=True`` a converged probe is re-run at the trainer's configured ``max_steps`` before it
-    is accepted. With ``early_stop=True`` a probe ends as soon as it is decisively collapsed or
+    Most users call :meth:`Trainer.tune_learning_rate() <gradiend.trainer.trainer.Trainer.tune_learning_rate>` or set
+    ``TrainingArguments(learning_rate="tune")`` instead; this is the function behind both.
+
+    Each probe trains one seed into ``<experiment_dir>/lr_search/<probe|confirm>_<lr>`` (no cache
+    reuse), always from the trainer's original base model, with ``max_steps=config.probe_steps``. With
+    ``config.confirm`` a converged probe is re-run at the trainer's configured ``max_steps`` before it
+    is accepted. With ``config.early_stop`` a probe ends as soon as it is decisively collapsed or
     diverged (:class:`ProbeStopCallback`). ``precheck`` runs once before the first probe (use
     :func:`~gradiend.trainer.core.signal_checks.assert_signal_diverse` on stacked inputs) for extra checks.
     Probe checkpoints are deleted after each probe (only ``training.json`` is kept) unless
-    ``keep_probe_artifacts=True``. ``metadata`` (e.g. the first guess and probe length) is stored next to the
-    result in ``lr_search.json`` so a later run can tell whether a finished search still applies.
-
-    ``probe_seeds``: some regimes (GRADIEND pair) drift to a common pole for one seed and converge for
-    another, so a single-seed probe can report ``collapsed``/``degrading`` at an LR that the multi-seed
-    training (``max_seeds`` > 1) converges at. With ``probe_seeds`` > 1 a probe whose first seed ends
-    ``collapsed`` or ``degrading`` is repeated with the next seeds (``seed + 1``, ...) and the best run is
-    kept (converged first, then the highest score). ``frozen``/``slow``/``diverged`` runs are not repeated:
-    another seed does not change their verdict. The remaining arguments are those of
-    :class:`LRSearch`.
+    ``config.keep_probe_artifacts``. ``metadata`` (e.g. the first guess and probe length) is stored next to the
+    result in ``lr_search.json`` so a later run can tell whether a finished search still applies. The search options
+    are those of :class:`LRSearchConfig` (``probe_seeds`` > 1 repeats a ``collapsed`` or ``degrading`` probe with
+    the next seeds); ``train_overrides`` are passed to every probe's ``trainer.train``.
     """
+    cfg = config or LRSearchConfig()
+    misplaced = sorted(set(train_overrides) & {f.name for f in fields(LRSearchConfig)})
+    if misplaced:
+        raise TypeError(f"tune_learning_rate got search option(s) {misplaced}: pass them as config=LRSearchConfig(...)")
     os.makedirs(experiment_dir, exist_ok=True)
     if precheck is not None:
         precheck()
@@ -672,44 +856,44 @@ def tune_learning_rate(
         if eval_steps is not None:
             overrides["eval_steps"] = int(eval_steps)
         # the diversity guard is free (it reads statistics every evaluation computes) and stays on
-        overrides["callbacks"] = [SignalDiversityCallback()] + ([ProbeStopCallback()] if early_stop else [])
-        with _isolated_probe(trainer):
+        overrides["callbacks"] = [SignalDiversityCallback()] + ([ProbeStopCallback()] if cfg.early_stop else [])
+        with _isolated_probe(trainer), _quiet_logs(not cfg.verbose):
             trainer.train(**overrides)
             result = _read_probe(probe_dir)
-        if not keep_probe_artifacts:
+        if not cfg.keep_probe_artifacts:
             _prune_probe_dir(probe_dir)
         return result
 
     def _train_and_read(lr: float, steps: Optional[int], eval_steps: Optional[int], tag: str) -> ProbeResult:
         best: Optional[ProbeResult] = None
-        for k in range(max(1, int(probe_seeds))):
+        for k in range(cfg.probe_seeds):
             result = _one_seed(lr, steps, eval_steps, tag, k)
             if best is None or _better_probe(result, best):
                 best = result
             if classify_probe(best) not in seed_dependent:
                 break  # converged, frozen, slow or diverged: another seed cannot change that verdict
-            if k + 1 < int(probe_seeds):
+            if k + 1 < cfg.probe_seeds:
                 logger.info("lr_search: lr=%g seed %d ended %s; trying the next seed", lr, k,
                             classify_probe(result).value)
         assert best is not None
         return best
 
-    eval_steps = probe_eval_steps
-    if eval_steps is None and probe_steps is not None:
-        eval_steps = max(1, int(probe_steps) // 6)
+    eval_steps = cfg.probe_eval_steps
+    if eval_steps is None and cfg.probe_steps is not None:
+        eval_steps = max(1, int(cfg.probe_steps) // 6)
 
     def run(lr: float) -> ProbeResult:
-        return _train_and_read(lr, probe_steps, eval_steps, "probe")
+        return _train_and_read(lr, cfg.probe_steps, eval_steps, "probe")
 
     confirm_fn = None
-    if confirm and probe_steps is not None and probe_steps != full_steps:
+    if cfg.confirm and cfg.probe_steps is not None and cfg.probe_steps != full_steps:
         def confirm_fn(lr: float) -> ProbeResult:  # noqa: E306
             return _train_and_read(lr, full_steps, full_eval, "confirm")
 
     search = LRSearch(
-        run, initial_lr, factor=factor, min_ratio=min_ratio, max_probes=max_probes,
-        resolution=resolution, lr_bounds=lr_bounds, confirm=confirm_fn,
-        center_window=center_window, max_window_probes=max_window_probes,
+        run, initial_lr, factor=cfg.factor, min_ratio=cfg.min_ratio, max_probes=cfg.max_probes,
+        resolution=cfg.resolution, lr_bounds=cfg.lr_bounds, confirm=confirm_fn,
+        center_window=cfg.center_window, max_window_probes=cfg.max_window_probes,
     )
     result = search.search()
     payload = {**dict(metadata or {}), "initial_lr": float(initial_lr), **result.to_dict()}
@@ -725,6 +909,22 @@ def _better_probe(a: ProbeResult, b: ProbeResult) -> bool:
     score_a = max(a.scores) if a.scores else float("-inf")
     score_b = max(b.scores) if b.scores else float("-inf")
     return score_a > score_b
+
+
+@contextlib.contextmanager
+def _quiet_logs(enabled: bool) -> Iterator[None]:
+    """Log only errors from the package while a probe trains (the search itself logs one line per probe).
+
+    Warnings such as "model did not converge" are expected for probes with a bad learning rate.
+    """
+    package_logger = logging.getLogger("gradiend")
+    previous = package_logger.level
+    if enabled:
+        package_logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        package_logger.setLevel(previous)
 
 
 @contextlib.contextmanager

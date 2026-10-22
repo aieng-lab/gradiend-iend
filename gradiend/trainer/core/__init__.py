@@ -23,7 +23,7 @@ from .signals import (
 )
 from .dataset import SignalTrainingDatasetBase
 from .decoder_lr import AutoDecoderLearningRate, AUTO_DECODER_LR
-from .lr_search import LRSearch, LRSearchResult, RunState, tune_learning_rate
+from .lr_search import LRSearch, LRSearchConfig, LRSearchResult, NoConvergentLearningRate, RunState, tune_learning_rate
 from .signal_checks import SignalDiversityCallback, SignalNotDiverseError, assert_signal_diverse
 
 __all__ = [
@@ -49,7 +49,9 @@ __all__ = [
     'AutoDecoderLearningRate',
     'AUTO_DECODER_LR',
     'LRSearch',
+    'LRSearchConfig',
     'LRSearchResult',
+    'NoConvergentLearningRate',
     'RunState',
     'tune_learning_rate',
     'assert_signal_diverse',

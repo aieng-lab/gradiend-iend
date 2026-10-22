@@ -134,6 +134,7 @@ def _make_bf16_tiny_mwg() -> _TinyMWG:
         input_dim=4,
         latent_dim=1,
         param_map={"weight": {"shape": (2, 2), "repr": "all"}},
+        device=torch.device("cpu"),  # the tiny base model lives on the CPU
         torch_dtype=torch.bfloat16,
     )
     with torch.no_grad():
