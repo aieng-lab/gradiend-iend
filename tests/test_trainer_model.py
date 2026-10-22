@@ -1506,3 +1506,38 @@ class TestEvalDeviceWarnings:
         trainer.evaluate_encoder(device="cuda")
         mock_model.place_for_evaluation.assert_called_once()
         assert mock_model.place_for_evaluation.call_args.kwargs.get("device") == "cuda"
+
+
+def test_get_model_releases_the_previous_model_before_loading_a_replacement():
+    """qwen3.5-27b ACTIEND on an 80 GiB A100: train() reloads its selected checkpoint while the
+    just-trained model was still cached -> two 27B backbones on one GPU -> CUDA OOM. The cached
+    model must be gone (collectable) before the replacement is created."""
+    import gc
+    import weakref
+
+    from gradiend.trainer.trainer import Trainer
+
+    class _M:
+        pass
+
+    concrete = type("_ConcreteTrainer", (Trainer,), {})
+    concrete.__abstractmethods__ = frozenset()  # only get_model is exercised
+    trainer = object.__new__(concrete)
+    old = _M()
+    trainer._model_instance = old
+    trainer._training_args = None
+    old_ref = weakref.ref(old)
+    del old
+    alive_during_load = []
+
+    def fake_create(load_directory, **kwargs):
+        gc.collect()
+        alive_during_load.append(old_ref() is not None)
+        return _M()
+
+    trainer.create_model_with_gradiend = fake_create
+    new = trainer.get_model(load_directory="ckpt/best")
+    assert alive_during_load == [False]
+    assert trainer._model_instance is new
+    # an unrelated get_model() with a cached instance does not reload or drop it
+    assert trainer.get_model() is new

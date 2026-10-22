@@ -556,11 +556,24 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             if "trust_remote_code" not in kwargs:
                 kwargs.setdefault("trust_remote_code", getattr(self._training_args, "trust_remote_code", False))
         load_directory = load_directory if load_directory is not None else self.model_path
+        # Never hold two backbones at once: the model being replaced (e.g. the just-trained one when
+        # train() reloads its selected checkpoint) is released BEFORE the new one loads. Otherwise a
+        # 27B model needs 2x its weights on one GPU for the duration of the load (qwen3.5-27b ACTIEND
+        # on an 80 GiB A100: every probe's reload failed with CUDA OOM, then the job died).
+        self._release_in_memory_model()
         model = self.create_model_with_gradiend(load_directory, **kwargs)
         # Always cache in memory; use_cache elsewhere is for disk/output only
         self._model_instance = model
         self._model_manually_unloaded = False
         return model
+
+    def _release_in_memory_model(self) -> None:
+        """Drop the cached in-memory model and return its GPU memory (no copy to CPU first)."""
+        had_model = self._model_instance is not None
+        self._model_instance = None
+        gc.collect()
+        if had_model and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def unload_model(self) -> None:
         """Release the in-memory model reference and try to move the model off GPU.
@@ -1129,6 +1142,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             from_gradiend_checkpoint = bool(
                 load_path_str and _is_gradiend_checkpoint(load_path_str)
             )
+            # A cached model from an earlier train()/evaluation must not stay on the GPU while this
+            # one loads (qwen3.5-27b ACTIEND on an 80 GiB A100: OOM loading the next probe's backbone).
+            self._release_in_memory_model()
             model_with_gradiend = self.create_model_with_gradiend(
                 load_path,
                 feature_definition=self,
@@ -1740,6 +1756,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                                     runtime_monitor.mark("trainer:seed:pre_prune:start", seed=seed_value)
                                     getattr(self, "_ensure_data_for_training", lambda: None)()
                                     runtime_monitor.mark("trainer:seed:create_model_with_gradiend:start", seed=seed_value)
+                                    self._release_in_memory_model()
                                     model_instance = self.create_model_with_gradiend(
                                         load_model_path,
                                         feature_definition=self,
@@ -2444,7 +2461,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 # Clear cached model so the next get_model() loads from output_dir (the selected best seed).
                 # That first load is then cached; subsequent get_model() calls reuse the same instance.
                 self._model_arg = output_dir
-                self._model_instance = None
+                self._release_in_memory_model()
                 method_name = _checkpoint_gradiend_method_name(output_dir)
 
                 # Check convergence and warn if non-convergent
@@ -3552,12 +3569,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             key = raw_key if increase_target_probabilities else f"{raw_key}_weaken"
             summary = summary_source.get(key)
             if not summary or "feature_factor" not in summary or "learning_rate" not in summary:
-                hint = ""
-                if not increase_target_probabilities and not key.endswith("_weaken"):
-                    hint = " evaluate_decoder currently only produces strengthen summaries."
                 raise ValueError(
                     f"Decoder results do not contain summary for metric '{key}'. "
-                    f"Available keys: {list(summary_source.keys())}.{hint}"
+                    f"Available keys: {list(summary_source.keys())}."
                 )
             selected.append((key, summary))
         return selected
@@ -3621,7 +3635,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         The decoder evaluation selects a feature factor and learning rate per target class and direction
         (strengthening vs weakening). This method applies the selected config: by default it strengthens
         the given target class(es); use increase_target_probabilities=False to apply the weakening config
-        instead (evaluate_decoder currently only produces strengthen summaries).
+        instead. The weakening config must have been computed first by calling
+        ``evaluate_decoder(..., increase_target_probabilities=False)``, whose summary keys carry the
+        ``"_weaken"`` suffix (e.g. ``"3SG_weaken"``).
 
         ``learning_rate`` and ``feature_factor`` from decoder results (and probability-shift plots)
         are passed through unchanged to :meth:`ModelWithGradiend.rewrite_base_model` for every
@@ -3644,7 +3660,9 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 "<class>_weaken" but you pass the class id here and set increase_target_probabilities=False.
             increase_target_probabilities: If True (default), apply the config that strengthens the
                 target class (higher probability for that class). If False, apply the config that weakens
-                it (uses opposite feature factor; evaluate_decoder currently only produces strengthen summaries).
+                it (uses opposite feature factor). This requires decoder results computed with
+                ``evaluate_decoder(..., increase_target_probabilities=False)``, i.e. summaries with
+                the ``"_weaken"`` key suffix.
             output_dir: Optional directory where the rewritten model(s) should be saved.
                 If provided, models are saved to disk. If None, models are returned in memory only.
                 For a single target_class, this is the exact save directory. For multiple target_classes,

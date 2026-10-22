@@ -249,6 +249,28 @@ class TestCreatorOutputFormats:
                 min_rows_per_class_for_split=0,
             )
 
+    def test_generate_training_data_raises_for_empty_configured_class(self):
+        """An absent class must fail at data creation, not later during training."""
+        creator = TextPredictionDataCreator(
+            base_data=["They play."] * 12,
+            feature_targets=[
+                TextFilterConfig(id="3SG", targets=["he"]),
+                TextFilterConfig(id="3PL", targets=["they"]),
+            ],
+            min_left_context_words=0,
+            seed=42,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match=r"No matches were found for configured feature class\(es\): \['3SG'\]",
+        ):
+            creator.generate_training_data(
+                max_size_per_class=20,
+                format="unified",
+                min_rows_per_class_for_split=0,
+            )
+
     def test_generate_training_data_excludes_and_saves_incomplete_classes_by_default(self):
         """Classes below the split minimum are saved separately and excluded from main data."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -434,6 +434,7 @@ class ModelWithGradiend(nn.Module, ABC):
         device_decoder=None,
         base_model_device_map=None,
         base_model_max_memory=None,
+        base_model_offload: str = "warn",
         gradient_creator=None,
         source: str = "factual",
         target: str = "diff",
@@ -452,6 +453,7 @@ class ModelWithGradiend(nn.Module, ABC):
 
         self.base_model_device_map = base_model_device_map or get_hf_device_map(base_model)
         self.base_model_max_memory = base_model_max_memory
+        self.base_model_offload = base_model_offload
         self.base_model_is_sharded = self.base_model_device_map not in (None, False)
 
         if gradiend.encoder is not None:
@@ -1887,6 +1889,7 @@ class ModelWithGradiend(nn.Module, ABC):
             "base_model_device": device_base_model,
             "base_model_device_map": kwargs.get("base_model_device_map"),
             "base_model_max_memory": kwargs.get("base_model_max_memory"),
+            "base_model_offload": kwargs.get("base_model_offload", "warn"),
         }
 
 
@@ -2030,7 +2033,7 @@ class ModelWithGradiend(nn.Module, ABC):
                 "init_fan_in_floor",
                 "gradiend_split",
                 "encoder_decoder_same_device", "pre_prune_config",
-                "base_model_device_map", "base_model_max_memory",
+                "base_model_device_map", "base_model_max_memory", "base_model_offload",
                 "prediction_objective",
                 "decoder_sequence_cloze_rhs_window",
                 "source", "target",
@@ -2044,10 +2047,12 @@ class ModelWithGradiend(nn.Module, ABC):
         feature_definition = kwargs.pop("feature_definition", feature_definition)
         base_model_device_map = kwargs.pop("base_model_device_map", None)
         base_model_max_memory = kwargs.pop("base_model_max_memory", None)
+        base_model_offload = kwargs.pop("base_model_offload", "warn")
         device_config = cls._get_device_config(
             load_directory_str,
             base_model_device_map=base_model_device_map,
             base_model_max_memory=base_model_max_memory,
+            base_model_offload=base_model_offload,
             **kwargs,
         )
         # ``_get_device_config`` resolves the caller's placement overrides into
@@ -2065,11 +2070,12 @@ class ModelWithGradiend(nn.Module, ABC):
             "base_model_device",
             "base_model_device_map",
             "base_model_max_memory",
+            "base_model_offload",
         ):
             load_kwargs.pop(key, None)
         gradiend_device_config = {
             k: v for k, v in device_config.items()
-            if k not in {"base_model_device", "base_model_device_map", "base_model_max_memory"}
+            if k not in {"base_model_device", "base_model_device_map", "base_model_max_memory", "base_model_offload"}
         }
 
         if _is_gradiend_checkpoint(load_directory_str):

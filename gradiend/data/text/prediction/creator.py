@@ -364,7 +364,8 @@ class TextPredictionDataCreator:
 
         Raises:
             ValueError: If split ratios do not sum to ``1.0``, ``format`` is
-                unknown, strict balancing is impossible for the requested cap, or
+                unknown, any configured feature class has no matches, strict
+                balancing is impossible for the requested cap, or
                 ``raise_on_incomplete_classes`` is True and one or more non-empty
                 classes have too few rows for splitting.
             TypeError: If lower-level split-key normalization receives an invalid
@@ -493,6 +494,18 @@ class TextPredictionDataCreator:
                 len(empty_class_ids),
                 len(stats_per_group),
                 empty_class_ids[:SUMMARY_LOG_EXAMPLES],
+            )
+
+        # A user interrupt intentionally permits returning/saving partial data.
+        # Otherwise, dropping an empty configured class creates invalid training
+        # input and defers the useful error until the trainer unifies the data.
+        if empty_class_ids and not interrupted:
+            raise ValueError(
+                "No matches were found for configured feature class(es): "
+                f"{empty_class_ids}. All configured feature classes need at least "
+                "one matching sentence before GRADIEND training data can be created. "
+                "Check the target patterns and preprocessing, or provide a corpus "
+                "that contains these classes."
             )
 
         if interrupted:

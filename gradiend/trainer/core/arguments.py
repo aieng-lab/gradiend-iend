@@ -416,6 +416,12 @@ class TrainingArguments:
     """Optional Hugging Face max_memory map for base-model device placement.
     When unset and base_model_device_map='auto' on multiple GPUs, GPU0 is reserved for GRADIEND automatically."""
 
+    base_model_offload: str = "warn"
+    """What to do when a device-mapped base model does not fit the visible GPUs and accelerate
+    offloads part of it to CPU/disk (numerically identical, but much slower): ``"warn"`` (default:
+    log the offloaded modules), ``"error"`` (raise -- for pipelines that must shard across GPUs
+    instead), or ``"allow"`` (silent)."""
+
     encoder_decoder_same_device: bool = False
     """If True, place encoder and decoder on the same GPU (cuda:0), giving the base model the rest.
     Useful for large base models with pre-pruning: encoder+decoder are small and can share GPU 0;
@@ -799,6 +805,10 @@ class TrainingArguments:
             raise TypeError(
                 "base_model_device_map must be None, False, a string such as 'auto', or a device-map dict; "
                 f"got {type(self.base_model_device_map).__name__}"
+            )
+        if self.base_model_offload not in ("warn", "error", "allow"):
+            raise ValueError(
+                f"base_model_offload must be 'warn', 'error' or 'allow'; got {self.base_model_offload!r}"
             )
         if self.base_model_max_memory is not None and not isinstance(self.base_model_max_memory, dict):
             raise TypeError(

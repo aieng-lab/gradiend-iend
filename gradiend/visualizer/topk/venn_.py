@@ -10,6 +10,7 @@ matplotlib is also optional; if missing, plotting raises ImportError with instal
 from typing import Dict, List, Optional, Tuple, Union
 
 from gradiend.visualizer.plot_optional import _require_matplotlib
+from gradiend.visualizer.topk.naming import as_named_models
 from gradiend.visualizer.labels import (
     escape_matplotlib_usetex_text,
     format_model_labels_with_convergence,
@@ -357,7 +358,8 @@ def plot_topk_overlap_venn(
     package for 4–6 models. Missing packages raise ImportError with install instructions.
 
     Args:
-        models: Mapping from display label (or model id) to ModelWithGradiend instance.
+        models: Mapping from display label (or model id) to ModelWithGradiend instance, or a list of
+            models that are labelled after their checkpoint folders (see ``as_named_models``).
         topk: Number of top weights to consider per model (base-model weight indices).
         part: ``'encoder-weight'`` or ``'decoder-weight'``.
         output_path: Optional path to save the figure.
@@ -378,6 +380,7 @@ def plot_topk_overlap_venn(
         Dict with keys: ``per_model`` (model_id -> list of weight indices), ``intersection``,
         ``union``, ``topk``, ``part``.
     """
+    models = as_named_models(models)
     if not models:
         return {"per_model": {}, "intersection": [], "union": [], "topk": topk, "part": part}
     if not isinstance(models, dict):

@@ -67,6 +67,49 @@ class TestClassify:
         r = _result([0.5, 0.5], [0.1, 0.1], [-0.1, -0.1], losses=[0.1, float("nan")])
         assert classify_probe(r) is RunState.DIVERGED
 
+    @staticmethod
+    def _gemma3(scores, f, m):
+        # gemma-3-4b-pt gender_en pair (slurm 4328305_4 / 4328306_1); F is the +1 pole
+        return ProbeResult(
+            steps=[16 * i for i in range(len(scores))], scores=list(scores), converged=False,
+            mean_by_class=[{"1.0": a, "-1.0": b} for a, b in zip(f, m)],
+        )
+
+    def test_unmoved_run_that_starts_saturated_on_one_side_is_frozen_not_collapsed(self):
+        # ACTIEND starts at F=-0.62, M=-0.56; at lr 1e-6..1e-12 nothing moves. Old rule: "collapsed"
+        # -> LR down forever -> no_convergent_lr after 8 probes.
+        assert classify_probe(self._gemma3([-0.3443, -0.3443], [-0.6218, -0.6218], [-0.5644, -0.5644])) is RunState.FROZEN
+        assert classify_probe(self._gemma3([-0.3443, -0.3462], [-0.6218, -0.6205], [-0.5644, -0.5625])) is RunState.FROZEN
+
+    def test_one_sided_run_whose_pole_gap_opens_is_not_collapsed(self):
+        # ACTIEND lr 1e-5: corr -0.34 -> 0.74 -> 0.60, gap F-M -0.06 -> +0.12, both poles > 0.5
+        r = self._gemma3([-0.3443, -0.5148, 0.7426, 0.6045], [-0.6218, -0.5153, 0.6349, 0.7137], [-0.5644, -0.3906, 0.4650, 0.5925])
+        assert classify_probe(r) is RunState.SLOW
+
+    def test_run_creeping_around_a_saturated_start_is_slow_not_collapsed(self):
+        # ACTIEND lr 2e-6 (slurm 4328827): moved 0.05 in correlation, poles barely moved
+        r = self._gemma3(
+            [-0.3443, -0.3524, -0.3595, -0.3754, -0.3955],
+            [-0.6218, -0.6160, -0.6212, -0.6286, -0.6365],
+            [-0.5644, -0.5563, -0.5614, -0.5674, -0.5730],
+        )
+        assert classify_probe(r) is RunState.SLOW
+
+    def test_full_lr_1e5_run_is_degrading(self):
+        # ACTIEND lr 1e-5 run to the end: peak 0.74, then both poles drift to +0.8/+0.9
+        r = self._gemma3(
+            [-0.3443, -0.5148, 0.7426, 0.6045, 0.4271, 0.2455, 0.1886, 0.1905],
+            [-0.6218, -0.5153, 0.6349, 0.7137, 0.7684, 0.8470, 0.8875, 0.8906],
+            [-0.5644, -0.3906, 0.4650, 0.5925, 0.6593, 0.7593, 0.8044, 0.8037],
+        )
+        assert classify_probe(r) is RunState.DEGRADING
+
+    def test_one_sided_run_whose_gap_does_not_open_is_still_collapsed(self):
+        # AGIEND lr 0.5 / 1.0: both poles pushed to the neutral pole
+        assert classify_probe(self._gemma3([-0.2486, -0.1087], [0.0028, 0.9593], [0.0033, 1.0])) is RunState.COLLAPSED
+        r = self._gemma3([-0.2486, -0.4491, -0.4424, -0.4033], [0.0028, 0.3352, 0.3683, 0.5896], [0.0033, 1.0, 1.0, 0.9999])
+        assert classify_probe(r) is RunState.COLLAPSED
+
     def test_direction(self):
         assert RunState.FROZEN.direction == +1 and RunState.SLOW.direction == +1
         assert RunState.COLLAPSED.direction == -1 and RunState.DEGRADING.direction == -1
@@ -222,6 +265,53 @@ class _FakeTrainer:
         self._model_arg = out  # what the real Trainer does
         self._model_instance = object()  # the trained model stays resident
         return self
+
+
+class _SeedDependentTrainer(_FakeTrainer):
+    """Only seed 1 converges; every other seed drifts both classes to the same pole (a collapse)."""
+
+    def __init__(self, tmp_path):
+        super().__init__(tmp_path)
+        self._training_args = type("A", (), {"max_steps": 500, "eval_steps": 50, "seed": 0})()
+        self.seeds = []
+
+    def train(self, **kw):
+        self.seeds.append(kw.get("seed", 0))
+        good = kw.get("seed", 0) == 1
+        out = kw["experiment_dir"] + "/model"
+        import os
+
+        os.makedirs(out, exist_ok=True)
+        payload = {
+            "training_stats": {
+                "scores": {"0": 0.2, "50": 0.95 if good else 0.0},
+                "mean_by_class": {"0": {"1.0": 0.05, "-1.0": 0.04},
+                                  "50": {"1.0": 0.9, "-1.0": -0.9} if good else {"1.0": -0.8, "-1.0": -0.7}},
+            },
+            "losses": [0.1],
+            "convergence_info": {"converged": good},
+        }
+        with open(out + "/training.json", "w") as fh:
+            json.dump(payload, fh)
+        self._model_arg, self._model_instance = out, object()
+        return self
+
+
+def test_a_collapsed_probe_is_retried_with_the_next_seed(tmp_path):
+    from gradiend.trainer.core.lr_search import RunState, tune_learning_rate
+
+    single = _SeedDependentTrainer(tmp_path)
+    one = tune_learning_rate(single, 1e-6, experiment_dir=str(tmp_path / "a"), probe_steps=100, confirm=False,
+                             max_probes=1)
+    assert one.probes[0].state is RunState.COLLAPSED and single.seeds == [0]
+
+    multi = _SeedDependentTrainer(tmp_path)
+    three = tune_learning_rate(multi, 1e-6, experiment_dir=str(tmp_path / "b"), probe_steps=100, confirm=False,
+                               max_probes=1, probe_seeds=3)
+    assert three.probes[0].state is RunState.CONVERGED
+    # the first probe: seed 0 collapsed, seed 1 converged, so the third seed never runs;
+    # whatever probes follow (window centring) start again at seed 0
+    assert multi.seeds[:2] == [0, 1] and 2 not in multi.seeds
 
 
 def test_every_probe_starts_from_the_base_model_and_the_trainer_is_left_untouched(tmp_path):
@@ -614,3 +704,94 @@ def test_search_context_is_stored_next_to_the_result(tmp_path):
     saved = json.loads((tmp_path / "exp" / "lr_search.json").read_text())
     assert saved["backend"] == "gradiend" and saved["probe_steps"] == 100 and saved["initial_lr"] == 1e-6
     assert saved["status"] == "converged" and saved["best_lr"] >= 1e-6
+
+
+class TestRefineAndFullLengthSlow:
+    """gemma-3-27b GRADIEND gender_en (slurm 4328877): 1e-6 slow but still rising at the end of the
+    150-step probe, 2e-6 degrading, coarse grid empty in between -> no_convergent_lr after 3 probes."""
+
+    SLOW_RISING = ([0.13, 0.19, 0.28, 0.36], [0.0, 0.002, 0.004, 0.005], [0.0, -0.005, -0.01, -0.012])
+    # A genuinely degrading run: the encoder moves (means ~0.2..0.9) and its correlation then collapses.
+    # (The real gemma-3-27b GRADIEND trace at 2e-6 -- means ~0.005, correlation sign flip -- was labelled
+    # "degrading" by the old classifier although nothing had moved; its convergent window is 5e-6..5e-5.)
+    DEGRADING = ([0.13, 0.06, -0.04, -0.12], [0.0, 0.2, 0.5, 0.8], [0.0, 0.3, 0.6, 0.9])
+
+    def test_coarse_bracket_without_convergence_is_refined_on_the_fine_grid(self):
+        calls = []
+
+        def run(lr):
+            calls.append(lr)
+            if abs(lr - 1.5e-6) < 1e-12:
+                return _result(*GOOD, converged=True)
+            return _result(*(self.SLOW_RISING if lr < 1.5e-6 else self.DEGRADING))
+
+        res = LRSearch(run, 1e-6, confirm=lambda lr: _result(*GOOD, converged=True)).search()
+        assert res.status == "converged" and res.best_lr == pytest.approx(1.5e-6)
+
+    def test_still_improving_slow_probe_gets_a_full_length_run(self):
+        full_runs = []
+
+        def run(lr):
+            return _result(*(self.SLOW_RISING if lr <= 1e-6 else self.DEGRADING))
+
+        def confirm(lr):
+            full_runs.append(lr)
+            return _result(*GOOD, converged=True)
+
+        res = LRSearch(run, 1e-6, confirm=confirm).search()
+        assert full_runs == [pytest.approx(1e-6)]
+        assert res.status == "converged" and res.best_lr == pytest.approx(1e-6)
+        assert "full budget" in next(p for p in res.probes if p.lr == pytest.approx(1e-6)).note
+
+    def test_slow_probe_that_already_peaked_is_not_rerun(self):
+        peaked = ([0.13, 0.23, 0.18, 0.14], [0.0, 0.01, 0.005, 0.004], [0.0, -0.01, -0.006, -0.005])
+        full_runs = []
+
+        def run(lr):
+            return _result(*(peaked if lr <= 1e-6 else self.DEGRADING))
+
+        res = LRSearch(run, 1e-6, confirm=lambda lr: full_runs.append(lr) or _result(*GOOD, converged=True)).search()
+        assert full_runs == [] and res.status == "no_convergent_lr"
+
+    def test_failed_full_length_run_still_reports_no_convergent_lr(self):
+        def run(lr):
+            return _result(*(self.SLOW_RISING if lr <= 1e-6 else self.DEGRADING))
+
+        res = LRSearch(run, 1e-6, confirm=lambda lr: _result(*self.SLOW_RISING)).search()
+        assert res.status == "no_convergent_lr"
+        assert any("full budget: slow" in p.note for p in res.probes)
+
+
+def test_expansion_tries_the_bound_instead_of_stopping_short_of_it():
+    # gemma-3-270m AGIEND one-pole: slow at 0.5, x10 = 5.0 is above the 1.0 bound
+    calls = []
+
+    def run(lr):
+        calls.append(lr)
+        return _result(*FROZEN)
+
+    res = LRSearch(run, 0.5, lr_bounds=(1e-12, 1.0)).search()
+    assert calls == [pytest.approx(0.5), pytest.approx(1.0)]
+    assert res.status == "no_convergent_lr"
+    calls.clear()
+    LRSearch(lambda lr: calls.append(lr) or _result(*COLLAPSE), 2e-12, lr_bounds=(1e-12, 1.0)).search()
+    assert calls == [pytest.approx(2e-12), pytest.approx(1e-12)]
+
+
+def test_sign_flip_of_an_untrained_encoder_is_frozen_not_degrading():
+    # gemma-3-4b AGIEND one-pole M, lr 7e-4: class means ~0.003 throughout, correlation +0.1657 -> -0.1655
+    r = ProbeResult(
+        steps=[0, 25, 75, 125, 150], scores=[0.1657, -0.1655, -0.1656, -0.1656, -0.1655], converged=False,
+        mean_by_class=[{"1.0": a, "-1.0": b, "0.0": n} for a, b, n in
+                       [(0.0032, 0.0028, 0.0029), (0.0009, 0.0012, 0.0012), (0.0020, 0.0023, 0.0023),
+                        (0.0020, 0.0023, 0.0023), (0.0020, 0.0023, 0.0023)]],
+    )
+    assert classify_probe(r) is RunState.FROZEN
+
+
+def test_encoder_that_actually_moved_is_still_classified_by_its_correlation():
+    r = ProbeResult(
+        steps=[0, 25, 75], scores=[0.14, 0.82, 0.31], converged=False,
+        mean_by_class=[{"1.0": a, "-1.0": b} for a, b in [(0.015, 0.011), (0.977, -0.918), (0.97, -0.99)]],
+    )
+    assert classify_probe(r) is RunState.DEGRADING

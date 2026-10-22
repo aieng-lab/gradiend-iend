@@ -1033,7 +1033,7 @@ class TextPredictionTrainer(Trainer):
         classes: List[str],
         param_name: str = "target_classes",
     ) -> None:
-        """Raise ValueError if any requested class is absent from per-class data.
+        """Raise ValueError if any requested class is absent or empty in per-class data.
 
         Args:
             class_dfs: Per-class DataFrame mapping.
@@ -1047,6 +1047,15 @@ class TextPredictionTrainer(Trainer):
                 f"{param_name} {missing} are not present in the data. "
                 f"Available classes: {sorted(available)}. "
                 "Ensure target_classes (or the classes used for training) match the keys of your per-class data."
+            )
+        empty = [c for c in classes if class_dfs[c].empty]
+        if empty:
+            row_counts = {str(c): len(class_dfs[c]) for c in classes}
+            raise ValueError(
+                f"{param_name} {empty} have no rows in the per-class data. "
+                "Each configured training class needs at least one row before GRADIEND "
+                f"can build transitions. Row counts: {row_counts}. "
+                "Check dataset filtering and target patterns, or provide data for these classes."
             )
 
     def _exclude_generated_incomplete_target_classes(self, data_path: Union[str, Path]) -> List[str]:

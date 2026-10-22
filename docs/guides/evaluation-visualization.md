@@ -201,7 +201,7 @@ trainer.plot_encoder_scatter(encoder_df=enc_df)
 
 ## 4. Top-k overlap heatmap { #topk-overlap-heatmap }
 
-Heatmap of pairwise overlap between top-k weight index sets across multiple GRADIEND models. Rows and columns are the **dict keys** of `models`; use display labels (e.g. run_id or ``"3SG ↔ 3PL"``) as keys for readable axis labels. Cell value is overlap (raw count or normalized fraction).
+Heatmap of pairwise overlap between top-k weight index sets across multiple GRADIEND models. Rows and columns are the **dict keys** of `models`; use display labels (e.g. run_id or ``"3SG ↔ 3PL"``) as keys for readable axis labels. A plain list of models is also accepted and labelled after the checkpoint folders (e.g. `runs/3SG_3PL/model` → `3SG_3PL`); if no unique label can be derived, pass a dict. Cell value is overlap (raw count or normalized fraction).
 
 ### Entry point
 

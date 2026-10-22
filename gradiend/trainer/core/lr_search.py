@@ -180,32 +180,63 @@ def classify_probe(
     if result.converged:
         return RunState.CONVERGED
 
-    # Collapse: the +1 and -1 classes end on the same side, saturated.
-    if result.mean_by_class:
-        pos, neg = _signed_pole_means(result.mean_by_class[-1])
-        if pos is not None and neg is not None:
-            if pos * neg > 0 and min(abs(pos), abs(neg)) >= collapse_abs_mean:
-                return RunState.COLLAPSED
-
     scores = result.scores
-    if len(scores) >= 2:
-        if scores[-1] < max(scores) - degrade_margin:
-            return RunState.DEGRADING
-        score_range = max(scores) - min(scores)
-    else:
-        score_range = 0.0
-
-    gap_range = 0.0
+    score_range = (max(scores) - min(scores)) if len(scores) >= 2 else 0.0
     gaps = []
     for means in result.mean_by_class:
         pos, neg = _signed_pole_means(means)
         if pos is not None and neg is not None:
             gaps.append(pos - neg)
-    if len(gaps) >= 2:
-        gap_range = max(gaps) - min(gaps)
+    gap_range = (max(gaps) - min(gaps)) if len(gaps) >= 2 else 0.0
 
+    # Frozen is judged BEFORE collapse: an untrained encoder can already sit with both poles
+    # saturated on one side (gemma-3-4b ACTIEND starts at F=-0.62, M=-0.56). A run that never moved
+    # from there is "LR too low", not "LR too high"; calling it collapsed sends the search down forever.
     if score_range < frozen_range and gap_range < frozen_range:
         return RunState.FROZEN
+
+    # Untrained encoder: every class mean stays tiny for the whole probe, so the correlation is computed
+    # on ~1e-3 values and can flip sign without anything having been learned (gemma-3-4b AGIEND one-pole
+    # M: outputs ~0.003 at every LR from 1e-4 to 1e-3, correlation +0.1657 -> -0.1655 at 7e-4, which was
+    # read as "degrading" and sent the search DOWN). Nothing has moved, so the LR is too low.
+    amplitude = 0.0
+    for means in result.mean_by_class:
+        for value in means.values():
+            amplitude = max(amplitude, abs(value))
+    # ... AND the pole gap never opens: a run whose class means are small but whose gap grows steadily
+    # (gemma-3-27b GRADIEND at 1e-6: gap 0 -> 0.017, correlation 0.13 -> 0.36) is genuine slow progress.
+    max_gap = max((abs(g) for g in gaps), default=None)
+    if max_gap is not None and amplitude < frozen_range and max_gap < 0.005:
+        return RunState.FROZEN
+
+    # Collapse: the +1 and -1 classes end on the same side, saturated, AND the pole gap did not open
+    # in the right direction relative to the start (a run separating the poles while still on one
+    # side of zero is learning, not collapsing).
+    # A run that STARTED saturated on one side (untrained gemma-3-4b ACTIEND) only counts as collapsed
+    # if training actually moved the poles there; creeping a few hundredths around its initial state
+    # (lr 2e-6: F -0.62 -> -0.64, M -0.56 -> -0.57, corr -0.34 -> -0.40) is "too low", not "too high".
+    # Moved = a pole shifted, or the score fell, by at least ``degrade_margin``.
+    def _is_collapsed(p, n):
+        return p * n > 0 and min(abs(p), abs(n)) >= collapse_abs_mean
+
+    if result.mean_by_class:
+        pos, neg = _signed_pole_means(result.mean_by_class[-1])
+        pos0, neg0 = _signed_pole_means(result.mean_by_class[0])
+        if pos is not None and neg is not None:
+            gap_opened = len(gaps) >= 2 and gaps[-1] > gaps[0] + frozen_range
+            started_collapsed = pos0 is not None and neg0 is not None and _is_collapsed(pos0, neg0)
+            pole_move = (
+                max(abs(pos - pos0), abs(neg - neg0)) if pos0 is not None and neg0 is not None else float("inf")
+            )
+            score_drop = (max(scores) - scores[-1]) if scores else 0.0
+            moved_into_it = (
+                not started_collapsed or pole_move >= degrade_margin or score_drop >= degrade_margin
+            )
+            if _is_collapsed(pos, neg) and not gap_opened and moved_into_it:
+                return RunState.COLLAPSED
+
+    if len(scores) >= 2 and scores[-1] < max(scores) - degrade_margin:
+        return RunState.DEGRADING
     # Moved, did not degrade, did not converge: still learning when the budget ended. A run whose
     # class-pole gap is *shrinking* is drifting to a common pole even if the score has not dropped yet.
     if len(gaps) >= 2 and gaps[-1] < gaps[0] - frozen_range:
@@ -362,6 +393,13 @@ class LRSearch:
         max_window_probes: extra probes allowed for that walk (separate from ``max_probes``), split
             evenly between the two sides (upward gets the odd one); the worst case is therefore
             ``max_probes + max_window_probes`` probes.
+        refine_fine: when a ``"coarse"`` search closes its bracket without a convergent LR, continue
+            bisecting inside that bracket on the ``"fine"`` grid before giving up (gemma-3-27b GRADIEND:
+            bracket 1e-6 slow / 2e-6 degrading had no coarse value in between).
+        max_refine_probes: probe budget for that fine refinement.
+        confirm_slow: before reporting ``no_convergent_lr``, re-run the highest-LR ``slow`` probe that
+            was still at its best score when the probe ended through ``confirm`` (the full budget):
+            a short probe cannot tell "too low" from "converges, but needs the full run".
     """
 
     def __init__(
@@ -373,11 +411,14 @@ class LRSearch:
         min_ratio: Optional[float] = None,
         max_probes: int = 12,
         resolution: str = "coarse",
-        lr_bounds: Tuple[float, float] = (1e-12, 1.0),
+        lr_bounds: Tuple[float, float] = (1e-12, 10.0),
         confirm: Optional[Callable[[float], ProbeResult]] = None,
         classify: Callable[[ProbeResult], RunState] = classify_probe,
         center_window: bool = True,
         max_window_probes: int = 4,
+        refine_fine: bool = True,
+        max_refine_probes: int = 3,
+        confirm_slow: bool = True,
     ) -> None:
         if initial_lr <= 0:
             raise ValueError("initial_lr must be positive")
@@ -398,6 +439,9 @@ class LRSearch:
         self.classify = classify
         self.center_window = bool(center_window)
         self.max_window_probes = int(max_window_probes)
+        self.refine_fine = bool(refine_fine)
+        self.max_refine_probes = int(max_refine_probes)
+        self.confirm_slow = bool(confirm_slow)
         self.probes: List[Probe] = []
 
     @staticmethod
@@ -423,12 +467,15 @@ class LRSearch:
         lo_b, hi_b = self.lr_bounds
         if low is None and high is None:
             return self.initial_lr
+        # Expansion clamps to the bound instead of stopping short of it: gemma-3-270m AGIEND one-pole
+        # was "slow" at 0.5, the x10 step (5.0) lies above the 1.0 bound, and the search used to end
+        # after that single probe without ever trying 1.0.
         if high is None:  # only "too low" so far: expand upward
-            nxt = self._norm(low * self.factor)
-            return nxt if nxt <= hi_b and nxt not in tried else None
+            nxt = self._norm(min(low * self.factor, hi_b))
+            return nxt if nxt > low and nxt not in tried else None
         if low is None:  # only "too high" so far: expand downward
-            nxt = self._norm(high / self.factor)
-            return nxt if nxt >= lo_b and nxt not in tried else None
+            nxt = self._norm(max(high / self.factor, lo_b))
+            return nxt if nxt < high and nxt not in tried else None
         # bracket exists: bisect on the readable grid
         if self.min_ratio is not None and high / low <= self.min_ratio * (1 + 1e-9):
             return None
@@ -502,6 +549,18 @@ class LRSearch:
         best = min(convergent, key=lambda c: (round(abs(math.log(c) - centre), 9), c))
         return LRSearchResult("converged", best, list(self.probes), window=(lo, hi))
 
+    def _still_improving_slow_probe(self) -> Optional[Probe]:
+        """Highest-LR ``slow`` probe below the bracket's high end whose score ended at its best."""
+        _, high = self._bracket()
+        candidates = [
+            p for p in self.probes
+            if p.state is RunState.SLOW and p.confirmed is None
+            and (high is None or p.lr < high)
+            and p.final_score is not None and p.best_score is not None
+            and p.final_score >= p.best_score - 0.02
+        ]
+        return max(candidates, key=lambda p: p.lr) if candidates else None
+
     def search(self) -> LRSearchResult:
         while len(self.probes) < self.max_probes:
             lr = self._next_lr()
@@ -511,6 +570,34 @@ class LRSearch:
             self.probes.append(probe)
             if probe.state is RunState.CONVERGED:
                 return self._converged_result(probe.lr)
+        bracket_closed = self._next_lr() is None
+        if bracket_closed and self.refine_fine and self.resolution == "coarse":
+            low, high = self._bracket()
+            if low is not None and high is not None:
+                self.resolution = "fine"
+                logger.info("lr_search: coarse bracket (%g, %g) closed without convergence; refining on the fine grid", low, high)
+                for _ in range(self.max_refine_probes):
+                    lr = self._next_lr()
+                    if lr is None:
+                        break
+                    probe = self._probe(lr)
+                    self.probes.append(probe)
+                    if probe.state is RunState.CONVERGED:
+                        return self._converged_result(probe.lr)
+        if self._next_lr() is None and self.confirm_slow and self.confirm is not None:
+            slow = self._still_improving_slow_probe()
+            if slow is not None:
+                logger.info("lr_search: lr=%g was still improving when its probe ended; running it at the full budget", slow.lr)
+                confirmed = self.confirm(slow.lr)
+                cstate = self.classify(confirmed)
+                slow.confirmed = cstate is RunState.CONVERGED
+                slow.note = f"slow probe re-run at the full budget: {cstate.value}"
+                slow.final_score = confirmed.scores[-1] if confirmed.scores else slow.final_score
+                slow.best_score = max(confirmed.scores) if confirmed.scores else slow.best_score
+                logger.info("lr_search: lr=%g at the full budget -> %s", slow.lr, cstate.value)
+                if slow.confirmed:
+                    slow.state = RunState.CONVERGED
+                    return LRSearchResult("converged", slow.lr, list(self.probes), window=(slow.lr, slow.lr))
         low, high = self._bracket()
         bracket = (low, high) if low is not None and high is not None else None
         exhausted = len(self.probes) >= self.max_probes and self._next_lr() is not None
@@ -532,17 +619,18 @@ def tune_learning_rate(
     resolution: str = "coarse",
     factor: float = 10.0,
     min_ratio: Optional[float] = None,
-    lr_bounds: Tuple[float, float] = (1e-12, 1.0),
+    lr_bounds: Tuple[float, float] = (1e-12, 10.0),
     center_window: bool = True,
     max_window_probes: int = 4,
     precheck: Optional[Callable[[], None]] = None,
     keep_probe_artifacts: bool = False,
     metadata: Optional[Mapping[str, Any]] = None,
+    probe_seeds: int = 1,
     **train_overrides: Any,
 ) -> LRSearchResult:
     """Search the learning rate of ``trainer`` and write ``lr_search.json`` into ``experiment_dir``.
 
-    Each probe trains one seed into ``<experiment_dir>/lr_search/<probe|confirm>_<lr>`` (no cache
+    Each probe trains one seed (``probe_seeds`` > 1: see below) into ``<experiment_dir>/lr_search/<probe|confirm>_<lr>`` (no cache
     reuse), always from the trainer's original base model, with ``max_steps=probe_steps``. With
     ``confirm=True`` a converged probe is re-run at the trainer's configured ``max_steps`` before it
     is accepted. With ``early_stop=True`` a probe ends as soon as it is decisively collapsed or
@@ -550,7 +638,14 @@ def tune_learning_rate(
     :func:`~gradiend.trainer.core.signal_checks.assert_signal_diverse` on stacked inputs) for extra checks.
     Probe checkpoints are deleted after each probe (only ``training.json`` is kept) unless
     ``keep_probe_artifacts=True``. ``metadata`` (e.g. the first guess and probe length) is stored next to the
-    result in ``lr_search.json`` so a later run can tell whether a finished search still applies. The remaining arguments are those of
+    result in ``lr_search.json`` so a later run can tell whether a finished search still applies.
+
+    ``probe_seeds``: some regimes (GRADIEND pair) drift to a common pole for one seed and converge for
+    another, so a single-seed probe can report ``collapsed``/``degrading`` at an LR that the multi-seed
+    training (``max_seeds`` > 1) converges at. With ``probe_seeds`` > 1 a probe whose first seed ends
+    ``collapsed`` or ``degrading`` is repeated with the next seeds (``seed + 1``, ...) and the best run is
+    kept (converged first, then the highest score). ``frozen``/``slow``/``diverged`` runs are not repeated:
+    another seed does not change their verdict. The remaining arguments are those of
     :class:`LRSearch`.
     """
     os.makedirs(experiment_dir, exist_ok=True)
@@ -561,12 +656,17 @@ def tune_learning_rate(
     full_steps = getattr(base_args, "max_steps", None)
     full_eval = getattr(base_args, "eval_steps", None)
 
-    def _train_and_read(lr: float, steps: Optional[int], eval_steps: Optional[int], tag: str) -> ProbeResult:
-        probe_dir = os.path.join(experiment_dir, "lr_search", f"{tag}_{lr:.3g}")
+    base_seed = int(getattr(base_args, "seed", 0) or 0)
+    seed_dependent = (RunState.COLLAPSED, RunState.DEGRADING)
+
+    def _one_seed(lr: float, steps: Optional[int], eval_steps: Optional[int], tag: str, k: int) -> ProbeResult:
+        probe_dir = os.path.join(experiment_dir, "lr_search", f"{tag}_{lr:.3g}" + (f"_seed{k}" if k else ""))
         overrides: Dict[str, Any] = dict(train_overrides)
         overrides.update(
             learning_rate=lr, experiment_dir=probe_dir, max_seeds=1, use_cache=False,
         )
+        if k:
+            overrides["seed"] = base_seed + k
         if steps is not None:
             overrides["max_steps"] = int(steps)
         if eval_steps is not None:
@@ -579,6 +679,20 @@ def tune_learning_rate(
         if not keep_probe_artifacts:
             _prune_probe_dir(probe_dir)
         return result
+
+    def _train_and_read(lr: float, steps: Optional[int], eval_steps: Optional[int], tag: str) -> ProbeResult:
+        best: Optional[ProbeResult] = None
+        for k in range(max(1, int(probe_seeds))):
+            result = _one_seed(lr, steps, eval_steps, tag, k)
+            if best is None or _better_probe(result, best):
+                best = result
+            if classify_probe(best) not in seed_dependent:
+                break  # converged, frozen, slow or diverged: another seed cannot change that verdict
+            if k + 1 < int(probe_seeds):
+                logger.info("lr_search: lr=%g seed %d ended %s; trying the next seed", lr, k,
+                            classify_probe(result).value)
+        assert best is not None
+        return best
 
     eval_steps = probe_eval_steps
     if eval_steps is None and probe_steps is not None:
@@ -602,6 +716,15 @@ def tune_learning_rate(
     with open(os.path.join(experiment_dir, "lr_search.json"), "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
     return result
+
+
+def _better_probe(a: ProbeResult, b: ProbeResult) -> bool:
+    """``a`` beats ``b``: converged first, then the higher best score."""
+    if a.converged != b.converged:
+        return bool(a.converged)
+    score_a = max(a.scores) if a.scores else float("-inf")
+    score_b = max(b.scores) if b.scores else float("-inf")
+    return score_a > score_b
 
 
 @contextlib.contextmanager

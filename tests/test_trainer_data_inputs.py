@@ -483,6 +483,20 @@ class TestTrainerDataAsDict:
         assert "not present" in str(exc_info.value).lower() or "not in" in str(exc_info.value).lower()
         assert "3SG" in str(exc_info.value) or "3PL" in str(exc_info.value)
 
+    def test_empty_per_class_data_raises_before_unification(self):
+        """Raw per-class input reports its empty class instead of an opaque unified-data failure."""
+        class_dfs = _per_class_dict()
+        class_dfs["3SG"] = class_dfs["3SG"].iloc[0:0]
+        config = TextPredictionConfig(
+            data=class_dfs,
+            target_classes=["3SG", "3PL"],
+            use_class_names_as_columns=True,
+        )
+        trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
+
+        with pytest.raises(ValueError, match=r"target_classes \['3SG'\] have no rows"):
+            trainer._ensure_data()
+
     def test_per_class_dict_without_target_classes_infers_from_data_and_run_id_none(self):
         """With data=dict and no explicit target_classes or run_id, target_classes are inferred and decoder eval targets can be inferred."""
         class_dfs = _per_class_dict()

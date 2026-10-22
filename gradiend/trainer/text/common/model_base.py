@@ -50,6 +50,41 @@ def _log_base_model_dtype(base_model: Any, requested: Any) -> None:
         logger.info("Base model %s loaded with dtype %s.", name, actual)
 
 
+def offloaded_modules(base_model: Any) -> list:
+    """Modules accelerate placed on CPU/disk (not a GPU) in a device-mapped model; [] otherwise."""
+    device_map = getattr(base_model, "hf_device_map", None) or {}
+    return sorted(name for name, dev in device_map.items() if str(dev) in ("cpu", "disk", "meta"))
+
+
+def check_cpu_offload(base_model: Any, policy: str = "warn") -> None:
+    """Apply ``base_model_offload`` to a freshly loaded backbone.
+
+    Offloading is numerically identical but much slower (gemma-3-27b on one 80 GiB A100: ~66 min
+    per LR probe instead of minutes). ``"warn"`` logs it, ``"error"`` raises (callers that must
+    shard across more GPUs instead), ``"allow"`` is silent.
+    """
+    if policy == "allow":
+        return
+    offloaded = offloaded_modules(base_model)
+    if not offloaded:
+        return
+    name = getattr(base_model, "name_or_path", "<model>")
+    visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    message = (
+        f"{name}: {len(offloaded)} module(s) were offloaded to CPU/disk instead of placed on a GPU "
+        f"({visible} CUDA device(s) visible; e.g. {offloaded[:3]}). The backbone does not fit the "
+        "visible GPUs; give it more GPUs to shard it instead (base_model_offload='allow' silences this)."
+    )
+    if policy == "error":
+        raise RuntimeError(message)
+    logger.warning(message)
+
+
+def assert_no_cpu_offload(base_model: Any) -> None:
+    """``check_cpu_offload(..., policy="error")``."""
+    check_cpu_offload(base_model, "error")
+
+
 _MODEL_SIZE_B_RE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s*b(?!\w)", re.IGNORECASE)
 
 
@@ -164,6 +199,7 @@ class TextModelWithGradiend(ModelWithGradiend):
         base_model_device=None,
         base_model_device_map=None,
         base_model_max_memory=None,
+        base_model_offload: str = "warn",
         trust_remote_code: bool = False,
         **kwargs,
     ) -> tuple:
@@ -183,6 +219,7 @@ class TextModelWithGradiend(ModelWithGradiend):
 
         if base_model_id is not None:
             base_model = AutoModelForLM.from_pretrained(load_path, **load_kwargs)
+            check_cpu_offload(base_model, base_model_offload)
             _log_base_model_dtype(base_model, torch_dtype)
             if base_model_device is not None and base_model_device_map is None:
                 base_model = base_model.to(base_model_device)
@@ -197,6 +234,7 @@ class TextModelWithGradiend(ModelWithGradiend):
 
         if isinstance(load_directory, str):
             base_model = AutoModelForLM.from_pretrained(load_directory, **load_kwargs)
+            check_cpu_offload(base_model, base_model_offload)
             # Only when this call loaded the backbone: a caller-supplied model
             # carries its own dtype and is not this call's to report on.
             _log_base_model_dtype(base_model, torch_dtype)
