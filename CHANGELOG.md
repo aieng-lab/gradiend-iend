@@ -7,11 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- `LRSearchConfig.probe_seeds`: a learning-rate probe that ends collapsed or degrading is repeated with the next seeds and the best run is kept (some regimes collapse for one seed and converge for another). Default `1`.
 - `TrainingArguments.label_token_protocol` (`"canonical"` default, `"legacy"`): which token id is supervised for a decoder-only label. `canonical` uses the leading-space variant, the same one `create_inputs` uses. Serialized arguments without the key load as `legacy`, so already-trained artifacts are read under the rule they were trained with.
 
 ### Fixed
-- Masked-LM training no longer fails on a long row whose mask lies beyond `max_length` ("Classic MLM training expected 1 tokenized mask position(s) ... got 0"). Such a row is cut to a window of whole tokens around the mask, with context on both sides; rows that fit are unchanged.
 - `evaluate_decoder`: with a custom `summary_extractor`, an explicit `summary_metrics` list is summarized as requested. It was reduced to the evaluated class names, which dropped derived metrics such as `_bpi` and failed with "Requested metrics not present". The default extractor still limits metrics to the evaluated classes.
 - A neutral evaluation dataset on the Hub that has only a `train` split is used for every encoder split (before: `Unknown split "test"`).
 - `TextPredictionDataCreator.generate_training_data` rejects `split_by_target` together with `split_group_col` before it scans the corpus.
@@ -22,6 +20,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - GRADIEND encoders use a trainable linear bias by default (`bias_encoder=True`). Existing checkpoints that lack `architecture.bias_encoder` remain loadable: loading infers whether the encoder bias exists from the saved state dict.
 - `GradiendModel` now supports default split metadata via `GradiendComponent` and exposes virtual component views through `gradiend.encoders[...]`, `gradiend.decoders[...]`, `encode_components(...)`, `with_components(...)`, and `without_split()`. These views slice the normal GRADIEND weights and do not create separate submodels.
+
+## [0.2.3] - 2026-10-23
+
+Patch release. Training defaults are unchanged from 0.2.2.
+
+### Added
+
+- `LRSearchConfig.probe_seeds` (default `1`): with `probe_seeds > 1` a probe run that ends `collapsed` or `degrading` is repeated with the next seeds before the learning rate is judged, so one unlucky seed does not decide the search ([guide](docs/guides/learning-rate-search.md)).
+
+### Fixed
+
+- Masked-language-model training: a row whose mask lay beyond `max_length` lost its mask in the truncation and was trained on without any label (loss over zero positions, no error). The text is now cut to a window around the mask; if the mask cannot be kept, a `ValueError` names the row.
+- The quick-start example in the README (`gradiend/examples/readme.py`) failed in about 30% of the runs with `fail_on_non_convergence`: only 3 validation rows were left, so an untrained model could reach a perfect correlation at step 0 by chance and no later step could beat it. It now uses a 60/20/20 split.
+- `gradiend/examples/create_german_article_data.py` produced no rows (the default of ten context words before the article is longer than its example sentences) and failed on its tiny splits.
+- The neutral data of the encoder evaluation no longer excludes the words of `decoder_eval_targets`. Those only score the decoder and can be a large subset of the vocabulary, which removed thousands of unrelated words from the neutral data.
 
 ## [0.2.2] - 2026-10-22
 
