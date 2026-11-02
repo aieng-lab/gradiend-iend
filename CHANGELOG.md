@@ -21,6 +21,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - GRADIEND encoders use a trainable linear bias by default (`bias_encoder=True`). Existing checkpoints that lack `architecture.bias_encoder` remain loadable: loading infers whether the encoder bias exists from the saved state dict.
 - `GradiendModel` now supports default split metadata via `GradiendComponent` and exposes virtual component views through `gradiend.encoders[...]`, `gradiend.decoders[...]`, `encode_components(...)`, `with_components(...)`, and `without_split()`. These views slice the normal GRADIEND weights and do not create separate submodels.
 
+
+## [0.2.4] - 2026-10-30
+
+Patch release. Training defaults are unchanged from 0.2.3.
+
+### Fixed
+
+- Decoder evaluation with a token that belongs to more than one class (for example German `sie`, singular and plural). The evaluation then scores every row on its own, and its summary was assembled wrongly: `evaluate_decoder(target_class=...)` failed with `No decoder grid candidates for strengthen ...`, and `evaluate_decoder()` for all classes reported each class under the other class's name and feature factor. Strengthening a class now reads its probability from the other class's rows, as it does for classes with disjoint tokens. Cached decoder results of such runs are not valid: run `evaluate_decoder(..., use_cache=False)` once so that they are recomputed.
+- Decoder-only training (Qwen, Gemma, GPT-2, ...) rebuilt the tokenizer vocabulary several times for every training item, about 0.1 s of CPU time per item for a 150k vocabulary, which made training CPU-bound. The vocabulary is now read once per dataset. The supervised label ids and all results are unchanged.
+
 ## [0.2.3] - 2026-10-23
 
 Patch release. Training defaults are unchanged from 0.2.2.

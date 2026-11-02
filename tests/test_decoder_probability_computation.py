@@ -358,3 +358,72 @@ class TestEvaluateBaseModelProbabilityComputation:
         assert set(training_like_df["split"]) == {"test"}
         assert len(neutral_df) == 2
         assert set(neutral_df["split"]) == {"test"}
+
+    def test_evaluate_base_model_row_wise_with_only_the_other_classes_rows(self, monkeypatch):
+        """Strengthening evaluates only the other class's rows; probs still holds P(T) on them."""
+        config = TextPredictionConfig(
+            data=_two_class_data("M", "F", "he", "she"),
+            target_classes=["M", "F"],
+            decoder_eval_targets="label",
+            decoder_eval_prob_on_other_class=True,
+            masked_col="masked",
+        )
+        trainer = _trainer(config)
+        monkeypatch.setattr(PredictionObjective, "score_probability_shift", lambda self, *a, **k: {"F": {"M": 0.81, "F": 0.19}})
+        monkeypatch.setattr(PredictionObjective, "compute_lms", lambda *args, **kwargs: {"lms": 0.5})
+
+        result = trainer.evaluate_base_model(
+            model=SimpleMockModel(),
+            tokenizer=MockTokenizer(),
+            training_like_df=pd.DataFrame(
+                [{"masked": "[MASK] there", "label_class": "F", "label": "she", "alternative": "he", "alternative_id": "M"}]
+            ),
+            neutral_df=pd.DataFrame([{"text": "neutral_data"}]),
+            use_cache=False,
+        )
+
+        assert result["probs"] == {"M": 0.81}
+        assert result["probs_factual"] == {"F": 0.19}
+
+    def test_evaluate_base_model_row_wise_with_three_classes(self, monkeypatch):
+        """With three classes, probs[T] is P(T) measured on the rows of another class."""
+        words = {"A": "a", "B": "b", "C": "c"}
+        rows = [
+            {"masked": "[MASK] z", "label_class": x, "label": words[x], "alternative_class": y, "alternative": words[y]}
+            for x in words
+            for y in words
+            if x != y
+        ]
+        config = TextPredictionConfig(
+            data=_with_required_splits(rows),
+            target_classes=["A", "B", "C"],
+            decoder_eval_targets="label",
+            decoder_eval_prob_on_other_class=True,
+            masked_col="masked",
+        )
+        trainer = _trainer(config)
+        by_dataset = {
+            "A": {"A": 0.50, "B": 0.11, "C": 0.12},
+            "B": {"B": 0.60, "A": 0.21, "C": 0.22},
+            "C": {"C": 0.70, "A": 0.31, "B": 0.32},
+        }
+        monkeypatch.setattr(PredictionObjective, "score_probability_shift", lambda self, *a, **k: by_dataset)
+        monkeypatch.setattr(PredictionObjective, "compute_lms", lambda *args, **kwargs: {"lms": 0.5})
+
+        result = trainer.evaluate_base_model(
+            model=SimpleMockModel(),
+            tokenizer=MockTokenizer(),
+            training_like_df=pd.DataFrame(
+                [
+                    {"masked": "[MASK] z", "label_class": c, "label": words[c], "alternative": "x", "alternative_id": "A"}
+                    for c in words
+                ]
+            ),
+            neutral_df=pd.DataFrame([{"text": "neutral_data"}]),
+            use_cache=False,
+        )
+
+        for target in words:
+            measured_elsewhere = {by_dataset[other][target] for other in words if other != target}
+            assert result["probs"][target] in measured_elsewhere
+            assert result["probs_factual"][target] == by_dataset[target][target]

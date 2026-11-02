@@ -4,6 +4,7 @@ Prediction datasets: TextBatchedDataset, TextTrainingDataset, create_masked_pair
 
 import random
 import re
+from functools import cached_property
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
@@ -208,7 +209,7 @@ def decoder_only_label_token_ids(tokenizer: Any, label: Any) -> List[int]:
     return list(tokenizer(f" {label}", add_special_tokens=False)["input_ids"])
 
 
-def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "legacy") -> int:
+def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "legacy", *, vocab: Optional[Any] = None) -> int:
     """The one token id a decoder-only *training* item supervises for ``label``.
 
     ``protocol`` is ``TrainingArguments.label_token_protocol``:
@@ -227,8 +228,10 @@ def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "legacy"
     if protocol != "legacy":
         raise ValueError(f"label_token_protocol must be 'canonical' or 'legacy', got {protocol!r}")
     label = str(label)
-    if hasattr(tokenizer, "vocab") and label in tokenizer.vocab:
-        return int(tokenizer.vocab[label])
+    if vocab is None:
+        vocab = getattr(tokenizer, "vocab", None)
+    if vocab is not None and label in vocab:
+        return int(vocab[label])
     return int(tokenizer(label, add_special_tokens=False)["input_ids"][0])
 
 
@@ -834,6 +837,15 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         self.mask_token_id = getattr(tokenizer, "mask_token_id", None)
         self.mask_placeholder = DEFAULT_DATASET_MASK_PLACEHOLDER
 
+    @cached_property
+    def _vocab_ids(self) -> Optional[Any]:
+        """The tokenizer's token -> id mapping, or None for a tokenizer without one.
+
+        Read once per dataset: Hugging Face fast tokenizers build a new dict on every ``tokenizer.vocab`` access
+        (about 40 ms for a 150k vocabulary), which made decoder-only training CPU-bound when it was read per item.
+        """
+        return getattr(self.tokenizer, "vocab", None)
+
     def _create_item(self, text: str, target: Union[str, Sequence[Any]]):
         """Create a single training item: input_ids, attention_mask, labels.
 
@@ -965,7 +977,10 @@ class TextBatchedDataset(TextBatchedDatasetBase):
             labels = torch.full_like(input_ids, -100)
             last_idxs = attention_mask.sum(dim=1)
             target_idx = training_label_token_id(
-                self.tokenizer, target, getattr(self, "label_token_protocol", "legacy")
+                self.tokenizer,
+                target,
+                getattr(self, "label_token_protocol", "legacy"),
+                vocab=self._vocab_ids,
             )
             last_positions = last_real_token_positions(attention_mask, allow_empty=True)
             for i, last_idx in enumerate(last_idxs):
