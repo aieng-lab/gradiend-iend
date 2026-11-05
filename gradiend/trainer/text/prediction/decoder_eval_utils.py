@@ -589,9 +589,15 @@ def compute_probability_shift_score_row_wise(
     other_class_col: str = DEFAULT_OTHER_CLASS_COL,
     return_per_row_df: bool = False,
     clm_unalignable_rows: str = "error",
+    label_token_protocol: str = "first_differing_token",
 ) -> Union[Dict[str, Dict[str, float]], Tuple[Dict[str, Dict[str, float]], pd.DataFrame]]:
     """
     Row-wise decoder eval: for each row, P(dataset_class) = P(factual), P(other_class) = P(alternative).
+
+    For decoder-only ``clm_next_token`` scoring, ``label_token_protocol="first_differing_token"`` scores rows whose
+    targets share k > 0 leading tokens at the first differing token (shared tokens as context) and applies
+    ``clm_unalignable_rows`` to rows that cannot be aligned; k == 0 rows are scored as before.
+    ``"no_leading_space"`` never aligns.
 
     DataFrame must have: key_text (masked), factual_col, alternative_col, dataset_class_col (e.g. factual_id),
     other_class_col (e.g. alternative_id). Returns same shape as static eval: {dataset_class: {class_name: mean_prob}}.
@@ -626,10 +632,14 @@ def compute_probability_shift_score_row_wise(
                 # Divergence-point scoring: a row whose factual and alternative continuations share k > 0
                 # leading tokens is scored at the first differing token with the shared tokens as context.
                 # Rows without a shared prefix (k == 0) keep the unchanged next-token scoring below.
+                # ``label_token_protocol="no_leading_space"`` skips the alignment entirely (as before it existed).
                 divergence_rows: Dict[int, Tuple[List[int], int, int]] = {}
                 kept = []
                 for i, raw_prefix in valid:
                     r = batch[i]
+                    if label_token_protocol != "first_differing_token":
+                        kept.append((i, raw_prefix))
+                        continue
                     try:
                         div = align_clm_divergence(
                             _tokenizer, raw_prefix, str(r.get(factual_col)), str(r.get(alternative_col))
@@ -641,7 +651,8 @@ def compute_probability_shift_score_row_wise(
                     kept.append((i, raw_prefix))
                     if div.k > 0:
                         # no lone whitespace token between the context and the appended shared tokens
-                        row_ids = _ids_for_text(_tokenizer, raw_prefix.rstrip()) + list(div.shared_ids)
+                        # same context encoding as the training item (special tokens such as BOS included)
+                        row_ids = list(_tokenizer(raw_prefix.rstrip(), add_special_tokens=True)["input_ids"]) + list(div.shared_ids)
                         divergence_rows[i] = (row_ids, div.factual_id, div.alternative_id)
                 valid = kept
                 if not valid:
@@ -1341,6 +1352,7 @@ def evaluate_probability_shift_score(
     objective: str = "auto",
     rhs_window: int = -1,
     clm_unalignable_rows: str = "error",
+    label_token_protocol: str = "first_differing_token",
 ) -> Union[Dict[str, Dict[str, float]], Tuple[Dict[str, Dict[str, float]], pd.DataFrame], Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]]:
     """
     Compute probabilities for all classes on all datasets.
@@ -1425,6 +1437,7 @@ def evaluate_probability_shift_score(
             other_class_col=DEFAULT_OTHER_CLASS_COL,
             return_per_row_df=return_per_row_df,
             clm_unalignable_rows=clm_unalignable_rows,
+            label_token_protocol=label_token_protocol,
         )
         return out
     return compute_probability_shift_score_mlm(

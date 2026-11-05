@@ -498,8 +498,14 @@ class TextPredictionTrainer(Trainer):
         return resolve_prediction_objective(self, model_or_tokenizer)
 
     def _check_and_filter_clm_alignment(self, training_args: Optional[TrainingArguments] = None) -> None:
-        """Run pre-training CLM divergence audit and drop or fail fast on unalignable rows."""
+        """Run pre-training CLM divergence audit and drop or fail fast on unalignable rows.
+
+        Applies under ``label_token_protocol="first_differing_token"`` only; ``"no_leading_space"`` never aligns.
+        """
         if getattr(self, "_clm_alignment_checked", False):
+            return
+        protocol = getattr(training_args, "label_token_protocol", None) or self._label_token_protocol()
+        if protocol != "first_differing_token":
             return
         m_check = getattr(self, "model", None) or getattr(self, "_model_arg", None)
         objective = self._prediction_objective(m_check)
@@ -2998,7 +3004,7 @@ class TextPredictionTrainer(Trainer):
         One accessor for every dataset this trainer builds, so training, in-training
         evaluation, neutral rows and post-training evaluation cannot disagree.
         """
-        return str(getattr(getattr(self, "training_args", None), "label_token_protocol", "legacy") or "legacy")
+        return str(getattr(getattr(self, "training_args", None), "label_token_protocol", "no_leading_space") or "no_leading_space")
 
     def _configure_model(self, model: Any) -> None:
         """Give single-row scorers (e.g. CGA detection) the run's label-token convention.

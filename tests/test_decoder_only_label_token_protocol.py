@@ -66,14 +66,14 @@ def test_helper_returns_the_leading_space_variant():
 
 
 def test_canonical_protocol_labels_with_the_leading_space_token():
-    assert _labelled_id(_dataset("canonical")) == 501
+    assert _labelled_id(_dataset("first_differing_token")) == 501
 
 
 def test_legacy_protocol_keeps_the_old_vocab_label():
-    assert _labelled_id(_dataset("legacy")) == 500
+    assert _labelled_id(_dataset("no_leading_space")) == 500
 
 
-def test_direct_dataset_construction_defaults_to_legacy():
+def test_direct_dataset_construction_defaults_to_no_leading_space():
     """Callers that never heard of the protocol must not change behaviour."""
     assert _labelled_id(_dataset(None)) == 500
 
@@ -84,17 +84,17 @@ def test_dataset_rejects_unknown_protocol():
 
 
 def test_new_training_arguments_default_to_canonical():
-    assert TrainingArguments().label_token_protocol == "canonical"
+    assert TrainingArguments().label_token_protocol == "first_differing_token"
 
 
 def test_serialized_arguments_without_the_key_stay_legacy():
     """A checkpoint written before the protocol existed must not be re-interpreted."""
     payload = TrainingArguments().to_dict()
     payload.pop("label_token_protocol")
-    assert TrainingArguments.from_dict(payload).label_token_protocol == "legacy"
+    assert TrainingArguments.from_dict(payload).label_token_protocol == "no_leading_space"
 
 
-@pytest.mark.parametrize("value", ["canonical", "legacy"])
+@pytest.mark.parametrize("value", ["first_differing_token", "no_leading_space"])
 def test_protocol_round_trips_through_to_dict(value):
     args = TrainingArguments(label_token_protocol=value)
     assert TrainingArguments.from_dict(args.to_dict()).label_token_protocol == value
@@ -105,14 +105,14 @@ def test_training_arguments_reject_unknown_protocol():
         TrainingArguments(label_token_protocol="bogus")
 
 
-@pytest.mark.parametrize("value", ["canonical", "legacy"])
+@pytest.mark.parametrize("value", ["first_differing_token", "no_leading_space"])
 def test_trainer_hands_its_protocol_to_every_dataset(value):
     fake_trainer = SimpleNamespace(training_args=TrainingArguments(label_token_protocol=value))
     assert TextPredictionTrainer._label_token_protocol(fake_trainer) == value
 
 
-def test_trainer_without_training_args_falls_back_to_legacy():
-    assert TextPredictionTrainer._label_token_protocol(SimpleNamespace(training_args=None)) == "legacy"
+def test_trainer_without_training_args_falls_back_to_no_leading_space():
+    assert TextPredictionTrainer._label_token_protocol(SimpleNamespace(training_args=None)) == "no_leading_space"
 
 
 def test_every_model_a_trainer_creates_is_stamped_with_its_protocol():
@@ -135,7 +135,7 @@ def test_every_model_a_trainer_creates_is_stamped_with_its_protocol():
         def model_with_gradiend_cls(self):
             return _Model
 
-    for protocol in ("canonical", "legacy"):
+    for protocol in ("first_differing_token", "no_leading_space"):
         model = _Trainer(protocol).create_model_with_gradiend("ignored")
         assert model.label_token_protocol == protocol
 
@@ -144,7 +144,23 @@ def test_training_label_token_id_matches_the_dataset_for_both_protocols():
     from gradiend.trainer.text.prediction.dataset import training_label_token_id
 
     tok = SpaceVariantTokenizer()
-    assert training_label_token_id(tok, "she", "canonical") == 501
-    assert training_label_token_id(tok, "she", "legacy") == 500
+    assert training_label_token_id(tok, "she", "first_differing_token") == 501
+    assert training_label_token_id(tok, "she", "no_leading_space") == 500
     with pytest.raises(ValueError, match="label_token_protocol"):
         training_label_token_id(tok, "she", "bogus")
+
+
+@pytest.mark.parametrize("old,new", [("canonical", "first_differing_token"), ("legacy", "no_leading_space")])
+def test_settings_saved_with_the_old_names_still_load(old, new):
+    payload = TrainingArguments().to_dict()
+    payload["label_token_protocol"] = old
+    assert TrainingArguments.from_dict(payload).label_token_protocol == new
+
+
+@pytest.mark.parametrize("old", ["canonical", "legacy"])
+def test_old_names_are_rejected_outside_from_dict(old):
+    with pytest.raises(ValueError, match="label_token_protocol"):
+        TrainingArguments(label_token_protocol=old)
+    with pytest.raises(ValueError, match="label_token_protocol"):
+        _dataset(old)
+

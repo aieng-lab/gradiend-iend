@@ -58,7 +58,7 @@ def test_divergence_item_construction(gpt2_tok):
         "alternative_id": "US",
     }])
 
-    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
     item_f = ds._create_item(text, f, alternative_target=a)
     item_a = ds._create_item(text, a, alternative_target=f)
 
@@ -93,7 +93,7 @@ def test_single_token_bit_identity(gpt2_tok):
         "alternative_id": "neg",
     }])
 
-    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
     item1 = ds._create_item(text, f, alternative_target=a)
     item2 = ds._create_item(text, f, alternative_target=a)
 
@@ -121,7 +121,7 @@ def test_mathematical_loss_equivalence(gpt2_tok, tiny_causal_model):
         "alternative_id": "US",
     }])
 
-    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
     item_f = ds._create_item(text, f, alternative_target=a)
 
     # 1. Forward training item through CausalLM
@@ -264,7 +264,7 @@ def test_left_padding_divergence_item(gpt2_tok):
     orig_pad_side = gpt2_tok.padding_side
     try:
         gpt2_tok.padding_side = "left"
-        ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+        ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
         item_f = ds._create_item(text, f, alternative_target=a)
 
         # First tokens must be pad tokens
@@ -315,7 +315,7 @@ def test_gradient_divergence_equivalence(gpt2_tok, tiny_causal_model):
         "alternative_id": "US",
     }])
 
-    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
     item_f = ds._create_item(text, f, alternative_target=a)
 
     device = next(tiny_causal_model.parameters()).device
@@ -354,7 +354,7 @@ def test_k0_bare_word_vocab_not_overriding_leading_space(gpt2_tok):
     f = "colour"
     a = "color"
     df = pd.DataFrame([{"masked": text, "factual": f, "alternative": a, "label": 1, "feature_class_id": 0}])
-    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
 
     bare_id = gpt2_tok.encode("colour", add_special_tokens=False)[0]
     lead_id = gpt2_tok.encode(" colour", add_special_tokens=False)[0]
@@ -379,7 +379,7 @@ def test_k_gt_0_no_lone_space_token_in_context(gpt2_tok):
     f = "anglicised"
     a = "anglicized"
     df = pd.DataFrame([{"masked": text, "factual": f, "alternative": a, "label": 1, "feature_class_id": 0}])
-    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
 
     div = align_clm_divergence(gpt2_tok, prefix, f, a)
     assert div.k > 0, "anglicised/anglicized should have k > 0 in GPT-2"
@@ -407,7 +407,7 @@ def test_identical_factual_alternative_neutral_creates_item(gpt2_tok):
     text = "The word was [MASK]"
     f = "medium"
     df = pd.DataFrame([{"masked": text, "factual": f, "alternative": f, "label": 0, "feature_class_id": 0}])
-    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None)
+    ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
 
     item = ds._create_item(text, f, alternative_target=f)
     assert item is not None

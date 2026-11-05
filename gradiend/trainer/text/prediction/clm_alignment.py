@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
+import torch
+
+from gradiend.util.logging import suppress_tokenizer_length_warning
+from gradiend.util.positions import assert_labels_on_real_tokens, last_real_token_positions
 
 
 class ClmAlignmentError(ValueError):
@@ -202,6 +206,73 @@ def align_clm_divergence(
         n=n,
         m=m,
     )
+
+
+def build_shared_prefix_item(
+    tokenizer: Any,
+    prefix: str,
+    shared_ids: Sequence[int],
+    label_id: int,
+    *,
+    max_length: int,
+    pad_to_max_length: bool,
+) -> Dict[str, torch.Tensor]:
+    """Build the one decoder-only item whose label sits on the token after a shared prefix.
+
+    The sequence is ``tokenizer(prefix.rstrip()) + shared_ids + [slot]``; ``label_id`` is written onto the
+    slot (the last real token) and, because causal-LM loss shifts by one, is predicted from the token
+    before it. The prefix is encoded without trailing whitespace so no lone space token separates it from
+    the shared tokens. The slot token only carries the label; no prediction reads its input id.
+
+    If the sequence is longer than ``max_length`` the TAIL is kept (the label sits at the end), whatever
+    the tokenizer's truncation side. A row with no real token before the slot (empty prefix, no shared
+    tokens) follows the dataset's empty-row convention when padding: an all-padding row with the label
+    on its last position.
+
+    Args:
+        tokenizer: Tokenizer (or wrapper with ``.tokenizer``).
+        prefix: Text before the target slot.
+        shared_ids: Token ids shared by factual and alternative (may be empty).
+        label_id: Token id to supervise.
+        max_length: Maximum sequence length.
+        pad_to_max_length: Pad to ``max_length`` (training item) or return the unpadded sequence.
+
+    Returns:
+        Dict of ``(1, L)`` tensors ``input_ids``, ``attention_mask``, ``labels``.
+    """
+    tok = getattr(tokenizer, "tokenizer", tokenizer)
+    with suppress_tokenizer_length_warning():
+        ctx_ids = list(tok(str(prefix).rstrip(), add_special_tokens=True, truncation=False)["input_ids"])
+    slot_id = getattr(tok, "eos_token_id", None)
+    if slot_id is None:
+        slot_id = getattr(tok, "pad_token_id", None)
+    if slot_id is None:
+        slot_id = 0
+    pad_id = getattr(tok, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = slot_id
+
+    empty_row = pad_to_max_length and not ctx_ids and not shared_ids
+    tokens = [] if empty_row else ctx_ids + list(shared_ids) + [slot_id]
+    if len(tokens) > max_length:
+        tokens = tokens[-max_length:]
+    if pad_to_max_length:
+        pad_len = max_length - len(tokens)
+        if getattr(tok, "padding_side", "right") == "left":
+            ids = [pad_id] * pad_len + tokens
+            mask = [0] * pad_len + [1] * len(tokens)
+        else:
+            ids = tokens + [pad_id] * pad_len
+            mask = [1] * len(tokens) + [0] * pad_len
+    else:
+        ids, mask = tokens, [1] * len(tokens)
+    input_ids = torch.tensor([ids], dtype=torch.long)
+    attention_mask = torch.tensor([mask], dtype=torch.long)
+    labels = torch.full_like(input_ids, -100)
+    label_pos = -1 if empty_row else int(last_real_token_positions(attention_mask)[0])
+    labels[0, label_pos] = int(label_id)
+    assert_labels_on_real_tokens(labels, attention_mask, where="shared-prefix item", allow_empty_rows=True)
+    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
 def audit_clm_alignment(

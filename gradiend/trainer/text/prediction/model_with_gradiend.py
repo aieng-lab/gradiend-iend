@@ -180,34 +180,29 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
             elif self.is_decoder_only_model:
                 from gradiend.trainer.text.prediction.dataset import decoder_only_label_token_ids
 
-                if alternative is not None and str(alternative) != str(label):
-                    # Divergence-point supervision (see ``clm_alignment``): the label is the first token
-                    # where ``label`` and ``alternative`` differ, after the shared leading tokens.
-                    from gradiend.trainer.text.prediction.clm_alignment import align_clm_divergence
-
-                    prefix = str(masked_text).split("[MASK]")[0] if "[MASK]" in str(masked_text) else str(masked_text)
-                    div = align_clm_divergence(self.tokenizer, prefix, str(label), str(alternative))
-                    if div.k > 0:
-                        # Context WITHOUT trailing whitespace, so no lone space token precedes the shared tokens.
-                        prefix_encoded = self.tokenizer(
-                            prefix.rstrip(), return_tensors="pt", add_special_tokens=True, truncation=False
+                if alternative is not None:
+                    # Divergence item (see ``clm_alignment``): the label is the first token where
+                    # ``label`` and ``alternative`` differ, after the tokens they share.
+                    protocol = getattr(self, "label_token_protocol", "first_differing_token")
+                    if protocol != "first_differing_token":
+                        raise ValueError(
+                            f"create_inputs(alternative=...) needs label_token_protocol='first_differing_token', "
+                            f"got {protocol!r}."
                         )
-                        ctx_ids = prefix_encoded["input_ids"][0].tolist()
-                        slot_id = getattr(self.tokenizer, "eos_token_id", None) or getattr(self.tokenizer, "pad_token_id", None) or 0
-                        seq_tokens = ctx_ids + list(div.shared_ids) + [slot_id]
-                        if len(seq_tokens) > max_len:
-                            seq_tokens = seq_tokens[:max_len]
-                        item = {
-                            "input_ids": torch.tensor([seq_tokens], dtype=torch.long),
-                            "attention_mask": torch.ones((1, len(seq_tokens)), dtype=torch.long),
-                        }
-                        item = self._place_inputs_for_base_forward(item)
-                        item['labels'] = torch.full_like(item['input_ids'], -100)
-                        item['labels'][0, -1] = div.factual_id
-                        return item
-                    label_token_id = [div.factual_id]
+                    from gradiend.trainer.text.prediction.clm_alignment import (
+                        align_clm_divergence,
+                        build_shared_prefix_item,
+                    )
+
+                    prefix = str(masked_text).split("[MASK]")[0]
+                    div = align_clm_divergence(self.tokenizer, prefix, str(label), str(alternative))
+                    div_item = build_shared_prefix_item(
+                        self.tokenizer, prefix, div.shared_ids, div.factual_id,
+                        max_length=max_len, pad_to_max_length=False,
+                    )
+                    return self._place_inputs_for_base_forward(div_item)
                 else:
-                    # Same rule as the training dataset's ``label_token_protocol="canonical"``.
+                    # Same rule as the training dataset's ``label_token_protocol="first_differing_token"``.
                     label_token_id = decoder_only_label_token_ids(self.tokenizer, label)
             else:
                 label_token_id = self.tokenizer(f'{label}', add_special_tokens=False)['input_ids']
