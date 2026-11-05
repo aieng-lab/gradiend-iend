@@ -58,7 +58,16 @@ Let $F$ and $A$ be the token sequences of the factual and alternative continuati
 
 1. **Shared prefix as context:** The model input is formed by the preceding context plus the $k$ shared tokens $F[:k]$.
 2. **Divergence-point contrast:** The factual label is $F[k]$ and the alternative label is $A[k]$, supervising next-token prediction at token position $k+1$.
-3. When $k = 0$ (single-token targets or multi-token targets with disjoint first tokens), supervision takes place at position 0, matching standard next-token training bit-for-bit.
+3. When $k = 0$ (single-token targets or multi-token targets with disjoint first tokens), the label is the first token of each target, i.e. the leading-space variant (`tokenizer(" " + word)`) when the target follows whitespace, exactly as before.
+
+### Label token protocol
+
+`TrainingArguments.label_token_protocol` decides which token a decoder-only training row supervises:
+
+- `"first_differing_token"` (default): the divergence-point rule above, applied to every row that has an alternative (also when $k = 0$). Rows without an alternative use the leading-space variant of the label. Training, row-wise evaluation and `create_inputs(text, label, alternative=...)` all use it.
+- `"no_leading_space"`: the rule used before 2026-09-25 (`vocab[label]`, the no-space token), without alignment and without the pre-training audit. Use it only to reproduce models trained before that date.
+
+Settings saved with the old names `canonical` / `legacy` still load (as `first_differing_token` / `no_leading_space`); a saved setting without the key loads as `no_leading_space`.
 
 ### Unalignable targets and pre-training audit
 
