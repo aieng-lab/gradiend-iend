@@ -342,6 +342,8 @@ class TestTextGradientTrainingDataset:
     def test_activation_gradient_next_token_uses_label_position(self):
         """AGIEND's explicit next-token mode must not fill the candidate span."""
         tokenizer = MockTokenizer()
+        # distinct ids so factual and alternative are contrastively alignable (CLM divergence)
+        tokenizer.vocab.update({"he": 20, "she": 21})
         raw = TextTrainingDataset(
             data=pd.DataFrame({
                 "masked": ["The person [MASK]"],

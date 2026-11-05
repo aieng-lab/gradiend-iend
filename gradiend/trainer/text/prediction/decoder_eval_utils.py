@@ -22,6 +22,7 @@ from gradiend.trainer.text.prediction.seq2seq import (
     seq2seq_mlm_probs_at_mask,
 )
 from gradiend.util.logging import get_logger
+from gradiend.trainer.text.prediction.clm_alignment import align_clm_divergence, ClmAlignmentError
 from gradiend.util.positions import last_real_token_positions
 
 from gradiend.trainer.text.common.lm_eval import compute_lms
@@ -587,6 +588,7 @@ def compute_probability_shift_score_row_wise(
     dataset_class_col: str = DEFAULT_DATASET_CLASS_COL,
     other_class_col: str = DEFAULT_OTHER_CLASS_COL,
     return_per_row_df: bool = False,
+    clm_unalignable_rows: str = "error",
 ) -> Union[Dict[str, Dict[str, float]], Tuple[Dict[str, Dict[str, float]], pd.DataFrame]]:
     """
     Row-wise decoder eval: for each row, P(dataset_class) = P(factual), P(other_class) = P(alternative).
@@ -621,11 +623,50 @@ def compute_probability_shift_score_row_wise(
                 raw_prefixes = [str(r[key_text]).split("[MASK]", 1)[0] for r in batch]
                 prefix_specs = [_clm_context_and_gap_from_prefix(prefix) for prefix in raw_prefixes]
                 valid = [(i, raw_prefixes[i]) for i, (context, _gap) in enumerate(prefix_specs) if context.strip()]
+                # Divergence-point scoring: a row whose factual and alternative continuations share k > 0
+                # leading tokens is scored at the first differing token with the shared tokens as context.
+                # Rows without a shared prefix (k == 0) keep the unchanged next-token scoring below.
+                divergence_rows: Dict[int, Tuple[List[int], int, int]] = {}
+                kept = []
+                for i, raw_prefix in valid:
+                    r = batch[i]
+                    try:
+                        div = align_clm_divergence(
+                            _tokenizer, raw_prefix, str(r.get(factual_col)), str(r.get(alternative_col))
+                        )
+                    except ClmAlignmentError:
+                        if clm_unalignable_rows == "drop":
+                            continue
+                        raise
+                    kept.append((i, raw_prefix))
+                    if div.k > 0:
+                        # no lone whitespace token between the context and the appended shared tokens
+                        row_ids = _ids_for_text(_tokenizer, raw_prefix.rstrip()) + list(div.shared_ids)
+                        divergence_rows[i] = (row_ids, div.factual_id, div.alternative_id)
+                valid = kept
                 if not valid:
                     continue
-                idxs, prefix_texts = zip(*valid)
-                probs = _clm_next_token_probs_for_prefixes(model, tokenizer, list(prefix_texts), device)
-                example_probs = {i: probs[j] for j, i in enumerate(idxs)}
+                plain = [(i, raw_prefix) for i, raw_prefix in valid if i not in divergence_rows]
+                example_probs = {}
+                if plain:
+                    idxs, prefix_texts = zip(*plain)
+                    probs = _clm_next_token_probs_for_prefixes(model, tokenizer, list(prefix_texts), device)
+                    example_probs = {i: probs[j] for j, i in enumerate(idxs)}
+                divergence_probs: Dict[int, Tuple[float, float]] = {}
+                if divergence_rows:
+                    d_idxs = list(divergence_rows)
+                    inputs = _tokenizer.pad(
+                        {"input_ids": [torch.tensor(divergence_rows[i][0]) for i in d_idxs]},
+                        padding=True,
+                        return_tensors="pt",
+                    )
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+                    d_probs = torch.softmax(model(**inputs).logits, dim=-1)
+                    d_positions = last_real_token_positions(inputs["attention_mask"])
+                    for j, b_idx in enumerate(d_idxs):
+                        row_probs = d_probs[j, int(d_positions[j].item()), :]
+                        _, f_id, a_id = divergence_rows[b_idx]
+                        divergence_probs[b_idx] = (float(row_probs[f_id].item()), float(row_probs[a_id].item()))
             elif eval_kind == "seq2seq_encoder_mlm":
                 texts = [str(r[key_text]) for r in batch]
                 probs = seq2seq_mlm_probs_at_mask(model, _tokenizer, texts, device)
@@ -650,30 +691,34 @@ def compute_probability_shift_score_row_wise(
                     example_probs[b_idx] = probs[b_idx, pos, :]
 
             for b_idx, row in enumerate(batch):
-                if b_idx not in example_probs:
+                is_divergence_row = eval_kind == "clm_next_token" and b_idx in divergence_probs
+                if b_idx not in example_probs and not is_divergence_row:
                     continue
-                p = example_probs[b_idx]
                 ds_class = row.get(dataset_class_col)
                 other_class = row.get(other_class_col)
                 if ds_class is None or other_class is None:
                     continue
-                if eval_kind == "clm_next_token":
-                    prefix_context, gap = _clm_context_and_gap_from_masked_text(str(row[key_text]))
-                    fids = _clm_first_continuation_token_ids_for_targets(
-                        _tokenizer, prefix_context, gap, [row.get(factual_col)], vocab_norm_map
-                    )
-                    aids = _clm_first_continuation_token_ids_for_targets(
-                        _tokenizer, prefix_context, gap, [row.get(alternative_col)], vocab_norm_map
-                    )
+                if is_divergence_row:
+                    p_f, p_a = divergence_probs[b_idx]
                 else:
-                    fids = _single_token_candidate_ids(_tokenizer, row.get(factual_col), vocab_norm_map)
-                    aids = _single_token_candidate_ids(_tokenizer, row.get(alternative_col), vocab_norm_map)
-                if not fids or not aids:
-                    continue
-                p_f_t = p[fids].sum()
-                p_a_t = p[aids].sum()
-                p_f = float(p_f_t.item() if hasattr(p_f_t, "item") else p_f_t)
-                p_a = float(p_a_t.item() if hasattr(p_a_t, "item") else p_a_t)
+                    p = example_probs[b_idx]
+                    if eval_kind == "clm_next_token":
+                        prefix_context, gap = _clm_context_and_gap_from_masked_text(str(row[key_text]))
+                        fids = _clm_first_continuation_token_ids_for_targets(
+                            _tokenizer, prefix_context, gap, [row.get(factual_col)], vocab_norm_map
+                        )
+                        aids = _clm_first_continuation_token_ids_for_targets(
+                            _tokenizer, prefix_context, gap, [row.get(alternative_col)], vocab_norm_map
+                        )
+                    else:
+                        fids = _single_token_candidate_ids(_tokenizer, row.get(factual_col), vocab_norm_map)
+                        aids = _single_token_candidate_ids(_tokenizer, row.get(alternative_col), vocab_norm_map)
+                    if not fids or not aids:
+                        continue
+                    p_f_t = p[fids].sum()
+                    p_a_t = p[aids].sum()
+                    p_f = float(p_f_t.item() if hasattr(p_f_t, "item") else p_f_t)
+                    p_a = float(p_a_t.item() if hasattr(p_a_t, "item") else p_a_t)
                 probs_by_dataset[ds_class][ds_class].append(p_f)
                 probs_by_dataset[ds_class][other_class].append(p_a)
                 if return_per_row_df:
@@ -1295,6 +1340,7 @@ def evaluate_probability_shift_score(
     return_per_row_df: bool = False,
     objective: str = "auto",
     rhs_window: int = -1,
+    clm_unalignable_rows: str = "error",
 ) -> Union[Dict[str, Dict[str, float]], Tuple[Dict[str, Dict[str, float]], pd.DataFrame], Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]]:
     """
     Compute probabilities for all classes on all datasets.
@@ -1378,6 +1424,7 @@ def evaluate_probability_shift_score(
             dataset_class_col=DEFAULT_DATASET_CLASS_COL,
             other_class_col=DEFAULT_OTHER_CLASS_COL,
             return_per_row_df=return_per_row_df,
+            clm_unalignable_rows=clm_unalignable_rows,
         )
         return out
     return compute_probability_shift_score_mlm(

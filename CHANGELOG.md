@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+
+- Divergence-point supervision for decoder-only causal language models (`clm_next_token`): multi-token factual and alternative targets that share a common token prefix of length $k$ (where $k < \text{len}(F)$ and $k < \text{len}(A)$) are supervised at the first diverging token position $k+1$ (0-indexed position $k$), passing preceding shared prefix tokens as context. Single-token rows ($n=m=1, k=0$) and multi-token rows without shared prefix ($k=0$) remain bit-identical.
+- Pre-training alignment audit via `audit_clm_alignment()` and `TrainingArguments.clm_unalignable_rows` (default `'error'`, or `'drop'`): validates all decoder-only CLM rows across train, validation, and test splits before training, pruning, or learning-rate search. Under `'error'`, raises an aggregated `ClmAlignmentError` listing offending pairs, counts, and guidance; under `'drop'`, drops unalignable rows (e.g. prefix overlap or identical tokens) and logs per-class counts.
+- Publicly exported diagnostic `audit_clm_alignment(tokenizer, pairs_or_df, context_prefix="") -> pd.DataFrame` to inspect alignment status (`'single'`, `'aligned'`, `'invalid'`) and token ids.
+- Exported `ClmDivergence`, `ClmAlignmentError`, `align_clm_divergence` from `gradiend`.
 - `TrainingArguments.label_token_protocol` (`"canonical"` default, `"legacy"`): which token id is supervised for a decoder-only label. `canonical` uses the leading-space variant, the same one `create_inputs` uses. Serialized arguments without the key load as `legacy`, so already-trained artifacts are read under the rule they were trained with.
 
 ### Fixed
@@ -18,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - (Beyond the `GradientTrainingDataset` fix of 0.2.2.) `SignalTrainingDatasetBase.__getitem__` (and its subclasses, incl. gradient and text-activation datasets) now raises `IndexError` for an out-of-range index instead of silently resolving to an empty slice. An out-of-range index previously produced an empty merged batch, which surfaced far downstream as a confusing `Masked template does not contain mask_placeholder='[MASK]'. Got template='None'.` (activation-gradient) or `KeyError: 'factual'` (gradient). This makes a caller that iterates past `len(dataset)` fail clearly at the source.
 
 ### Changed
+- Behaviour change for decoder-only CLM multi-token targets with shared token prefixes (e.g. GPT-2 `anglicised` vs `anglicized` sharing ` ang`, `lic`): previously only supervised the first subword token, creating degenerate zero-contrast gradients whenever targets shared the first piece. Now supervises the first diverging subword token at position $k+1$.
 - GRADIEND encoders use a trainable linear bias by default (`bias_encoder=True`). Existing checkpoints that lack `architecture.bias_encoder` remain loadable: loading infers whether the encoder bias exists from the saved state dict.
 - `GradiendModel` now supports default split metadata via `GradiendComponent` and exposes virtual component views through `gradiend.encoders[...]`, `gradiend.decoders[...]`, `encode_components(...)`, `with_components(...)`, and `without_split()`. These views slice the normal GRADIEND weights and do not create separate submodels.
 

@@ -343,6 +343,13 @@ class TrainingArguments:
     decoder_sequence_cloze_rhs_window: int = -1
     """Right-context token window for clm_sequence_cloze / seq2seq_decoder_sequence_cloze scoring and training. -1 uses the full RHS."""
 
+    clm_unalignable_rows: Literal["error", "drop"] = "error"
+    """Policy for unalignable decoder-only CLM rows where one target is a token-prefix of the other or token sequences are identical.
+
+    - ``"error"`` (default): fail fast with an aggregated error during pre-training check.
+    - ``"drop"``: drop unalignable rows during pre-training check and log counts per feature class.
+    """
+
     params: Optional[List[str]] = None
     """If set, only these parameter names or wildcards are included in the GRADIEND param map when building from a base model. None = include all backbone parameters (default). Enables future params selection processes."""
 
@@ -829,6 +836,10 @@ class TrainingArguments:
             )
         if self.criterion is None:
             self.criterion = nn.MSELoss()
+        if self.clm_unalignable_rows not in ("error", "drop"):
+            raise ValueError(
+                f"clm_unalignable_rows must be 'error' or 'drop', got {self.clm_unalignable_rows!r}"
+            )
         if self.supervised_encoder and self.supervised_decoder:
             raise ValueError(
                 "Cannot set both supervised_encoder and supervised_decoder. "

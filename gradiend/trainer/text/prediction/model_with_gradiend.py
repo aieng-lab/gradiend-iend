@@ -80,8 +80,8 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
         finally:
             self._zero_base_grad(set_to_none=True)
 
-    def create_gradients(self, text, label, return_dict=False, verbose=False):
-        item = self.create_inputs(text, label)
+    def create_gradients(self, text, label, return_dict=False, verbose=False, alternative=None):
+        item = self.create_inputs(text, label, alternative=alternative)
         if self.use_seq2seq_encoder_mlm:
             loss_base_model = seq2seq_encoder_mlm_loss(self._get_base_forward_model(), item)
             if verbose:
@@ -120,7 +120,7 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
         )
         return gradients
 
-    def create_inputs(self, masked_text, label):
+    def create_inputs(self, masked_text, label, alternative=None):
         with self.exclusive_base_gradient_access():
             if self.use_seq2seq_encoder_mlm:
                 item = create_seq2seq_mlm_item(
@@ -178,10 +178,37 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
                 if self.tokenizer.tokenizer.decode(label_token_id[0]).strip() == '':
                     label_token_id = label_token_id[1:]
             elif self.is_decoder_only_model:
-                # Same rule as the training dataset's ``label_token_protocol="canonical"``.
                 from gradiend.trainer.text.prediction.dataset import decoder_only_label_token_ids
 
-                label_token_id = decoder_only_label_token_ids(self.tokenizer, label)
+                if alternative is not None and str(alternative) != str(label):
+                    # Divergence-point supervision (see ``clm_alignment``): the label is the first token
+                    # where ``label`` and ``alternative`` differ, after the shared leading tokens.
+                    from gradiend.trainer.text.prediction.clm_alignment import align_clm_divergence
+
+                    prefix = str(masked_text).split("[MASK]")[0] if "[MASK]" in str(masked_text) else str(masked_text)
+                    div = align_clm_divergence(self.tokenizer, prefix, str(label), str(alternative))
+                    if div.k > 0:
+                        # Context WITHOUT trailing whitespace, so no lone space token precedes the shared tokens.
+                        prefix_encoded = self.tokenizer(
+                            prefix.rstrip(), return_tensors="pt", add_special_tokens=True, truncation=False
+                        )
+                        ctx_ids = prefix_encoded["input_ids"][0].tolist()
+                        slot_id = getattr(self.tokenizer, "eos_token_id", None) or getattr(self.tokenizer, "pad_token_id", None) or 0
+                        seq_tokens = ctx_ids + list(div.shared_ids) + [slot_id]
+                        if len(seq_tokens) > max_len:
+                            seq_tokens = seq_tokens[:max_len]
+                        item = {
+                            "input_ids": torch.tensor([seq_tokens], dtype=torch.long),
+                            "attention_mask": torch.ones((1, len(seq_tokens)), dtype=torch.long),
+                        }
+                        item = self._place_inputs_for_base_forward(item)
+                        item['labels'] = torch.full_like(item['input_ids'], -100)
+                        item['labels'][0, -1] = div.factual_id
+                        return item
+                    label_token_id = [div.factual_id]
+                else:
+                    # Same rule as the training dataset's ``label_token_protocol="canonical"``.
+                    label_token_id = decoder_only_label_token_ids(self.tokenizer, label)
             else:
                 label_token_id = self.tokenizer(f'{label}', add_special_tokens=False)['input_ids']
             if len(label_token_id) > 1:

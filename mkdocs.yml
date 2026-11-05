@@ -136,6 +136,7 @@ nav:
             - SignalTrainer: api/training/SignalTrainer.md
             - TransitionSpec: api/training/TransitionSpec.md
             - set_seed: api/training/set_seed.md
+            - audit_clm_alignment: api/training/audit_clm_alignment.md
             - Learning-rate search: api/training/lr_search.md
         - Evaluation:
             - Overview: api/evaluation/index.md

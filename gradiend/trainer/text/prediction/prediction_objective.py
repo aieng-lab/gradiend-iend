@@ -169,6 +169,7 @@ class PredictionObjective:
             return_per_row_df=return_per_row_df,
             objective=self.name,
             rhs_window=getattr(getattr(trainer, "_training_args", None), "decoder_sequence_cloze_rhs_window", -1),
+            clm_unalignable_rows=getattr(getattr(trainer, "_training_args", None), "clm_unalignable_rows", "error"),
         )
 
     def compute_lms(
@@ -258,12 +259,16 @@ def resolve_prediction_objective(trainer: Any, model_or_tokenizer: Any = None) -
         head_dir = resolve_decoder_mlm_head_dir(trainer.experiment_dir)
         if head_dir and has_saved_decoder_mlm_head(head_dir):
             objective = DecoderMLMHeadObjective()
-        elif model_or_tokenizer is not None and is_seq2seq_model(model_or_tokenizer):
-            objective = PredictionObjective("seq2seq_encoder_mlm")
-        elif model_or_tokenizer is not None and is_decoder_only_model(model_or_tokenizer):
-            objective = PredictionObjective("clm_next_token")
         else:
-            objective = PredictionObjective("mlm_mask_token")
+            m_or_t = model_or_tokenizer
+            if m_or_t is None:
+                m_or_t = getattr(trainer, "model", None) or getattr(trainer, "_model_arg", None)
+            if m_or_t is not None and is_seq2seq_model(m_or_t):
+                objective = PredictionObjective("seq2seq_encoder_mlm")
+            elif m_or_t is not None and is_decoder_only_model(m_or_t):
+                objective = PredictionObjective("clm_next_token")
+            else:
+                objective = PredictionObjective("mlm_mask_token")
 
     if explicit != "auto" and model_or_tokenizer is not None:
         validate_prediction_objective_for_model(explicit, model_or_tokenizer)

@@ -497,6 +497,101 @@ class TextPredictionTrainer(Trainer):
     def _prediction_objective(self, model_or_tokenizer: Any = None):
         return resolve_prediction_objective(self, model_or_tokenizer)
 
+    def _check_and_filter_clm_alignment(self, training_args: Optional[TrainingArguments] = None) -> None:
+        """Run pre-training CLM divergence audit and drop or fail fast on unalignable rows."""
+        if getattr(self, "_clm_alignment_checked", False):
+            return
+        m_check = getattr(self, "model", None) or getattr(self, "_model_arg", None)
+        objective = self._prediction_objective(m_check)
+        if objective.name != "clm_next_token":
+            return
+        self._ensure_data()
+        if self._combined_data is None or self._combined_data.empty:
+            return
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None:
+            model_arg = self._model_arg
+            if hasattr(model_arg, "tokenizer"):
+                tokenizer = model_arg.tokenizer
+            elif isinstance(model_arg, str):
+                from transformers import AutoTokenizer
+                trust_rc = bool(getattr(getattr(self, "_training_args", None), "trust_remote_code", False))
+                try:
+                    tokenizer = AutoTokenizer.from_pretrained(model_arg, trust_remote_code=trust_rc)
+                except Exception:
+                    tokenizer = None
+        if tokenizer is None:
+            return
+
+        from gradiend.trainer.text.prediction.clm_alignment import audit_clm_alignment, ClmAlignmentError
+        audit_df = audit_clm_alignment(tokenizer, self._combined_data)
+        invalid_mask = audit_df["status"] == "invalid"
+        if not invalid_mask.any():
+            self._clm_alignment_checked = True
+            return
+
+        args = training_args or getattr(self, "_training_args", None)
+        policy = getattr(args, "clm_unalignable_rows", "error")
+        invalid_rows = audit_df[invalid_mask]
+
+        if policy == "error":
+            counts = invalid_rows.groupby(
+                ["factual", "alternative", "status", "reason"]
+            ).size().reset_index(name="count")
+            lines = []
+            for _, r in counts.iterrows():
+                f_sample = invalid_rows[(invalid_rows["factual"] == r["factual"]) & (invalid_rows["alternative"] == r["alternative"])].iloc[0]
+                lines.append(
+                    f"  - factual={r['factual']!r} (ids={f_sample['factual_ids']}, n={f_sample['n']}) vs "
+                    f"alternative={r['alternative']!r} (ids={f_sample['alternative_ids']}, m={f_sample['m']}), "
+                    f"k={f_sample['k']}: {r['reason']} (count: {r['count']})"
+                )
+            offending_str = "\n".join(lines)
+            raise ClmAlignmentError(
+                f"Found {len(invalid_rows)} unalignable row(s) for decoder-only CLM training/evaluation under clm_next_token.\n"
+                f"Unalignable rows cannot be supervised because one target is a token-prefix of the other or token sequences are identical.\n"
+                f"Offending pairs:\n{offending_str}\n"
+                "Hint: Filter unalignable pairs from your dataset, or set TrainingArguments(clm_unalignable_rows='drop') to drop them automatically."
+            )
+        elif policy == "drop":
+            counts_per_class = {}
+            if UNIFIED_FACTUAL_CLASS in self._combined_data.columns:
+                dropped_classes = self._combined_data.loc[invalid_mask, UNIFIED_FACTUAL_CLASS].value_counts().to_dict()
+                counts_per_class = {str(k): int(v) for k, v in dropped_classes.items()}
+            logger.warning(
+                "Dropped %d unalignable decoder-only CLM row(s) (clm_unalignable_rows='drop'). Counts per feature class: %s",
+                int(invalid_mask.sum()),
+                counts_per_class,
+            )
+            self._combined_data = self._combined_data.loc[~invalid_mask].reset_index(drop=True)
+            if self._combined_data_template is not None:
+                self._combined_data_template = self._combined_data.copy()
+            self._clm_alignment_checked = True
+
+    def train(
+        self,
+        output_dir: Optional[str] = None,
+        model: Optional[Union[str, Any]] = None,
+        model_with_gradiend_cls: Optional[Type[Any]] = None,
+        callbacks: Optional[List[Any]] = None,
+        **training_args_overrides: Any,
+    ) -> Union["Trainer", Dict[int, Any]]:
+        args = self._training_args
+        if args is not None:
+            args = TrainingArguments.from_dict({**args.to_dict(), **training_args_overrides})
+        elif training_args_overrides:
+            args = TrainingArguments.from_dict(training_args_overrides)
+        else:
+            args = TrainingArguments()
+        self._check_and_filter_clm_alignment(args)
+        return super().train(
+            output_dir=output_dir,
+            model=model,
+            model_with_gradiend_cls=model_with_gradiend_cls,
+            callbacks=callbacks,
+            **training_args_overrides,
+        )
+
     def _train(
         self,
         output_dir: str,
@@ -1354,6 +1449,7 @@ class TextPredictionTrainer(Trainer):
         """Ensure data is loaded before creating the model for training (so pair is set and from_pretrained can set feature_class_encoding_direction)."""
         self._ensure_data()
         self._validate_required_splits(self._combined_data)
+        self._check_and_filter_clm_alignment()
 
     def _ensure_data(self, *, materialize_all_class_transitions: Optional[bool] = None) -> None:
         """Load and normalize data on first use. Idempotent.
@@ -2620,6 +2716,7 @@ class TextPredictionTrainer(Trainer):
             is_decoder_only_model = False
         requested_all_transitions = bool(include_other_classes or transition_selection)
         self._ensure_data(materialize_all_class_transitions=requested_all_transitions)
+        self._check_and_filter_clm_alignment()
         max_size = self._default_from_training_args(max_size, "train_max_size")
         if self.combined_data is None:
             raise ValueError("No data provided. Set data in config or override create_training_data().")

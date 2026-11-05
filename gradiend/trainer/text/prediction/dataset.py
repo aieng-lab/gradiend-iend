@@ -35,6 +35,7 @@ from gradiend.util.positions import (
     last_real_token_positions,
 )
 from gradiend.util.tokenization import offset_pairs, tokenize_with_offsets
+from gradiend.trainer.text.prediction.clm_alignment import align_clm_divergence
 
 # Dataset-level cloze placeholder (matches TextFilterConfig.mask). Independent of
 # tokenizer.mask_token, which is an MLM model special and may be absent (e.g. GPT-2).
@@ -846,7 +847,12 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         """
         return getattr(self.tokenizer, "vocab", None)
 
-    def _create_item(self, text: str, target: Union[str, Sequence[Any]]):
+    def _create_item(
+        self,
+        text: str,
+        target: Union[str, Sequence[Any]],
+        alternative_target: Optional[str] = None,
+    ):
         """Create a single training item: input_ids, attention_mask, labels.
 
         For decoder-only: labels at last non-pad position. For classic encoder
@@ -969,6 +975,60 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                     "classic encoder MLM; decoder-only training expects a single target string."
                 )
             # ``text`` is the CLM prefix (mask slot already removed upstream).
+            shared_ids: List[int] = []
+            if alternative_target is not None and str(alternative_target) != str(target):
+                # Divergence-point supervision: the label is ALWAYS the first token where factual and
+                # alternative differ (given the shared leading tokens as context), never a bare-word
+                # vocab entry. ``label_token_protocol`` only governs rows without an alternative.
+                prefix = text.split(mask_placeholder)[0] if mask_placeholder in text else text
+                div = align_clm_divergence(self.tokenizer, prefix, str(target), str(alternative_target))
+                shared_ids = list(div.shared_ids)
+                target_idx = div.factual_id
+                text = prefix
+            else:
+                target_idx = training_label_token_id(
+                    self.tokenizer,
+                    target,
+                    getattr(self, "label_token_protocol", "legacy"),
+                    vocab=self._vocab_ids,
+                )
+            if shared_ids:
+                # The context prefix is encoded WITHOUT trailing whitespace, so no lone space token
+                # separates it from the appended shared tokens.
+                clean_prefix = text.rstrip()
+                with suppress_tokenizer_length_warning():
+                    ctx_ids = self.tokenizer(clean_prefix, add_special_tokens=True, truncation=False)["input_ids"]
+                slot_id = getattr(self.tokenizer, "eos_token_id", None)
+                if slot_id is None:
+                    slot_id = getattr(self.tokenizer, "pad_token_id", None)
+                if slot_id is None:
+                    slot_id = 0
+                seq_tokens = list(ctx_ids) + shared_ids + [slot_id]
+                max_len = self.max_length
+                if len(seq_tokens) > max_len:
+                    if getattr(self.tokenizer, "truncation_side", "right") == "left":
+                        seq_tokens = seq_tokens[-max_len:]
+                    else:
+                        seq_tokens = seq_tokens[:max_len]
+                pad_len = max_len - len(seq_tokens)
+                pad_id = getattr(self.tokenizer, "pad_token_id", None)
+                if pad_id is None:
+                    pad_id = slot_id
+                if getattr(self.tokenizer, "padding_side", "right") == "left":
+                    padded_ids = [pad_id] * pad_len + seq_tokens
+                    mask = [0] * pad_len + [1] * len(seq_tokens)
+                else:
+                    padded_ids = seq_tokens + [pad_id] * pad_len
+                    mask = [1] * len(seq_tokens) + [0] * pad_len
+                input_ids = torch.tensor([padded_ids], dtype=torch.long)
+                attention_mask = torch.tensor([mask], dtype=torch.long)
+                labels = torch.full_like(input_ids, -100)
+                last_positions = last_real_token_positions(attention_mask, allow_empty=True)
+                labels[0, last_positions[0]] = target_idx
+                assert_labels_on_real_tokens(
+                    labels, attention_mask, where="decoder-only training item", allow_empty_rows=True
+                )
+                return {"input_ids": input_ids.squeeze(0), "attention_mask": attention_mask.squeeze(0), "labels": labels.squeeze(0)}
             expanded_text = text
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
@@ -976,12 +1036,6 @@ class TextBatchedDataset(TextBatchedDatasetBase):
             attention_mask = encoded["attention_mask"]
             labels = torch.full_like(input_ids, -100)
             last_idxs = attention_mask.sum(dim=1)
-            target_idx = training_label_token_id(
-                self.tokenizer,
-                target,
-                getattr(self, "label_token_protocol", "legacy"),
-                vocab=self._vocab_ids,
-            )
             last_positions = last_real_token_positions(attention_mask, allow_empty=True)
             for i, last_idx in enumerate(last_idxs):
                 if last_idx == 0:
@@ -1169,8 +1223,8 @@ class TextTrainingDataset(TextBatchedDataset):
                 label = int(label)
         except Exception:
             pass
-        item_factual = self._create_item(input_text, entry[UNIFIED_FACTUAL])
-        item_alternative = self._create_item(input_text, entry[UNIFIED_ALTERNATIVE])
+        item_factual = self._create_item(input_text, entry[UNIFIED_FACTUAL], alternative_target=entry[UNIFIED_ALTERNATIVE])
+        item_alternative = self._create_item(input_text, entry[UNIFIED_ALTERNATIVE], alternative_target=entry[UNIFIED_FACTUAL])
         out = {
             "factual": item_factual,
             "alternative": item_alternative,

@@ -123,6 +123,8 @@ def test_create_training_data_follows_the_wrapped_model(config, expected_decoder
         config=TextPredictionConfig(data=df, target_classes=["3SG", "3PL"]),
     )
     wrapper = TextPredictionModelWithGradiend(config)
+    # distinct ids so factual/alternative are contrastively alignable (CLM divergence)
+    wrapper.tokenizer.vocab.update({"he": 20, "they": 21})
     training_data = trainer.create_training_data(wrapper, split="train", batch_size=1)
     item = training_data[0]
     assert training_data.is_decoder_only_model is expected_decoder_only
