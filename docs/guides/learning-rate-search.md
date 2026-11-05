@@ -21,6 +21,10 @@ result = trainer.tune_learning_rate(probe_steps=100)  # the next trainer.train()
 - An explicit `trainer.train(learning_rate=...)` always wins.
 - If no learning rate converges, `NoConvergentLearningRate` is raised (check your data and setup); `error.result.probes`
   shows what each probe did. The search is saved in `lr_search.json` and reused with `use_cache=True`.
+## Reusing a learning rate across tasks
+
+The learning rate GRADIEND needs depends mostly on the model (architecture and size), not on the task. In practice, run the automatic search (`learning_rate="tune"` or `trainer.tune_learning_rate`) once per model on one well-behaved task and reuse the resulting rate (`trainer.lr_search_result.best_lr`) for the model's other tasks, for example with `trainer.train(learning_rate=...)`. This is a rule of thumb, not a guarantee: if a task does not converge at the reused rate (check `trainer.plot_training_convergence()` or the `convergence_info` stored in the run's `training.json`), run the search for that task. Use the same rate for tasks you want to compare, so that they get the same optimisation budget.
+
 ## How the search proceeds
 
 1. Probe the starting value `initial_lr` (default: [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments].learning_rate, or `1e-5` for `"tune"`).
