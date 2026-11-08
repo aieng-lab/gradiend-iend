@@ -252,6 +252,12 @@ def build_training_cache_fingerprint(training_args: Any) -> dict:
     signal_scope_cfg = _normalize_signal_scope_config(args_dict.get("signal_scope"))
     if signal_scope_cfg is not None:
         fingerprint["signal_scope"] = signal_scope_cfg
+    input_signal_cfg = _normalize_signal_config(args_dict.get("input_signal"))
+    if input_signal_cfg is not None:
+        fingerprint["input_signal"] = input_signal_cfg
+    input_scope_cfg = _normalize_signal_scope_config(args_dict.get("input_signal_scope"))
+    if input_scope_cfg is not None:
+        fingerprint["input_signal_scope"] = input_scope_cfg
     gradiend_split_cfg = _normalize_gradiend_split_config(args_dict.get("gradiend_split"))
     if gradiend_split_cfg is not None:
         fingerprint["gradiend_split"] = gradiend_split_cfg

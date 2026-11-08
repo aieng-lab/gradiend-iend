@@ -36,6 +36,7 @@ from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
 from gradiend.model import ModelWithGradiend
 from gradiend.trainer.text.prediction.dataset import (
     TextActivationTrainingDataset,
+    TextPairedSignalTrainingDataset,
     TextTrainingDataset,
     create_masked_pair_from_text,
     resolve_mask_placeholder,
@@ -92,7 +93,13 @@ from gradiend.trainer.text.prediction.prediction_objective import (
 )
 from gradiend.trainer.text.prediction.seq2seq import tokenize_prediction_label
 from gradiend.trainer.text.common.dataset import TextGradientTrainingDataset
-from gradiend.trainer.core.signals import ActivationSignalExtractor, SignalSet, require_single_signal
+from gradiend.trainer.core.signals import (
+    ActivationSignalExtractor,
+    GradientSignalExtractor,
+    PairedSignalExtractor,
+    SignalSet,
+    require_single_signal,
+)
 
 logger = get_logger(__name__)
 
@@ -477,6 +484,9 @@ class TextPredictionTrainer(Trainer):
                 TextActivationTrainingDataset.default_signal(item)
                 for item in signals
             )
+        input_signal = getattr(normalized, "input_signal", None)
+        if input_signal is not None:
+            normalized.input_signal = TextActivationTrainingDataset.default_signal(input_signal)
         return normalized
 
     def resolve_custom_prediction_head_dir(self) -> Optional[str]:
@@ -2963,6 +2973,31 @@ class TextPredictionTrainer(Trainer):
             signals=kwargs.get("signals"),
             context="TextPredictionTrainer.create_gradient_training_dataset",
         )
+        # Optional separate encoder-input signal (see TrainingArguments.input_signal). Always
+        # popped so it never reaches a dataset constructor that does not know it.
+        input_signal = kwargs.pop("input_signal", None)
+        input_scope = kwargs.pop("input_signal_scope", None)
+        if input_signal is None and args is not None:
+            input_signal = getattr(args, "input_signal", None)
+            if input_scope is None:
+                input_scope = getattr(args, "input_signal_scope", None)
+        if input_signal is not None:
+            return self._create_paired_signal_dataset(
+                raw_training_data,
+                model_with_gradiend,
+                target_signal=signal,
+                input_signal=input_signal,
+                input_scope=input_scope,
+                source=source,
+                target=target,
+                cache_dir=cache_dir,
+                use_cached_gradients=use_cached_gradients,
+                dtype=dtype,
+                device=device,
+                gradient_creator=gradient_creator,
+                tokenizer=tokenizer,
+                **{k: v for k, v in kwargs.items() if k not in ("signal", "signals")},
+            )
         if (
             signal.kind == "gradient"
             and args is not None
@@ -3016,6 +3051,73 @@ class TextPredictionTrainer(Trainer):
             use_cached_gradients=use_cached_gradients,
             dtype=dtype,
             device=device,
+            **kwargs,
+        )
+
+    def _create_paired_signal_dataset(
+        self,
+        raw_training_data: Any,
+        model_with_gradiend: Any,
+        *,
+        target_signal: Any,
+        input_signal: Any,
+        input_scope: Any,
+        source: str,
+        target: str,
+        cache_dir: Optional[str],
+        use_cached_gradients: bool,
+        dtype: Any,
+        device: Any,
+        gradient_creator: Any,
+        tokenizer: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Dataset whose encoder source is an activation and whose decoder target is a gradient.
+
+        Both come from the same example (see :class:`TextPairedSignalTrainingDataset`). Pre/post
+        pruning is not involved here: it acts on the gradient (target) side only.
+        """
+        if target_signal.kind != "gradient":
+            raise NotImplementedError(
+                f"input_signal requires a gradient target signal, got {target_signal.kind!r}."
+            )
+        args = getattr(self, "training_args", None)
+        if args is not None and getattr(args, "prediction_objective", None) == "clm_target_span":
+            raise NotImplementedError(
+                "prediction_objective='clm_target_span' is not implemented for parameter-gradient training."
+            )
+        input_signal = TextActivationTrainingDataset.default_signal(input_signal)
+        mask_placeholder = getattr(raw_training_data, "mask_placeholder", "[MASK]")
+        if not isinstance(mask_placeholder, str):
+            mask_placeholder = "[MASK]"
+        extractor = PairedSignalExtractor(
+            ActivationSignalExtractor(
+                model_with_gradiend,
+                signal=input_signal,
+                scope=input_scope,
+                tokenizer=tokenizer,
+                state_prefix="input_",
+            ),
+            GradientSignalExtractor(gradient_creator, signal=target_signal),
+        )
+        return TextPairedSignalTrainingDataset(
+            raw_training_data,
+            tokenizer,
+            extractor,
+            source=source,
+            target=target,
+            cache_dir=cache_dir,
+            use_cached_signals=use_cached_gradients,
+            dtype=dtype,
+            device=device,
+            timing_label=kwargs.pop("timing_label", "text-paired"),
+            signal=target_signal,
+            mask_placeholder=mask_placeholder,
+            prediction_objective=(
+                getattr(args, "prediction_objective", None)
+                if args is not None and getattr(args, "prediction_objective", None) not in (None, "auto")
+                else "clm_next_token"
+            ),
             **kwargs,
         )
 

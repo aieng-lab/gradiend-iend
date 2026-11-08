@@ -26,7 +26,7 @@ from gradiend.trainer.core.unified_schema import (
     UNIFIED_MASKED,
     UNIFIED_SPLIT,
 )
-from gradiend.trainer.core.signals import Signal
+from gradiend.trainer.core.signals import PairedInputs, Signal
 from gradiend.util import normalize_split_name
 from gradiend.util.logging import suppress_tokenizer_length_warning
 from gradiend.util.positions import (
@@ -1342,4 +1342,41 @@ class TextActivationTrainingDataset(SignalTrainingDatasetBase):
             )
         batch["factual"] = self._filled_side_batch(templates, factual_tokens)
         batch["alternative"] = self._filled_side_batch(templates, alternative_tokens)
+        return batch
+
+
+class TextPairedSignalTrainingDataset(TextActivationTrainingDataset):
+    """
+    Text-prediction dataset for a separate encoder-input signal and decoder-target signal.
+
+    The encoder input is an activation of the prediction slot FILLED with the factual /
+    alternative candidate (exactly what :class:`TextActivationTrainingDataset` builds); the
+    decoder target is the gradient item of the SAME example (the unfilled prefix plus label that
+    :class:`TextTrainingDataset` yields). Both are wrapped as ``PairedInputs`` and extracted by a
+    :class:`~gradiend.trainer.core.signals.PairedSignalExtractor`, so source and target always
+    come from one and the same row and pole (including the source="both" pole swap, which swaps
+    the whole pairs).
+
+    ``signal`` is the TARGET signal; the encoder-input signal is ``signal_extractor.input_signal``.
+    The target item is only attached when a target is requested (``target is not None``), so
+    encoder evaluation / encoding never pays for gradients.
+    """
+
+    def _merge_batch(self, indices: list) -> dict:
+        # Base merge only (stacked gradient items + metadata); the activation-specific
+        # re-filling of the parent is replaced by the pairing below.
+        batch = SignalTrainingDatasetBase._merge_batch(self, indices)
+        templates = self._as_list(batch.get("template"))
+        factual_tokens = self._as_list(batch.get("factual_token"))
+        alternative_tokens = self._as_list(batch.get("alternative_token"))
+        if not (len(templates) == len(factual_tokens) == len(alternative_tokens)):
+            raise ValueError(
+                "Paired text batch metadata lengths must match for template, factual_token, and alternative_token."
+            )
+        with_target = self.target is not None
+        for side, tokens in (("factual", factual_tokens), ("alternative", alternative_tokens)):
+            batch[side] = PairedInputs(
+                input=self._filled_side_batch(templates, tokens),
+                target=batch[side] if with_target else None,
+            )
         return batch
