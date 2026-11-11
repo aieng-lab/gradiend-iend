@@ -60,6 +60,10 @@ def dtype_from_name(name: Any) -> torch.dtype:
     return resolved
 
 
+LABEL_TOKEN_PROTOCOLS = ("first_differing_token", "no_leading_space")
+"""Valid values of :attr:`TrainingArguments.label_token_protocol`."""
+
+
 @dataclass
 class TrainingArguments:
     """
@@ -293,22 +297,24 @@ class TrainingArguments:
     """When False (default), pass use_cache=False to decoder model forward during training (KV cache disabled).
     Use True only for inference/generation. Decoder-only MLM head training respects this via train_decoder_only_mlm_head."""
 
-    label_token_protocol: str = "canonical"
-    """Which token id a decoder-only *training* item labels the prediction with.
+    label_token_protocol: str = "first_differing_token"
+    """Which token a decoder-only (``clm_next_token``) training row supervises.
 
-    ``"canonical"`` (default for new runs): the leading-space variant of the label
-    (``▁she`` / ``Ġshe``), i.e. ``tokenizer(" " + label)`` -- the rule
-    :meth:`TextPredictionModelWithGradiend.create_inputs` always used, so training
-    items and single-row scoring agree. The label is written onto the last prefix
-    token (the template's trailing space) and predicted from the token before it,
-    so the natural next token is the leading-space variant.
+    ``"first_differing_token"`` (default): the label is the first token where the factual and the
+    alternative target differ; tokens they share are appended to the context
+    (:func:`~gradiend.trainer.text.prediction.clm_alignment.align_clm_divergence`). When the two targets
+    already differ in their first token and the target follows whitespace, this is the leading-space
+    variant of the label (``▁she`` / ``Ġshe``, ``tokenizer(" " + label)``), the rule
+    :meth:`TextPredictionModelWithGradiend.create_inputs` uses. Rows without an alternative use that
+    leading-space rule. Rows that cannot be aligned (identical targets, or one a token-prefix of the
+    other) follow :attr:`clm_unalignable_rows`.
 
-    ``"legacy"``: the pre-2026-09-25 dataset rule, ``vocab[label]`` i.e. the
-    no-space variant (``she``), which the model almost never predicts after a
-    word boundary and which disagrees with ``create_inputs``.
+    ``"no_leading_space"``: the rule used before 2026-09-25, ``vocab[label]`` (the no-space variant
+    ``she``, else the first id of ``tokenizer(label)``). No alignment, no pre-training check. It exists
+    only to reproduce models trained before that date.
 
-    Checkpoints/argument dicts that do not carry this key deserialize as
-    ``"legacy"`` (see :meth:`from_dict`), so already trained artifacts are never
+    Settings saved with the old names ``canonical`` / ``legacy`` still load (:meth:`from_dict`), and a
+    saved dict without this key loads as ``"no_leading_space"``, so trained artifacts are never
     silently re-interpreted."""
 
     prediction_objective: str = "auto"
@@ -342,6 +348,13 @@ class TrainingArguments:
 
     decoder_sequence_cloze_rhs_window: int = -1
     """Right-context token window for clm_sequence_cloze / seq2seq_decoder_sequence_cloze scoring and training. -1 uses the full RHS."""
+
+    clm_unalignable_rows: Literal["error", "drop"] = "error"
+    """Policy for unalignable decoder-only CLM rows where one target is a token-prefix of the other or token sequences are identical.
+
+    - ``"error"`` (default): fail fast with an aggregated error during pre-training check.
+    - ``"drop"``: drop unalignable rows during pre-training check and log counts per feature class.
+    """
 
     params: Optional[List[str]] = None
     """If set, only these parameter names or wildcards are included in the GRADIEND param map when building from a base model. None = include all backbone parameters (default). Enables future params selection processes."""
@@ -623,9 +636,9 @@ class TrainingArguments:
         if self.output_dir is not None and not isinstance(self.output_dir, str):
             raise TypeError(f"output_dir must be str or None, got {type(self.output_dir).__name__}")
         normalize_use_cache(self.use_cache)
-        if self.label_token_protocol not in ("canonical", "legacy"):
+        if self.label_token_protocol not in LABEL_TOKEN_PROTOCOLS:
             raise ValueError(
-                f"label_token_protocol must be 'canonical' or 'legacy', got {self.label_token_protocol!r}"
+                f"label_token_protocol must be one of {LABEL_TOKEN_PROTOCOLS}, got {self.label_token_protocol!r}"
             )
         if self.learning_rate_decoder == "default":
             # Signal-kind-aware default: 'auto' only for pure activation signals (see the
@@ -829,6 +842,10 @@ class TrainingArguments:
             )
         if self.criterion is None:
             self.criterion = nn.MSELoss()
+        if self.clm_unalignable_rows not in ("error", "drop"):
+            raise ValueError(
+                f"clm_unalignable_rows must be 'error' or 'drop', got {self.clm_unalignable_rows!r}"
+            )
         if self.supervised_encoder and self.supervised_decoder:
             raise ValueError(
                 "Cannot set both supervised_encoder and supervised_decoder. "
@@ -942,7 +959,11 @@ class TrainingArguments:
         d = dict(d)
         # A serialized dict without the key was written before the protocol existed:
         # it must keep the old label convention, not silently pick up the new default.
-        d.setdefault("label_token_protocol", "legacy")
+        d.setdefault("label_token_protocol", "no_leading_space")
+        # Settings saved under the pre-rename names; this is the only place that knows them.
+        d["label_token_protocol"] = {"canonical": "first_differing_token", "legacy": "no_leading_space"}.get(
+            d["label_token_protocol"], d["label_token_protocol"]
+        )
         if "signal" in d and isinstance(d.get("signal"), dict):
             d["signal"] = Signal.from_dict(d["signal"])
         if "signals" in d and isinstance(d.get("signals"), list):

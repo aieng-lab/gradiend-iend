@@ -49,6 +49,44 @@ dec_results = trainer.evaluate_decoder()
 **Runnable example:** [train_gender_en.py](https://github.com/aieng-lab/gradiend/blob/main/gradiend/examples/train_gender_en.py)
 — set `DECODER_ONLY = True` in the script or pass `--decoder-only` (see that file).
 
+## Multi-token targets and divergence-point supervision
+
+When factual and alternative target words tokenize into multiple subwords under a causal language model (for example, GPT-2 tokenizes `anglicised` into `[' ang', 'lic', 'ised']` and `anglicized` into `[' ang', 'lic', 'ized']`), supervising only the first subword token yields zero contrast because both sides share the first pieces.
+
+GRADIEND automatically resolves this via **divergence-point alignment**:
+Let $F$ and $A$ be the token sequences of the factual and alternative continuations, and let $k$ be the length of their longest common prefix. When $k < \text{len}(F)$ and $k < \text{len}(A)$:
+
+1. **Shared prefix as context:** The model input is formed by the preceding context plus the $k$ shared tokens $F[:k]$.
+2. **Divergence-point contrast:** The factual label is $F[k]$ and the alternative label is $A[k]$, supervising next-token prediction at token position $k+1$.
+3. When $k = 0$ (single-token targets or multi-token targets with disjoint first tokens), the label is the first token of each target, i.e. the leading-space variant (`tokenizer(" " + word)`) when the target follows whitespace, exactly as before.
+
+### Label token protocol
+
+`TrainingArguments.label_token_protocol` decides which token a decoder-only training row supervises:
+
+- `"first_differing_token"` (default): the divergence-point rule above, applied to every row that has an alternative (also when $k = 0$). Rows without an alternative use the leading-space variant of the label. Training, row-wise evaluation and `create_inputs(text, label, alternative=...)` all use it.
+- `"no_leading_space"`: the rule used before 2026-09-25 (`vocab[label]`, the no-space token), without alignment and without the pre-training audit. Use it only to reproduce models trained before that date.
+
+Settings saved with the old names `canonical` / `legacy` still load (as `first_differing_token` / `no_leading_space`); a saved setting without the key loads as `no_leading_space`.
+
+### Unalignable targets and pre-training audit
+
+If one target is a token prefix of the other (e.g. `bride` vs `bridegroom` where $k = \min(\text{len}(F), \text{len}(A))$) or if both sides tokenize to identical token sequences ($F = A$), contrastive next-token supervision is invalid because the shorter side has no valid next-token alternative.
+
+GRADIEND performs a pre-training audit before training, pruning, or learning-rate search. You can configure the behavior via [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments]:
+
+- `clm_unalignable_rows="error"` (default): fails fast with an aggregated [`ClmAlignmentError`][gradiend.trainer.text.prediction.clm_alignment.ClmAlignmentError] listing all offending pairs, token IDs, and counts.
+- `clm_unalignable_rows="drop"`: automatically drops unalignable rows from all data splits and logs the dropped count per feature class.
+
+You can also run [`audit_clm_alignment`][gradiend.trainer.text.prediction.clm_alignment.audit_clm_alignment] directly to inspect dataset alignment:
+
+```python
+from gradiend import audit_clm_alignment
+
+summary_df = audit_clm_alignment(tokenizer, dataframe_or_pairs)
+print(summary_df[["factual", "alternative", "status", "reason", "k"]])
+```
+
 ## Optional: train a custom MLM head (`clm_mlm_head`)
 
 Decoder-only models naturally only see the left context of the `[MASK]`. For GRADIEND

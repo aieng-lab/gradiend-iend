@@ -80,8 +80,8 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
         finally:
             self._zero_base_grad(set_to_none=True)
 
-    def create_gradients(self, text, label, return_dict=False, verbose=False):
-        item = self.create_inputs(text, label)
+    def create_gradients(self, text, label, return_dict=False, verbose=False, alternative=None):
+        item = self.create_inputs(text, label, alternative=alternative)
         if self.use_seq2seq_encoder_mlm:
             loss_base_model = seq2seq_encoder_mlm_loss(self._get_base_forward_model(), item)
             if verbose:
@@ -120,7 +120,7 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
         )
         return gradients
 
-    def create_inputs(self, masked_text, label):
+    def create_inputs(self, masked_text, label, alternative=None):
         with self.exclusive_base_gradient_access():
             if self.use_seq2seq_encoder_mlm:
                 item = create_seq2seq_mlm_item(
@@ -178,10 +178,34 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
                 if self.tokenizer.tokenizer.decode(label_token_id[0]).strip() == '':
                     label_token_id = label_token_id[1:]
             elif self.is_decoder_only_model:
-                # Same rule as the training dataset's ``label_token_protocol="canonical"``.
                 from gradiend.trainer.text.prediction.dataset import decoder_only_label_token_ids
 
-                label_token_id = decoder_only_label_token_ids(self.tokenizer, label)
+                if alternative is not None and str(alternative) != str(label):
+                    # (An alternative that is the very same string is a neutral identity row: no contrast,
+                    # so it keeps the plain leading-space label below, like the training dataset.)
+                    # Divergence item (see ``clm_alignment``): the label is the first token where
+                    # ``label`` and ``alternative`` differ, after the tokens they share.
+                    protocol = getattr(self, "label_token_protocol", "first_differing_token")
+                    if protocol != "first_differing_token":
+                        raise ValueError(
+                            f"create_inputs(alternative=...) needs label_token_protocol='first_differing_token', "
+                            f"got {protocol!r}."
+                        )
+                    from gradiend.trainer.text.prediction.clm_alignment import (
+                        align_clm_divergence,
+                        build_shared_prefix_item,
+                    )
+
+                    prefix = str(masked_text).split("[MASK]")[0]
+                    div = align_clm_divergence(self.tokenizer, prefix, str(label), str(alternative))
+                    div_item = build_shared_prefix_item(
+                        self.tokenizer, prefix, div.shared_ids, div.factual_id,
+                        max_length=max_len, pad_to_max_length=False,
+                    )
+                    return self._place_inputs_for_base_forward(div_item)
+                else:
+                    # Same rule as the training dataset's ``label_token_protocol="first_differing_token"``.
+                    label_token_id = decoder_only_label_token_ids(self.tokenizer, label)
             else:
                 label_token_id = self.tokenizer(f'{label}', add_special_tokens=False)['input_ids']
             if len(label_token_id) > 1:

@@ -26,6 +26,7 @@ from gradiend.trainer.core.unified_schema import (
     UNIFIED_MASKED,
     UNIFIED_SPLIT,
 )
+from gradiend.trainer.core.arguments import LABEL_TOKEN_PROTOCOLS
 from gradiend.trainer.core.signals import Signal
 from gradiend.util import normalize_split_name
 from gradiend.util.logging import suppress_tokenizer_length_warning
@@ -35,6 +36,7 @@ from gradiend.util.positions import (
     last_real_token_positions,
 )
 from gradiend.util.tokenization import offset_pairs, tokenize_with_offsets
+from gradiend.trainer.text.prediction.clm_alignment import align_clm_divergence, build_shared_prefix_item
 
 # Dataset-level cloze placeholder (matches TextFilterConfig.mask). Independent of
 # tokenizer.mask_token, which is an MLM model special and may be absent (e.g. GPT-2).
@@ -200,7 +202,7 @@ def decoder_only_label_token_ids(tokenizer: Any, label: Any) -> List[int]:
     The natural next token after a word boundary is the *leading-space* variant
     (``▁she`` / ``Ġshe``), so that is the label: ``tokenizer(" " + label)``.
     ``vocab[label]`` (``she``) is the mid-word variant and is only kept for
-    ``label_token_protocol="legacy"``.
+    ``label_token_protocol="no_leading_space"``.
 
     ``TextPredictionModelWithGradiend.create_inputs`` and the training dataset must
     both call this; it returns all ids so callers can apply their own multi-token
@@ -209,24 +211,25 @@ def decoder_only_label_token_ids(tokenizer: Any, label: Any) -> List[int]:
     return list(tokenizer(f" {label}", add_special_tokens=False)["input_ids"])
 
 
-def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "legacy", *, vocab: Optional[Any] = None) -> int:
+def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "no_leading_space", *, vocab: Optional[Any] = None) -> int:
     """The one token id a decoder-only *training* item supervises for ``label``.
 
     ``protocol`` is ``TrainingArguments.label_token_protocol``:
 
-    - ``"canonical"``: :func:`decoder_only_label_token_ids` (leading-space variant),
-      first id for multi-token labels.
+    - ``"first_differing_token"``: for a row without an alternative,
+      :func:`decoder_only_label_token_ids` (leading-space variant), first id for multi-token labels.
+      (Rows with an alternative are labelled by the divergence alignment, not by this function.)
 
-    - ``"legacy"``: ``vocab[label]`` (else the first id of ``tokenizer(label)``), the
+    - ``"no_leading_space"``: ``vocab[label]`` (else the first id of ``tokenizer(label)``), the
       rule every artifact trained before 2026-09-25 used.
 
     The dataset and single-row scorers (e.g. CGA detection) must both resolve the
     label through this function so their gradients live in the same signal space.
     """
-    if protocol == "canonical":
+    if protocol == "first_differing_token":
         return int(decoder_only_label_token_ids(tokenizer, label)[0])
-    if protocol != "legacy":
-        raise ValueError(f"label_token_protocol must be 'canonical' or 'legacy', got {protocol!r}")
+    if protocol != "no_leading_space":
+        raise ValueError(f"label_token_protocol must be one of {LABEL_TOKEN_PROTOCOLS}, got {protocol!r}")
     label = str(label)
     if vocab is None:
         vocab = getattr(tokenizer, "vocab", None)
@@ -846,7 +849,12 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         """
         return getattr(self.tokenizer, "vocab", None)
 
-    def _create_item(self, text: str, target: Union[str, Sequence[Any]]):
+    def _create_item(
+        self,
+        text: str,
+        target: Union[str, Sequence[Any]],
+        alternative_target: Optional[str] = None,
+    ):
         """Create a single training item: input_ids, attention_mask, labels.
 
         For decoder-only: labels at last non-pad position. For classic encoder
@@ -969,6 +977,21 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                     "classic encoder MLM; decoder-only training expects a single target string."
                 )
             # ``text`` is the CLM prefix (mask slot already removed upstream).
+            protocol = getattr(self, "label_token_protocol", "no_leading_space")
+            if protocol == "first_differing_token" and alternative_target is not None and str(alternative_target) != str(target):
+                # (A row whose alternative is the very same string is a neutral identity transition: it has
+                # no contrast to align and keeps the plain leading-space label below.)
+                # The label is the first token where factual and alternative differ, given the tokens
+                # they share as context (rows whose targets are unalignable raise ClmAlignmentError;
+                # the trainer's pre-training check applies ``clm_unalignable_rows`` before this point).
+                prefix = text.split(mask_placeholder)[0] if mask_placeholder in text else text
+                div = align_clm_divergence(self.tokenizer, prefix, str(target), str(alternative_target))
+                item = build_shared_prefix_item(
+                    self.tokenizer, prefix, div.shared_ids, div.factual_id,
+                    max_length=self.max_length, pad_to_max_length=True,
+                )
+                return {k: v.squeeze(0) for k, v in item.items()}
+            target_idx = training_label_token_id(self.tokenizer, target, protocol, vocab=self._vocab_ids)
             expanded_text = text
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
@@ -976,12 +999,6 @@ class TextBatchedDataset(TextBatchedDatasetBase):
             attention_mask = encoded["attention_mask"]
             labels = torch.full_like(input_ids, -100)
             last_idxs = attention_mask.sum(dim=1)
-            target_idx = training_label_token_id(
-                self.tokenizer,
-                target,
-                getattr(self, "label_token_protocol", "legacy"),
-                vocab=self._vocab_ids,
-            )
             last_positions = last_real_token_positions(attention_mask, allow_empty=True)
             for i, last_idx in enumerate(last_idxs):
                 if last_idx == 0:
@@ -1075,15 +1092,16 @@ class TextTrainingDataset(TextBatchedDataset):
         rhs_window: int = -1,
         mlm_head_target_labels: Optional[List[str]] = None,
         mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
-        label_token_protocol: str = "legacy",
+        label_token_protocol: str = "no_leading_space",
     ):
         """Initialize the training dataset.
 
         Args:
-            label_token_protocol: ``"canonical"`` labels decoder-only items with the
-                leading-space token (see :func:`decoder_only_label_token_ids`);
-                ``"legacy"`` (default here, so direct callers are unchanged) uses
-                ``vocab[label]``. The trainer passes ``TrainingArguments.label_token_protocol``.
+            label_token_protocol: ``"first_differing_token"`` labels decoder-only items with the first
+                token where factual and alternative differ (leading-space token for rows without
+                alternative, see :func:`decoder_only_label_token_ids`); ``"no_leading_space"`` (default
+                here, so direct callers are unchanged) uses ``vocab[label]``. The trainer passes
+                ``TrainingArguments.label_token_protocol``.
             data: DataFrame with masked, factual, alternative columns (unified schema).
             tokenizer: Tokenizer for encoding.
             batch_size: Batch size.
@@ -1117,9 +1135,9 @@ class TextTrainingDataset(TextBatchedDataset):
         self.mlm_head_target_labels = list(mlm_head_target_labels) if mlm_head_target_labels else None
         self.rhs_window = rhs_window
         self.mask_placeholder = str(mask_placeholder)
-        if label_token_protocol not in ("canonical", "legacy"):
+        if label_token_protocol not in LABEL_TOKEN_PROTOCOLS:
             raise ValueError(
-                f"label_token_protocol must be 'canonical' or 'legacy', got {label_token_protocol!r}"
+                f"label_token_protocol must be one of {LABEL_TOKEN_PROTOCOLS}, got {label_token_protocol!r}"
             )
         self.label_token_protocol = label_token_protocol
         validate_masked_templates_in_dataframe(
@@ -1169,8 +1187,8 @@ class TextTrainingDataset(TextBatchedDataset):
                 label = int(label)
         except Exception:
             pass
-        item_factual = self._create_item(input_text, entry[UNIFIED_FACTUAL])
-        item_alternative = self._create_item(input_text, entry[UNIFIED_ALTERNATIVE])
+        item_factual = self._create_item(input_text, entry[UNIFIED_FACTUAL], alternative_target=entry[UNIFIED_ALTERNATIVE])
+        item_alternative = self._create_item(input_text, entry[UNIFIED_ALTERNATIVE], alternative_target=entry[UNIFIED_FACTUAL])
         out = {
             "factual": item_factual,
             "alternative": item_alternative,
