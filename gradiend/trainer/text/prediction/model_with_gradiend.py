@@ -180,7 +180,9 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
             elif self.is_decoder_only_model:
                 from gradiend.trainer.text.prediction.dataset import decoder_only_label_token_ids
 
-                if alternative is not None:
+                if alternative is not None and str(alternative) != str(label):
+                    # (An alternative that is the very same string is a neutral identity row: no contrast,
+                    # so it keeps the plain leading-space label below, like the training dataset.)
                     # Divergence item (see ``clm_alignment``): the label is the first token where
                     # ``label`` and ``alternative`` differ, after the tokens they share.
                     protocol = getattr(self, "label_token_protocol", "first_differing_token")

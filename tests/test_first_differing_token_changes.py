@@ -202,6 +202,16 @@ def test_create_inputs_with_alternative_under_no_leading_space_raises(wrapper):
         wrapper.create_inputs("The word is [MASK]", "good", alternative="bad")
 
 
+def test_create_inputs_with_identical_alternative_is_the_plain_row(wrapper):
+    """A neutral identity row (alternative == label) has no contrast: it gets the plain leading-space label, under both rules."""
+    for protocol in (FDT, NLS):
+        wrapper.label_token_protocol = protocol
+        item = wrapper.create_inputs("The word is [MASK]", "good", alternative="good")
+        plain = wrapper.create_inputs("The word is [MASK]", "good")
+        assert item["input_ids"].tolist() == plain["input_ids"].tolist()
+        assert item["labels"].tolist() == plain["labels"].tolist()
+
+
 def test_create_inputs_without_alternative_ignores_the_protocol(wrapper):
     """On main create_inputs always uses the leading-space rule, also for a model trained under legacy."""
     wrapper.label_token_protocol = NLS
