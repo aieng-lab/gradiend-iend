@@ -293,6 +293,38 @@ def test_trainer_checks_alignment_before_training(tok, tiny_model):
     assert len(dropping.create_training_data(tok)) == 1
 
 
+def test_pre_training_audit_runs_when_the_model_is_given_as_a_hub_id(tok):
+    """A model passed as a string id is not loaded yet at audit time: the audit must still see a CLM.
+
+    Regression: ``is_decoder_only_model("gpt2")`` is False for a bare string, so the audit resolved an
+    MLM objective, skipped itself, and the bridegroom/bride row reached ``pre_prune`` and crashed there.
+    """
+    from gradiend.trainer.text.prediction.trainer import TextPredictionConfig, TextPredictionTrainer
+
+    data = pd.DataFrame([
+        {"masked": "The word was [MASK]", "factual": "anglicised", "alternative": "anglicized",
+         "split": "train", "label_class": "UK", "alternative_class": "US"},
+        {"masked": "She saw the [MASK]", "factual": "bride", "alternative": "bridegroom",
+         "split": "train", "label_class": "UK", "alternative_class": "US"},
+    ])
+    cfg = TextPredictionConfig(
+        target_classes=["UK", "US"], data=data, masked_col="masked", label_col="factual",
+        alternative_col="alternative", label_class_col="label_class",
+        alternative_class_col="alternative_class", split_col="split",
+    )
+    args = TrainingArguments(label_token_protocol=FDT, clm_unalignable_rows="drop")
+    trainer = TextPredictionTrainer(model="gpt2", config=cfg, training_args=args)
+    trainer._check_and_filter_clm_alignment(args)
+    assert len(trainer._combined_data) == 1
+
+    failing = TextPredictionTrainer(
+        model="gpt2", config=cfg,
+        training_args=TrainingArguments(label_token_protocol=FDT, clm_unalignable_rows="error"),
+    )
+    with pytest.raises(ClmAlignmentError, match="bridegroom"):
+        failing._check_and_filter_clm_alignment(failing._training_args)
+
+
 # ----------------------------------------------------------------------------- MLM unaffected
 
 def test_mlm_items_ignore_the_protocol():

@@ -497,6 +497,23 @@ class TextPredictionTrainer(Trainer):
     def _prediction_objective(self, model_or_tokenizer: Any = None):
         return resolve_prediction_objective(self, model_or_tokenizer)
 
+    def _tokenizer_for_clm_audit(self) -> Optional[Any]:
+        """Tokenizer available before training starts: the trainer's, the model object's, or one loaded from a hub id."""
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is not None:
+            return tokenizer
+        model_arg = self._model_arg
+        if hasattr(model_arg, "tokenizer"):
+            return model_arg.tokenizer
+        if isinstance(model_arg, str):
+            from transformers import AutoTokenizer
+            trust_rc = bool(getattr(getattr(self, "_training_args", None), "trust_remote_code", False))
+            try:
+                return AutoTokenizer.from_pretrained(model_arg, trust_remote_code=trust_rc)
+            except Exception:
+                return None
+        return None
+
     def _check_and_filter_clm_alignment(self, training_args: Optional[TrainingArguments] = None) -> None:
         """Run pre-training CLM divergence audit and drop or fail fast on unalignable rows.
 
@@ -507,26 +524,17 @@ class TextPredictionTrainer(Trainer):
         protocol = getattr(training_args, "label_token_protocol", None) or self._label_token_protocol()
         if protocol != "first_differing_token":
             return
-        m_check = getattr(self, "model", None) or getattr(self, "_model_arg", None)
-        objective = self._prediction_objective(m_check)
+        tokenizer = self._tokenizer_for_clm_audit()
+        if tokenizer is None:
+            return
+        # A model given as a hub id is not loaded yet; ``is_decoder_only_model`` cannot read a bare string,
+        # so the tokenizer (whose ``name_or_path`` resolves the model config) stands in for it.
+        loaded = getattr(self, "model", None) or getattr(self, "_model_arg", None)
+        objective = self._prediction_objective(tokenizer if isinstance(loaded, str) or loaded is None else loaded)
         if objective.name != "clm_next_token":
             return
         self._ensure_data()
         if self._combined_data is None or self._combined_data.empty:
-            return
-        tokenizer = getattr(self, "tokenizer", None)
-        if tokenizer is None:
-            model_arg = self._model_arg
-            if hasattr(model_arg, "tokenizer"):
-                tokenizer = model_arg.tokenizer
-            elif isinstance(model_arg, str):
-                from transformers import AutoTokenizer
-                trust_rc = bool(getattr(getattr(self, "_training_args", None), "trust_remote_code", False))
-                try:
-                    tokenizer = AutoTokenizer.from_pretrained(model_arg, trust_remote_code=trust_rc)
-                except Exception:
-                    tokenizer = None
-        if tokenizer is None:
             return
 
         from gradiend.trainer.text.prediction.clm_alignment import audit_clm_alignment, ClmAlignmentError
