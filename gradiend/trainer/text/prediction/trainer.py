@@ -3006,14 +3006,42 @@ class TextPredictionTrainer(Trainer):
         """
         return str(getattr(getattr(self, "training_args", None), "label_token_protocol", "no_leading_space") or "no_leading_space")
 
-    def _configure_model(self, model: Any) -> None:
-        """Give single-row scorers (e.g. CGA detection) the run's label-token convention.
+    @staticmethod
+    def _recorded_label_token_protocol(model: Any) -> Optional[str]:
+        """The label-token convention a loaded model was trained with, or ``None`` if it carries no record.
 
-        They receive only the model, but must label exactly as this trainer's
-        datasets do; see :func:`gradiend.trainer.text.prediction.dataset.training_label_token_id`.
+        The record is the ``training_args`` saved in the model's ``training.json``. A record without the key
+        belongs to a model trained before the key existed; :meth:`TrainingArguments.from_dict` gives it
+        ``"no_leading_space"`` (and translates the old names), so this is the one place nothing else needs to know.
+        """
+        gradiend = getattr(model, "gradiend", None)
+        training = (getattr(gradiend, "kwargs", None) or {}).get("training")
+        saved = training.get("training_args") if isinstance(training, dict) else None
+        if not isinstance(saved, dict):
+            return None
+        payload = {"label_token_protocol": saved["label_token_protocol"]} if "label_token_protocol" in saved else {}
+        return TrainingArguments.from_dict(payload).label_token_protocol
+
+    def _configure_model(self, model: Any) -> None:
+        """Give every model this trainer hands out the label-token convention it was trained with.
+
+        A model loaded from a directory knows its own rule (see :meth:`_recorded_label_token_protocol`); it wins
+        over this trainer's ``training_args``, which datasets and evaluation then follow, so a model is never
+        scored under another rule than the one it was trained for. A model without a record (e.g. a fresh
+        backbone) takes the trainer's rule. Single-row scorers (e.g. CGA detection) receive only the model, but
+        must label exactly as this trainer's datasets do; see
+        :func:`gradiend.trainer.text.prediction.dataset.training_label_token_id`.
         """
         super()._configure_model(model)
-        model.label_token_protocol = self._label_token_protocol()
+        recorded = self._recorded_label_token_protocol(model)
+        if recorded is not None and recorded != self._label_token_protocol():
+            logger.warning(
+                "Loaded model was trained with label_token_protocol=%r; using it instead of %r from the trainer's training_args.",
+                recorded, self._label_token_protocol(),
+            )
+            if self._training_args is not None:
+                self._training_args.label_token_protocol = recorded
+        model.label_token_protocol = recorded if recorded is not None else self._label_token_protocol()
 
     def create_gradient_training_dataset(
         self,

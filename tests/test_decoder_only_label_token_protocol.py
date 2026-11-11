@@ -164,3 +164,51 @@ def test_old_names_are_rejected_outside_from_dict(old):
     with pytest.raises(ValueError, match="label_token_protocol"):
         _dataset(old)
 
+
+def _loaded_model(saved_training_args):
+    """A model as ``from_pretrained`` returns it: the saved training.json sits on ``model.gradiend.kwargs``."""
+    training = None if saved_training_args is None else {"training_args": saved_training_args}
+    return SimpleNamespace(gradiend=SimpleNamespace(kwargs={} if training is None else {"training": training}))
+
+
+def _configured(trainer_protocol, saved_training_args):
+    class _Model:
+        @classmethod
+        def from_pretrained(cls, load_directory, **kwargs):
+            return _loaded_model(saved_training_args)
+
+    class _Trainer(TextPredictionTrainer):
+        def __init__(self, protocol):  # bypass the heavy constructor
+            self._training_args = TrainingArguments(label_token_protocol=protocol)
+
+        @property
+        def model_with_gradiend_cls(self):
+            return _Model
+
+    trainer = _Trainer(trainer_protocol)
+    return trainer, trainer.create_model_with_gradiend("ignored")
+
+
+@pytest.mark.parametrize(
+    "saved,expected",
+    [
+        ({"label_token_protocol": "no_leading_space"}, "no_leading_space"),
+        ({"label_token_protocol": "first_differing_token"}, "first_differing_token"),
+        ({"label_token_protocol": "legacy"}, "no_leading_space"),  # saved under the old name
+        ({"label_token_protocol": "canonical"}, "first_differing_token"),  # saved under the old name
+        ({"max_steps": 5}, "no_leading_space"),  # a record from before the key existed
+    ],
+)
+def test_a_loaded_model_keeps_the_rule_it_was_trained_with(saved, expected):
+    """The recorded rule wins over the trainer's current arguments, which datasets and evaluation then follow."""
+    other = "first_differing_token" if expected == "no_leading_space" else "no_leading_space"
+    trainer, model = _configured(other, saved)
+    assert model.label_token_protocol == expected
+    assert trainer._label_token_protocol() == expected
+
+
+def test_a_model_without_a_record_takes_the_trainers_rule():
+    for protocol in ("first_differing_token", "no_leading_space"):
+        trainer, model = _configured(protocol, None)
+        assert model.label_token_protocol == protocol
+        assert trainer._label_token_protocol() == protocol
