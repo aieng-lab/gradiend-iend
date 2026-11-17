@@ -120,6 +120,60 @@ class TextPredictionModelWithGradiend(TextModelWithGradiend):
         )
         return gradients
 
+    def create_encoder_input(self, masked_text, label):
+        """Encoder input for raw text: the gradient, or the separate input signal when configured."""
+        if not getattr(self.gradiend, "has_separate_encoder_input", False):
+            return self.create_gradients(masked_text, label)
+        return self._create_input_signal(masked_text, label)
+
+    def _input_signal_extractor(self):
+        """Rebuild the encoder-input extractor from the signal space persisted with the model.
+
+        The space, the signal (incl. its running-RMS scale options) and the frozen scale state are
+        all stored in ``gradiend.kwargs['input_signal_space']``, so a reloaded checkpoint encodes
+        text exactly like the model that was trained.
+        """
+        from gradiend.trainer.core.signals import ActivationSignalExtractor, Signal, SignalScope
+        from gradiend.trainer.text.prediction.dataset import TextActivationTrainingDataset
+
+        space = (getattr(self.gradiend, "kwargs", None) or {}).get("input_signal_space")
+        if not space or not space.get("signal"):
+            raise ValueError(
+                "Model has a separate encoder input space but no 'input_signal_space' metadata; "
+                "it cannot encode raw text."
+            )
+        signal = TextActivationTrainingDataset.default_signal(Signal.from_dict(space["signal"]))
+        return ActivationSignalExtractor(
+            self,
+            signal=signal,
+            scope=SignalScope.from_signal_space(space),
+            tokenizer=self.tokenizer,
+            state_prefix="input_",
+        )
+
+    def _create_input_signal(self, masked_text, label):
+        """Activation of the prediction slot filled with ``label`` (what training encodes)."""
+        from gradiend.trainer.text.prediction.dataset import (
+            _filled_prediction_from_template,
+            _stack_text_items,
+        )
+
+        item = _filled_prediction_from_template(
+            self.tokenizer,
+            template=str(masked_text),
+            target=str(label),
+            max_length=128,
+        )
+        extractor = self._input_signal_extractor()
+        with self.exclusive_base_gradient_access():
+            batch = extractor(
+                factual_inputs=_stack_text_items([item]),
+                alternative_inputs=None,
+                requires_factual=True,
+                requires_alternative=False,
+            )
+        return batch.factual.to(self.gradiend.device_encoder, dtype=self.gradiend.torch_dtype)
+
     def create_inputs(self, masked_text, label, alternative=None):
         with self.exclusive_base_gradient_access():
             if self.use_seq2seq_encoder_mlm:

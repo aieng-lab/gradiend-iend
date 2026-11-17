@@ -884,18 +884,34 @@ class ModelWithGradiend(nn.Module, ABC):
     # ----------------------------
     # Encoding
     # ----------------------------
+    def create_encoder_input(self, input, label):
+        """
+        Turn raw modality input into the tensor the encoder reads.
+
+        For a model whose encoder reads the gradient space this is ``create_gradients``. A
+        model with a separate encoder input space (``gradiend.has_separate_encoder_input``)
+        needs a modality-specific extractor and must override this hook.
+        """
+        if getattr(self.gradiend, "has_separate_encoder_input", False):
+            raise NotImplementedError(
+                f"{type(self).__name__} has a separate encoder input space but does not implement "
+                "create_encoder_input()."
+            )
+        return self.create_gradients(input, label)
+
     def encode(self, input, label=None, return_float=False):
         """
         Encode input to latent space.
 
         Supports:
 
-        - raw modality input (e.g. str) -> create_gradients -> encode
-        - already-created gradient tensor in GRADIEND input space
+        - raw modality input (e.g. str) -> create_encoder_input -> encode
+        - already-created tensor in the ENCODER input space (the gradient space unless the
+          model was trained with a separate ``input_signal``)
         """
         if not isinstance(input, torch.Tensor):
             assert label is not None, "Label must be provided if input is not a tensor!"
-            input = self.create_gradients(input, label)
+            input = self.create_encoder_input(input, label)
         elif hasattr(input, "to"):
             input = input.to(self.gradiend.device_encoder, dtype=self.gradiend.torch_dtype)
 
@@ -1960,6 +1976,18 @@ class ModelWithGradiend(nn.Module, ABC):
             raise NotImplementedError(
                 f"Model construction for Signal(kind={signal_space.kind!r}) is not implemented yet."
             )
+        input_space = signal_plan.input_space
+        if input_space is not None:
+            # Separate encoder-input space: the encoder is sized for the input signal and the
+            # input-space description is persisted so that reload and text encoding can rebuild
+            # the exact same extractor (see ``encoder_input_signal_space``).
+            create_kwargs["encoder_input_dim"] = int(input_space.input_dim)
+            create_kwargs["input_signal_space"] = {
+                "kind": input_space.kind,
+                "signal_id": input_space.signal_id,
+                "mapping": list(input_space.mapping),
+                "signal": dict(input_space.signal or {}),
+            }
         lazy_init = bool(create_kwargs.get("pre_prune_config") is not None)
         legacy_params = create_kwargs.pop("params", None)
         if legacy_params is not None:

@@ -227,6 +227,7 @@ class ParamMappedGradiendModel(GradiendModel):
         init_fan_in_floor: Optional[int] = DEFAULT_INIT_FAN_IN_FLOOR,
         component_slices: Optional[List[Union[GradiendComponent, Dict[str, Any]]]] = None,
         component_split_mode: Optional[str] = None,
+        encoder_input_dim: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -253,6 +254,9 @@ class ParamMappedGradiendModel(GradiendModel):
                 small activation-space components on a conservative random scale
                 while leaving larger gradient-space models unchanged.
             component_slices: Optional default split metadata over the flattened GRADIEND input space.
+            encoder_input_dim: Optional width of a separate encoder input space (see
+                ``GradiendModel``). The parameter mapping always describes the decoder output
+                (the gradient space); a separate encoder input is a plain tensor space.
             **kwargs: Stored in `self.kwargs` and serialized into config.json metadata
                 on save.
         """
@@ -271,6 +275,7 @@ class ParamMappedGradiendModel(GradiendModel):
             init_fan_in_floor=init_fan_in_floor,
             component_slices=component_slices,
             component_split_mode=component_split_mode,
+            encoder_input_dim=encoder_input_dim,
             **kwargs,
         )
         self.param_map = param_map
@@ -861,6 +866,14 @@ class ParamMappedGradiendModel(GradiendModel):
         dev = next(iter(grad_dict.values())).device if grad_dict else torch.device("cpu")
         return torch.empty(0, dtype=self.torch_dtype, device=dev)
 
+    def _require_tied_input_space(self, what: str) -> None:
+        if self.has_separate_encoder_input:
+            raise ValueError(
+                f"{what} is only defined when the encoder reads the gradient space; this model's "
+                f"encoder reads a separate input space of width {self.encoder_input_dim}. "
+                "Pass a tensor in the encoder input space instead."
+            )
+
     def forward(
         self, x: Union[torch.Tensor, Dict[str, torch.Tensor]], return_encoded: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor], Tuple[Dict[str, torch.Tensor], torch.Tensor]]:
@@ -888,6 +901,7 @@ class ParamMappedGradiendModel(GradiendModel):
         if torch.is_tensor(x):
             pass
         elif isinstance(x, dict):
+            self._require_tied_input_space("dict-of-gradients input")
             parts: List[torch.Tensor] = []
             for selector in self._get_compiled_param_selectors():
                 if selector.num_selected == 0:
@@ -954,6 +968,7 @@ class ParamMappedGradiendModel(GradiendModel):
             Encoded tensor of shape (latent_dim,).
         """
         if isinstance(x, dict):
+            self._require_tied_input_space("dict-of-gradients input")
             parts: List[torch.Tensor] = []
             for selector in self._get_compiled_param_selectors():
                 if selector.num_selected == 0:
@@ -1404,6 +1419,7 @@ class ParamMappedGradiendModel(GradiendModel):
             device_decoder=core.device_decoder,
             component_slices=component_slices,
             component_split_mode=component_split_mode,
+            encoder_input_dim=core.encoder_input_dim if core.has_separate_encoder_input else None,
             **meta,
         )
 

@@ -1197,6 +1197,13 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
         if len(training_data) == 0:
             raise ValueError("Training data is empty; cannot train. Check create_training_data implementation and train_max_size.")
 
+        # Forwarded only when a separate encoder-input signal is configured, so trainers that
+        # do not know the concept never see the extra keywords.
+        input_signal_kwargs = (
+            {"input_signal": config.input_signal, "input_signal_scope": config.input_signal_scope}
+            if getattr(config, "input_signal", None) is not None
+            else {}
+        )
         gradient_dataset = self.create_gradient_training_dataset(
             training_data,
             model_with_gradiend,
@@ -1208,6 +1215,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
             timing_label="train-gradient",
             signal=config.signal,
             signals=config.signals,
+            **input_signal_kwargs,
         )
         if runtime_monitor is not None:
             runtime_monitor.mark("trainer:create_gradient_dataset:done", size=len(gradient_dataset))

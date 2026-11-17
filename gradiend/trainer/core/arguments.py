@@ -372,6 +372,18 @@ class TrainingArguments:
     """Optional ``SignalScope`` describing where the signal is measured (parameters for gradient signals, module
     sites for activation signals). ``None`` uses the default backbone scope."""
 
+    input_signal: Optional[Union[Signal, str, Dict[str, Any]]] = None
+    """Optional separate ENCODER-input signal. ``None`` (default) means the encoder reads the same signal the
+    decoder reconstructs (``signal``), which is the classic GRADIEND/ACTIEND behaviour. Setting it pairs a different
+    signal with the target: the encoder input is ``input_signal`` (currently only ``Signal.activation(...)``) while the
+    decoder target stays ``signal`` (currently only ``Signal.gradient()``, i.e. weight-gradient reconstruction with
+    activation-valued encoding). Both are extracted from the SAME example. Pre/post-pruning acts on the target
+    (decoder/gradient) side only. Strings and dicts are coerced like ``signal``."""
+
+    input_signal_scope: Optional[Union[SignalScope, Dict[str, Any]]] = None
+    """Where ``input_signal`` is measured (module sites for an activation input). Only valid together with
+    ``input_signal``; ``None`` uses the default activation scope."""
+
     gradiend_split: Optional[Union[GradiendSplit, str, Dict[str, Any]]] = None
     """Optional GradiendSplit describing component partitioning over the resolved signal space.
 
@@ -582,6 +594,27 @@ class TrainingArguments:
         kinds.discard(None)
         return kinds == {"activation"}
 
+    def _normalize_input_signal_arguments(self) -> None:
+        """Coerce and validate the optional separate encoder-input signal (see ``input_signal``)."""
+        self.input_signal_scope = coerce_signal_scope(self.input_signal_scope)
+        if self.input_signal is None:
+            if self.input_signal_scope is not None:
+                raise ValueError("input_signal_scope requires input_signal to be set.")
+            return
+        input_signal, _ = normalize_signal_arguments(signal=self.input_signal, signals=None)
+        self.input_signal = input_signal
+        if input_signal.kind != "activation":
+            raise NotImplementedError(
+                f"input_signal must be Signal.activation(...); got kind={input_signal.kind!r}."
+            )
+        if not self.signals.is_single or self.signal is None or self.signal.kind != "gradient":
+            raise NotImplementedError(
+                "input_signal is currently defined only for a single gradient target signal "
+                "(signal=Signal.gradient()): activation-valued encoding of a gradient target."
+            )
+        if self.gradiend_split is not None and self.gradiend_split.mode != "none":
+            raise NotImplementedError("input_signal cannot be combined with gradiend_split.")
+
     def _normalize_signal_arguments(self) -> None:
         signal, signals = normalize_signal_arguments(signal=self.signal, signals=self.signals)
         self.signal = signal
@@ -607,6 +640,7 @@ class TrainingArguments:
                 "(or .default()/.full() for the built-in mode presets) instead."
             )
         self.gradiend_split = coerce_gradiend_split(self.gradiend_split)
+        self._normalize_input_signal_arguments()
         if self.params is not None:
             warnings.warn(
                 "TrainingArguments.params is deprecated; use "
@@ -920,6 +954,9 @@ class TrainingArguments:
         for k in fields:
             if k in ("evaluate_fn", "criterion"):
                 continue
+            if k in ("input_signal", "input_signal_scope") and getattr(self, k, None) is None:
+                # Absent rather than null: keeps every existing (tied-space) config byte-identical.
+                continue
             v = getattr(self, k, None)
             if callable(v):
                 continue
@@ -943,7 +980,7 @@ class TrainingArguments:
                 result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
             elif k == "signals":
                 result[k] = list(v.to_list()) if v is not None and hasattr(v, "to_list") else v
-            elif k == "signal_scope":
+            elif k in ("signal_scope", "input_signal", "input_signal_scope"):
                 result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
             elif k == "gradiend_split":
                 result[k] = v.to_dict() if v is not None and hasattr(v, "to_dict") else v
@@ -970,6 +1007,10 @@ class TrainingArguments:
             d["signals"] = SignalSet.from_list(d["signals"])
         if "signal_scope" in d and isinstance(d.get("signal_scope"), dict):
             d["signal_scope"] = SignalScope.from_dict(d["signal_scope"])
+        if "input_signal" in d and isinstance(d.get("input_signal"), dict):
+            d["input_signal"] = Signal.from_dict(d["input_signal"])
+        if "input_signal_scope" in d and isinstance(d.get("input_signal_scope"), dict):
+            d["input_signal_scope"] = SignalScope.from_dict(d["input_signal_scope"])
         if "gradiend_split" in d and isinstance(d.get("gradiend_split"), dict):
             d["gradiend_split"] = GradiendSplit.from_dict(d["gradiend_split"])
         if "torch_dtype" in d and isinstance(d.get("torch_dtype"), str):

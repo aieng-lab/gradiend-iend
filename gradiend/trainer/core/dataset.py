@@ -29,6 +29,7 @@ from gradiend.trainer.core.config import (
 )
 from gradiend.trainer.core.signals import (
     GradientSignalExtractor,
+    Signal,
     SignalSet,
     require_single_gradient_signal,
     require_single_signal,
@@ -352,6 +353,10 @@ class SignalTrainingDatasetBase:
         return False
 
     def _is_mixed_site(self) -> bool:
+        # An extractor that pairs a separate target signal with the encoder input always yields
+        # distinct source and target tensors.
+        if getattr(self.signal_extractor, "has_separate_target", False) is True:
+            return True
         opts = getattr(self.signal, "options", None) or {}
         target = opts.get("target_token_selector")
         return target is not None and target != opts.get("token_selector")
@@ -478,7 +483,16 @@ class SignalTrainingDatasetBase:
                         f"Cache key requires batch keys {self.cache_key_fields}; missing in batch: {missing}. "
                         "Ensure training_data yields these keys when caching is used."
                     )
-                h = hash_it([batch[k] for k in self.cache_key_fields] + [self.dtype, self.signal.to_dict()])
+                cache_signals = [self.signal.to_dict()]
+                input_signal = getattr(self.signal_extractor, "input_signal", None)
+                if isinstance(input_signal, Signal):
+                    # Same example, different encoder input signal => different cached source.
+                    cache_signals.append(input_signal.to_dict())
+                h = hash_it(
+                    [batch[k] for k in self.cache_key_fields]
+                    + [self.dtype, cache_signals[0]]
+                    + cache_signals[1:]
+                )
                 cache_file_factual = os.path.join(self.cache_dir, f'factual_{h}.pt')
                 cache_file_alternative = os.path.join(self.cache_dir, f'alternative_{h}.pt')
 

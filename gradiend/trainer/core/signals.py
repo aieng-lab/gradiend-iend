@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Iterable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
@@ -763,8 +763,13 @@ class ActivationSignalExtractor:
         scope: Optional[SignalScope] = None,
         tokenizer: Any = None,
         aggregate_batch: str = "mean",
+        state_prefix: str = "",
     ) -> None:
         self.model = model
+        # Prefix of the ``gradiend.kwargs`` keys this extractor persists/restores its scale state
+        # under. "" is the classic ACTIEND layout; a separate encoder-input extractor uses
+        # "input_" so it never overwrites (or reads) the target-side signal space.
+        self._state_prefix = str(state_prefix or "")
         self.base_model = getattr(model, "base_model", model)
         if not isinstance(self.base_model, nn.Module):
             raise TypeError("ActivationSignalExtractor requires a torch.nn.Module or object with .base_model")
@@ -798,9 +803,9 @@ class ActivationSignalExtractor:
             # Restore frozen stats from a loaded checkpoint when present.
             gradiend = getattr(self.model, "gradiend", None)
             kwargs = dict(getattr(gradiend, "kwargs", None) or {}) if gradiend is not None else {}
-            saved = kwargs.get("activation_scale") or (kwargs.get("signal_space") or {}).get(
-                "activation_scale"
-            )
+            saved = kwargs.get(f"{self._state_prefix}activation_scale") or (
+                kwargs.get(f"{self._state_prefix}signal_space") or {}
+            ).get("activation_scale")
             if isinstance(saved, Mapping):
                 self._scale.load_state_dict(saved)
 
@@ -822,7 +827,12 @@ class ActivationSignalExtractor:
 
     def _expected_input_dim(self) -> Tuple[Optional[int], str]:
         gradiend = getattr(self.model, "gradiend", None)
-        configured = self._positive_int(getattr(gradiend, "input_dim", None))
+        # ``encoder_input_dim`` equals ``input_dim`` unless the model has a separate encoder input
+        # space (then it is the width THIS extractor must produce); older stand-ins only have input_dim.
+        encoder_dim = getattr(gradiend, "encoder_input_dim", None)
+        configured = self._positive_int(
+            encoder_dim if isinstance(encoder_dim, int) else getattr(gradiend, "input_dim", None)
+        )
         if configured is not None:
             return configured, "configured encoder input_dim"
         inferred = self.infer_input_dim_static()
@@ -1291,10 +1301,11 @@ class ActivationSignalExtractor:
         if gradiend is None:
             return
         kwargs = dict(getattr(gradiend, "kwargs", None) or {})
-        kwargs["activation_scale"] = self._scale.state_dict()
-        signal_space = dict(kwargs.get("signal_space") or {})
-        signal_space["activation_scale"] = kwargs["activation_scale"]
-        kwargs["signal_space"] = signal_space
+        prefix = self._state_prefix
+        kwargs[f"{prefix}activation_scale"] = self._scale.state_dict()
+        signal_space = dict(kwargs.get(f"{prefix}signal_space") or {})
+        signal_space["activation_scale"] = kwargs[f"{prefix}activation_scale"]
+        kwargs[f"{prefix}signal_space"] = signal_space
         gradiend.kwargs = kwargs
         self._persisted_scale_version = self._scale.version
 
@@ -1378,7 +1389,97 @@ class ActivationSignalExtractor:
         )
 
 
+@dataclass(frozen=True)
+class PairedInputs:
+    """
+    One pole's inputs for a paired (encoder-input signal, decoder-target signal) extraction.
+
+    ``input`` feeds the encoder-input extractor, ``target`` the decoder-target extractor.
+    ``target`` is ``None`` when only the encoder input is needed (encoder evaluation / encoding),
+    so the (expensive) target signal is then not computed at all.
+    """
+
+    input: Any
+    target: Optional[Any] = None
+
+
+class PairedSignalExtractor:
+    """
+    Combine two independent extractors on the SAME example: one provides the encoder source,
+    the other the decoder target.
+
+    This is a pairing of two existing signals, not a new signal kind: each side keeps its own
+    extractor, scope, scaling and width validation. The result is an ordinary mixed-site
+    ``SignalBatch`` (``factual``/``alternative`` = input signal, ``factual_target``/
+    ``alternative_target`` = target signal), which the dataset machinery already routes to
+    ``source`` and ``target``.
+
+    ``signal``/``signals`` expose the TARGET signal (what the decoder reconstructs and what the
+    trained model's ``signal_kind`` is); ``input_signal`` exposes the encoder-input signal.
+    """
+
+    has_separate_target = True
+
+    def __init__(self, input_extractor: Any, target_extractor: Any) -> None:
+        for name, extractor in (("input_extractor", input_extractor), ("target_extractor", target_extractor)):
+            if not callable(extractor) or getattr(extractor, "signal", None) is None:
+                raise TypeError(f"{name} must be a callable signal extractor with a .signal")
+        self.input_extractor = input_extractor
+        self.target_extractor = target_extractor
+        self.signal = target_extractor.signal
+        self.signals = SignalSet(self.signal)
+        self.input_signal = input_extractor.signal
+
+    @contextmanager
+    def exclusive_signal_access(self):
+        # Both extractors run on the same base model; hold both guards (the model's lock is
+        # re-entrant, so nesting the same lock twice is safe).
+        with ExitStack() as stack:
+            stack.enter_context(self.input_extractor.exclusive_signal_access())
+            stack.enter_context(self.target_extractor.exclusive_signal_access())
+            yield
+
+    def _extract_pole(self, inputs: PairedInputs, *, factual: bool) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not isinstance(inputs, PairedInputs):
+            raise TypeError(f"PairedSignalExtractor expects PairedInputs, got {type(inputs).__name__}")
+        kw = dict(requires_factual=factual, requires_alternative=not factual)
+        if factual:
+            source = self.input_extractor(factual_inputs=inputs.input, alternative_inputs=None, **kw).factual
+        else:
+            source = self.input_extractor(factual_inputs=None, alternative_inputs=inputs.input, **kw).alternative
+        target = None
+        if inputs.target is not None:
+            if factual:
+                target = self.target_extractor(factual_inputs=inputs.target, alternative_inputs=None, **kw).factual
+            else:
+                target = self.target_extractor(factual_inputs=None, alternative_inputs=inputs.target, **kw).alternative
+        return source, target
+
+    def __call__(
+        self,
+        factual_inputs: Optional[PairedInputs] = None,
+        alternative_inputs: Optional[PairedInputs] = None,
+        *,
+        requires_factual: bool = True,
+        requires_alternative: bool = True,
+    ) -> SignalBatch:
+        factual = factual_target = alternative = alternative_target = None
+        if requires_factual:
+            factual, factual_target = self._extract_pole(factual_inputs, factual=True)
+        if requires_alternative:
+            alternative, alternative_target = self._extract_pole(alternative_inputs, factual=False)
+        return SignalBatch.from_factual_alternative(
+            factual,
+            alternative,
+            factual_target=factual_target,
+            alternative_target=alternative_target,
+            signal_id=self.signal.id,
+        )
+
+
 __all__ = [
+    "PairedInputs",
+    "PairedSignalExtractor",
     "Signal",
     "SignalSet",
     "ActivationRunningRms",

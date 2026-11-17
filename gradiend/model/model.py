@@ -341,6 +341,7 @@ class GradiendModel(nn.Module):
         init_fan_in_floor: Optional[int] = DEFAULT_INIT_FAN_IN_FLOOR,
         component_slices: Optional[List[Union[GradiendComponent, Dict[str, Any]]]] = None,
         component_split_mode: Optional[str] = None,
+        encoder_input_dim: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -383,6 +384,11 @@ class GradiendModel(nn.Module):
                 GRADIEND behavior (virtual full span only); other modes expose
                 partitions via public ``component_slices``, including a single
                 ``"full"`` partition for ``"single"``.
+            encoder_input_dim: Optional width of the encoder input when it differs from the
+                decoder output width ``input_dim`` (separate encoder-input signal space, e.g.
+                activation values encoding a gradient target). ``None`` (default) means the
+                encoder reads the same space the decoder writes, which is the classic
+                GRADIEND/ACTIEND layout. A value equal to ``input_dim`` is normalized to ``None``.
             **kwargs: Additional metadata stored in `self.kwargs` and serialized into config.json metadata
                 on save. Non-JSONable values are stringified in a safe way.
         """
@@ -414,6 +420,18 @@ class GradiendModel(nn.Module):
         self.input_dim = int(input_dim)
         if self.input_dim <= 0 or self.latent_dim <= 0:
             raise ValueError("Input and latent dimensions must be positive integers.")
+        if encoder_input_dim is not None:
+            if not isinstance(encoder_input_dim, int) or isinstance(encoder_input_dim, bool):
+                raise TypeError(
+                    f"encoder_input_dim must be int or None, got {type(encoder_input_dim).__name__}"
+                )
+            if encoder_input_dim <= 0:
+                raise ValueError("encoder_input_dim must be a positive integer.")
+        self._encoder_input_dim = (
+            int(encoder_input_dim)
+            if encoder_input_dim is not None and int(encoder_input_dim) != self.input_dim
+            else None
+        )
 
         self.activation = activation_encoder.lower()
         self.activation_decoder = activation_decoder
@@ -452,7 +470,7 @@ class GradiendModel(nn.Module):
 
             self.encoder = nn.Sequential(
                 LargeLinear(
-                    self.input_dim,
+                    self.encoder_input_dim,
                     self.latent_dim,
                     bias=self.bias_encoder,
                     dtype=torch_dtype,
@@ -466,6 +484,16 @@ class GradiendModel(nn.Module):
             )
 
             self._initialize_encoder_decoder_parameters()
+
+    @property
+    def encoder_input_dim(self) -> int:
+        """Width of the encoder input (equals ``input_dim`` unless the input space is separate)."""
+        return self._encoder_input_dim if self._encoder_input_dim is not None else self.input_dim
+
+    @property
+    def has_separate_encoder_input(self) -> bool:
+        """True when the encoder reads a different space than the decoder writes."""
+        return self._encoder_input_dim is not None
 
     def __str__(self) -> str:
         return (
@@ -502,7 +530,7 @@ class GradiendModel(nn.Module):
 
         self.encoder = nn.Sequential(
             LargeLinear(
-                self.input_dim,
+                self.encoder_input_dim,
                 self.latent_dim,
                 bias=self.bias_encoder,
                 dtype=self.torch_dtype,
@@ -544,6 +572,10 @@ class GradiendModel(nn.Module):
         self._require_built()
         enc = self.encoder[0].linear
         dec = self.decoder[0].linear
+
+        if self.has_separate_encoder_input:
+            self._initialize_separate_input_parameters(enc, dec)
+            return
 
         full_bound = self._init_bound_for_fan_in(self.input_dim)
         default_linear_bound = 1.0 / math.sqrt(float(self.input_dim))
@@ -592,6 +624,31 @@ class GradiendModel(nn.Module):
                             -component_scale,
                             component_scale,
                         )
+
+    def _initialize_separate_input_parameters(self, enc: nn.Linear, dec: nn.Linear) -> None:
+        """
+        Initialize a model whose encoder input space differs from its decoder output space.
+
+        The tied rule above derives the decoder scale from the encoder weights, which is only
+        meaningful when both live in the same space. With a separate input space the encoder
+        weights are sized for the (small) input width, so inheriting that scale would start the
+        decoder far too large for a (huge) output space. Each side therefore uses the uniform
+        bound of its own fan-in (after the fan-in floor).
+        """
+        if self.component_split_mode != "none":
+            raise ValueError(
+                "A separate encoder input space is not supported together with component splitting "
+                f"(component_split_mode={self.component_split_mode!r})."
+            )
+        enc_bound = self._init_bound_for_fan_in(self.encoder_input_dim)
+        dec_bound = self._init_bound_for_fan_in(self.input_dim)
+        with torch.no_grad():
+            nn.init.uniform_(enc.weight, -enc_bound, enc_bound)
+            if enc.bias is not None:
+                nn.init.uniform_(enc.bias, -enc_bound, enc_bound)
+            nn.init.uniform_(dec.weight, -dec_bound, dec_bound)
+            if dec.bias is not None:
+                nn.init.uniform_(dec.bias, -dec_bound, dec_bound)
 
     def to(
         self,
@@ -993,6 +1050,11 @@ class GradiendModel(nn.Module):
             w = vec.view(self.decoder[0].linear.weight.shape)
             return w.abs().sum(dim=1)
         if part == "encoder-weight":
+            if self.has_separate_encoder_input:
+                raise ValueError(
+                    "'encoder-weight' importance is undefined when the encoder reads a separate input "
+                    "space: its columns do not index the decoder/target dimensions. Use 'decoder-weight'."
+                )
             w = vec.view(self.encoder[0].linear.weight.shape)
             return w.abs().sum(dim=0)
 
@@ -1068,20 +1130,21 @@ class GradiendModel(nn.Module):
         return idx.tolist()
 
     def _ensure_input(self, x: torch.Tensor):
+        in_dim = self.encoder_input_dim
         if x.dim() == 0:
-            raise ValueError(f"Input tensor must have final dimension {self.input_dim}, got scalar input")
+            raise ValueError(f"Input tensor must have final dimension {in_dim}, got scalar input")
 
         if x.dim() == 1:
-            if x.numel() != self.input_dim:
-                raise ValueError(f"Input tensor has incorrect size {x.numel()}, expected {self.input_dim}")
-        elif x.shape[-1] == self.input_dim:
+            if x.numel() != in_dim:
+                raise ValueError(f"Input tensor has incorrect size {x.numel()}, expected {in_dim}")
+        elif x.shape[-1] == in_dim:
             pass
-        elif x.numel() == self.input_dim:
+        elif x.numel() == in_dim:
             # Legacy convenience: accept shapes like (input_dim, 1) as one vector.
             x = x.view(-1)
         else:
             raise ValueError(
-                f"Input tensor has incorrect shape {tuple(x.shape)}, expected final dimension {self.input_dim}"
+                f"Input tensor has incorrect shape {tuple(x.shape)}, expected final dimension {in_dim}"
             )
 
         if x.dtype != self.torch_dtype:
@@ -1177,13 +1240,21 @@ class GradiendModel(nn.Module):
 
         new_in = int(keep_idx_dev.numel())
 
-        new_enc = LargeLinear(new_in, m.latent_dim, bias=m.bias_encoder, dtype=m.torch_dtype, device=m.device_encoder)
+        # With a separate encoder input space the keep index addresses decoder rows only; the
+        # encoder reads a different space and is left untouched.
+        slice_encoder = not m.has_separate_encoder_input
+        new_enc = (
+            LargeLinear(new_in, m.latent_dim, bias=m.bias_encoder, dtype=m.torch_dtype, device=m.device_encoder)
+            if slice_encoder
+            else None
+        )
         new_dec = LargeLinear(m.latent_dim, new_in, bias=m.bias_decoder, dtype=m.torch_dtype, device=m.device_decoder)
 
         with torch.no_grad():
-            new_enc.linear.weight.copy_(enc_w[:, keep_idx_dev].to(new_enc.linear.weight.device))
-            if new_enc.linear.bias is not None and enc_b is not None:
-                new_enc.linear.bias.copy_(enc_b.to(new_enc.linear.bias.device))
+            if slice_encoder:
+                new_enc.linear.weight.copy_(enc_w[:, keep_idx_dev].to(new_enc.linear.weight.device))
+                if new_enc.linear.bias is not None and enc_b is not None:
+                    new_enc.linear.bias.copy_(enc_b.to(new_enc.linear.bias.device))
 
             keep_idx_dec = keep_idx_dev if dec_w.device == keep_idx_dev.device else keep_idx_dev.to(dec_w.device)
             new_dec.linear.weight.copy_(dec_w[keep_idx_dec, :].to(new_dec.linear.weight.device))
@@ -1193,9 +1264,10 @@ class GradiendModel(nn.Module):
                 else:
                     new_dec.linear.bias.copy_(dec_b[keep_idx_dec].to(new_dec.linear.bias.device))
 
-        m.encoder[0] = new_enc
+        if slice_encoder:
+            m.encoder[0] = new_enc
+            m.encoder[0].train(m.training)
         m.decoder[0] = new_dec
-        m.encoder[0].train(m.training)
         m.decoder[0].train(m.training)
         m.input_dim = new_in
         m._virtual_component_slices = _normalize_component_slices(None, input_dim=new_in)
@@ -1351,18 +1423,23 @@ class GradiendModel(nn.Module):
 
         run_info = meta.pop("training", None)
 
+        architecture = {
+            "input_dim": self.input_dim,
+            "latent_dim": self.latent_dim,
+            "activation_encoder": self.activation,
+            "activation_decoder": self.activation_decoder,
+            "bias_encoder": self.bias_encoder,
+            "bias_decoder": self.bias_decoder,
+            "init_fan_in_floor": self.init_fan_in_floor,
+            "torch_dtype": str(self.torch_dtype).replace("torch.", ""),
+        }
+        if self.has_separate_encoder_input:
+            # Only written for a separate input space, so configs of every existing
+            # (tied-space) model stay byte-identical.
+            architecture["encoder_input_dim"] = self.encoder_input_dim
         config = {
             "format_version": 0,
-            "architecture": {
-                "input_dim": self.input_dim,
-                "latent_dim": self.latent_dim,
-                "activation_encoder": self.activation,
-                "activation_decoder": self.activation_decoder,
-                "bias_encoder": self.bias_encoder,
-                "bias_decoder": self.bias_decoder,
-                "init_fan_in_floor": self.init_fan_in_floor,
-                "torch_dtype": str(self.torch_dtype).replace("torch.", ""),
-            },
+            "architecture": architecture,
             "components": (
                 [component.to_dict() for component in self.component_slices]
                 if self.has_component_split
@@ -1474,6 +1551,7 @@ class GradiendModel(nn.Module):
             device_decoder=device_decoder,
             component_slices=component_slices,
             component_split_mode=component_split_mode,
+            encoder_input_dim=arch.get("encoder_input_dim"),
             **meta,
         )
 

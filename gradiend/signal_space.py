@@ -44,10 +44,19 @@ class SignalTrainingPlan:
 
     spaces: Tuple[ResolvedSignalSpace, ...]
     scope: Any = None
+    # Optional separate ENCODER-input space (activation values) for a plan whose
+    # ``spaces`` (the decoder-output/target side) is a gradient space. ``None`` means the
+    # encoder reads the target space itself (every classic GRADIEND/ACTIEND plan).
+    input_space: Optional[ResolvedSignalSpace] = None
 
     def __post_init__(self) -> None:
         if not self.spaces:
             raise ValueError("SignalTrainingPlan requires at least one signal space")
+        if self.input_space is not None and self.single_space.kind != "gradient":
+            raise ValueError(
+                "A separate encoder input space is only defined for a gradient target space; "
+                f"got target kind {self.single_space.kind!r}."
+            )
 
     @property
     def single_space(self) -> ResolvedSignalSpace:
@@ -553,8 +562,17 @@ def resolve_signal_training_plan(
     signal: Any = None,
     signals: Any = None,
     scope: Any = None,
+    input_signal: Any = None,
+    input_scope: Any = None,
 ) -> SignalTrainingPlan:
-    """Resolve independent signal/scope axes into concrete GRADIEND spaces."""
+    """
+    Resolve independent signal/scope axes into concrete GRADIEND spaces.
+
+    ``signal``/``scope`` describe the decoder-output (target) side. ``input_signal`` /
+    ``input_scope`` optionally describe a different ENCODER-input side (activation
+    values); they resolve through the same activation-space machinery, so there is one
+    implementation of site/width resolution for both roles.
+    """
     if training_args is not None:
         if signal is None:
             signal = getattr(training_args, "signal", None)
@@ -562,6 +580,10 @@ def resolve_signal_training_plan(
             signals = getattr(training_args, "signals", None)
         if scope is None:
             scope = getattr(training_args, "signal_scope", None)
+        if input_signal is None:
+            input_signal = getattr(training_args, "input_signal", None)
+        if input_scope is None:
+            input_scope = getattr(training_args, "input_signal_scope", None)
 
     spaces = []
     for item in _iter_signal_axis(signal=signal, signals=signals):
@@ -591,4 +613,12 @@ def resolve_signal_training_plan(
                 f"Signal training plan resolution for Signal(kind={kind!r}) is not implemented yet."
             )
 
-    return SignalTrainingPlan(spaces=tuple(spaces), scope=scope)
+    input_space = None
+    if input_signal is not None:
+        if signal_kind(input_signal) != "activation":
+            raise NotImplementedError(
+                f"input_signal must be an activation signal, got kind={signal_kind(input_signal)!r}."
+            )
+        input_space = resolve_activation_signal_space(base_model, input_signal, input_scope)
+
+    return SignalTrainingPlan(spaces=tuple(spaces), scope=scope, input_space=input_space)
