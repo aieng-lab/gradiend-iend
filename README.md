@@ -1,8 +1,8 @@
 # GRADIEND
 
 [![PyPI](https://img.shields.io/pypi/v/gradiend.svg)](https://pypi.org/project/gradiend/)
+[![EMNLP 2026 Demos](https://img.shields.io/badge/EMNLP%202026-System%20Demonstrations-blue.svg)](https://aclanthology.org/2026.emnlp-demos.18/)
 [![arXiv:2609.32355](https://img.shields.io/badge/arXiv-2609.32355-blue.svg)](https://arxiv.org/abs/2609.32355)
-[![arXiv:2602.23993](https://img.shields.io/badge/arXiv-2602.23993-blue.svg)](https://arxiv.org/abs/2602.23993)
 [![arXiv:2502.01406](https://img.shields.io/badge/arXiv-2502.01406-blue.svg)](https://arxiv.org/abs/2502.01406)
 [![arXiv:2601.09313](https://img.shields.io/badge/arXiv-2601.09313-blue.svg)](https://arxiv.org/abs/2601.09313)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
@@ -10,10 +10,11 @@
 [![Tests](https://github.com/aieng-lab/gradiend/actions/workflows/tests.yml/badge.svg)](https://github.com/aieng-lab/gradiend/actions/workflows/tests.yml)
 [![Documentation](https://img.shields.io/badge/docs-github.io-blue.svg)](https://aieng-lab.github.io/gradiend/)
 
-GRADIEND (Gradient-based targeted feature learning within neural networks) learns features inside language models by training an encoder-decoder on gradients. Find where a model encodes a feature (e.g. gender, race) and rewrite the model to strengthen or weaken it—for example debias it—while keeping other behaviour. See [GRADIEND: Feature Learning within Neural Networks Exemplified through Biases](https://arxiv.org/abs/2502.01406) (introducing the GRADIEND method), and [The GRADIEND Python Package: An End-to-End System for Gradient-Based Feature Learning](https://arxiv.org/abs/2602.23993) (introducing this Python library).
+GRADIEND (Gradient-based targeted feature learning within neural networks) learns features inside language models by training an encoder-decoder on gradients. Find where a model encodes a feature (e.g. gender, race) and rewrite the model to strengthen or weaken it—for example debias it—while keeping other behaviour. See [GRADIEND: Feature Learning within Neural Networks Exemplified through Biases](https://arxiv.org/abs/2502.01406) (introducing the GRADIEND method), and [The GRADIEND Python Package: An End-to-End System for Gradient-Based Feature Learning](https://aclanthology.org/2026.emnlp-demos.18/) (EMNLP 2026 System Demonstrations; introducing this Python library).
 
 ![GRADIEND overview](docs/img/workflow-diagram.png)
 
+**Try it in Google Colab:** [Quickstart](https://colab.research.google.com/github/aieng-lab/gradiend/blob/main/gradiend/examples/demo/01_quickstart_english_pronouns.ipynb) · [Sentiment](https://colab.research.google.com/github/aieng-lab/gradiend/blob/main/gradiend/examples/demo/02_sentiment.ipynb) · [Compare features](https://colab.research.google.com/github/aieng-lab/gradiend/blob/main/gradiend/examples/demo/03_compare_features.ipynb) · [Learn your own feature](https://colab.research.google.com/github/aieng-lab/gradiend/blob/main/gradiend/examples/demo/04_learn_your_own_feature.ipynb)
 
 ## Installation
 
@@ -268,14 +269,22 @@ The IEND extension (this fork):
 
 The [Python package paper](https://arxiv.org/html/2602.23993):
 ```bibtex
-@misc{drechsel2026gradiendpythonpackage,
-      title={The {GRADIEND} Python Package: An End-to-End System for Gradient-Based Feature Learning}, 
-      author={Jonathan Drechsel and Steffen Herbold},
-      year={2026},
-      eprint={2602.23993},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2602.23993}, 
+@inproceedings{drechsel2026gradiendpythonpackage,
+    title = "The {GRADIEND} Python Package: An End-to-End System for Gradient-Based Feature Learning",
+    author = "Drechsel, Jonathan  and
+      Herbold, Steffen",
+    editor = "Agrawal, Sweta  and
+      Abad, Alberto",
+    booktitle = "Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing: System Demonstrations",
+    month = oct,
+    year = "2026",
+    address = "Budapest, Hungary",
+    publisher = "Association for Computational Linguistics",
+    url = "https://aclanthology.org/2026.emnlp-demos.18/",
+    doi = "10.18653/2026.emnlp-demos.18",
+    pages = "189--198",
+    ISBN = "979-8-89176-461-3",
+    abstract = "We present `gradiend{`}, an open-source Python package that operationalizes the GRADIEND method for learning feature directions from factual-counterfactual MLM and CLM gradients in language models. The package provides a unified workflow for feature-related data creation, training, evaluation, visualization, persistent model rewriting via controlled weight updates, and multi-feature comparison. We demonstrate `gradiend{`} through an English pronoun running example, a semantic sentiment use case that evaluates lexical generalization to held-out target words, and a large-scale feature comparison."
 }
 ```
 

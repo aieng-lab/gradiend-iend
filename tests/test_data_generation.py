@@ -754,6 +754,104 @@ class TestSplitByTarget:
         assert len(hate_splits) == 1
         assert apply_split_group_key(" AMAZING ", [str.strip, str.casefold]) == "amazing"
 
+    def test_split_by_target_unpaired_unified_has_zero_leakage_and_passes_coverage(self):
+        """Unpaired TextFilterConfigs with split_by_target=True have disjoint factual & alternative vocabularies across splits."""
+        texts = []
+        for word in ["apple", "apricot", "avocado"]:
+            texts.extend([f"I like {word} very much in the morning."] * 4)
+        for word in ["banana", "blueberry", "blackberry"]:
+            texts.extend([f"I like {word} very much in the morning."] * 4)
+
+        creator = TextPredictionDataCreator(
+            base_data=texts,
+            feature_targets=[
+                TextFilterConfig(id="A", targets=["apple", "apricot", "avocado"]),
+                TextFilterConfig(id="B", targets=["banana", "blueberry", "blackberry"]),
+            ],
+            min_left_context_words=0,
+            split_by_target=True,
+            seed=42,
+        )
+        data = creator.generate_training_data(
+            format="unified",
+            train_ratio=0.34,
+            val_ratio=0.33,
+            test_ratio=0.33,
+            min_rows_per_class_for_split=0,
+            # The fixture repeats one template per word: keep the repeats and the shared masked prompts.
+            deduplicate=False,
+            drop_ambiguous_masked=False,
+        )
+
+        from gradiend.trainer.core.unified_data import merged_to_unified
+        from gradiend.util.split_policy import validate_target_class_vocabulary_coverage
+
+        unified = merged_to_unified(data, pair=("A", "B"))
+
+        validate_target_class_vocabulary_coverage(
+            unified,
+            ["A", "B"],
+            train_ratio=0.34,
+            val_ratio=0.33,
+            test_ratio=0.33,
+            vocabulary_held_out=True,
+        )
+
+        splits = ("train", "validation", "test")
+        fact_by_split = {
+            s: set(unified.loc[unified["split"] == s, "factual"].str.lower()) for s in splits
+        }
+        alt_by_split = {
+            s: set(unified.loc[unified["split"] == s, "alternative"].str.lower()) for s in splits
+        }
+
+        for s in splits:
+            assert len(fact_by_split[s]) > 0
+            assert len(alt_by_split[s]) > 0
+
+        for i in range(len(splits)):
+            for j in range(i + 1, len(splits)):
+                s1, s2 = splits[i], splits[j]
+                assert len(fact_by_split[s1] & fact_by_split[s2]) == 0, f"Factual leakage between {s1} and {s2}"
+                assert len(alt_by_split[s1] & alt_by_split[s2]) == 0, f"Alternative leakage between {s1} and {s2}"
+
+    def test_max_size_per_target_caps_frequent_and_preserves_rare(self):
+        """max_size_per_target caps frequent targets without oversampling rare targets."""
+        texts = ["The cat sleeps on the mat."] * 10 + ["The dog barks at the mailman."] * 2
+        creator = TextPredictionDataCreator(
+            base_data=texts,
+            feature_targets=[TextFilterConfig(id="pet", targets=["cat", "dog"])],
+            min_left_context_words=0,
+            max_size_per_target=3,
+            seed=42,
+        )
+        res = creator.generate_training_data(
+            format="per_class", min_rows_per_class_for_split=0, train_ratio=1.0, val_ratio=0.0, test_ratio=0.0,
+            deduplicate=False,
+        )
+        df = res["pet"]
+        counts = df["label"].str.lower().value_counts().to_dict()
+        assert counts.get("cat") == 3
+        assert counts.get("dog") == 2
+
+        res_override = creator.generate_training_data(
+            format="per_class", max_size_per_target=1, min_rows_per_class_for_split=0, train_ratio=1.0, val_ratio=0.0, test_ratio=0.0,
+            deduplicate=False,
+        )
+        counts_override = res_override["pet"]["label"].str.lower().value_counts().to_dict()
+        assert counts_override.get("cat") == 1
+        assert counts_override.get("dog") == 1
+
+        with pytest.raises(ValueError, match="max_size_per_target must be >= 1"):
+            TextPredictionDataCreator(
+                base_data=texts,
+                feature_targets=[TextFilterConfig(id="pet", targets=["cat"])],
+                max_size_per_target=0,
+            )
+
+        with pytest.raises(ValueError, match="max_size_per_target must be >= 1"):
+            creator.generate_training_data(max_size_per_target=-5)
+
 
 def test_prediction_creator_deduplicates_before_cap_and_keeps_scanning():
     from gradiend import TextFilterConfig, TextPredictionDataCreator

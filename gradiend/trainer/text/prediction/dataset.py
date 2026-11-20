@@ -36,7 +36,17 @@ from gradiend.util.positions import (
     last_real_token_positions,
 )
 from gradiend.util.tokenization import offset_pairs, tokenize_with_offsets
-from gradiend.trainer.text.prediction.clm_alignment import align_clm_divergence, build_shared_prefix_item
+from gradiend.trainer.text.common.chat_format import (
+    raw_tokenizer,
+    require_first_differing_token_for_chat,
+    uses_chat_format,
+)
+from gradiend.trainer.text.prediction.clm_alignment import (
+    build_shared_prefix_item,
+    label_token_id,
+    label_token_ids,
+    resolve_clm_labels,
+)
 
 # Dataset-level cloze placeholder (matches TextFilterConfig.mask). Independent of
 # tokenizer.mask_token, which is an MLM model special and may be absent (e.g. GPT-2).
@@ -194,48 +204,40 @@ def _continuation_ids_from_prefix(tokenizer: Any, prefix: str, continuation: str
     return _ids_for_text(tokenizer, continuation)
 
 
-def decoder_only_label_token_ids(tokenizer: Any, label: Any) -> List[int]:
-    """Single source of truth: token ids that label a decoder-only prediction.
+def build_first_differing_token_item(
+    tokenizer: Any,
+    prefix: str,
+    label: Any,
+    alternative: Optional[Any],
+    *,
+    max_length: int,
+    pad_to_max_length: bool,
+) -> dict:
+    """Build the decoder-only item of ``label`` after ``prefix`` under ``label_token_protocol="first_differing_token"``.
 
-    The label is written onto the LAST prefix token (the template's trailing space)
-    and, because causal-LM loss shifts by one, predicted from the token before it.
-    The natural next token after a word boundary is the *leading-space* variant
-    (``▁she`` / ``Ġshe``), so that is the label: ``tokenizer(" " + label)``.
-    ``vocab[label]`` (``she``) is the mid-word variant and is only kept for
-    ``label_token_protocol="no_leading_space"``.
+    The one builder of these items: the training dataset and ``create_inputs`` both call it, for plain and for
+    chat (Instruct) tokenizers. With an ``alternative`` that differs from ``label`` the row is a contrast row: the
+    context is ``prefix`` plus the tokens ``label`` and ``alternative`` share, and the label is the first token where
+    they differ (unalignable pairs raise :class:`~gradiend.trainer.text.prediction.clm_alignment.ClmAlignmentError`).
+    Without one the row has nothing shared and the label is the first token of ``label`` after ``prefix``
+    (:func:`~gradiend.trainer.text.prediction.clm_alignment.label_token_ids`, the same rule as for a contrast row).
 
-    ``TextPredictionModelWithGradiend.create_inputs`` and the training dataset must
-    both call this; it returns all ids so callers can apply their own multi-token
-    policy (``create_inputs`` rejects them, the dataset uses the first).
+    Args:
+        tokenizer: Plain or chat tokenizer.
+        prefix: Text before the prediction slot.
+        label: Factual target word.
+        alternative: Alternative target word, or None for a row without contrast.
+        max_length: Maximum sequence length.
+        pad_to_max_length: Pad to ``max_length`` (training item) or return the unpadded sequence.
+
+    Returns:
+        Dict of ``(1, L)`` tensors ``input_ids``, ``attention_mask``, ``labels``.
     """
-    return list(tokenizer(f" {label}", add_special_tokens=False)["input_ids"])
+    shared_ids, label_id = resolve_clm_labels(tokenizer, prefix, label, alternative)
+    return build_shared_prefix_item(
+        tokenizer, prefix, shared_ids, label_id, max_length=max_length, pad_to_max_length=pad_to_max_length
+    )
 
-
-def training_label_token_id(tokenizer: Any, label: Any, protocol: str = "no_leading_space", *, vocab: Optional[Any] = None) -> int:
-    """The one token id a decoder-only *training* item supervises for ``label``.
-
-    ``protocol`` is ``TrainingArguments.label_token_protocol``:
-
-    - ``"first_differing_token"``: for a row without an alternative,
-      :func:`decoder_only_label_token_ids` (leading-space variant), first id for multi-token labels.
-      (Rows with an alternative are labelled by the divergence alignment, not by this function.)
-
-    - ``"no_leading_space"``: ``vocab[label]`` (else the first id of ``tokenizer(label)``), the
-      rule every artifact trained before 2026-09-25 used.
-
-    The dataset and single-row scorers (e.g. CGA detection) must both resolve the
-    label through this function so their gradients live in the same signal space.
-    """
-    if protocol == "first_differing_token":
-        return int(decoder_only_label_token_ids(tokenizer, label)[0])
-    if protocol != "no_leading_space":
-        raise ValueError(f"label_token_protocol must be one of {LABEL_TOKEN_PROTOCOLS}, got {protocol!r}")
-    label = str(label)
-    if vocab is None:
-        vocab = getattr(tokenizer, "vocab", None)
-    if vocab is not None and label in vocab:
-        return int(vocab[label])
-    return int(tokenizer(label, add_special_tokens=False)["input_ids"][0])
 
 
 def _find_subsequence(values: List[int], needle: List[int], start: int = 0) -> int:
@@ -698,7 +700,7 @@ def create_masked_pair_from_text(
 
     Args:
         text: Raw input text to create a masked example from.
-        tokenizer: Tokenizer for encoding and decoding.
+        tokenizer: Tokenizer for encoding and decoding (a chat tokenizer is used through its raw tokenizer).
         is_decoder_only_model: If True, uses prefix+placeholder mode; else uses MLM mask mode.
         excluded_tokens: Tokens to avoid masking (e.g., target class tokens).
         mask_token: The tokenizer's MLM special, used only to decide whether the
@@ -741,6 +743,10 @@ def create_masked_pair_from_text(
                 f"function."
             )
     excluded_tokens = excluded_tokens or []
+    # A chat tokenizer (Instruct model) chat-formats whatever it tokenizes. The masked target must come from
+    # the sentence itself, never from the system prompt or the chat headers, so the sentence is split with the
+    # raw tokenizer; the training item built from this pair is chat-formatted later, by the dataset.
+    tokenizer = raw_tokenizer(tokenizer)
     tokens = tokenizer.tokenize(text)
     if not tokens:
         return None
@@ -867,6 +873,9 @@ class TextBatchedDataset(TextBatchedDatasetBase):
         Args:
             text: Input text or template used for the prediction objective.
             target: Shared target string, or per-site sequence of targets.
+            alternative_target: The other side of the transition. Under
+                ``label_token_protocol="first_differing_token"`` a decoder-only row with a different
+                alternative is labelled at the first token where the two targets differ.
         """
         is_decoder_only_model = getattr(self, "is_decoder_only_model", False)
         prediction_objective = getattr(self, "prediction_objective", None)
@@ -978,21 +987,23 @@ class TextBatchedDataset(TextBatchedDatasetBase):
                 )
             # ``text`` is the CLM prefix (mask slot already removed upstream).
             protocol = getattr(self, "label_token_protocol", "no_leading_space")
-            if protocol == "first_differing_token" and alternative_target is not None and str(alternative_target) != str(target):
+            has_contrast = alternative_target is not None and str(alternative_target) != str(target)
+            if uses_chat_format(self.tokenizer) or (protocol == "first_differing_token" and has_contrast):
                 # (A row whose alternative is the very same string is a neutral identity transition: it has
-                # no contrast to align and keeps the plain leading-space label below.)
+                # no contrast to align and keeps the plain leading-space label below. A chat tokenizer
+                # (Instruct model) has only this rule: every row is built here, identity rows with nothing
+                # shared; the dataset constructor rejects any other label_token_protocol for it.)
                 # The label is the first token where factual and alternative differ, given the tokens
                 # they share as context (rows whose targets are unalignable raise ClmAlignmentError;
                 # the trainer's pre-training check applies ``clm_unalignable_rows`` before this point).
                 prefix = text.split(mask_placeholder)[0] if mask_placeholder in text else text
-                div = align_clm_divergence(self.tokenizer, prefix, str(target), str(alternative_target))
-                item = build_shared_prefix_item(
-                    self.tokenizer, prefix, div.shared_ids, div.factual_id,
+                item = build_first_differing_token_item(
+                    self.tokenizer, prefix, target, alternative_target,
                     max_length=self.max_length, pad_to_max_length=True,
                 )
                 return {k: v.squeeze(0) for k, v in item.items()}
-            target_idx = training_label_token_id(self.tokenizer, target, protocol, vocab=self._vocab_ids)
-            expanded_text = text
+            expanded_text = text.split(mask_placeholder)[0] if mask_placeholder in text else text
+            target_idx = label_token_id(self.tokenizer, expanded_text, target, protocol, vocab=self._vocab_ids)
             with suppress_tokenizer_length_warning():
                 encoded = self.tokenizer(expanded_text, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=self.max_length, padding="max_length")
             input_ids = encoded["input_ids"]
@@ -1092,16 +1103,19 @@ class TextTrainingDataset(TextBatchedDataset):
         rhs_window: int = -1,
         mlm_head_target_labels: Optional[List[str]] = None,
         mask_placeholder: str = DEFAULT_DATASET_MASK_PLACEHOLDER,
-        label_token_protocol: str = "no_leading_space",
+        *,
+        label_token_protocol: str,
     ):
         """Initialize the training dataset.
 
         Args:
-            label_token_protocol: ``"first_differing_token"`` labels decoder-only items with the first
-                token where factual and alternative differ (leading-space token for rows without
-                alternative, see :func:`decoder_only_label_token_ids`); ``"no_leading_space"`` (default
-                here, so direct callers are unchanged) uses ``vocab[label]``. The trainer passes
-                ``TrainingArguments.label_token_protocol``.
+            label_token_protocol: Required, no default (a forgotten value would silently label under the wrong
+                rule). ``"first_differing_token"`` labels decoder-only items with the first
+                token where factual and alternative differ (for rows without alternative the token the label
+                is after the prefix, see :func:`~gradiend.trainer.text.prediction.clm_alignment.label_token_ids`);
+                ``"no_leading_space"`` uses ``vocab[label]``. The trainer passes
+                ``TrainingArguments.label_token_protocol``. A chat tokenizer (Instruct model) supports only
+                ``"first_differing_token"``; any other value raises a ``ValueError``.
             data: DataFrame with masked, factual, alternative columns (unified schema).
             tokenizer: Tokenizer for encoding.
             batch_size: Batch size.
@@ -1139,6 +1153,7 @@ class TextTrainingDataset(TextBatchedDataset):
             raise ValueError(
                 f"label_token_protocol must be one of {LABEL_TOKEN_PROTOCOLS}, got {label_token_protocol!r}"
             )
+        require_first_differing_token_for_chat(tokenizer, label_token_protocol)
         self.label_token_protocol = label_token_protocol
         validate_masked_templates_in_dataframe(
             self.data,

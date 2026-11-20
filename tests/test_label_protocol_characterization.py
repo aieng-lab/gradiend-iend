@@ -1,15 +1,19 @@
 """Characterization tests for ``label_token_protocol`` on decoder-only models.
 
-Expected values were computed on main (97af0f48), before CLM divergence supervision existed, and are
-hard-coded.
+Expected values are the ones of gradiend 0.2.5 (before CLM divergence supervision existed) and are hard-coded.
 
-- ``"no_leading_space"`` must reproduce main byte-for-byte: training items, ``create_inputs``, row-wise
-  evaluation, and no alignment check.
-- ``"first_differing_token"`` now labels the first token where factual and alternative differ. For rows whose first
-  tokens already differ and whose target follows whitespace this is main's label (and main's
-  evaluation); the items differ only in the input id AT the label position, which no prediction reads.
-  Shared-prefix rows and rows whose target does not follow whitespace change by design; their old
-  (main) and new values are pinned separately.
+- ``"no_leading_space"`` must reproduce 0.2.5 byte-for-byte: training items, ``create_inputs``, and no
+  alignment check.
+- ``"first_differing_token"`` labels the first token where factual and alternative differ. For rows whose first
+  tokens already differ and whose target follows whitespace this is the leading-space label; the items differ
+  from 0.2.5 only in the input id AT the label position, which no prediction reads. Shared-prefix rows and
+  rows whose target does not follow whitespace change by design; they are pinned in
+  ``test_first_differing_token_changes.py``.
+
+Row-wise evaluation of rows WITHOUT a shared prefix is not pinned to numbers: 0.2.5 resolves the target word to
+a token id by iterating ``tokenizer.get_vocab()``, whose order is random for a fast tokenizer, so the same row
+scores differently from call to call. These rows keep that scorer under both protocols, which the
+row-wise test below checks with a fixed vocabulary order.
 """
 
 import pandas as pd
@@ -35,7 +39,8 @@ ROWS = {
     "empty_prefix": ("[MASK] is nice", "good", "bad"),
 }
 
-# (protocol, row) -> (real tokens, label position, factual label id, alternative label id), as on main
+# (protocol, row) -> (real tokens, label position, factual label id, alternative label id), as in 0.2.5
+# (for first_differing_token: the leading-space label)
 MAIN_ITEMS = {
     ("no_leading_space", "k0"): ([1135, 2497, 262, 220], 3, 49903, 8043),
     ("no_leading_space", "k0_no_trailing_space"): ([1135, 2497, 262], 2, 49903, 8043),
@@ -81,7 +86,7 @@ def _items(tok, protocol, row):
     return ds[0]
 
 
-def _expected_main(protocol, row, side):
+def _expected_items(protocol, row, side):
     real, pos, f_label, a_label = MAIN_ITEMS[(protocol, row)]
     ids = real + [PAD] * (MAX_LEN - len(real))
     mask = [1] * len(real) + [0] * (MAX_LEN - len(real))
@@ -93,22 +98,22 @@ def _expected_main(protocol, row, side):
 # ----------------------------------------------------------------------------- training items
 
 @pytest.mark.parametrize("row", sorted(ROWS))
-def test_legacy_items_are_byte_identical_to_main(tok, row):
+def test_no_leading_space_items_are_byte_identical_to_0_2_5(tok, row):
     item = _items(tok, "no_leading_space", row)
     for side in ("factual", "alternative"):
-        ids, mask, labels, _ = _expected_main("no_leading_space", row, side)
+        ids, mask, labels, _ = _expected_items("no_leading_space", row, side)
         assert item[side]["input_ids"].tolist() == ids
         assert item[side]["attention_mask"].tolist() == mask
         assert item[side]["labels"].tolist() == labels
 
 
 @pytest.mark.parametrize("row", ["k0", "identical"])
-def test_canonical_items_equal_main_for_first_token_differing_rows(tok, row):
+def test_first_differing_token_items_equal_the_leading_space_items_for_first_token_differing_rows(tok, row):
     """Same label, same mask; the input id AT the label position (never read by any prediction) is the
-    slot token instead of main's trailing-space token."""
+    slot token instead of the trailing-space token of 0.2.5."""
     item = _items(tok, "first_differing_token", row)
     for side in ("factual", "alternative"):
-        ids, mask, labels, pos = _expected_main("first_differing_token", row, side)
+        ids, mask, labels, pos = _expected_items("first_differing_token", row, side)
         got = item[side]
         assert got["labels"].tolist() == labels
         assert got["attention_mask"].tolist() == mask
@@ -116,11 +121,11 @@ def test_canonical_items_equal_main_for_first_token_differing_rows(tok, row):
         assert got_ids[:pos] + got_ids[pos + 1:] == ids[:pos] + ids[pos + 1:]
 
 
-def test_canonical_k0_loss_and_gradient_equal_main_item(tok, tiny_model):
+def test_first_differing_token_k0_loss_and_gradient_equal_the_0_2_5_input(tok, tiny_model):
     """The changed input id at the label position does not change the loss or the gradient."""
     item = _items(tok, "first_differing_token", "k0")["factual"]
-    main_ids = item["input_ids"].clone()
-    main_ids[3] = 220  # main's trailing-space token at the label position
+    old_ids = item["input_ids"].clone()
+    old_ids[3] = 220  # the trailing-space token 0.2.5 had at the label position
 
     def loss(ids):
         tiny_model.zero_grad(set_to_none=True)
@@ -131,9 +136,9 @@ def test_canonical_k0_loss_and_gradient_equal_main_item(tok, tiny_model):
         return out.loss.item(), tiny_model.lm_head.weight.grad.clone()
 
     l_new, g_new = loss(item["input_ids"])
-    l_main, g_main = loss(main_ids)
-    assert l_new == l_main
-    assert torch.equal(g_new, g_main)
+    l_old, g_old = loss(old_ids)
+    assert l_new == l_old
+    assert torch.equal(g_new, g_old)
 
 
 # ----------------------------------------------------------------------------- create_inputs
@@ -158,6 +163,11 @@ def test_create_inputs_without_alternative_is_unchanged(wrapper, protocol, text,
         wrapper.label_token_protocol = protocol
     item = wrapper.create_inputs(text, label)
     ids, label_id = EXPECTED_CREATE_INPUTS[(text, label)]
+    if text.endswith("is[MASK]") and protocol != "no_leading_space":
+        # Deliberate change of first_differing_token: the mask is glued to the previous word ("The word is[MASK]"),
+        # so the word really has no leading space. 0.2.5 create_inputs used the leading-space token (922) here while
+        # its training used the literal one; both paths now agree on the literal token (11274, "good").
+        label_id = 11274
     assert item["input_ids"].tolist() == [ids]
     assert item["attention_mask"].tolist() == [[1] * len(ids)]
     assert item["labels"].tolist() == [[-100] * (len(ids) - 1) + [label_id]]
@@ -173,26 +183,6 @@ def test_create_inputs_rejects_multi_token_label(wrapper, protocol):
 
 # ----------------------------------------------------------------------------- row-wise evaluation
 
-# row -> (P_factual, P_alternative) of the seeded tiny model on main; the empty-prefix row is skipped
-EXPECTED_EVAL = {
-    "k0": (5.708002936444245e-05, 9.01132807484828e-05),
-    "k_gt0": (4.751824599225074e-05, 4.751824599225074e-05),
-    "prefix_overlap": (5.234353739069775e-05, 3.408146585570648e-05),
-    "identical": (7.654204819118604e-05, 7.654204819118604e-05),
-    "plain": (9.893087553791702e-05, 9.955378482118249e-05),
-}
-EVAL_KEYS = ["k0", "k_gt0", "prefix_overlap", "identical", "plain"]
-
-
-def _row_wise(model, tok, df, protocol=None, **kw):
-    """Main's row-wise eval has no protocol argument (it always scores the first token of ' ' + word)."""
-    import inspect
-
-    if protocol is not None and "label_token_protocol" in inspect.signature(compute_probability_shift_score_row_wise).parameters:
-        kw["label_token_protocol"] = protocol
-    return compute_probability_shift_score_row_wise(model, tok, df, return_per_row_df=True, **kw)
-
-
 def _eval_frame(rows):
     return pd.DataFrame([
         {"factual_id": "A", "alternative_id": "B", "masked": m, "factual": f, "alternative": a}
@@ -200,27 +190,37 @@ def _eval_frame(rows):
     ])
 
 
-def test_legacy_and_unspecified_row_wise_eval_is_byte_identical_to_main(tok, tiny_model):
-    rows = [ROWS["k0"], ROWS["k_gt0"], ROWS["prefix_overlap"], ROWS["identical"], ROWS["empty_prefix"],
-            ("The review was [MASK]", "good", "bad")]
-    df = _eval_frame(rows)
-    for protocol in ("no_leading_space",):
-        _, per_row = _row_wise(tiny_model, tok, df, protocol)
-        assert len(per_row) == 5
-        for (_, rec), key in zip(per_row.iterrows(), EVAL_KEYS):
-            p_f, p_a = EXPECTED_EVAL[key]
-            assert rec["P_factual"] == pytest.approx(p_f, rel=1e-3)
-            assert rec["P_alternative"] == pytest.approx(p_a, rel=1e-3)
+@pytest.fixture
+def fixed_vocab_order(monkeypatch):
+    """0.2.5 resolves a target word through ``tokenizer.get_vocab()``, whose order is random for a fast tokenizer.
+
+    A fixed order makes that scorer repeatable, so the two protocols can be compared on the rows that use it.
+    """
+    from collections import defaultdict
+
+    from gradiend.trainer.text.prediction import decoder_eval_utils
+
+    def ordered(tokenizer):
+        norm_map = defaultdict(list)
+        for token, _ in sorted(tokenizer.get_vocab().items(), key=lambda item: item[1]):
+            norm_map[decoder_eval_utils._normalize_token_string(token)].append(token)
+        return norm_map
+
+    monkeypatch.setattr(decoder_eval_utils, "_build_vocab_norm_map", ordered)
 
 
-def test_canonical_row_wise_eval_equals_main_for_first_token_differing_rows(tok, tiny_model):
+def test_row_wise_eval_of_rows_without_a_shared_prefix_is_the_same_under_both_protocols(tok, tiny_model, fixed_vocab_order):
+    """Only shared-prefix and unalignable rows are scored differently by first_differing_token; the rest keeps the 0.2.5 scorer."""
     df = _eval_frame([ROWS["k0"], ("The review was [MASK]", "good", "bad"), ROWS["empty_prefix"]])
-    _, per_row = _row_wise(tiny_model, tok, df, "first_differing_token")
-    assert len(per_row) == 2
-    for (_, rec), key in zip(per_row.iterrows(), ["k0", "plain"]):
-        p_f, p_a = EXPECTED_EVAL[key]
-        assert rec["P_factual"] == pytest.approx(p_f, rel=1e-3)
-        assert rec["P_alternative"] == pytest.approx(p_a, rel=1e-3)
+    results = {
+        protocol: compute_probability_shift_score_row_wise(
+            tiny_model, tok, df, return_per_row_df=True, label_token_protocol=protocol
+        )[1]
+        for protocol in ("no_leading_space", "first_differing_token")
+    }
+    assert len(results["no_leading_space"]) == len(results["first_differing_token"]) == 2  # empty prefix: no row
+    for column in ("P_factual", "P_alternative"):
+        assert results["first_differing_token"][column].tolist() == results["no_leading_space"][column].tolist()
 
 
 # ----------------------------------------------------------------------------- trainer pre-training check
@@ -244,16 +244,16 @@ def _trainer(tok, tiny_model, **args):
     return TextPredictionTrainer(model=tiny_model, config=cfg, training_args=TrainingArguments(**args))
 
 
-def test_legacy_trainer_keeps_unalignable_rows_and_runs_no_alignment_check(tok, tiny_model):
+def test_no_leading_space_trainer_keeps_unalignable_rows_and_runs_no_alignment_check(tok, tiny_model):
     assert len(_trainer(tok, tiny_model, label_token_protocol="no_leading_space").create_training_data(tok)) == 2
 
 
 
 
-# ----------------------------------------------------------------------------- Qwen2.5 tokenizer (main values)
+# ----------------------------------------------------------------------------- Qwen2.5 tokenizer (0.2.5 values)
 
 QWEN_PAD = 151643
-# (protocol, row) -> (real tokens, label position, factual label id, alternative label id), as on main
+# (protocol, row) -> (real tokens, label position, factual label id, alternative label id), as in 0.2.5
 QWEN_MAIN_ITEMS = {
     ("no_leading_space", "k0"): ([1654, 5485, 279, 220], 3, 47339, 3423),
     ("no_leading_space", "k0_no_trailing_space"): ([1654, 5485, 279], 2, 47339, 3423),
@@ -279,7 +279,7 @@ def qwen_tok():
 
 
 @pytest.mark.parametrize("key", sorted(QWEN_MAIN_ITEMS))
-def test_qwen_items_match_main(qwen_tok, key):
+def test_qwen_items_match_0_2_5(qwen_tok, key):
     protocol, row = key
     item = _items(qwen_tok, protocol, row)
     real, pos, f_label, a_label = QWEN_MAIN_ITEMS[key]
@@ -291,20 +291,20 @@ def test_qwen_items_match_main(qwen_tok, key):
         assert got["labels"].tolist() == expected
         ids = got["input_ids"].tolist()
         want = real + [QWEN_PAD] * (MAX_LEN - len(real))
-        # canonical: the input id AT the label position is never read, so it may differ (slot token)
+        # first_differing_token: the input id AT the label position is never read, so it may differ (slot token)
         assert ids == want if protocol == "no_leading_space" else ids[:pos] + ids[pos + 1:] == want[:pos] + want[pos + 1:]
 
 
 # ----------------------------------------------------------------------------- old names via saved settings
 
 @pytest.mark.parametrize("row", sorted(ROWS))
-def test_settings_saved_with_the_legacy_name_reproduce_main(tok, row):
+def test_settings_saved_with_the_legacy_name_reproduce_0_2_5(tok, row):
     from gradiend import TrainingArguments
 
     protocol = TrainingArguments.from_dict({"label_token_protocol": "legacy"}).label_token_protocol
     assert protocol == "no_leading_space"
     item = _items(tok, protocol, row)
     for side in ("factual", "alternative"):
-        ids, mask, labels, _ = _expected_main("no_leading_space", row, side)
+        ids, mask, labels, _ = _expected_items("no_leading_space", row, side)
         assert item[side]["input_ids"].tolist() == ids
         assert item[side]["labels"].tolist() == labels

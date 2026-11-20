@@ -875,6 +875,39 @@ class TestAntiAlignedEncoder:
         assert LRSearchResult.from_dict({"status": "converged", "best_lr": 1e-5, "probes": [old]}).probes[0].orientation == 1
 
 
+class TestOrientationOfRerunProbes:
+    """A probe is reported in the orientation of the run whose scores it carries: the confirmation or the full-length re-run."""
+
+    SLOW_RISING = TestRefineAndFullLengthSlow.SLOW_RISING
+    DEGRADING = TestRefineAndFullLengthSlow.DEGRADING
+
+    @staticmethod
+    def _anti_aligned(result):
+        result.orientation = -1
+        return result
+
+    def test_failed_confirmation_run_replaces_the_orientation_of_the_probe(self):
+        res = LRSearch(
+            lambda lr: _result(*GOOD, converged=True),
+            1e-6,
+            confirm=lambda lr: self._anti_aligned(_result(*self.SLOW_RISING)),
+            max_probes=1,
+        ).search()
+        first = res.probes[0]
+        assert first.confirmed is False and "confirmation run was slow" in first.note
+        assert first.orientation == -1
+
+    def test_full_length_rerun_of_a_slow_probe_replaces_its_orientation(self):
+        def run(lr):
+            return _result(*(self.SLOW_RISING if lr <= 1e-6 else self.DEGRADING))
+
+        res = LRSearch(run, 1e-6, confirm=lambda lr: self._anti_aligned(_result(*self.SLOW_RISING))).search()
+        slow = next(p for p in res.probes if p.lr == pytest.approx(1e-6))
+        assert "full budget: slow" in slow.note
+        assert slow.orientation == -1
+        assert all(p.orientation == 1 for p in res.probes if p is not slow)
+
+
 class TestProbeLogging:
     @staticmethod
     def _logging_fake(tmp_path):

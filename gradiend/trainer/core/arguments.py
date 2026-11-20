@@ -4,6 +4,8 @@ Training arguments for GRADIEND Trainer (HF-like API).
 
 import dataclasses
 import warnings
+import datetime
+import re
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Callable, Union, Any, List, Dict
 
@@ -28,14 +30,18 @@ from gradiend.gradiend_split import GradiendSplit, coerce_gradiend_split
 
 
 def dtype_to_name(dtype: torch.dtype) -> str:
-    """Serialize a torch dtype as its bare name ("bfloat16", not "torch.bfloat16").
+    """Serialize a torch dtype as its bare name (``"bfloat16"``, not ``"torch.bfloat16"``).
 
-    ``str(torch.bfloat16)`` returns ``"torch.bfloat16"``, which no longer
-    resolves through ``getattr(torch, name)``.  Writing the prefixed form and
-    reading it back silently produced ``float32``, so a configured
-    ``torch_dtype=bfloat16`` was lost on every ``to_dict()``/``from_dict()``
-    round trip -- and :class:`TextPredictionTrainer` round-trips its arguments
-    on construction, so no trainer ever saw the requested dtype.
+    ``str(torch.bfloat16)`` is ``"torch.bfloat16"``, and ``getattr(torch, "torch.bfloat16")`` finds nothing.
+    Releases up to 0.2.5 wrote that prefixed form and read it back with ``getattr(torch, name, torch.float32)``,
+    so a configured ``torch_dtype`` such as ``bfloat16`` was reset to ``float32`` whenever
+    :class:`TrainingArguments` went through ``to_dict()`` and ``from_dict()``.
+
+    Args:
+        dtype: The dtype to serialize.
+
+    Raises:
+        TypeError: If ``dtype`` is not a ``torch.dtype``.
     """
     if not isinstance(dtype, torch.dtype):
         raise TypeError(f"dtype_to_name expects a torch.dtype, got {type(dtype).__name__}")
@@ -43,12 +49,18 @@ def dtype_to_name(dtype: torch.dtype) -> str:
 
 
 def dtype_from_name(name: Any) -> torch.dtype:
-    """Resolve a serialized dtype name back to the torch dtype.
+    """Resolve a serialized dtype name to the torch dtype.
 
-    Accepts both the bare name and the legacy ``"torch."``-prefixed form so
-    configs and caches written before :func:`dtype_to_name` still load.  An
-    unknown name raises instead of falling back to ``float32``: a silent
-    fallback is what hid the round-trip loss described above.
+    Both the bare name (``"bfloat16"``) and the ``"torch."``-prefixed form written by 0.2.5 and earlier are read,
+    so saved records still load. An unknown name raises: falling back to ``float32`` is what hid the loss
+    described in :func:`dtype_to_name`.
+
+    Args:
+        name: A dtype name, or a ``torch.dtype`` (returned as it is).
+
+    Raises:
+        TypeError: If ``name`` is neither a string nor a ``torch.dtype``.
+        ValueError: If ``name`` does not name a torch dtype.
     """
     if isinstance(name, torch.dtype):
         return name
@@ -62,6 +74,26 @@ def dtype_from_name(name: Any) -> torch.dtype:
 
 LABEL_TOKEN_PROTOCOLS = ("first_differing_token", "no_leading_space")
 """Valid values of :attr:`TrainingArguments.label_token_protocol`."""
+
+
+def parse_chat_template_date(value: Any) -> datetime.date:
+    """Parse :attr:`TrainingArguments.chat_template_date`: an ISO date ``YYYY-MM-DD``.
+
+    The date is checked with :meth:`datetime.date.fromisoformat`. The shape is checked as well, because newer
+    Python versions also accept other ISO forms (``20240726``) that older ones reject.
+
+    Args:
+        value: The date as a string.
+
+    Raises:
+        ValueError: If ``value`` is not a string of the form ``YYYY-MM-DD`` that names a real date.
+    """
+    if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        try:
+            return datetime.date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise ValueError(f"chat_template_date must be an ISO date 'YYYY-MM-DD' (e.g. '2024-07-26'), got {value!r}")
 
 
 @dataclass
@@ -309,13 +341,34 @@ class TrainingArguments:
     leading-space rule. Rows that cannot be aligned (identical targets, or one a token-prefix of the
     other) follow :attr:`clm_unalignable_rows`.
 
-    ``"no_leading_space"``: the rule used before 2026-09-25, ``vocab[label]`` (the no-space variant
+    ``"no_leading_space"``: the rule of gradiend 0.2.5 and earlier, ``vocab[label]`` (the no-space variant
     ``she``, else the first id of ``tokenizer(label)``). No alignment, no pre-training check. It exists
-    only to reproduce models trained before that date.
+    only to reproduce models trained with those releases.
 
     Settings saved with the old names ``canonical`` / ``legacy`` still load (:meth:`from_dict`), and a
     saved dict without this key loads as ``"no_leading_space"``, so trained artifacts are never
     silently re-interpreted."""
+
+    instruction_model: Optional[bool] = None
+    """Whether the model is an instruction-tuned ("Instruct") model, whose rows are chat prompts.
+
+    ``None`` (default): decided by the model name. The base name (the last path component, for a hub id the part
+    after the organisation) split at non-alphanumeric characters must contain one of the words ``instruct``,
+    ``chat`` or ``it`` (case-insensitive), e.g. ``Qwen2.5-1.5B-Instruct``, ``gemma-2-2b-it``,
+    ``Llama-2-7b-chat-hf``. ``True``: chat-format the model whatever its name. ``False``: read plain text even if the
+    name matches. The decision in force (always ``True`` or ``False``, also for a plain model) is stored with the
+    trained model, and a loaded model keeps it, whatever the name rule says later. A model saved before the
+    decision was stored was trained under the old rule, so it is decided by that rule: ``"instruct"`` anywhere in
+    the name (any case)."""
+
+    chat_template_date: Optional[str] = None
+    """Fixed date (ISO ``YYYY-MM-DD``) for chat templates that write the current date into the prompt (Llama 3.1 and
+    later, gpt-oss). The template never reads the system clock, because the training rows would change with the day
+    they are built. ``None`` (default) uses ``gradiend.trainer.text.common.chat_format.DEFAULT_CHAT_TEMPLATE_DATE``,
+    the date Llama's own templates fall back to. A template that does not ask for the date ignores it. When a
+    template does ask for it, the trainer stores the date actually used here (also when it was the default), the
+    record of a trained model keeps it, and a loaded model uses it, so changing the default later never changes an
+    existing model."""
 
     prediction_objective: str = "auto"
     """Prediction objective for text-gradient training and decoder probability scoring.
@@ -674,6 +727,10 @@ class TrainingArguments:
             raise ValueError(
                 f"label_token_protocol must be one of {LABEL_TOKEN_PROTOCOLS}, got {self.label_token_protocol!r}"
             )
+        if self.instruction_model is not None and not isinstance(self.instruction_model, bool):
+            raise TypeError(f"instruction_model must be True, False or None, got {self.instruction_model!r}")
+        if self.chat_template_date is not None:
+            parse_chat_template_date(self.chat_template_date)
         if self.learning_rate_decoder == "default":
             # Signal-kind-aware default: 'auto' only for pure activation signals (see the
             # field documentation); explicit 'auto'/None/float bypass this.
@@ -971,10 +1028,6 @@ class TrainingArguments:
             if callable(v):
                 continue
             if isinstance(v, torch.dtype):
-                # ``str(torch.bfloat16)`` is "torch.bfloat16"; ``from_dict``
-                # resolves the name via ``getattr(torch, name)``, which cannot
-                # see through that prefix.  Serialize the bare name so the
-                # round-trip is lossless (see ``dtype_from_name``).
                 result[k] = dtype_to_name(v)
             elif isinstance(v, nn.Module):
                 result[k] = str(v) if v is not None else None
@@ -1002,7 +1055,12 @@ class TrainingArguments:
 
     @classmethod
     def from_dict(cls, d: dict) -> "TrainingArguments":
-        """Create from dict (e.g. loaded from JSON). Canonical keys only."""
+        """Read a serialized record (e.g. loaded from JSON). Canonical keys only.
+
+        A key missing from the record was written before that key existed and takes the value of those releases:
+        a record without ``label_token_protocol`` loads as ``"no_leading_space"``. This reads records; it is not
+        how arguments are built from user input (use ``TrainingArguments(...)``, whose defaults are the current ones).
+        """
         d = dict(d)
         # A serialized dict without the key was written before the protocol existed:
         # it must keep the old label convention, not silently pick up the new default.
@@ -1032,6 +1090,21 @@ class TrainingArguments:
         if "lr_search_config" in d and isinstance(d.get("lr_search_config"), dict):
             d["lr_search_config"] = LRSearchConfig(**d["lr_search_config"])
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+    def _with_overrides(self, overrides: Dict[str, Any]) -> "TrainingArguments":
+        """A copy of these arguments with ``overrides`` applied; keys that are not fields are ignored.
+
+        This is how user-supplied keyword arguments are merged into arguments (``Trainer.train(**overrides)``,
+        ``gradiend.trainer.core.train(**kwargs)``). Every field that is not overridden keeps this instance's value,
+        so a default is the current default; :meth:`from_dict` alone would read a missing key as an old record.
+        """
+        base = self.to_dict()
+        # ``signal`` and ``signals`` are alternatives: overriding one drops the stored other.
+        if "signal" in overrides and "signals" not in overrides:
+            base["signals"] = None
+        if "signals" in overrides and "signal" not in overrides:
+            base["signal"] = None
+        return type(self).from_dict({**base, **overrides})
 
     def get(self, key: str, default: Any = None) -> Any:
         """Dict-like get method."""

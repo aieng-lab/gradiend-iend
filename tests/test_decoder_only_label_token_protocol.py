@@ -4,7 +4,8 @@ The dataset used ``vocab[label]`` (``she``, the mid-word token) while
 ``create_inputs`` used ``tokenizer(" " + label)`` (``▁she``). The label sits on the
 last prefix token and is predicted from the token before it, so the leading-space
 variant is the natural one. ``label_token_protocol`` selects the rule per run:
-``canonical`` (new runs) or ``legacy`` (everything already trained).
+``first_differing_token`` (new runs) or ``no_leading_space`` (the rule of everything
+trained with gradiend 0.2.5 or earlier).
 """
 
 from types import SimpleNamespace
@@ -13,10 +14,8 @@ import pandas as pd
 import pytest
 
 from gradiend.trainer.core.arguments import TrainingArguments
-from gradiend.trainer.text.prediction.dataset import (
-    TextTrainingDataset,
-    decoder_only_label_token_ids,
-)
+from gradiend.trainer.text.prediction.clm_alignment import label_token_id, label_token_ids
+from gradiend.trainer.text.prediction.dataset import TextTrainingDataset
 from gradiend.trainer.text.prediction.trainer import TextPredictionTrainer
 from tests.testing_mocks import MockTokenizer
 
@@ -30,8 +29,12 @@ class SpaceVariantTokenizer(MockTokenizer):
         self.vocab["▁she"] = 501    # leading-space variant
 
     def __call__(self, text, *args, **kwargs):
-        if kwargs.get("add_special_tokens") is False and isinstance(text, str) and text.startswith(" "):
-            return {"input_ids": [self.vocab["▁" + text.strip()]]}
+        if kwargs.get("add_special_tokens") is False and isinstance(text, str):
+            ids = []
+            for i, word in enumerate(text.split()):
+                spaced = i > 0 or text.startswith(" ")
+                ids.append(self.vocab["▁" + word] if spaced and "▁" + word in self.vocab else self.vocab.get(word, 0))
+            return {"input_ids": ids}
         return super().__call__(text, *args, **kwargs)
 
 
@@ -62,20 +65,21 @@ def _labelled_id(dataset):
 
 def test_helper_returns_the_leading_space_variant():
     tok = SpaceVariantTokenizer()
-    assert decoder_only_label_token_ids(tok, "she") == [tok.vocab["▁she"]]
+    assert label_token_ids(tok, "token_5 token_6 ", "she") == [tok.vocab["▁she"]]
 
 
-def test_canonical_protocol_labels_with_the_leading_space_token():
+def test_first_differing_token_protocol_labels_with_the_leading_space_token():
     assert _labelled_id(_dataset("first_differing_token")) == 501
 
 
-def test_legacy_protocol_keeps_the_old_vocab_label():
+def test_no_leading_space_protocol_keeps_the_old_vocab_label():
     assert _labelled_id(_dataset("no_leading_space")) == 500
 
 
-def test_direct_dataset_construction_defaults_to_no_leading_space():
-    """Callers that never heard of the protocol must not change behaviour."""
-    assert _labelled_id(_dataset(None)) == 500
+def test_direct_dataset_construction_requires_the_protocol():
+    """No silent default: a caller that forgets the rule must fail, not label under the wrong one."""
+    with pytest.raises(TypeError, match="label_token_protocol"):
+        _dataset(None)
 
 
 def test_dataset_rejects_unknown_protocol():
@@ -83,11 +87,11 @@ def test_dataset_rejects_unknown_protocol():
         _dataset("bogus")
 
 
-def test_new_training_arguments_default_to_canonical():
+def test_new_training_arguments_default_to_first_differing_token():
     assert TrainingArguments().label_token_protocol == "first_differing_token"
 
 
-def test_serialized_arguments_without_the_key_stay_legacy():
+def test_serialized_arguments_without_the_key_load_as_no_leading_space():
     """A checkpoint written before the protocol existed must not be re-interpreted."""
     payload = TrainingArguments().to_dict()
     payload.pop("label_token_protocol")
@@ -141,13 +145,11 @@ def test_every_model_a_trainer_creates_is_stamped_with_its_protocol():
 
 
 def test_training_label_token_id_matches_the_dataset_for_both_protocols():
-    from gradiend.trainer.text.prediction.dataset import training_label_token_id
-
     tok = SpaceVariantTokenizer()
-    assert training_label_token_id(tok, "she", "first_differing_token") == 501
-    assert training_label_token_id(tok, "she", "no_leading_space") == 500
+    assert label_token_id(tok, "token_5 token_6 ", "she", "first_differing_token") == 501
+    assert label_token_id(tok, "token_5 token_6 ", "she", "no_leading_space") == 500
     with pytest.raises(ValueError, match="label_token_protocol"):
-        training_label_token_id(tok, "she", "bogus")
+        label_token_id(tok, "token_5 token_6 ", "she", "bogus")
 
 
 @pytest.mark.parametrize("old,new", [("canonical", "first_differing_token"), ("legacy", "no_leading_space")])

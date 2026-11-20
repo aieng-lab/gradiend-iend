@@ -41,6 +41,7 @@ from gradiend.trainer.config import TrainerConfig
 from gradiend.trainer.core.arguments import TrainingArguments
 from gradiend.trainer.core.config import GRADIENT_DATASET_KWARG_UNSET
 from gradiend.model import ModelWithGradiend
+from gradiend.model.model_with_gradiend import checkpoint_base_model_id
 from gradiend.trainer.text.prediction.dataset import (
     TextActivationTrainingDataset,
     TextPairedSignalTrainingDataset,
@@ -72,6 +73,12 @@ from gradiend.trainer.core.unified_data import (
     RAW_ALTERNATIVE_CLASS,
     transition_id,
 )
+from gradiend.trainer.text.common.chat_format import (
+    configure_chat_tokenizer,
+    require_first_differing_token_for_chat,
+    uses_chat_format,
+)
+from gradiend.trainer.text.common.model_base import recorded_training_args
 from gradiend.trainer.text.prediction.model_with_gradiend import TextPredictionModelWithGradiend
 from gradiend.trainer.text.prediction.decoder_only_mlm import load_decoder_mlm_head_meta, train_mlm_head
 from gradiend.util.logging import get_logger
@@ -511,41 +518,116 @@ class TextPredictionTrainer(Trainer):
     def _prediction_objective(self, model_or_tokenizer: Any = None):
         return resolve_prediction_objective(self, model_or_tokenizer)
 
-    def _tokenizer_for_clm_audit(self) -> Optional[Any]:
-        """Tokenizer available before training starts: the trainer's, the model object's, or one loaded from a hub id."""
-        tokenizer = getattr(self, "tokenizer", None)
-        if tokenizer is not None:
-            return tokenizer
-        model_arg = self._model_arg
+    def _base_model_in_force(self, model: Any = None) -> Any:
+        """The model the CLM audit looks at: the model in force, as the base model it is built on.
+
+        The model in force is ``model``, else the trainer's ``_model_arg``. That is a Hugging Face id or directory
+        before training, but the saved GRADIEND checkpoint after ``train()`` (and for every seed while the seeds are
+        evaluated). A checkpoint directory is not a Hugging Face model directory (no ``model_type``, no tokenizer),
+        so it stands for the base model its ``config.json`` records (see :func:`checkpoint_base_model_id`). A model
+        object is returned as it is. The objective, the tokenizer and the memory of the audit (``_clm_audit``) all
+        read this one answer, so they cannot disagree about which model is trained.
+        """
+        model = model if model is not None else self._model_arg
+        if isinstance(model, (str, os.PathLike)):
+            path = os.fspath(model)
+            base_model = checkpoint_base_model_id(path)
+            return path if base_model is None else base_model
+        return model
+
+    def _tokenizer_for_clm_audit(self, model: Any = None) -> Optional[Any]:
+        """Tokenizer available before training starts: the model object's, or one loaded from a hub id.
+
+        A tokenizer loaded from a hub id goes through the training loader (:class:`AutoTokenizerForLM`) with the
+        trainer's ``instruction_model`` and ``chat_template_date``, so the audit aligns the rows of an Instruct model
+        in its chat format, as training will. For a saved checkpoint the id is that of its base model (see
+        :meth:`_base_model_in_force`).
+        """
+        model_arg = self._base_model_in_force(model)
         if hasattr(model_arg, "tokenizer"):
             return model_arg.tokenizer
         if isinstance(model_arg, str):
-            from transformers import AutoTokenizer
-            trust_rc = bool(getattr(getattr(self, "_training_args", None), "trust_remote_code", False))
+            from gradiend.trainer.text.common.loading import AutoTokenizerForLM
+            args = getattr(self, "_training_args", None)
+            trust_rc = bool(getattr(args, "trust_remote_code", False))
             try:
-                return AutoTokenizer.from_pretrained(model_arg, trust_remote_code=trust_rc)
-            except Exception:
+                tokenizer = AutoTokenizerForLM.from_pretrained(
+                    model_arg, trust_remote_code=trust_rc, instruction_model=getattr(args, "instruction_model", None)
+                )
+            except Exception as error:
+                logger.warning(
+                    "Pre-training CLM alignment audit skipped: could not load the tokenizer of %r (%s: %s).",
+                    model_arg, type(error).__name__, error,
+                )
                 return None
+            configure_chat_tokenizer(tokenizer, getattr(args, "chat_template_date", None))
+            return tokenizer
         return None
 
-    def _check_and_filter_clm_alignment(self, training_args: Optional[TrainingArguments] = None) -> None:
+    def _model_for_clm_objective(self, model: Any = None) -> Any:
+        """The model (or a config-only stand-in for a hub id) that decides the prediction objective before anything is loaded.
+
+        A hub id costs one ``AutoConfig`` read, not a tokenizer or the weights. Returns None if the config cannot be
+        read (a warning names the error).
+        """
+        loaded = self._base_model_in_force(model)
+        if not isinstance(loaded, str):
+            return loaded
+        from types import SimpleNamespace
+        from transformers import AutoConfig
+        args = getattr(self, "_training_args", None)
+        try:
+            config = AutoConfig.from_pretrained(loaded, trust_remote_code=bool(getattr(args, "trust_remote_code", False)))
+        except Exception as error:
+            logger.warning(
+                "Pre-training CLM alignment audit skipped: could not read the model config of %r (%s: %s).",
+                loaded, type(error).__name__, error,
+            )
+            return None
+        return SimpleNamespace(config=config, name_or_path=loaded)
+
+    def _check_and_filter_clm_alignment(
+        self, training_args: Optional[TrainingArguments] = None, model: Any = None
+    ) -> None:
         """Run pre-training CLM divergence audit and drop or fail fast on unalignable rows.
 
         Applies under ``label_token_protocol="first_differing_token"`` only; ``"no_leading_space"`` never aligns.
+        The rule audited is the one in force for training: the one recorded with ``model`` if it is a saved model
+        (see :meth:`_recorded_label_token_protocol`), else the one of ``training_args``.
+
+        Decided from cheap facts first (the rule, then the objective from the model config), so a trainer that does
+        not train a decoder-only model under clm_next_token never loads a tokenizer or touches its data. The model
+        that decides is the base model of the model in force (:meth:`_base_model_in_force`), so a trained checkpoint
+        is audited, or not, exactly as the model it was trained from. The outcome is remembered together with the
+        data it audited (``_clm_audit``): reloaded or re-split data is audited again, the same data is not.
+
+        Args:
+            training_args: Arguments of the run; default the trainer's own.
+            model: Model that will be trained (object or id/path); default the trainer's model.
         """
-        if getattr(self, "_clm_alignment_checked", False):
+        args = training_args or getattr(self, "_training_args", None)
+        model_in_force = model if model is not None else self._model_arg
+        base_model = self._base_model_in_force(model_in_force)
+        recorded = self._recorded_label_token_protocol(model_in_force)
+        protocol = recorded or getattr(args, "label_token_protocol", None) or self._label_token_protocol()
+        policy = getattr(args, "clm_unalignable_rows", "error")
+        base_key = base_model if isinstance(base_model, str) else id(base_model)
+        scope = (protocol, policy, base_key, getattr(args, "prediction_objective", None))
+        audit = getattr(self, "_clm_audit", None)
+        if audit is not None and audit[0] == scope and (audit[1] is None or audit[1] is self._combined_data):
             return
-        protocol = getattr(training_args, "label_token_protocol", None) or self._label_token_protocol()
-        if protocol != "first_differing_token":
+
+        def applies() -> bool:
+            if protocol != "first_differing_token":
+                return False
+            loaded = self._model_for_clm_objective(base_model)
+            return loaded is not None and self._prediction_objective(loaded).name == "clm_next_token"
+
+        if not applies():
+            self._clm_audit = (scope, None)
             return
-        tokenizer = self._tokenizer_for_clm_audit()
+        tokenizer = self._tokenizer_for_clm_audit(base_model)
         if tokenizer is None:
-            return
-        # A model given as a hub id is not loaded yet; ``is_decoder_only_model`` cannot read a bare string,
-        # so the tokenizer (whose ``name_or_path`` resolves the model config) stands in for it.
-        loaded = getattr(self, "model", None) or getattr(self, "_model_arg", None)
-        objective = self._prediction_objective(tokenizer if isinstance(loaded, str) or loaded is None else loaded)
-        if objective.name != "clm_next_token":
             return
         self._ensure_data()
         if self._combined_data is None or self._combined_data.empty:
@@ -553,13 +635,13 @@ class TextPredictionTrainer(Trainer):
 
         from gradiend.trainer.text.prediction.clm_alignment import audit_clm_alignment, ClmAlignmentError
         audit_df = audit_clm_alignment(tokenizer, self._combined_data)
-        invalid_mask = audit_df["status"] == "invalid"
-        if not invalid_mask.any():
-            self._clm_alignment_checked = True
+        # Positional: the audit has one row per data row, whatever the index of the data is.
+        invalid = (audit_df["status"] == "invalid").to_numpy()
+        if not invalid.any():
+            self._clm_audit = (scope, self._combined_data)
             return
 
-        args = training_args or getattr(self, "_training_args", None)
-        policy = getattr(args, "clm_unalignable_rows", "error")
+        invalid_mask = audit_df["status"] == "invalid"
         invalid_rows = audit_df[invalid_mask]
 
         if policy == "error":
@@ -584,17 +666,17 @@ class TextPredictionTrainer(Trainer):
         elif policy == "drop":
             counts_per_class = {}
             if UNIFIED_FACTUAL_CLASS in self._combined_data.columns:
-                dropped_classes = self._combined_data.loc[invalid_mask, UNIFIED_FACTUAL_CLASS].value_counts().to_dict()
+                dropped_classes = self._combined_data.loc[invalid, UNIFIED_FACTUAL_CLASS].value_counts().to_dict()
                 counts_per_class = {str(k): int(v) for k, v in dropped_classes.items()}
             logger.warning(
                 "Dropped %d unalignable decoder-only CLM row(s) (clm_unalignable_rows='drop'). Counts per feature class: %s",
-                int(invalid_mask.sum()),
+                int(invalid.sum()),
                 counts_per_class,
             )
-            self._combined_data = self._combined_data.loc[~invalid_mask].reset_index(drop=True)
+            self._combined_data = self._combined_data.loc[~invalid].reset_index(drop=True)
             if self._combined_data_template is not None:
                 self._combined_data_template = self._combined_data.copy()
-            self._clm_alignment_checked = True
+            self._clm_audit = (scope, self._combined_data)
 
     def train(
         self,
@@ -604,14 +686,8 @@ class TextPredictionTrainer(Trainer):
         callbacks: Optional[List[Any]] = None,
         **training_args_overrides: Any,
     ) -> Union["Trainer", Dict[int, Any]]:
-        args = self._training_args
-        if args is not None:
-            args = TrainingArguments.from_dict({**args.to_dict(), **training_args_overrides})
-        elif training_args_overrides:
-            args = TrainingArguments.from_dict(training_args_overrides)
-        else:
-            args = TrainingArguments()
-        self._check_and_filter_clm_alignment(args)
+        args = self._resolve_training_args(training_args_overrides)
+        self._check_and_filter_clm_alignment(args, model=model or self._model_arg)
         return super().train(
             output_dir=output_dir,
             model=model,
@@ -1665,7 +1741,6 @@ class TextPredictionTrainer(Trainer):
                 self._combined_data = None
                 self._combined_data_template = None
                 self._splits_resplit_seed = None
-                self._clm_alignment_checked = False
                 self._data_loaded = False
             else:
                 return
@@ -3114,30 +3189,80 @@ class TextPredictionTrainer(Trainer):
     def _recorded_label_token_protocol(model: Any) -> Optional[str]:
         """The label-token convention a loaded model was trained with, or ``None`` if it carries no record.
 
-        The record is the ``training_args`` saved in the model's ``training.json``. A record without the key
+        The record is the ``training_args`` saved in the model's ``training.json`` (read from the file for a saved
+        model given as a path). A record without the key
         belongs to a model trained before the key existed; :meth:`TrainingArguments.from_dict` gives it
         ``"no_leading_space"`` (and translates the old names), so this is the one place nothing else needs to know.
         """
-        gradiend = getattr(model, "gradiend", None)
-        training = (getattr(gradiend, "kwargs", None) or {}).get("training")
-        saved = training.get("training_args") if isinstance(training, dict) else None
-        if not isinstance(saved, dict):
+        if isinstance(model, (str, os.PathLike)):
+            record_path = os.path.join(os.fspath(model), "training.json")
+            if not os.path.isfile(record_path):
+                return None
+            with open(record_path, "r", encoding="utf-8") as handle:
+                saved = recorded_training_args({"training": json.load(handle)})
+        else:
+            saved = recorded_training_args(getattr(getattr(model, "gradiend", None), "kwargs", None))
+        if saved is None:
             return None
         payload = {"label_token_protocol": saved["label_token_protocol"]} if "label_token_protocol" in saved else {}
         return TrainingArguments.from_dict(payload).label_token_protocol
 
+    def _adopt_recorded_setting(self, name: str, recorded: Any) -> None:
+        """Make this trainer's ``training_args`` carry the value of ``name`` a loaded model was trained with.
+
+        A warning is logged only when this replaces a value the trainer's arguments had set (not when they left it
+        at ``None``).
+        """
+        args = getattr(self, "_training_args", None)
+        current = getattr(args, name, None)
+        if recorded == current:
+            return
+        if current is not None:
+            logger.warning(
+                "Loaded model was trained with %s=%r; using it instead of %r from the trainer's training_args.",
+                name, recorded, current,
+            )
+        if args is not None:
+            setattr(args, name, recorded)
+
     def _configure_model(self, model: Any) -> None:
-        """Give every model this trainer hands out the label-token convention it was trained with.
+        """Give every model this trainer hands out the label-token and chat settings it was trained with.
 
         A model loaded from a directory knows its own rule (see :meth:`_recorded_label_token_protocol`); it wins
         over this trainer's ``training_args``, which datasets and evaluation then follow, so a model is never
         scored under another rule than the one it was trained for. A model without a record (e.g. a fresh
-        backbone) takes the trainer's rule. Single-row scorers (e.g. CGA detection) receive only the model, but
-        must label exactly as this trainer's datasets do; see
-        :func:`gradiend.trainer.text.prediction.dataset.training_label_token_id`.
+        backbone) takes the trainer's rule. Single-row scorers receive only the model, but must label exactly
+        as this trainer's datasets do; see
+        :func:`gradiend.trainer.text.prediction.clm_alignment.label_token_id`.
+
+        A model with a chat tokenizer (Instruct) supports only ``"first_differing_token"``: the rule in effect is
+        checked here, before anything is trained or evaluated, so a loaded model whose record says
+        ``"no_leading_space"`` (an Instruct model trained with the old rule) fails at load time.
+
+        The chat settings follow the same pattern. ``instruction_model`` and ``chat_template_date`` decided which
+        tokenizer the model was loaded with and which date its chat template sees (see
+        ``TextModelWithGradiend._load_model``); a loaded model's recorded value wins over the trainer's, and the
+        trainer's ``training_args`` adopt it (with a warning only when that replaces a value the trainer had set).
+        For ``instruction_model`` the value adopted is the decision in force, i.e. what the loader made of the
+        record: its stored value, or for a record without one (a model saved before it was stored) the old name
+        rule. A record without a date leaves the trainer's date (else the default) in force. The chat frame is rendered
+        once here, so a chat template that cannot frame a system prompt and a user turn fails now, before training,
+        and a template that inserts the current date logs the fixed date it gets.
+
+        Raises:
+            ValueError: If the model's tokenizer chat-formats its input and the rule in effect is another one, or
+                its chat template cannot frame a system prompt and a user turn.
         """
         super()._configure_model(model)
+        saved = recorded_training_args(getattr(getattr(model, "gradiend", None), "kwargs", None))
+        if saved is not None:
+            self._adopt_recorded_setting("instruction_model", uses_chat_format(getattr(model, "tokenizer", None)))
+            if saved.get("chat_template_date") is not None:
+                self._adopt_recorded_setting("chat_template_date", saved["chat_template_date"])
         recorded = self._recorded_label_token_protocol(model)
+        require_first_differing_token_for_chat(
+            getattr(model, "tokenizer", None), recorded if recorded is not None else self._label_token_protocol()
+        )
         if recorded is not None and recorded != self._label_token_protocol():
             logger.warning(
                 "Loaded model was trained with label_token_protocol=%r; using it instead of %r from the trainer's training_args.",
@@ -3146,6 +3271,7 @@ class TextPredictionTrainer(Trainer):
             if self._training_args is not None:
                 self._training_args.label_token_protocol = recorded
         model.label_token_protocol = recorded if recorded is not None else self._label_token_protocol()
+        configure_chat_tokenizer(getattr(model, "tokenizer", None))
 
     def create_gradient_training_dataset(
         self,

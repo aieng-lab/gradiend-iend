@@ -1,5 +1,6 @@
 import copy
 import pytest
+from gradiend.trainer.text.common.chat_format import ChatFormat
 from gradiend.trainer.text.common.loading import InstructTokenizerWrapper
 
 
@@ -25,9 +26,16 @@ class DummyTokenizer:
         return "hello world"
 
 
+class BracketFormat(ChatFormat):
+    """A minimal chat format, so the dummy tokenizer (no chat template) can be wrapped."""
+
+    def frame(self, system_prompt):
+        return f"[SYS]{system_prompt}[/SYS][USER]", "[/USER][ASSISTANT]"
+
+
 def test_instruct_tokenizer_wrapper_delegation():
     base = DummyTokenizer()
-    wrapper = InstructTokenizerWrapper(base)
+    wrapper = InstructTokenizerWrapper(base, chat_format=BracketFormat())
     assert wrapper.pad_token == "<pad>"
     assert wrapper.custom_attr == 42
     assert wrapper.tokenize("hello") == ["hello", "world"]
@@ -38,7 +46,7 @@ def test_instruct_tokenizer_wrapper_delegation():
 
 def test_instruct_tokenizer_wrapper_deepcopy_no_recursion():
     base = DummyTokenizer()
-    wrapper = InstructTokenizerWrapper(base, user_prompt_header="u_hdr", assistant_prompt_header="a_hdr")
+    wrapper = InstructTokenizerWrapper(base, chat_format=BracketFormat())
     
     # Check hasattr for standard special attributes without recursion
     assert not hasattr(wrapper, "__setstate__")
@@ -48,8 +56,9 @@ def test_instruct_tokenizer_wrapper_deepcopy_no_recursion():
     wrapper_copy = copy.deepcopy(wrapper)
     assert isinstance(wrapper_copy, InstructTokenizerWrapper)
     assert wrapper_copy.pad_token == "<pad>"
-    assert wrapper_copy.user_prompt_header == "u_hdr"
-    assert wrapper_copy.assistant_prompt_header == "a_hdr"
+    # the chat format is the wrapper's own state and must keep working on the copy
+    assert isinstance(wrapper_copy.chat_format, BracketFormat)
+    assert wrapper_copy.chat_format.render("s", "hi") == wrapper.chat_format.render("s", "hi")
     assert wrapper_copy.tokenizer.custom_attr == 42
     
     # Shallow copy

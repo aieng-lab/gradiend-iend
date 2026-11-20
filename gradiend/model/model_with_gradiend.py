@@ -112,24 +112,57 @@ def _gradiend_checkpoint_diagnostic(load_directory: str) -> str:
     return "ok"
 
 
+def _read_checkpoint_config(load_directory: str) -> Optional[Dict[str, Any]]:
+    """
+    The parsed config.json of a local GRADIEND checkpoint, or None if load_directory is not one.
+
+    A GRADIEND checkpoint is a directory whose config.json has an 'architecture' key; this is the one place that
+    says so. HF model IDs, decoder_mlm_head and other base-model paths are not checkpoints.
+    """
+    if not load_directory or not isinstance(load_directory, str):
+        return None
+    if not os.path.isdir(load_directory):
+        return None
+    cfg_path = os.path.join(load_directory, "config.json")
+    if not os.path.isfile(cfg_path):
+        return None
+    try:
+        with open(cfg_path, "r") as f:
+            cfg = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    return cfg if isinstance(cfg, dict) and "architecture" in cfg else None
+
+
 def _is_gradiend_checkpoint(load_directory: str) -> bool:
     """
     True if load_directory is a local GRADIEND checkpoint (config.json with 'architecture' key).
     False for HF model IDs, decoder_mlm_head, or other base-model paths.
     """
-    if not load_directory or not isinstance(load_directory, str):
-        return False
-    if not os.path.isdir(load_directory):
-        return False
-    cfg_path = os.path.join(load_directory, "config.json")
-    if not os.path.isfile(cfg_path):
-        return False
-    try:
-        with open(cfg_path, "r") as f:
-            cfg = json.load(f)
-        return "architecture" in cfg
-    except (json.JSONDecodeError, OSError):
-        return False
+    return _read_checkpoint_config(load_directory) is not None
+
+
+def checkpoint_base_model_id(load_directory: str) -> Optional[str]:
+    """
+    The base model a local GRADIEND checkpoint was trained on, or None if load_directory is not a checkpoint.
+
+    Reads the 'base_model' entry of the config.json metadata and nothing else (no weights are loaded): the entry
+    that GradiendModel.base_model_id returns for a loaded checkpoint and that ModelWithGradiend.from_pretrained
+    loads the base model from. A checkpoint directory is not a Hugging Face model directory, so whoever needs the
+    Hugging Face model of a checkpoint path (its config, its tokenizer) asks here.
+
+    Raises:
+        ValueError: If the checkpoint records no base model (it could not be loaded either).
+    """
+    cfg = _read_checkpoint_config(load_directory)
+    if cfg is None:
+        return None
+    base_model = (cfg.get("metadata") or {}).get("base_model")
+    if not base_model:
+        raise ValueError(
+            f"GRADIEND checkpoint {load_directory!r} records no base model (config.json metadata.base_model)."
+        )
+    return str(base_model)
 
 
 def _checkpoint_gradiend_method_name(load_directory: str) -> str:
@@ -1818,6 +1851,18 @@ class ModelWithGradiend(nn.Module, ABC):
             }
 
 
+    def resolved_training_settings(self) -> Dict[str, Any]:
+        """Training-argument values this model resolved from its own configuration.
+
+        A setting whose default depends on the model (e.g. the date a chat template inserts) is resolved when the
+        model is created. The trainer writes the result into the training arguments that are saved with the trained
+        model, so a later change of the default never changes what the saved model is.
+
+        Returns:
+            ``{TrainingArguments field: resolved value}``; empty for a model with nothing to resolve (the default).
+        """
+        return {}
+
     # ----------------------------
     # Saving (unchanged naming; GRADIEND writes config + training.json itself)
     # ----------------------------
@@ -2064,6 +2109,7 @@ class ModelWithGradiend(nn.Module, ABC):
                 "base_model_device_map", "base_model_max_memory", "base_model_offload",
                 "prediction_objective",
                 "decoder_sequence_cloze_rhs_window",
+                "instruction_model", "chat_template_date",
                 "source", "target",
             )
             for key in gradiend_keys:

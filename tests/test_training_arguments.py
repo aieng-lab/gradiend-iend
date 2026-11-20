@@ -426,37 +426,31 @@ class TestTrainingArguments:
 
 
 class TestTorchDtypeRoundTrip:
-    """``torch_dtype`` must survive ``to_dict()``/``from_dict()``.
+    """``torch_dtype`` must survive ``to_dict()`` and ``from_dict()``.
 
-    ``TextPredictionTrainer`` normalizes its arguments with
-    ``TrainingArguments.from_dict(args.to_dict())`` on construction, so a lossy
-    round trip silently downgraded every configured ``bfloat16`` run to
-    ``float32`` -- doubling the base model's memory (an 8B model went from
-    ~16 GB to ~32 GB) with nothing in the logs to show it.
+    ``to_dict()`` used to write ``str(torch.bfloat16)`` = ``"torch.bfloat16"`` and ``from_dict()`` read it back with
+    ``getattr(torch, name, torch.float32)``, which finds no such attribute. Every copy of the arguments that went
+    through the two methods therefore trained in float32, whatever ``torch_dtype`` was configured.
     """
 
-    @pytest.mark.parametrize(
-        "dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64]
-    )
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32, torch.float64])
     def test_dtype_survives_round_trip(self, dtype):
         args = TrainingArguments(torch_dtype=dtype)
         assert TrainingArguments.from_dict(args.to_dict()).torch_dtype == dtype
 
     def test_to_dict_writes_the_bare_dtype_name(self):
-        # "torch.bfloat16" is what str() gives and what getattr(torch, ...)
-        # cannot resolve; the serialized form must be the bare name.
         assert TrainingArguments(torch_dtype=torch.bfloat16).to_dict()["torch_dtype"] == "bfloat16"
 
-    def test_from_dict_accepts_the_legacy_prefixed_name(self):
+    def test_from_dict_accepts_the_prefixed_name_written_by_earlier_releases(self):
         args = TrainingArguments.from_dict({"torch_dtype": "torch.bfloat16"})
         assert args.torch_dtype == torch.bfloat16
 
     def test_from_dict_raises_on_an_unknown_dtype_name(self):
-        # Never fall back to float32: that silent default is what hid the bug.
+        # No fall back to float32: that silent default is what hid the loss.
         with pytest.raises(ValueError, match="Unknown torch dtype"):
             TrainingArguments.from_dict({"torch_dtype": "not_a_dtype"})
 
-    def test_dtype_is_json_serializable_and_round_trips_through_json(self):
+    def test_dtype_round_trips_through_json(self):
         args = TrainingArguments(torch_dtype=torch.bfloat16)
         restored = TrainingArguments.from_dict(json.loads(json.dumps(args.to_dict())))
         assert restored.torch_dtype == torch.bfloat16

@@ -452,6 +452,14 @@ def _unified_df_for_text_training(unified_df: pd.DataFrame, pairs: List[Dict[str
     return out
 
 
+def _trainer_label_token_protocol(trainer: object) -> str:
+    """The label-token rule the trainer's own datasets use (single source: ``trainer._label_token_protocol``)."""
+    resolve = getattr(trainer, "_label_token_protocol", None)
+    if callable(resolve):
+        return str(resolve())
+    return str(getattr(getattr(trainer, "training_args", None), "label_token_protocol", None) or "no_leading_space")
+
+
 def _gradient_dataset_for_unified_df(
     trainer: object,
     model: object,
@@ -472,11 +480,6 @@ def _gradient_dataset_for_unified_df(
         is_decoder_only_model = False
     args = getattr(trainer, "training_args", None) or getattr(trainer, "_training_args", None)
     max_length = int(getattr(args, "max_length", 128) or 128) if args is not None else 128
-    label_token_protocol = (
-        trainer._label_token_protocol()
-        if callable(getattr(trainer, "_label_token_protocol", None))
-        else str(getattr(args, "label_token_protocol", "no_leading_space") or "no_leading_space")
-    )
     mlm_head_target_labels = None
     if objective_name == "clm_mlm_head" and getattr(trainer, "experiment_dir", None):
         head_dir = resolve_decoder_mlm_head_dir(trainer.experiment_dir)
@@ -503,7 +506,7 @@ def _gradient_dataset_for_unified_df(
             config=getattr(trainer, "config", None),
             training_args=args,
         ),
-        label_token_protocol=label_token_protocol,
+        label_token_protocol=_trainer_label_token_protocol(trainer),
     )
     sig = inspect.signature(trainer.create_gradient_training_dataset)
     accepts_target = "target" in sig.parameters or any(

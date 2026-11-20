@@ -1,7 +1,6 @@
-"""Behaviour of ``label_token_protocol="first_differing_token"`` that differs from main by design.
+"""Behaviour of ``label_token_protocol="first_differing_token"`` that differs from gradiend 0.2.5 by design.
 
-Old values are what main (97af0f48) labelled under ``"canonical"``; they are pinned in
-``test_label_protocol_characterization.py`` for the rows that did not change.
+The rows that did not change are pinned in ``test_label_protocol_characterization.py``.
 """
 
 import pandas as pd
@@ -53,15 +52,15 @@ def _items(tok, protocol, text, factual, alternative):
 
 
 # row -> (text, factual, alternative, real tokens, label position, factual id, alternative id,
-#         label ids main used under "canonical")
+#         label ids of a plain leading-space rule without alignment; documentation only, not asserted)
 BY_DESIGN = {
-    # shared leading token "ang": main labelled that shared token for both sides
+    # shared leading token "ang": a plain leading-space rule labels that shared token for both sides
     "k_gt0": ("The word is [MASK]", "anglicised", "anglicized",
               [464, 1573, 318, 3550, 677, PAD], 5, 1417, 1143, (3550, 3550)),
-    # target glued to the previous word: main put the label ON the last context token ("the")
+    # target glued to the previous word: a plain leading-space rule puts the label ON the last context token ("the")
     "k0_no_trailing_space": ("We saw the[MASK]", "colour", "color",
                              [1135, 2497, 262, PAD], 3, 49903, 8043, (9568, 3124)),
-    # target is the first word: main labelled " good" / " bad"
+    # target is the first word: a plain leading-space rule labels " good" / " bad"
     "empty_prefix": ("[MASK] is nice", "good", "bad", [], 11, 11274, 14774, (922, 2089)),
 }
 
@@ -82,23 +81,23 @@ def test_items_that_change_by_design(tok, row):
 def test_no_leading_space_does_not_align_shared_prefix_rows(tok):
     item = _items(tok, NLS, "The word is [MASK]", "anglicised", "anglicized")
     assert item["factual"]["input_ids"].tolist() == item["alternative"]["input_ids"].tolist()
-    assert item["factual"]["labels"].tolist() == item["alternative"]["labels"].tolist()  # both 648, as on main
+    assert item["factual"]["labels"].tolist() == item["alternative"]["labels"].tolist()  # both 648, as in 0.2.5
 
 
 def test_prefix_overlap_row_is_unalignable(tok):
     with pytest.raises(ClmAlignmentError):
         _items(tok, FDT, "She saw the [MASK]", "bride", "bridegroom")
-    # main labelled the shared first token 26619 for both sides under "canonical"
+    # a plain leading-space rule labels the shared first token 26619 for both sides; no_leading_space (0.2.5) labels 1671
     legacy = _items(tok, NLS, "She saw the [MASK]", "bride", "bridegroom")["factual"]["labels"]
     assert legacy.max().item() == 1671
 
 
 def test_identical_strings_are_a_neutral_identity_row_with_the_plain_label(tok):
     item = _items(tok, FDT, "The word is [MASK]", "medium", "medium")
-    assert item["factual"]["labels"][3].item() == 7090  # main's canonical label, " medium"
+    assert item["factual"]["labels"][3].item() == 7090  # the plain leading-space label, " medium"
 
 
-def test_k0_label_equals_the_old_canonical_label_when_the_target_follows_whitespace(tok):
+def test_k0_label_is_the_leading_space_token_when_the_target_follows_whitespace(tok):
     text, f, a = "We saw the [MASK]", "colour", "color"
     for word, side in ((f, "factual"), (a, "alternative")):
         old = tok(f" {word}", add_special_tokens=False)["input_ids"][0]
@@ -213,7 +212,7 @@ def test_create_inputs_with_identical_alternative_is_the_plain_row(wrapper):
 
 
 def test_create_inputs_without_alternative_ignores_the_protocol(wrapper):
-    """On main create_inputs always uses the leading-space rule, also for a model trained under legacy."""
+    """Without an alternative create_inputs always uses the leading-space rule (as in 0.2.5), also under no_leading_space."""
     wrapper.label_token_protocol = NLS
     item = wrapper.create_inputs("The word is [MASK]", "good")
     assert item["labels"][0, -1].item() == 922
@@ -234,18 +233,18 @@ def test_row_wise_eval_scores_shared_prefix_rows_at_the_divergence_token(tok, ti
         tiny_model, tok, frame, return_per_row_df=True, label_token_protocol=FDT
     )
     div = align_clm_divergence(tok, "The word is ", f, a)
-    ids = torch.tensor([tok("The word is", add_special_tokens=False)["input_ids"] + list(div.shared_ids)])
+    ids = torch.tensor([tok("The word is", add_special_tokens=False)["input_ids"] + list(div.shared_ids)], device=tiny_model.device)
     with torch.no_grad():
         probs = torch.softmax(tiny_model(input_ids=ids).logits[0, -1], dim=-1)
     assert per_row["P_factual"][0] == pytest.approx(float(probs[div.factual_id]), rel=1e-4)
     assert per_row["P_alternative"][0] == pytest.approx(float(probs[div.alternative_id]), rel=1e-4)
     assert per_row["P_factual"][0] != pytest.approx(per_row["P_alternative"][0], rel=1e-3)
-    # main (and no_leading_space) score both sides at the shared first token, i.e. identically
+    # no_leading_space scores both sides at the shared first token, i.e. identically (0.2.5 resolves the shared
+    # token through get_vocab(), whose order is random, so the common value itself is not pinned)
     _, legacy = compute_probability_shift_score_row_wise(
         tiny_model, tok, frame, return_per_row_df=True, label_token_protocol=NLS
     )
-    assert legacy["P_factual"][0] == pytest.approx(4.751824599225074e-05, rel=1e-3)
-    assert legacy["P_alternative"][0] == pytest.approx(4.751824599225074e-05, rel=1e-3)
+    assert legacy["P_factual"][0] == pytest.approx(legacy["P_alternative"][0], rel=1e-6)
 
 
 @pytest.mark.parametrize("bad", [

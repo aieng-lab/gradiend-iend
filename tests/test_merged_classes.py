@@ -447,7 +447,7 @@ class TestMergedFullEvalAndCacheGuards:
         assert uk_to_ca[0]["factual_id"] == "non_US"
         assert uk_to_ca[0]["alternative_id"] == "non_US"
 
-    def test_ensure_data_reload_resets_clm_alignment_checked(self):
+    def test_ensure_data_reload_invalidates_the_clm_audit(self):
         config = TextPredictionConfig(
             data=_four_dialect_merged_data(),
             target_classes=["US", "non_US"],
@@ -458,10 +458,11 @@ class TestMergedFullEvalAndCacheGuards:
         )
         trainer = TextPredictionTrainer(model="bert-base-uncased", config=config)
         trainer._ensure_data(materialize_all_class_transitions=False)
-        trainer._clm_alignment_checked = True
+        # the audit remembers the data object it audited (see ``_check_and_filter_clm_alignment``)
+        trainer._clm_audit = (("scope",), trainer._combined_data)
 
         trainer._ensure_data(materialize_all_class_transitions=True)
-        assert trainer._clm_alignment_checked is False
+        assert trainer._clm_audit[1] is not trainer._combined_data
         assert trainer._data_materialized_all_class_transitions is True
 
     def test_cached_encoder_df_matches_request_merged_and_one_pole(self):

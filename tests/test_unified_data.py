@@ -319,6 +319,37 @@ class TestPerClassDictToUnified:
         alts_from_a = set(df_pair.loc[df_pair["factual_class"] == "A", "alternative_class"])
         assert alts_from_a == {"B"}
 
+    def test_per_class_dict_to_unified_counterfactuals_respect_split_without_leakage(self):
+        """Counterfactual tokens derived from other_df must only come from the same split."""
+        class_dfs = {
+            "A": pd.DataFrame({
+                "masked": ["[MASK] a_tr", "[MASK] a_va", "[MASK] a_te"],
+                "split": ["train", "validation", "test"],
+                "A": ["a_train_tok", "a_val_tok", "a_test_tok"],
+            }),
+            "B": pd.DataFrame({
+                "masked": ["[MASK] b_tr", "[MASK] b_va", "[MASK] b_te"],
+                "split": ["train", "validation", "test"],
+                "B": ["b_train_tok", "b_val_tok", "b_test_tok"],
+            }),
+        }
+        df = per_class_dict_to_unified(
+            class_dfs,
+            classes=["A", "B"],
+            pair=("A", "B"),
+            masked_col="masked",
+            split_col="split",
+            max_counterfactuals_per_sentence=1,
+            random_state=42,
+        )
+        for split in ("train", "validation", "test"):
+            sub = df[df["split"] == split]
+            expected_tag = "train" if split == "train" else ("val" if split == "validation" else "test")
+            a_to_b = sub[(sub["factual_class"] == "A") & (sub["alternative_class"] == "B")]
+            assert set(a_to_b["alternative"].str.lower()) == {f"b_{expected_tag}_tok"}
+            b_to_a = sub[(sub["factual_class"] == "B") & (sub["alternative_class"] == "A")]
+            assert set(b_to_a["alternative"].str.lower()) == {f"a_{expected_tag}_tok"}
+
 
 class TestMergedToUnified:
     """merged_to_unified with pair derives alternative from other class."""

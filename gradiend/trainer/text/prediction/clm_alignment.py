@@ -6,6 +6,11 @@ k (where k < len(factual) and k < len(alternative)), the causal divergence point
 occurs at token position k+1 (0-indexed position k). At this position, preceding
 shared tokens act as context, and the contrastive supervision is applied to
 predict the differing tokens factual[k] vs alternative[k].
+
+For an Instruct model (a chat tokenizer, see :func:`~gradiend.trainer.text.common.chat_format.uses_chat_format`) the
+context is the chat prompt, which ends with the generation prompt of the assistant turn, and the answer words are the
+first thing the assistant says: they are tokenized on their own, without a leading space, and the row is
+``chat prompt + shared tokens + slot``.
 """
 
 from __future__ import annotations
@@ -16,6 +21,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import pandas as pd
 import torch
 
+from gradiend.trainer.core.arguments import LABEL_TOKEN_PROTOCOLS
+from gradiend.trainer.text.common.chat_format import chat_prompt_ids, raw_tokenizer, uses_chat_format
 from gradiend.util.logging import suppress_tokenizer_length_warning
 from gradiend.util.positions import assert_labels_on_real_tokens, last_real_token_positions
 
@@ -111,6 +118,94 @@ def continuation_ids_from_prefix(tokenizer: Any, prefix: str, continuation: str)
     return _ids_for_text(tokenizer, continuation)
 
 
+def answer_ids(tokenizer: Any, word: str) -> List[int]:
+    """Return the token ids of ``word`` as the first thing the assistant says after a chat prompt.
+
+    The generation prompt ends with a newline, so the word starts the text: it is tokenized on its own, without
+    a leading space. A leading token that decodes to blank space (a tokenizer artifact) is dropped.
+
+    Args:
+        tokenizer: A chat tokenizer or its raw tokenizer.
+        word: Answer word.
+    """
+    raw = raw_tokenizer(tokenizer)
+    ids = list(continuation_ids_from_prefix(raw, "", str(word)))
+    if ids and raw.decode(ids[0]).strip() == "":
+        ids = ids[1:]
+    return ids
+
+
+def label_token_ids(
+    tokenizer: Any,
+    prefix: str,
+    word: Any,
+    protocol: str = "first_differing_token",
+    *,
+    vocab: Optional[Any] = None,
+) -> List[int]:
+    """The token ids that label ``word`` after ``prefix`` under ``protocol``: THE label rule of decoder-only rows.
+
+    Every place that needs to know which token(s) a word is after a prefix asks here: the training item, the
+    single-row scorer ``create_inputs``, the divergence alignment (:func:`align_clm_divergence`), the alignment
+    audit and the row-wise decoder evaluation. They keep no variant of their own.
+
+    - ``"first_differing_token"``: the ids ``word`` contributes when it follows ``prefix`` (see
+
+      :func:`continuation_ids_from_prefix`). After a prefix that ends in a space this is the *leading-space*
+      token (``Ġshe`` / ``▁she``); when the slot is glued to the preceding character (``"("`` + ``[MASK]``) or the
+      prefix is empty it is the literal token without a space. A chat tokenizer (Instruct model) gets the answer
+      ids of the assistant turn (:func:`answer_ids`), whatever the prefix.
+
+    - ``"no_leading_space"``: the rule of gradiend 0.2.5, independent of the prefix: ``vocab[word]``, else the first
+
+      id of ``tokenizer(word)``.
+
+    Args:
+        tokenizer: Plain or chat tokenizer.
+        prefix: Text in front of the slot (the part of the masked text before the mask).
+        word: The label word.
+        protocol: ``TrainingArguments.label_token_protocol``.
+        vocab: Optional ``token -> id`` map used by ``"no_leading_space"`` (default ``tokenizer.vocab``).
+
+    Returns:
+        All ids of the word (callers apply their own multi-token policy); one id under ``"no_leading_space"``.
+
+    Raises:
+        ValueError: If ``protocol`` is unknown.
+    """
+    if protocol == "first_differing_token":
+        if uses_chat_format(tokenizer):
+            return answer_ids(tokenizer, word)
+        return continuation_ids_from_prefix(tokenizer, prefix, str(word))
+    if protocol != "no_leading_space":
+        raise ValueError(f"label_token_protocol must be one of {LABEL_TOKEN_PROTOCOLS}, got {protocol!r}")
+    word = str(word)
+    if vocab is None:
+        vocab = getattr(tokenizer, "vocab", None)
+    if vocab is not None and word in vocab:
+        return [int(vocab[word])]
+    return [int(tokenizer(word, add_special_tokens=False)["input_ids"][0])]
+
+
+def label_token_id(
+    tokenizer: Any,
+    prefix: str,
+    word: Any,
+    protocol: str = "first_differing_token",
+    *,
+    vocab: Optional[Any] = None,
+) -> int:
+    """The one id a row of ``word`` after ``prefix`` supervises: the first id of :func:`label_token_ids`.
+
+    Raises:
+        ValueError: If ``protocol`` is unknown or ``word`` has no token.
+    """
+    ids = label_token_ids(tokenizer, prefix, word, protocol, vocab=vocab)
+    if not ids:
+        raise ValueError(f"Could not tokenize label {word!r} to any token id.")
+    return int(ids[0])
+
+
 def align_clm_divergence(
     tokenizer: Any,
     context_prefix: str,
@@ -120,7 +215,8 @@ def align_clm_divergence(
     """Align factual and alternative continuations to find their first divergence point.
 
     Tokenizes ``factual`` and ``alternative`` as continuations of ``context_prefix``
-    (respecting leading-space and BPE boundary behaviors). Let n = len(factual_ids),
+    (respecting leading-space and BPE boundary behaviors); for a chat tokenizer they are tokenized as answer
+    words that open the assistant turn (see :func:`answer_ids`), whatever ``context_prefix`` is. Let n = len(factual_ids),
     m = len(alternative_ids), and k = length of their longest common prefix.
 
     The alignment is valid iff strict inequality holds: ``k < n AND k < m``.
@@ -148,8 +244,8 @@ def align_clm_divergence(
     """
     f_str = str(factual)
     a_str = str(alternative)
-    f_ids = continuation_ids_from_prefix(tokenizer, context_prefix, f_str)
-    a_ids = continuation_ids_from_prefix(tokenizer, context_prefix, a_str)
+    f_ids = label_token_ids(tokenizer, context_prefix, f_str)
+    a_ids = label_token_ids(tokenizer, context_prefix, a_str)
     n = len(f_ids)
     m = len(a_ids)
 
@@ -208,6 +304,55 @@ def align_clm_divergence(
     )
 
 
+def resolve_clm_labels(
+    tokenizer: Any, prefix: str, factual: Any, alternative: Optional[Any] = None
+) -> Tuple[Tuple[int, ...], int]:
+    """The ids that make up the label of one decoder-only row under ``label_token_protocol="first_differing_token"``.
+
+    With an ``alternative`` that differs from ``factual`` the row is a contrast row: the result is the tokens the two
+    share (they join the context) and the first token where they differ (:func:`align_clm_divergence`; unalignable
+    pairs raise :class:`ClmAlignmentError`). Without one (or with the very same string, a neutral identity row) nothing
+    is shared and the label is the first id of :func:`label_token_ids`. Both cases read the word ids from the same
+    function, so a row with and without an alternative gets the same token variant for the same prefix.
+
+    Args:
+        tokenizer: Plain or chat tokenizer.
+        prefix: Text in front of the slot.
+        factual: Factual target word.
+        alternative: Alternative target word, or None.
+
+    Returns:
+        ``(shared_ids, label_id)``.
+    """
+    if alternative is not None and str(alternative) != str(factual):
+        divergence = align_clm_divergence(tokenizer, prefix, str(factual), str(alternative))
+        return divergence.shared_ids, divergence.factual_id
+    return (), label_token_id(tokenizer, prefix, factual)
+
+
+def clm_context_ids(tokenizer: Any, prefix: str, *, max_length: Optional[int] = None) -> List[int]:
+    """Return the token ids of the context in front of the shared tokens of a divergence row.
+
+    This is the one definition of that context, used by the training item, ``create_inputs`` and the decoder
+    evaluation: ``tokenizer(prefix.rstrip())`` with the tokenizer's own special tokens, or, for a chat tokenizer,
+    the chat prompt of ``prefix.rstrip()`` (system prompt, user turn, generation prompt; see
+    :func:`~gradiend.trainer.text.common.chat_format.chat_prompt_ids`). Trailing whitespace of the prefix is
+    dropped in both cases: the answer is a separate token (a plain model) or a separate turn (a chat model), so a
+    prefix with and without a trailing space gives the same row.
+
+    Args:
+        tokenizer: Plain or chat tokenizer (or wrapper with ``.tokenizer``).
+        prefix: Text before the target slot.
+        max_length: Maximum number of context tokens; only a chat prompt is shortened to it (see
+            :func:`~gradiend.trainer.text.common.chat_format.chat_prompt_ids`).
+    """
+    if uses_chat_format(tokenizer):
+        return chat_prompt_ids(tokenizer, str(prefix).rstrip(), max_length=max_length)
+    tok = getattr(tokenizer, "tokenizer", tokenizer)
+    with suppress_tokenizer_length_warning():
+        return list(tok(str(prefix).rstrip(), add_special_tokens=True, truncation=False)["input_ids"])
+
+
 def build_shared_prefix_item(
     tokenizer: Any,
     prefix: str,
@@ -229,6 +374,12 @@ def build_shared_prefix_item(
     tokens) follows the dataset's empty-row convention when padding: an all-padding row with the label
     on its last position.
 
+    For a chat tokenizer (Instruct model) the context is the chat prompt of ``prefix.rstrip()``: the
+    sequence is ``chat prompt + shared_ids + [slot]``, so the label is predicted from the position that
+    ends the generation prompt (or the last shared token), the position the decoder evaluation reads. A
+    prefix that does not fit is shortened from its left, never the system prompt or the generation prompt;
+    a ``max_length`` too small for the chat frame raises.
+
     Args:
         tokenizer: Tokenizer (or wrapper with ``.tokenizer``).
         prefix: Text before the target slot.
@@ -239,10 +390,18 @@ def build_shared_prefix_item(
 
     Returns:
         Dict of ``(1, L)`` tensors ``input_ids``, ``attention_mask``, ``labels``.
+
+    Raises:
+        ValueError: If ``tokenizer`` is a chat tokenizer and ``max_length`` cannot hold the chat frame.
     """
     tok = getattr(tokenizer, "tokenizer", tokenizer)
-    with suppress_tokenizer_length_warning():
-        ctx_ids = list(tok(str(prefix).rstrip(), add_special_tokens=True, truncation=False)["input_ids"])
+    budget = int(max_length) - len(shared_ids) - 1
+    ctx_ids = clm_context_ids(tokenizer, prefix, max_length=budget)
+    if uses_chat_format(tokenizer) and len(ctx_ids) > budget:
+        raise ValueError(
+            f"max_length={max_length} is too small for the chat prompt of {getattr(tok, 'name_or_path', tok)!r}: "
+            f"its system prompt and headers take {len(ctx_ids)} tokens, plus {len(shared_ids) + 1} for the answer."
+        )
     slot_id = getattr(tok, "eos_token_id", None)
     if slot_id is None:
         slot_id = getattr(tok, "pad_token_id", None)
@@ -339,8 +498,8 @@ def audit_clm_alignment(
         f = rec["factual"]
         a = rec["alternative"]
         p = rec["prefix"]
-        f_ids = continuation_ids_from_prefix(tokenizer, p, f)
-        a_ids = continuation_ids_from_prefix(tokenizer, p, a)
+        f_ids = label_token_ids(tokenizer, p, f)
+        a_ids = label_token_ids(tokenizer, p, a)
         n = len(f_ids)
         m = len(a_ids)
 

@@ -30,17 +30,51 @@ def gpt2_tok():
     return tok
 
 
-@pytest.fixture(scope="module")
-def tiny_causal_model(gpt2_tok):
-    """Tiny randomly-initialized CausalLM (no download) for mathematical equivalence tests."""
+def _tiny_gpt2_config(tokenizer):
+    """Config of the tiny GPT-2 used by the tests of this module."""
     config = AutoConfig.from_pretrained("gpt2")
     config.n_layer = 2
     config.n_head = 2
     config.n_embd = 64
-    config.vocab_size = len(gpt2_tok)
-    model = AutoModelForCausalLM.from_config(config)
+    config.vocab_size = len(tokenizer)
+    return config
+
+
+@pytest.fixture(scope="module")
+def tiny_causal_model(gpt2_tok):
+    """Tiny randomly-initialized CausalLM (no download) for mathematical equivalence tests."""
+    model = AutoModelForCausalLM.from_config(_tiny_gpt2_config(gpt2_tok))
     model.eval()
     return model
+
+
+def _float64_tiny_causal_model(tokenizer, seed):
+    """Seeded float64 tiny CausalLM for the exact padded-vs-unpadded equivalence tests.
+
+    Why float64: the padded training item (32 tokens) and the unpadded evaluation sequence are the same maths, but
+    they go through different tensor shapes, and in float32 the BLAS kernels (which depend on the machine) round
+    them differently: gradient differences of 1e-6 to 2e-5 on gradients of size ~3, so a float32 comparison passes
+    on one machine and fails on another. In float64 the rounding is ~1e-15, so a real mismatch (a label one
+    position off, or on the wrong token) cannot hide in rounding noise and the result does not depend on the machine.
+    A local copy, not the module fixture, so no other test sees a double model; the inputs are integer ids, so only
+    the model changes. ``seed`` makes the weights reproducible without touching the global random state.
+    """
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        model = AutoModelForCausalLM.from_config(_tiny_gpt2_config(tokenizer))
+    return model.double().eval()
+
+
+def _next_token_cross_entropy(logits, labels):
+    """Mean cross-entropy of ``logits[t]`` against ``labels[t + 1]`` over the supervised positions (``-100`` ignored).
+
+    This is the definition of the HF causal-LM loss, computed in the dtype of the logits. HF casts the logits to
+    float32 first, which puts a float32 floor under a float64 comparison (about 1e-7 on the gradients here, 1e-6 on
+    a loss of ~11).
+    """
+    return torch.nn.functional.cross_entropy(
+        logits[..., :-1, :].reshape(-1, logits.size(-1)), labels[..., 1:].reshape(-1), ignore_index=-100
+    )
 
 
 def test_divergence_item_construction(gpt2_tok):
@@ -106,8 +140,13 @@ def test_single_token_bit_identity(gpt2_tok):
     assert item1["labels"][last_pos].item() == lead_id
 
 
-def test_mathematical_loss_equivalence(gpt2_tok, tiny_causal_model):
-    """HF CausalLM training loss with slot token bit-identically matches -log_softmax(eval_logits)[target]."""
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_mathematical_loss_equivalence(gpt2_tok, seed):
+    """The training item's loss with the slot token equals -log_softmax(eval_logits)[target] of the unpadded sequence.
+
+    Run in float64 (see :func:`_float64_tiny_causal_model`), so the padded and the unpadded forward pass agree to
+    rounding at 1e-15 whatever the machine's BLAS does.
+    """
     text = "The spelling used in the paper was [MASK]"
     f = "anglicised"
     a = "anglicized"
@@ -125,15 +164,17 @@ def test_mathematical_loss_equivalence(gpt2_tok, tiny_causal_model):
     item_f = ds._create_item(text, f, alternative_target=a)
 
     # 1. Forward training item through CausalLM
-    device = next(tiny_causal_model.parameters()).device
+    model = _float64_tiny_causal_model(gpt2_tok, seed)
+    device = next(model.parameters()).device
     inputs = {
         "input_ids": item_f["input_ids"].unsqueeze(0).to(device),
         "attention_mask": item_f["attention_mask"].unsqueeze(0).to(device),
         "labels": item_f["labels"].unsqueeze(0).to(device),
     }
     with torch.no_grad():
-        out_train = tiny_causal_model(**inputs)
+        out_train = model(**inputs)
     train_loss = float(out_train.loss.item())
+    train_loss_float64 = float(_next_token_cross_entropy(out_train.logits, inputs["labels"]))
 
     # 2. Forward eval item (prefix.rstrip() + shared, no slot token)
     prefix = "The spelling used in the paper was "
@@ -142,11 +183,15 @@ def test_mathematical_loss_equivalence(gpt2_tok, tiny_causal_model):
     eval_ids = prefix_ids + list(div.shared_ids)
     eval_inputs = {"input_ids": torch.tensor([eval_ids], dtype=torch.long, device=device)}
     with torch.no_grad():
-        out_eval = tiny_causal_model(**eval_inputs)
+        out_eval = model(**eval_inputs)
     eval_last_logits = out_eval.logits[0, -1, :]
     manual_loss = float((-torch.log_softmax(eval_last_logits, dim=-1)[div.factual_id]).item())
 
-    assert abs(train_loss - manual_loss) < 1e-5, f"Train loss {train_loss} != eval loss {manual_loss}"
+    # the loss of the item labels, computed in float64: equal up to rounding at 1e-15
+    assert abs(train_loss_float64 - manual_loss) < 1e-9, f"Train loss {train_loss_float64} != eval loss {manual_loss}"
+    # the HF loss casts the logits to float32 and returns a float32 loss, so it agrees only to about one float32 ulp
+    # of the loss (~1e-6 at a loss of ~11)
+    assert abs(train_loss - manual_loss) < 1e-5, f"HF train loss {train_loss} != eval loss {manual_loss}"
 
 
 def test_row_wise_eval_reads_divergence(gpt2_tok, tiny_causal_model):
@@ -206,7 +251,7 @@ def test_trainer_pre_training_check_error_mode(gpt2_tok, tiny_causal_model):
         config=cfg,
         training_args=TrainingArguments(clm_unalignable_rows="error"),
     )
-    tiny_causal_model.tokenizer = gpt2_tok  # main: Trainer.tokenizer is read-only; the audit reads it from the model
+    tiny_causal_model.tokenizer = gpt2_tok  # the audit reads the tokenizer from the model object
 
     with pytest.raises(ClmAlignmentError) as exc_info:
         trainer.create_training_data(gpt2_tok)
@@ -239,7 +284,7 @@ def test_trainer_pre_training_check_drop_mode(gpt2_tok, tiny_causal_model):
         config=cfg,
         training_args=TrainingArguments(clm_unalignable_rows="drop"),
     )
-    tiny_causal_model.tokenizer = gpt2_tok  # main: Trainer.tokenizer is read-only; the audit reads it from the model
+    tiny_causal_model.tokenizer = gpt2_tok  # the audit reads the tokenizer from the model object
 
     train_data = trainer.create_training_data(gpt2_tok)
     # The invalid bride/bridegroom row was dropped, only anglicised/anglicized remains
@@ -299,9 +344,17 @@ def test_model_with_gradiend_create_inputs(gpt2_tok, tiny_causal_model):
     assert item["labels"][0, -1].item() == div.factual_id
 
 
-def test_gradient_divergence_equivalence(gpt2_tok, tiny_causal_model):
-    """Base model gradient from training item matches gradient from next-token cross-entropy loss."""
-    tiny_causal_model.zero_grad(set_to_none=True)
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_gradient_divergence_equivalence(gpt2_tok, seed):
+    """Base model gradient from training item matches gradient from next-token cross-entropy loss.
+
+    Run in float64 (see :func:`_float64_tiny_causal_model`): the padded 32-token item and the unpadded evaluation
+    sequence are the same maths, only float32 rounding of different kernel shapes made this comparison depend on
+    the machine. The loss of the item is the next-token cross-entropy of its labels in float64
+    (:func:`_next_token_cross_entropy`), so the float32 cast of the logits inside the HF loss adds no noise floor
+    either.
+    """
+    model = _float64_tiny_causal_model(gpt2_tok, seed)
     text = "The spelling used was [MASK]"
     f = "anglicised"
     a = "anglicized"
@@ -318,18 +371,18 @@ def test_gradient_divergence_equivalence(gpt2_tok, tiny_causal_model):
     ds = TextTrainingDataset(df, gpt2_tok, batch_size=1, is_decoder_only_model=True, max_length=32, balance_column=None, label_token_protocol="first_differing_token")
     item_f = ds._create_item(text, f, alternative_target=a)
 
-    device = next(tiny_causal_model.parameters()).device
+    device = next(model.parameters()).device
     inputs = {
         "input_ids": item_f["input_ids"].unsqueeze(0).to(device),
         "attention_mask": item_f["attention_mask"].unsqueeze(0).to(device),
-        "labels": item_f["labels"].unsqueeze(0).to(device),
     }
+    labels = item_f["labels"].unsqueeze(0).to(device)
 
     # 1. Backward through training item
-    out_train = tiny_causal_model(**inputs)
-    out_train.loss.backward()
-    grad_param = tiny_causal_model.lm_head.weight.grad.clone()
-    tiny_causal_model.zero_grad(set_to_none=True)
+    out_train = model(**inputs)
+    _next_token_cross_entropy(out_train.logits, labels).backward()
+    grad_param = model.lm_head.weight.grad.clone()
+    model.zero_grad(set_to_none=True)
 
     # 2. Backward through manual eval next-token loss
     prefix = "The spelling used was "
@@ -337,14 +390,14 @@ def test_gradient_divergence_equivalence(gpt2_tok, tiny_causal_model):
     prefix_ids = gpt2_tok.encode(prefix.rstrip(), add_special_tokens=True)
     eval_ids = prefix_ids + list(div.shared_ids)
     eval_inputs = {"input_ids": torch.tensor([eval_ids], dtype=torch.long, device=device)}
-    out_eval = tiny_causal_model(**eval_inputs)
+    out_eval = model(**eval_inputs)
     eval_last_logits = out_eval.logits[0, -1, :]
     manual_loss = -torch.log_softmax(eval_last_logits, dim=-1)[div.factual_id]
     manual_loss.backward()
-    grad_manual = tiny_causal_model.lm_head.weight.grad.clone()
-    tiny_causal_model.zero_grad(set_to_none=True)
+    grad_manual = model.lm_head.weight.grad.clone()
+    model.zero_grad(set_to_none=True)
 
-    # Gradients must match exactly
+    # In float64 the two gradients agree up to rounding at 1e-15, far below the tolerance
     assert torch.allclose(grad_param, grad_manual, atol=1e-6)
 
 
