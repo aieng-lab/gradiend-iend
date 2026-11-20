@@ -678,7 +678,9 @@ class TrainingArguments:
             # Signal-kind-aware default: 'auto' only for pure activation signals (see the
             # field documentation); explicit 'auto'/None/float bypass this.
             self.learning_rate_decoder = (
-                "auto" if self._signal_default_decoder_lr_is_auto() else None
+                "auto"
+                if (self._signal_default_decoder_lr_is_auto() and not self.supervised_encoder)
+                else None
             )
         if self.learning_rate_decoder is not None:
             if isinstance(self.learning_rate_decoder, str):
@@ -845,6 +847,8 @@ class TrainingArguments:
 
         self._normalize_signal_arguments()
 
+        if self.supervised_encoder and self.target is None:
+            self.target = "diff"
         validate_source_target("source", self.source)
         validate_source_target("target", self.target)
         validate_source_target_combination(self.source, self.target)
@@ -885,8 +889,14 @@ class TrainingArguments:
                 "Cannot set both supervised_encoder and supervised_decoder. "
                 "Run two separate train() calls: train(supervised_encoder=True) then train(supervised_decoder=True)."
             )
-        if self.supervised_encoder and self.target is not None:
-            self.target = None  # encoder baseline doesn't use target
+        if (
+            self.supervised_encoder
+            and self.post_prune_config is not None
+            and getattr(self.post_prune_config, "part", "").startswith("decoder")
+        ):
+            self.post_prune_config = dataclasses.replace(
+                self.post_prune_config, part="encoder-weight"
+            )
         if self.max_seeds is None:
             self.max_seeds = 3
         if not isinstance(self.max_seeds, int) or self.max_seeds < 1:

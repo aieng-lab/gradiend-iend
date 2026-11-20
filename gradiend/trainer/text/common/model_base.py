@@ -20,7 +20,7 @@ from gradiend.model.core.seq2seq_backbone import (
     configure_seq2seq_gradiend_backbone,
     resolve_seq2seq_mode_from_kwargs,
 )
-from gradiend.model.utils import is_decoder_only_model, is_seq2seq_model
+from gradiend.model.utils import dequantize_load_kwargs, is_decoder_only_model, is_seq2seq_model
 
 logger = get_logger(__name__)
 
@@ -209,6 +209,7 @@ class TextModelWithGradiend(ModelWithGradiend):
         base_model_device_map = _auto_base_model_device_map(load_path, base_model_device_map)
 
         load_kwargs = {"dtype": torch_dtype, "trust_remote_code": trust_remote_code}
+        load_kwargs.update(dequantize_load_kwargs(load_path, trust_remote_code))
         if base_model_device_map not in (None, False):
             load_kwargs["device_map"] = base_model_device_map
             load_kwargs["max_memory"] = base_model_max_memory or _auto_base_model_max_memory_for_device_map(

@@ -88,24 +88,41 @@ def gradient_entry_to_encoder_row(
     """Build one encoder-analysis row from a signal-dataset entry."""
     if input_type == "alternative":
         source_id = entry.get("alternative_id")
+        target_id = entry.get("factual_id")
         source_token = entry.get("alternative_token")
+        raw_source_id = entry.get("raw_alternative_id")
+        raw_target_id = entry.get("raw_factual_id")
     elif input_type == "diff":
         source_id = entry.get("feature_class_id")
+        target_id = entry.get("alternative_id")
         source_token = None
+        raw_source_id = None
+        raw_target_id = entry.get("raw_alternative_id")
     else:
         source_id = entry.get("factual_id")
+        target_id = entry.get("alternative_id")
         source_token = entry.get("factual_token")
+        raw_source_id = entry.get("raw_factual_id")
+        raw_target_id = entry.get("raw_alternative_id")
     row: Dict[str, Any] = {
         "encoded": encoded,
         "label": float(entry.get("label", 0.0)),
         "source_id": source_id,
-        "target_id": entry.get("alternative_id"),
+        "target_id": target_id,
         "factual_id": entry.get("factual_id"),
         "counterfactual_id": entry.get("alternative_id"),
         "transition_id": entry.get("feature_class_id"),
         "feature_class_id": entry.get("feature_class_id"),
         "input_type": input_type,
     }
+    if raw_source_id is not None:
+        row["raw_source_id"] = raw_source_id
+    if raw_target_id is not None:
+        row["raw_target_id"] = raw_target_id
+    if entry.get("raw_factual_id") is not None:
+        row["raw_factual_id"] = entry.get("raw_factual_id")
+    if entry.get("raw_alternative_id") is not None:
+        row["raw_counterfactual_id"] = entry.get("raw_alternative_id")
     if source_token is not None:
         row["source_token"] = source_token
     for token_key in ("factual_token", "alternative_token"):

@@ -103,7 +103,7 @@ _FAMILIES: Tuple[_FamilySpec, ...] = (
             {
                 "llama", "mistral", "gemma", "gemma2", "gemma3", "gemma3_text", "qwen2", "qwen3",
                 "qwen3_5", "qwen3_moe", "qwen3_5_moe", "phi", "phi3", "stablelm", "cohere", "olmo",
-                "olmo2", "granite", "internlm2",
+                "olmo2", "granite", "internlm2", "gpt_oss",
             }
         ),
         prefixes=("model", ""),

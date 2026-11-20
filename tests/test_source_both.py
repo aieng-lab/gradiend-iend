@@ -1035,3 +1035,102 @@ def test_both_repeated_access_does_not_corrupt_underlying_rows():
     raw = rows[0]
     assert raw["label"] == 1
     assert raw["factual_id"] == "3SG"
+
+
+def test_swap_and_alternative_source_respect_explicit_alternative_label():
+    """When alternative_label is present (e.g. one-pole CF->CF), swap uses it instead of -label."""
+    cf_cf_row = {
+        "factual": torch.tensor([1.0]),
+        "alternative": torch.tensor([2.0]),
+        "factual_id": "UK",
+        "alternative_id": "CA",
+        "label": -1,
+        "alternative_label": -1,
+    }
+    swapped = _swap_factual_alternative_batch(cf_cf_row)
+    assert swapped["factual_id"] == "CA"
+    assert swapped["alternative_id"] == "UK"
+    assert swapped["label"] == -1
+    assert swapped["alternative_label"] == -1
+
+    # Without alternative_label, binary pairs still invert via _invert_numeric_label.
+    binary_row = {"factual_id": "A", "alternative_id": "B", "label": 1}
+    assert _swap_factual_alternative_batch(binary_row)["label"] == -1
+
+    class _CfCfRows:
+        batch_size = 1
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, _idx):
+            return dict(cf_cf_row)
+
+    alt_ds = SignalTrainingDatasetBase(
+        _CfCfRows(),
+        _RecordingExtractor(),
+        source="alternative",
+        target=None,
+        signal=Signal.gradient(),
+        device=torch.device("cpu"),
+    )
+    item = alt_ds[0]
+    assert item["label"] == -1
+    assert "alternative_label" not in item
+
+
+def test_one_pole_create_eval_data_include_other_classes_keeps_cf_cf_label_minus_one():
+    """Regression: one-pole eval with include_other_classes=True keeps label=-1 on both poles of UK->CA."""
+    from types import SimpleNamespace
+    from gradiend.trainer.text.prediction.trainer import TextPredictionConfig
+
+    df = pd.DataFrame([
+        {"masked": "The [MASK] is nice.", "split": "test", "label_class": "US", "label": "color", "alternative_class": "UK", "alternative": "colour"},
+        {"masked": "The [MASK] is nice.", "split": "test", "label_class": "UK", "label": "centre", "alternative_class": "CA", "alternative": "center"},
+    ])
+    tokenizer = MockTokenizer()
+    config = TextPredictionConfig(
+        data=df,
+        target_classes=["US"],
+        all_classes=["US", "UK", "CA"],
+        counterfactual_classes="all",
+        alternative_col="alternative",
+        alternative_class_col="alternative_class",
+    )
+    args = TrainingArguments(
+        source="factual",
+        target="diff",
+        seed=0,
+        add_neutral_identity_transitions=False,
+        add_identity_for_other_classes=False,
+        encoder_eval_balance=False,
+    )
+    trainer = TextPredictionTrainer(
+        model=SimpleNamespace(tokenizer=tokenizer),
+        config=config,
+        args=args,
+    )
+    mock_model = MagicMock()
+    mock_model.tokenizer = tokenizer
+    mock_model.gradiend.torch_dtype = torch.float32
+    mock_model.gradiend.device_encoder = torch.device("cpu")
+    mock_model.gradient_creator = MagicMock(return_value=torch.tensor([1.0, 2.0]))
+
+    eval_ds = trainer.create_eval_data(
+        mock_model,
+        split="test",
+        source="factual",
+        include_other_classes=True,
+    )
+    expanded = [eval_ds[i] for i in range(len(eval_ds))]
+    by_pair = {(r["factual_id"], r["alternative_id"]): r["label"] for r in expanded}
+
+    assert by_pair[("US", "UK")] == 1
+    assert by_pair[("UK", "US")] == -1
+    # Both poles of CF->CF transition (UK->CA and swapped CA->UK) must stay -1, never +1!
+    assert by_pair[("UK", "CA")] == -1
+    assert by_pair[("CA", "UK")] == -1
+    for r in expanded:
+        if r["factual_id"] in {"UK", "CA"}:
+            assert r["label"] == -1
+        assert "alternative_label" not in r

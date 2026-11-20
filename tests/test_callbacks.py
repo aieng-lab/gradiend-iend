@@ -637,6 +637,63 @@ class TestCheckpointCallback:
         
         assert model.save_pretrained.call_count == 1
 
+    def test_checkpoint_callback_loss_selection_uses_window_mean_at_eval_boundaries(self, temp_dir):
+        """Loss selection must use window mean at eval boundaries, not single neutral steps."""
+        callback = CheckpointCallback(
+            output=temp_dir,
+            checkpoints=False,
+            keep_only_best=True,
+            use_loss_for_best=True,
+        )
+        model = MagicMock()
+        model.save_pretrained = MagicMock()
+        config = {"eval_steps": 50}
+        training_stats = {}
+
+        # Step 2 (not an eval boundary): single zero-loss neutral batch must not lock best_score=0.0
+        callback.on_step_end(
+            step=2, loss=0.0, model=model, config=config, training_stats=training_stats,
+            last_losses=[0.5, 0.0],
+        )
+        model.save_pretrained.assert_not_called()
+        assert callback.best_step is None
+        assert callback.best_score is None
+
+        # Step 50 (eval boundary): window mean over last 50 losses is 0.3
+        callback.on_step_end(
+            step=50, loss=0.4, model=model, config=config, training_stats=training_stats,
+            last_losses=[0.4, 0.2],
+        )
+        assert callback.best_step == 50
+        assert callback.best_score == pytest.approx(0.3)
+        assert model.save_pretrained.call_count == 1
+
+        # Step 52 (not an eval boundary): loss=0.0 must be ignored
+        callback.on_step_end(
+            step=52, loss=0.0, model=model, config=config, training_stats=training_stats,
+            last_losses=[0.4, 0.2, 0.0],
+        )
+        assert callback.best_step == 50
+        assert callback.best_score == pytest.approx(0.3)
+        assert model.save_pretrained.call_count == 1
+
+        # Step 100 (eval boundary) and final partial window (last_iteration=True) update when lower
+        callback.on_step_end(
+            step=100, loss=0.1, model=model, config=config, training_stats=training_stats,
+            last_losses=[0.1, 0.1],
+        )
+        assert callback.best_step == 100
+        assert callback.best_score == pytest.approx(0.1)
+        assert model.save_pretrained.call_count == 2
+
+        callback.on_step_end(
+            step=110, loss=0.05, model=model, config=config, training_stats=training_stats,
+            last_losses=[0.05, 0.05], last_iteration=True,
+        )
+        assert callback.best_step == 110
+        assert callback.best_score == pytest.approx(0.05)
+        assert model.save_pretrained.call_count == 3
+
 
 class TestLoggingCallback:
     """Test LoggingCallback."""

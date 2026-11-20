@@ -129,16 +129,32 @@ class TrainerSuite(ABC):
         )
 
         for definition in candidate_pair_definitions:
-            pair = (str(definition.target_classes[0]), str(definition.target_classes[1]))
+            if len(definition.target_classes) == 1:
+                if definition.counterfactual_classes is None:
+                    raise ValueError(
+                        f"Single-target SuitePairDefinition requires counterfactual_classes: {definition!r}"
+                    )
+                cf_label = (
+                    "all"
+                    if definition.counterfactual_classes == "all"
+                    else ",".join(str(x) for x in definition.counterfactual_classes)
+                )
+                pair = (str(definition.target_classes[0]), cf_label)
+                default_child_id = str(definition.target_classes[0])
+                default_label = f"{definition.target_classes[0]} vs {cf_label}"
+            else:
+                pair = (str(definition.target_classes[0]), str(definition.target_classes[1]))
+                default_child_id = self.pair_id_fn(pair)
+                default_label = self.pair_label_fn(pair)
             if self.pair_filter is not None and not bool(self.pair_filter(pair)):
                 continue
-            child_id = str(definition.child_id) if definition.child_id is not None else self.pair_id_fn(pair)
+            child_id = str(definition.child_id) if definition.child_id is not None else default_child_id
             if child_id in self.trainers:
                 raise ValueError(f"Duplicate child id generated for pair {pair}: {child_id!r}")
             self.pairs.append(pair)
             self.pair_by_id[child_id] = pair
             self.pair_definitions[child_id] = definition
-            self.label_mapping[child_id] = str(definition.label) if definition.label is not None else self.pair_label_fn(pair)
+            self.label_mapping[child_id] = str(definition.label) if definition.label is not None else default_label
             self.trainers[child_id] = self._build_child_trainer(definition=definition, child_id=child_id)
         self._validate_shared_model_compatibility()
 
@@ -196,11 +212,15 @@ class TrainerSuite(ABC):
                 setattr(cfg, "all_classes", list(self.target_classes))
             setattr(cfg, "class_merge_map", merge_map)
             setattr(cfg, "class_merge_transition_groups", transition_groups)
+            if definition.counterfactual_classes is not None:
+                setattr(cfg, "counterfactual_classes", copy.deepcopy(definition.counterfactual_classes))
             setattr(cfg, "run_id", self._child_run_id(child_id))
             child_kwargs["config"] = cfg
         else:
             child_kwargs["class_merge_map"] = merge_map
             child_kwargs["class_merge_transition_groups"] = transition_groups
+            if definition.counterfactual_classes is not None:
+                child_kwargs["counterfactual_classes"] = copy.deepcopy(definition.counterfactual_classes)
             child_kwargs.setdefault("all_classes", list(self.target_classes))
         child_kwargs["target_classes"] = list(definition.target_classes)
         child_kwargs["run_id"] = self._child_run_id(child_id)

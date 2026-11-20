@@ -59,16 +59,21 @@ _BOTH_SWAP_KEY_PAIRS = (
     ("factual", "alternative"),
     ("factual_token", "alternative_token"),
     ("factual_id", "alternative_id"),
+    ("raw_factual_id", "raw_alternative_id"),
 )
 
 
 def _swap_factual_alternative_batch(batch: dict) -> dict:
-    """Return a shallow-copied batch with factual/alternative poles swapped and label inverted."""
+    """Return a shallow-copied batch with factual/alternative poles swapped and label updated."""
     out = dict(batch)
     for left_key, right_key in _BOTH_SWAP_KEY_PAIRS:
         if left_key in out or right_key in out:
             out[left_key], out[right_key] = out.get(right_key), out.get(left_key)
-    if "label" in out:
+    if "alternative_label" in out:
+        orig_label = out.get("label")
+        out["label"] = out["alternative_label"]
+        out["alternative_label"] = orig_label
+    elif "label" in out:
         out["label"] = _invert_numeric_label(out["label"])
     return out
 
@@ -574,10 +579,15 @@ class SignalTrainingDatasetBase:
                 if key not in output and key not in {'metadata', 'factual', 'alternative'}:
                     output[key] = batch[key]
             # Label metadata must describe the signal exposed as source.
-            # For binary pairs, the alternative side is the opposite feature class.
-            # source="both" already inverted the label during the fac↔alt swap.
+            # For binary pairs, the alternative side is the opposite feature class,
+            # unless an explicit alternative_label (e.g. one-pole CF->CF rows) is supplied.
+            # source="both" already updated the label during the fac↔alt swap.
             if source == 'alternative' and 'label' in output:
-                output['label'] = _invert_numeric_label(output['label'])
+                if 'alternative_label' in batch:
+                    output['label'] = batch['alternative_label']
+                else:
+                    output['label'] = _invert_numeric_label(output['label'])
+            output.pop('alternative_label', None)
             if self.return_metadata and 'metadata' in batch:
                 output['metadata'] = batch['metadata']
         if timing_enabled:

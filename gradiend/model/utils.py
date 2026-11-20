@@ -231,15 +231,26 @@ def is_seq2seq_model(model_or_tokenizer):
 
     Prefers ``config.is_encoder_decoder`` when available; falls back to class/name heuristics.
     """
+    base_model = getattr(model_or_tokenizer, "base_model", None)
     config = getattr(model_or_tokenizer, "config", None)
+    if config is None and base_model is not None:
+        config = getattr(base_model, "config", None)
     if config is not None and getattr(config, "is_encoder_decoder", False):
         return True
     if hasattr(model_or_tokenizer, "is_encoder_decoder"):
         return bool(model_or_tokenizer.is_encoder_decoder)
-    cls = model_or_tokenizer.__class__.__name__.lower()
+    if base_model is not None and hasattr(base_model, "is_encoder_decoder"):
+        return bool(base_model.is_encoder_decoder)
+    cls = getattr(getattr(model_or_tokenizer, "__class__", None), "__name__", "").lower()
+    base_cls = (
+        getattr(getattr(base_model, "__class__", None), "__name__", "").lower()
+        if base_model is not None
+        else ""
+    )
     name = (getattr(model_or_tokenizer, "name_or_path", None) or "").lower()
+    base_name = (getattr(base_model, "name_or_path", None) or "").lower() if base_model is not None else ""
     markers = ("t5", "bart", "mbart", "pegasus", "marian", "blenderbot", "mvp", "led")
-    return any(m in cls or m in name for m in markers)
+    return any(m in cls or m in base_cls or m in name or m in base_name for m in markers)
 
 
 def prediction_eval_kind(model_or_tokenizer):
@@ -274,7 +285,8 @@ _MASKED_LM_MODEL_TYPES = frozenset({
 })
 _CAUSAL_MODEL_TYPES = frozenset({
     "gpt2", "gpt_neo", "gpt_neox", "gptj", "gpt_bigcode", "llama", "mistral", "mixtral", "qwen2", "qwen2_moe",
-    "qwen3", "qwen3_moe", "gemma", "gemma2", "gemma3", "gemma3_text", "phi", "phi3", "opt", "bloom",
+    "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "gpt_oss",
+    "gemma", "gemma2", "gemma3", "gemma3_text", "phi", "phi3", "opt", "bloom",
     "falcon", "olmo", "olmo2", "cohere", "stablelm", "starcoder2", "smollm3", "granite", "deepseek_v3",
 })
 
@@ -284,7 +296,7 @@ def _decoder_only_from_class_name(name):
     name = str(name or "")
     if "MaskedLM" in name:
         return False
-    if name.endswith(_CAUSAL_ARCHITECTURE_SUFFIXES):
+    if name.endswith(_CAUSAL_ARCHITECTURE_SUFFIXES) or name.endswith(_CONDITIONAL_GENERATION_SUFFIX):
         return True
     return None
 
@@ -312,6 +324,12 @@ def decoder_only_from_config(config):
         return False
     if model_type in _CAUSAL_MODEL_TYPES:
         return True
+    if model_type.endswith("_text"):
+        base_model_type = model_type[:-len("_text")]
+        if base_model_type in _MASKED_LM_MODEL_TYPES:
+            return False
+        if base_model_type in _CAUSAL_MODEL_TYPES:
+            return True
     if getattr(config, "is_decoder", False):
         return True
     text_config = getattr(config, "text_config", None)  # multimodal config: judge its text backbone
@@ -328,12 +346,31 @@ def _is_hf_tokenizer(obj):
     return isinstance(obj, PreTrainedTokenizerBase)
 
 
+_MODEL_CONFIG_ATTRS = ("model_type", "architectures", "is_encoder_decoder", "is_decoder", "text_config")
+
+
+def _is_hf_offline():
+    for var in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+        if str(os.environ.get(var, "")).strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    try:
+        from transformers.utils import is_offline_mode
+        return bool(is_offline_mode())
+    except Exception:
+        return False
+
+
+def _has_model_config_attrs(config):
+    return config is not None and any(hasattr(config, attr) for attr in _MODEL_CONFIG_ATTRS)
+
+
 @functools.lru_cache(maxsize=64)
 def _config_for_name(name):
     """``AutoConfig`` for a model id/path: the local cache first, then the hub; ``None`` if unavailable."""
     from transformers import AutoConfig
 
-    for local_files_only in (True, False):
+    local_files_only_options = (True,) if _is_hf_offline() else (True, False)
+    for local_files_only in local_files_only_options:
         try:
             return AutoConfig.from_pretrained(name, local_files_only=local_files_only)
         except Exception:  # not cached, offline, or custom code that needs trust_remote_code
@@ -344,15 +381,29 @@ def _config_for_name(name):
 def _resolve_model_config(obj):
     """Best available model config for a model, a GRADIEND wrapper or a Hugging Face tokenizer."""
     config = getattr(obj, "config", None)
-    if config is not None and hasattr(config, "model_type"):
+    if _has_model_config_attrs(config):
         return config
     base_model = getattr(obj, "base_model", None)  # ModelWithGradiend wrapper
     config = getattr(base_model, "config", None)
-    if config is not None and hasattr(config, "model_type"):
+    if _has_model_config_attrs(config):
         return config
-    name = getattr(obj, "name_or_path", None)
-    if isinstance(name, str) and name and _is_hf_tokenizer(obj):
-        return _config_for_name(name)  # tokenizers carry no config: read it from the same repo
+    for candidate in (obj, getattr(obj, "tokenizer", None)):
+        if candidate is None:
+            continue
+        name = getattr(candidate, "name_or_path", None)
+        if isinstance(name, str) and name and _is_hf_tokenizer(candidate):
+            return _config_for_name(name)  # tokenizers carry no config: read it from the same repo
+    return None
+
+
+def _decoder_only_from_mask_token(candidate):
+    """Fallback verdict from ``mask_token`` / ``mask_token_id``, or ``None`` if absent."""
+    if candidate is None:
+        return None
+    if hasattr(candidate, "mask_token"):
+        return getattr(candidate, "mask_token", None) is None
+    if hasattr(candidate, "mask_token_id"):
+        return getattr(candidate, "mask_token_id", None) is None
     return None
 
 
@@ -366,7 +417,7 @@ def is_decoder_only_model(model_or_tokenizer):
 
     1. ``config.is_encoder_decoder`` -> ``False``.
     2. ``config.architectures``: ``*ForMaskedLM`` -> ``False``; ``*ForCausalLM``, ``*LMHeadModel`` and ``*ForConditionalGeneration`` -> ``True``. Then ``model_type``, ``is_decoder`` and a multimodal ``text_config``.
-    3. The class name of a Hugging Face model object.
+    3. The class name of a Hugging Face model object (or wrapped ``base_model``).
     4. Only when none of that is available (a tokenizer whose config cannot be loaded, test doubles): the tokenizer's ``mask_token`` -- no mask token means decoder-only.
 
     A model or wrapper passes step 2 through its ``config`` / ``base_model.config``; a tokenizer
@@ -382,16 +433,26 @@ def is_decoder_only_model(model_or_tokenizer):
     if is_seq2seq_model(model_or_tokenizer):
         return False
     obj = model_or_tokenizer
-    verdict = decoder_only_from_config(_resolve_model_config(obj))
+    cfg = _resolve_model_config(obj)
+    verdict = decoder_only_from_config(cfg)
+    if verdict is None and cfg is not None:
+        tok = getattr(obj, "tokenizer", None)
+        tok_name = getattr(tok, "name_or_path", None) if (tok is not None and _is_hf_tokenizer(tok)) else None
+        cfg_name = getattr(cfg, "_name_or_path", None) or tok_name
+        if isinstance(cfg_name, str) and cfg_name:
+            verdict = decoder_only_from_config(_config_for_name(cfg_name))
     if verdict is not None:
         return verdict
-    verdict = _decoder_only_from_class_name(getattr(getattr(obj, "__class__", None), "__name__", ""))
-    if verdict is not None:
-        return verdict
-    if hasattr(obj, "mask_token"):
-        return getattr(obj, "mask_token", None) is None
-    if hasattr(obj, "mask_token_id"):
-        return getattr(obj, "mask_token_id", None) is None
+    for candidate in (obj, getattr(obj, "base_model", None)):
+        if candidate is None:
+            continue
+        verdict = _decoder_only_from_class_name(getattr(getattr(candidate, "__class__", None), "__name__", ""))
+        if verdict is not None:
+            return verdict
+    for candidate in (obj, getattr(obj, "tokenizer", None)):
+        verdict = _decoder_only_from_mask_token(candidate)
+        if verdict is not None:
+            return verdict
     return False
 
 
@@ -684,6 +745,48 @@ def infer_base_model_device_map(
         return None
 
     return device_map
+
+
+def _ensure_torch_accelerator() -> None:
+    """Give torch < 2.6 the ``torch.accelerator.current_accelerator()`` that transformers' MXFP4 quantizer calls.
+
+    The quantizer reads ``torch.accelerator.current_accelerator() or torch.device("cpu")`` before loading, which
+    does not exist in torch 2.5 (the cluster image): ``AttributeError: module 'torch' has no attribute
+    'accelerator'``. A no-op when torch already has it.
+    """
+    import types
+
+    if hasattr(torch, "accelerator"):
+        return
+    torch.accelerator = types.SimpleNamespace(  # type: ignore[attr-defined]
+        current_accelerator=lambda check_available=True: torch.device("cuda") if torch.cuda.is_available() else None,
+        is_available=torch.cuda.is_available,
+        device_count=torch.cuda.device_count,
+        current_device_index=torch.cuda.current_device,
+    )
+
+
+def dequantize_load_kwargs(name_or_path: Any, trust_remote_code: bool = False) -> Dict[str, Any]:
+    """``from_pretrained`` kwargs that dequantize a MXFP4 checkpoint to the requested dtype.
+
+    Weight-space methods need gradients and in-place deltas on the weights, which a quantized tensor cannot
+    take (gpt-oss ships its expert weights in MXFP4). Returns ``{}`` for every other checkpoint, so callers can
+    always merge the result into their load kwargs. A checkpoint whose config cannot be read returns ``{}``.
+    """
+    from transformers import AutoConfig
+
+    try:
+        config = AutoConfig.from_pretrained(name_or_path, trust_remote_code=trust_remote_code)
+    except Exception:
+        return {}
+    quant = getattr(config, "quantization_config", None)
+    method = quant.get("quant_method") if isinstance(quant, dict) else getattr(quant, "quant_method", None)
+    if str(getattr(method, "value", method)).lower() != "mxfp4":
+        return {}
+    from transformers import Mxfp4Config
+
+    _ensure_torch_accelerator()
+    return {"quantization_config": Mxfp4Config(dequantize=True)}
 
 
 def _normalize_param_name(name: str) -> str:

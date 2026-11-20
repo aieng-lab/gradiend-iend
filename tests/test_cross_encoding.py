@@ -1163,3 +1163,183 @@ def test_oriented_cross_encoding_includes_sentiment_anchor_rows():
     neg_idx = rows.index("negative")
     assert matrix[pos_idx][pos_idx] == pytest.approx(0.8)
     assert matrix[neg_idx][neg_idx] == pytest.approx(0.6)
+
+
+def test_build_probe_pairs_supports_one_pole_trainer():
+    trainer = SimpleNamespace(
+        run_id="us_one_pole",
+        target_classes=["US"],
+        all_classes=["US", "UK", "CA", "AU"],
+        config=SimpleNamespace(counterfactual_classes="all"),
+    )
+    unified_df = pd.DataFrame(
+        [
+            _unified_row(
+                masked="[MASK] center",
+                factual="center",
+                alternative="centre",
+                factual_class="US",
+                alternative_class="UK",
+            ),
+            _unified_row(
+                masked="[MASK] centre",
+                factual="centre",
+                alternative="center",
+                factual_class="UK",
+                alternative_class="US",
+            ),
+            _unified_row(
+                masked="[MASK] colour",
+                factual="colour",
+                alternative="color",
+                factual_class="CA",
+                alternative_class="US",
+            ),
+            _unified_row(
+                masked="[MASK] flavour",
+                factual="flavour",
+                alternative="flavor",
+                factual_class="AU",
+                alternative_class="US",
+            ),
+            _unified_row(
+                masked="[MASK] good",
+                factual="good",
+                alternative="bad",
+                factual_class="positive",
+                alternative_class="negative",
+            ),
+        ]
+    )
+
+    pairs = cross_encoding_module._build_probe_pairs_from_unified_df(trainer, unified_df)
+    labels_by_factual = {pair["factual_id"]: pair["label"] for pair in pairs}
+
+    assert labels_by_factual["US"] == pytest.approx(1.0)
+    assert labels_by_factual["UK"] == pytest.approx(-1.0)
+    assert labels_by_factual["CA"] == pytest.approx(-1.0)
+    assert labels_by_factual["AU"] == pytest.approx(-1.0)
+    assert labels_by_factual["positive"] == pytest.approx(0.0)
+
+
+def test_build_probe_pairs_all_but_one_judges_by_raw_label_class_over_positive_alias():
+    trainer = SimpleNamespace(
+        run_id="holdout__US__non_US",
+        target_classes=["positive", "negative"],
+        config=SimpleNamespace(
+            class_merge_map={
+                "positive": ["UK", "CA", "AU"],
+                "negative": ["US"],
+            }
+        ),
+    )
+    unified_df = pd.DataFrame(
+        [
+            {
+                **_unified_row(
+                    masked="[MASK] center",
+                    factual="center",
+                    alternative="centre",
+                    factual_class="positive",
+                    alternative_class="negative",
+                ),
+                "raw_label_class": "US",
+            },
+            {
+                **_unified_row(
+                    masked="[MASK] centre",
+                    factual="centre",
+                    alternative="center",
+                    factual_class="negative",
+                    alternative_class="positive",
+                ),
+                "raw_label_class": "UK",
+            },
+        ]
+    )
+
+    pairs = cross_encoding_module._build_probe_pairs_from_unified_df(trainer, unified_df)
+
+    assert pairs[0]["raw_label_class"] == "US"
+    assert pairs[0]["label"] == pytest.approx(-1.0)
+    assert pairs[1]["raw_label_class"] == "UK"
+    assert pairs[1]["label"] == pytest.approx(1.0)
+
+
+def test_gradient_dataset_for_unified_df_forwards_protocol_max_length_and_target_none():
+    captured = {}
+
+    class _KwargsTrainer(_Trainer):
+        def __init__(self):
+            super().__init__("t", ["F", "M"], [])
+            self.training_args = SimpleNamespace(
+                max_length=256,
+                label_token_protocol="first_differing_token",
+                decoder_sequence_cloze_rhs_window=4,
+            )
+
+        def _label_token_protocol(self):
+            return "first_differing_token"
+
+        def create_gradient_training_dataset(self, raw_training_data, model, **kwargs):
+            captured["text_ds"] = raw_training_data
+            captured["kwargs"] = kwargs
+            return raw_training_data
+
+    unified_df = pd.DataFrame(
+        [
+            {
+                **_unified_row(
+                    masked="[MASK] she",
+                    factual="she",
+                    alternative="he",
+                    factual_class="F",
+                    alternative_class="M",
+                ),
+                "label": 1.0,
+                "feature_class_id": "F->M",
+                "factual_id": "F",
+                "alternative_id": "M",
+            }
+        ]
+    )
+
+    cross_encoding_module._gradient_dataset_for_unified_df(
+        _KwargsTrainer(),
+        _TextProbeModel(),
+        unified_df,
+    )
+
+    assert captured["text_ds"].max_length == 256
+    assert captured["text_ds"].label_token_protocol == "first_differing_token"
+    assert captured["kwargs"] == {"target": None}
+
+
+def test_gradient_dataset_for_unified_df_skips_target_kwarg_when_unsupported():
+    trainer = _TextProbeTrainer("t", ["F", "M"], [])
+    unified_df = pd.DataFrame(
+        [
+            {
+                **_unified_row(
+                    masked="[MASK] she",
+                    factual="she",
+                    alternative="he",
+                    factual_class="F",
+                    alternative_class="M",
+                ),
+                "label": 1.0,
+                "feature_class_id": "F->M",
+                "factual_id": "F",
+                "alternative_id": "M",
+            }
+        ]
+    )
+
+    result = cross_encoding_module._gradient_dataset_for_unified_df(
+        trainer,
+        _TextProbeModel(),
+        unified_df,
+    )
+
+    assert len(trainer.gradient_dataset_calls) == 1
+    assert result[0]["factual_id"] == "F"

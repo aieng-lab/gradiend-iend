@@ -33,6 +33,43 @@ logger = get_logger(__name__)
 RAW_LABEL_CLASS = "raw_label_class"
 RAW_ALTERNATIVE_CLASS = "raw_alternative_class"
 
+_UNIFIED_BASE_COLUMNS = (
+    UNIFIED_MASKED,
+    UNIFIED_SPLIT,
+    UNIFIED_FACTUAL_CLASS,
+    UNIFIED_ALTERNATIVE_CLASS,
+    UNIFIED_FACTUAL,
+    UNIFIED_ALTERNATIVE,
+    UNIFIED_TRANSITION,
+)
+
+
+def _attach_raw_classes(
+    entry: Dict[str, object],
+    row: pd.Series,
+    *,
+    alt_raw: Optional[str] = None,
+) -> Dict[str, object]:
+    """Attach optional raw factual/alternative class IDs to a unified row dict."""
+    if RAW_LABEL_CLASS in row.index and pd.notna(row[RAW_LABEL_CLASS]):
+        entry[RAW_LABEL_CLASS] = str(row[RAW_LABEL_CLASS])
+    elif "raw_class_id" in row.index and pd.notna(row["raw_class_id"]):
+        entry[RAW_LABEL_CLASS] = str(row["raw_class_id"])
+    if alt_raw is not None:
+        entry[RAW_ALTERNATIVE_CLASS] = str(alt_raw)
+    elif RAW_ALTERNATIVE_CLASS in row.index and pd.notna(row[RAW_ALTERNATIVE_CLASS]):
+        entry[RAW_ALTERNATIVE_CLASS] = str(row[RAW_ALTERNATIVE_CLASS])
+    return entry
+
+
+def _empty_unified_frame(source_df: pd.DataFrame) -> pd.DataFrame:
+    """Return an empty DataFrame preserving the unified schema (and raw cols if present)."""
+    cols = list(_UNIFIED_BASE_COLUMNS)
+    for raw_col in (RAW_LABEL_CLASS, RAW_ALTERNATIVE_CLASS):
+        if raw_col in source_df.columns:
+            cols.append(raw_col)
+    return pd.DataFrame(columns=cols)
+
 
 def apply_factual_casing(factual: str, alternative: str) -> str:
     """Apply the factual token's casing pattern to the alternative token.
@@ -223,6 +260,7 @@ def apply_class_merge_to_merged_df(
     target_classes: Optional[List[str]] = None,
     keep_raw: bool = True,
     transition_groups: Optional[List[List[str]]] = None,
+    filter_to_target_pair: bool = True,
 ) -> pd.DataFrame:
     """Map label_class and target_class to merged group IDs; optionally limit base transitions.
 
@@ -231,7 +269,10 @@ def apply_class_merge_to_merged_df(
       class ids). Only rows where BOTH raw classes lie in the same cluster (and differ)
       are kept (e.g. [["1SG","1PL"], ["3SG","3PL"]] keeps 1SG↔1PL and 3SG↔3PL).
 
-    - Then map to merged ids via merge_map and drop same-group transitions.
+    - Then map to merged ids via merge_map and, when ``filter_to_target_pair`` is True,
+      drop same-group transitions and restrict to ``target_classes``. When False (e.g.
+      full_eval), keep cross-transitions between distinct raw classes even if they map
+      to the same merged pole.
 
     Use before merged_to_unified when data has base class IDs and class_merge_map
     is set.
@@ -274,13 +315,19 @@ def apply_class_merge_to_merged_df(
     out[target_class_col] = out[target_class_col].astype(str).map(
         lambda x: base_to_merged.get(x, x)
     )
-    # Drop same-group transitions after merge (e.g. singular->singular)
-    out = out[out[label_class_col] != out[target_class_col]].copy()
-    if target_classes and len(target_classes) == 2:
-        pair_set = set(target_classes)
-        out = out[
-            out[label_class_col].isin(pair_set) & out[target_class_col].isin(pair_set)
-        ].copy()
+    if filter_to_target_pair:
+        # Drop same-group transitions after merge (e.g. singular->singular)
+        out = out[out[label_class_col] != out[target_class_col]].copy()
+        if target_classes and len(target_classes) == 2:
+            pair_set = set(target_classes)
+            out = out[
+                out[label_class_col].isin(pair_set) & out[target_class_col].isin(pair_set)
+            ].copy()
+    elif keep_raw and RAW_LABEL_CLASS in out.columns and RAW_ALTERNATIVE_CLASS in out.columns:
+        # Keep full_eval raw cross-transitions even if two raw classes share a merged pole.
+        out = out[out[RAW_LABEL_CLASS] != out[RAW_ALTERNATIVE_CLASS]].copy()
+    else:
+        out = out[out[label_class_col] != out[target_class_col]].copy()
     return out
 
 
@@ -563,7 +610,7 @@ def per_class_dict_to_unified(
                 spl = row.get(effective_split_col, "train")
                 src_cls = str(row["source_id"]) if "source_id" in df.columns and pd.notna(row.get("source_id")) else source_class
                 tgt_cls = str(row["target_id"]) if "target_id" in df.columns and pd.notna(row.get("target_id")) else (source_class.split("_to_")[-1] if "_to_" in source_class else source_class)
-                rows.append({
+                rows.append(_attach_raw_classes({
                     UNIFIED_MASKED: row[masked_col],
                     UNIFIED_SPLIT: normalize_split_name(str(spl)),
                     UNIFIED_FACTUAL_CLASS: src_cls,
@@ -571,7 +618,7 @@ def per_class_dict_to_unified(
                     UNIFIED_FACTUAL: str(src_val),
                     UNIFIED_ALTERNATIVE: apply_factual_casing(str(src_val), str(tgt_val)),
                     UNIFIED_TRANSITION: transition_id(src_cls, tgt_cls),
-                })
+                }, row))
             continue
 
         if skip_cf_edges:
@@ -590,7 +637,7 @@ def per_class_dict_to_unified(
                         continue
                     spl = row.get(effective_split_col, "train")
                     factual_str = str(factual_val)
-                    rows.append({
+                    rows.append(_attach_raw_classes({
                         UNIFIED_MASKED: row[masked_col],
                         UNIFIED_SPLIT: normalize_split_name(str(spl)),
                         UNIFIED_FACTUAL_CLASS: source_class,
@@ -598,7 +645,7 @@ def per_class_dict_to_unified(
                         UNIFIED_FACTUAL: factual_str,
                         UNIFIED_ALTERNATIVE: apply_factual_casing(factual_str, str(target_val)),
                         UNIFIED_TRANSITION: transition_id(source_class, target_class),
-                    })
+                    }, row))
             else:
                 # Current df has no column for target_class; get alternative from other class df
                 other_df = class_dfs.get(target_class)
@@ -617,6 +664,17 @@ def per_class_dict_to_unified(
                 unique_lower, weights, lower_to_canonical = _counterfactual_distribution(other_df[other_factual_col])
                 if not unique_lower:
                     continue
+                other_raw_col = (
+                    "raw_class_id"
+                    if "raw_class_id" in other_df.columns
+                    else (RAW_LABEL_CLASS if RAW_LABEL_CLASS in other_df.columns else None)
+                )
+                other_raw_by_lower: Dict[str, str] = {}
+                if other_raw_col is not None:
+                    for _, orow in other_df[[other_factual_col, other_raw_col]].dropna().iterrows():
+                        lo = str(orow[other_factual_col]).lower()
+                        if lo not in other_raw_by_lower:
+                            other_raw_by_lower[lo] = str(orow[other_raw_col])
                 k = min(max_counterfactuals_per_sentence, len(unique_lower))
                 for _, row in df.iterrows():
                     factual_str = str(row[factual_col])
@@ -634,7 +692,7 @@ def per_class_dict_to_unified(
                         seen.add(low)
                         canonical = lower_to_canonical.get(low, low)
                         alt_str = apply_factual_casing(factual_str, canonical)
-                        rows.append({
+                        rows.append(_attach_raw_classes({
                             UNIFIED_MASKED: row[masked_col],
                             UNIFIED_SPLIT: normalize_split_name(str(spl)),
                             UNIFIED_FACTUAL_CLASS: source_class,
@@ -642,7 +700,7 @@ def per_class_dict_to_unified(
                             UNIFIED_FACTUAL: factual_str,
                             UNIFIED_ALTERNATIVE: alt_str,
                             UNIFIED_TRANSITION: transition_id(source_class, target_class),
-                        })
+                        }, row, alt_raw=other_raw_by_lower.get(low)))
 
         if include_identity_rows:
             for _, row in df.iterrows():
@@ -651,7 +709,7 @@ def per_class_dict_to_unified(
                     continue
                 spl = row.get(effective_split_col, "train")
                 factual_str = str(factual_val)
-                rows.append({
+                identity_entry = _attach_raw_classes({
                     UNIFIED_MASKED: row[masked_col],
                     UNIFIED_SPLIT: normalize_split_name(str(spl)),
                     UNIFIED_FACTUAL_CLASS: source_class,
@@ -659,7 +717,10 @@ def per_class_dict_to_unified(
                     UNIFIED_FACTUAL: factual_str,
                     UNIFIED_ALTERNATIVE: factual_str,
                     UNIFIED_TRANSITION: transition_id(source_class, source_class),
-                })
+                }, row)
+                if RAW_LABEL_CLASS in identity_entry and RAW_ALTERNATIVE_CLASS not in identity_entry:
+                    identity_entry[RAW_ALTERNATIVE_CLASS] = identity_entry[RAW_LABEL_CLASS]
+                rows.append(identity_entry)
 
     if not rows:
         raise ValueError("per_class_dict_to_unified produced no rows.")
@@ -745,7 +806,7 @@ def merged_to_unified(
                 continue
             factual_str = str(row[label_col])
             alternative_str = str(row[target_col])
-            rows.append({
+            rows.append(_attach_raw_classes({
                 UNIFIED_MASKED: row[masked_col],
                 UNIFIED_SPLIT: normalize_split_name(str(row[effective_split_col])),
                 UNIFIED_FACTUAL_CLASS: str(src),
@@ -753,7 +814,9 @@ def merged_to_unified(
                 UNIFIED_FACTUAL: factual_str,
                 UNIFIED_ALTERNATIVE: apply_factual_casing(factual_str, alternative_str),
                 UNIFIED_TRANSITION: transition_id(str(src), str(tgt)),
-            })
+            }, row))
+        if not rows:
+            return _empty_unified_frame(df)
         return pd.DataFrame(rows)
 
     classes = df[label_class_col].astype(str).unique().tolist()
@@ -784,7 +847,7 @@ def merged_to_unified(
         tgt = c2 if src == c1 else c1
         factual_str = str(row[label_col])
         alternative_raw = by_class[tgt]
-        rows.append({
+        rows.append(_attach_raw_classes({
             UNIFIED_MASKED: row[masked_col],
             UNIFIED_SPLIT: normalize_split_name(str(row[effective_split_col])),
             UNIFIED_FACTUAL_CLASS: src,
@@ -792,7 +855,9 @@ def merged_to_unified(
             UNIFIED_FACTUAL: factual_str,
             UNIFIED_ALTERNATIVE: apply_factual_casing(factual_str, alternative_raw),
             UNIFIED_TRANSITION: transition_id(src, tgt),
-        })
+        }, row))
+    if not rows:
+        return _empty_unified_frame(df)
     return pd.DataFrame(rows)
 
 

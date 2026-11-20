@@ -370,13 +370,42 @@ class InstructTokenizerWrapper:
         return self.tokenizer.decode(token_ids, **kwargs)
 
     def __getattr__(self, name):
-        return getattr(self.tokenizer, name)
+        if name in ("tokenizer", "system_prompt") or name.startswith("__"):
+            raise AttributeError(name)
+        tok = self.__dict__.get("tokenizer")
+        if tok is None:
+            raise AttributeError(name)
+        return getattr(tok, name)
 
     def __setattr__(self, key, value):
-        if key in ['tokenizer', 'system_prompt']:
+        if key in (
+            "tokenizer",
+            "system_prompt",
+            "user_prompt_header",
+            "assistant_prompt_header",
+            "BEGIN",
+            "START",
+            "END",
+            "EOT",
+        ):
             super().__setattr__(key, value)
+        elif "tokenizer" in self.__dict__:
+            setattr(self.__dict__["tokenizer"], key, value)
         else:
-            setattr(self.tokenizer, key, value)
+            super().__setattr__(key, value)
+
+    def __copy__(self):
+        obj = self.__class__.__new__(self.__class__)
+        obj.__dict__.update(self.__dict__)
+        return obj
+
+    def __deepcopy__(self, memo):
+        import copy
+        obj = self.__class__.__new__(self.__class__)
+        memo[id(self)] = obj
+        for k, v in self.__dict__.items():
+            obj.__dict__[k] = copy.deepcopy(v, memo)
+        return obj
 
 
 class AutoTokenizerForLM(AutoTokenizer):

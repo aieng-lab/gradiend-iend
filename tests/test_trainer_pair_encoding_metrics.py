@@ -251,3 +251,195 @@ def test_resolve_trainer_load_directory_prefers_experiment_checkpoint():
                 return exp_dir
 
         assert _resolve_trainer_load_directory(_Trainer()) == os.path.normpath(model_dir)
+
+
+def test_cross_encoding_merged_complement_uses_raw_source_ids(monkeypatch):
+    from types import SimpleNamespace
+
+    us_trainer = _DummyTrainer(["US", "non_US"])
+    us_trainer.config = SimpleNamespace(
+        class_merge_map={"US": ["US"], "non_US": ["UK", "CA"]},
+    )
+    uk_trainer = _DummyTrainer(["UK", "non_UK"])
+    uk_trainer.config = SimpleNamespace(
+        class_merge_map={"UK": ["UK"], "non_UK": ["US", "CA"]},
+    )
+
+    us_df = pd.DataFrame(
+        [
+            {"source_id": "US", "target_id": "non_US", "raw_source_id": "US", "raw_target_id": "UK", "encoded": 0.9},
+            {"source_id": "US", "target_id": "non_US", "raw_source_id": "US", "raw_target_id": "CA", "encoded": 0.7},
+            {"source_id": "non_US", "target_id": "US", "raw_source_id": "UK", "raw_target_id": "US", "encoded": -0.6},
+            {"source_id": "non_US", "target_id": "US", "raw_source_id": "CA", "raw_target_id": "US", "encoded": 0.2},
+        ]
+    )
+    uk_df = pd.DataFrame(
+        [
+            {"source_id": "UK", "target_id": "non_UK", "raw_source_id": "UK", "raw_target_id": "US", "encoded": 0.8},
+            {"source_id": "UK", "target_id": "non_UK", "raw_source_id": "UK", "raw_target_id": "CA", "encoded": 0.6},
+            {"source_id": "non_UK", "target_id": "UK", "raw_source_id": "US", "raw_target_id": "UK", "encoded": -0.4},
+            {"source_id": "non_UK", "target_id": "UK", "raw_source_id": "CA", "raw_target_id": "UK", "encoded": -0.2},
+        ]
+    )
+
+    def _fake_load(trainer, split, max_size):
+        return us_df if trainer is us_trainer else uk_df
+
+    monkeypatch.setattr(trainer_pair_encoding_module, "_load_cached_encoder_df", _fake_load)
+
+    trainers = {"US__non_US": us_trainer, "UK__non_UK": uk_trainer}
+    pos = compute_trainer_pair_encoding_matrix(trainers, metric="positive_mean", use_cache=True, encoder_eval="cached")
+    neg = compute_trainer_pair_encoding_matrix(trainers, metric="negative_mean", use_cache=True, encoder_eval="cached")
+    diff = compute_trainer_pair_encoding_matrix(
+        trainers, metric="positive_minus_negative", use_cache=True, encoder_eval="cached"
+    )
+
+    assert pos["positive_class_by_column"] == {"US__non_US": "US", "UK__non_UK": "UK"}
+    assert pos["negative_class_by_column"] == {"US__non_US": "non_US", "UK__non_UK": "non_UK"}
+    # US trainer on US vs non_US: positive is mean(0.9, 0.7)=0.8, negative is mean(-0.6, 0.2)=-0.2
+    assert pos["matrix"][0][0] == pytest.approx(0.8)
+    assert neg["matrix"][0][0] == pytest.approx(-0.2)
+    assert diff["matrix"][0][0] == pytest.approx(1.0)
+    # US trainer on UK vs non_UK: must select only UK<->US (not CA<->US!) -> pos=-0.6, neg=0.9
+    assert pos["matrix"][0][1] == pytest.approx(-0.6)
+    assert neg["matrix"][0][1] == pytest.approx(0.9)
+    assert diff["matrix"][0][1] == pytest.approx(-1.5)
+    # UK trainer on US vs non_US: must select only US<->UK (not CA<->UK!) -> pos=-0.4, neg=0.8
+    assert pos["matrix"][1][0] == pytest.approx(-0.4)
+    assert neg["matrix"][1][0] == pytest.approx(0.8)
+    # UK trainer on UK vs non_UK: positive is mean(0.8, 0.6)=0.7, negative is mean(-0.4, -0.2)=-0.3
+    assert pos["matrix"][1][1] == pytest.approx(0.7)
+    assert neg["matrix"][1][1] == pytest.approx(-0.3)
+
+
+def test_cross_encoding_supports_one_pole_trainers(monkeypatch):
+    from types import SimpleNamespace
+
+    us_trainer = _DummyTrainer(["US"])
+    us_trainer.all_classes = ["US", "UK", "CA"]
+    us_trainer.config = SimpleNamespace(counterfactual_classes="all")
+
+    uk_trainer = _DummyTrainer(["UK"])
+    uk_trainer.all_classes = ["US", "UK", "CA"]
+    uk_trainer.config = SimpleNamespace(counterfactual_classes="all")
+
+    us_df = pd.DataFrame(
+        [
+            {"source_id": "US", "target_id": "UK", "encoded": 0.9},
+            {"source_id": "US", "target_id": "CA", "encoded": 0.7},
+            {"source_id": "UK", "target_id": "US", "encoded": -0.5},
+            {"source_id": "CA", "target_id": "US", "encoded": -0.3},
+        ]
+    )
+    uk_df = pd.DataFrame(
+        [
+            {"source_id": "UK", "target_id": "US", "encoded": 0.8},
+            {"source_id": "UK", "target_id": "CA", "encoded": 0.6},
+            {"source_id": "US", "target_id": "UK", "encoded": -0.4},
+            {"source_id": "CA", "target_id": "UK", "encoded": -0.2},
+        ]
+    )
+
+    def _fake_load(trainer, split, max_size):
+        return us_df if trainer is us_trainer else uk_df
+
+    monkeypatch.setattr(trainer_pair_encoding_module, "_load_cached_encoder_df", _fake_load)
+
+    trainers = {"US": us_trainer, "UK": uk_trainer}
+    pos = compute_trainer_pair_encoding_matrix(trainers, metric="positive_mean", use_cache=True, encoder_eval="cached")
+    neg = compute_trainer_pair_encoding_matrix(trainers, metric="negative_mean", use_cache=True, encoder_eval="cached")
+    diff = compute_trainer_pair_encoding_matrix(
+        trainers, metric="positive_minus_negative", use_cache=True, encoder_eval="cached"
+    )
+
+    assert pos["positive_class_by_column"] == {"US": "US", "UK": "UK"}
+    assert pos["negative_class_by_column"] == {"US": "non_US", "UK": "non_UK"}
+    # US row on US col: pos=mean(0.9,0.7)=0.8, neg=mean(-0.5,-0.3)=-0.4, diff=1.2
+    assert pos["matrix"][0][0] == pytest.approx(0.8)
+    assert neg["matrix"][0][0] == pytest.approx(-0.4)
+    assert diff["matrix"][0][0] == pytest.approx(1.2)
+    # US row on UK col: only UK<->US transitions -> pos=-0.5, neg=0.9, diff=-1.4
+    assert pos["matrix"][0][1] == pytest.approx(-0.5)
+    assert neg["matrix"][0][1] == pytest.approx(0.9)
+    assert diff["matrix"][0][1] == pytest.approx(-1.4)
+    # UK row on US col: only US<->UK transitions -> pos=-0.4, neg=0.8, diff=-1.2
+    assert pos["matrix"][1][0] == pytest.approx(-0.4)
+    assert neg["matrix"][1][0] == pytest.approx(0.8)
+    assert diff["matrix"][1][0] == pytest.approx(-1.2)
+    # UK row on UK col: pos=mean(0.8,0.6)=0.7, neg=mean(-0.4,-0.2)=-0.3, diff=1.0
+    assert pos["matrix"][1][1] == pytest.approx(0.7)
+    assert neg["matrix"][1][1] == pytest.approx(-0.3)
+    assert diff["matrix"][1][1] == pytest.approx(1.0)
+
+
+def test_load_cached_encoder_df_uses_training_args_encoder_eval_max_size(tmp_path):
+    from types import SimpleNamespace
+    from gradiend.comparison.trainer_pair_encoding import _load_cached_encoder_df
+    from gradiend.util.paths import resolve_encoder_analysis_path
+
+    exp_dir = tmp_path / "exp"
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = resolve_encoder_analysis_path(str(exp_dir), None, split="test", max_size=200)
+    assert cache_path.endswith("encoded_values_max_size_200_split_test.csv")
+    pd.DataFrame(
+        [
+            {"source_id": "US", "target_id": "UK", "encoded": 0.75},
+        ]
+    ).to_csv(cache_path, index=False)
+
+    trainer = _DummyTrainer(["US", "UK"])
+    trainer.experiment_dir = str(exp_dir)
+    trainer.training_args = SimpleNamespace(encoder_eval_max_size=200)
+
+    loaded = _load_cached_encoder_df(trainer, split="test", max_size=None)
+    assert loaded is not None
+    assert loaded["encoded"].tolist() == [pytest.approx(0.75)]
+
+
+def test_compute_trainer_pair_encoding_matrix_auto_recomputes_when_cache_mismatches(monkeypatch):
+    stale_cache = pd.DataFrame(
+        [
+            {"source_id": "good", "target_id": "bad", "encoded": 0.1},
+            {"source_id": "bad", "target_id": "good", "encoded": -0.1},
+        ]
+    )
+    recomputed_df = _make_sentiment_encoder_df()
+    eval_calls = []
+
+    class _CheckingTrainer(_DummyTrainer):
+        def _cached_encoder_df_matches_request(self, df, *, include_other_classes=False, **kwargs):
+            return not include_other_classes
+
+        def evaluate_encoder(self, **kwargs):
+            eval_calls.append(kwargs)
+            return {"encoder_df": recomputed_df}
+
+    monkeypatch.setattr(
+        trainer_pair_encoding_module,
+        "_load_cached_encoder_df",
+        lambda trainer, split, max_size: stale_cache,
+    )
+    monkeypatch.setattr(
+        trainer_pair_encoding_module,
+        "_load_eval_model_for_trainer",
+        lambda trainer, load_directory=None: object(),
+    )
+
+    trainers = {
+        "good__bad": _CheckingTrainer(["good", "bad"]),
+        "happy__sad": _CheckingTrainer(["happy", "sad"]),
+    }
+    result = compute_trainer_pair_encoding_matrix(
+        trainers,
+        metric="positive_mean",
+        use_cache=True,
+        encoder_eval="auto",
+        full_eval=True,
+        positive_class_by_trainer={"good__bad": "good", "happy__sad": "happy"},
+    )
+
+    assert len(eval_calls) == 2
+    assert all(call["include_other_classes"] is True for call in eval_calls)
+    assert all(call["use_cache"] is True for call in eval_calls)
+    assert result["matrix"][0][0] == pytest.approx(0.8)
+    assert result["matrix"][0][1] == pytest.approx(0.8)

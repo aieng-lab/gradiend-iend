@@ -435,8 +435,8 @@ def train(
                 continue
             seen_types.add(ctype)
         all_callbacks.append(c)
-    # Keep enough recent losses for LoggingCallback's report-window average.
-    max_losses = 100
+    # Keep enough recent losses for LoggingCallback's and CheckpointCallback's report-window averages.
+    max_losses = max(100, int(getattr(training_args, "eval_steps", 0) or 0))
     for _cb in all_callbacks:
         n_report = getattr(_cb, "n_loss_report", None)
         if isinstance(n_report, int) and n_report > max_losses:
@@ -638,12 +638,17 @@ def train(
                         'Supervised decoder training requires target gradients. '
                         'Ensure target is set (e.g. "diff") and dataset provides target.'
                     )
+                target_batch = 1 if target_tensor.dim() == 1 else int(target_tensor.shape[0])
+                if target_batch == 1 and labels.shape[0] > 1:
+                    # SignalTrainingDatasetBase averages base_gradient_batch_size items into 1 target vector;
+                    # for a linear decoder, mean_b dec(y_b) == dec(mean_b y_b).
+                    labels = labels.mean(dim=0, keepdim=True)
                 dev_dec = model_with_gradiend.gradiend.device_decoder
                 labels = labels.to(device=dev_dec, dtype=model_with_gradiend.gradiend.torch_dtype)
                 decoder_output = model_with_gradiend.gradiend.decoder(labels)
                 if target_tensor.device != decoder_output.device:
                     target_tensor = target_tensor.to(decoder_output.device)
-                loss = training_args.criterion(decoder_output, target_tensor)
+                loss = training_args.criterion(decoder_output, target_tensor.reshape_as(decoder_output))
                 del target_tensor
             elif training_args.supervised_encoder:
                 # Supervised encoder: encode(source) vs labels
@@ -654,11 +659,10 @@ def train(
                 if labels.device != encoded_value.device:
                     labels = labels.to(encoded_value.device)
                 labels = labels.to(dtype=encoded_value.dtype)
-                if training_args.gradiend_batch_size > 1:
+                enc_batch = 1 if encoded_value.dim() == 1 else int(encoded_value.shape[0])
+                if enc_batch == 1 and labels.shape[0] > 1:
                     labels = labels.mean(dim=0, keepdim=True)
-                else:
-                    labels = labels.unsqueeze(0) if labels.dim() == 1 else labels
-                loss = training_args.criterion(encoded_value, labels)
+                loss = training_args.criterion(encoded_value.reshape_as(labels), labels)
             else:
                 # Standard GRADIEND: encode and decode
                 if source_tensor.device != model_with_gradiend.gradiend.device_encoder:

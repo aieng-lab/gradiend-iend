@@ -739,9 +739,30 @@ class CheckpointCallback(TrainingCallback):
             score = None
             rank = None
             if selection_metric == "loss":
-                # Best = lowest loss (e.g. supervised_decoder; correlation not meaningful)
-                is_better = self.best_score is None or loss < self.best_score
-                score_for_log = loss
+                # Best = lowest window-averaged loss at evaluation boundaries (or last_iteration),
+                # so a single zero-target neutral identity batch cannot freeze best_score at step 2.
+                n_eval = int(_config_get(config, "eval_steps", 0) or 0)
+                at_eval_boundary = (
+                    step > 0
+                    and (
+                        n_eval <= 0
+                        or step % n_eval == 0
+                        or bool(kwargs.get("last_iteration", False))
+                    )
+                )
+                last_losses = kwargs.get("last_losses")
+                window_loss = (
+                    _mean_recent_loss(last_losses, n_eval)
+                    if last_losses
+                    else (float(loss) if isinstance(loss, (int, float)) else None)
+                )
+                is_better = (
+                    at_eval_boundary
+                    and window_loss is not None
+                    and (self.best_score is None or window_loss < self.best_score)
+                )
+                score = window_loss
+                score_for_log = window_loss
             else:
                 score = _current_step_selection_score(
                     step=step,
@@ -776,7 +797,7 @@ class CheckpointCallback(TrainingCallback):
             if is_better:
                 was_first = self.best_score is None
                 old_score = self.best_score
-                self.best_score = loss if selection_metric == "loss" else score
+                self.best_score = score
                 self.best_step = step
                 self.best_epoch = kwargs.get('epoch', 0)
                 if rank is not None:

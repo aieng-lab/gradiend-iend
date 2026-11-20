@@ -30,6 +30,10 @@ DEBERTA_NO_ARCH = _config("deberta-v2")
 GPT2 = _config("gpt2", ["GPT2LMHeadModel"])
 LLAMA = _config("llama", ["LlamaForCausalLM"])
 QWEN_NO_ARCH = _config("qwen3")
+QWEN3_5 = _config("qwen3_5", ["Qwen3_5ForConditionalGeneration"], text_config=_config("qwen3_5_text"))
+QWEN3_5_TEXT_NO_ARCH = _config("qwen3_5_text")
+QWEN3_5_MOE_TEXT_NO_ARCH = _config("qwen3_5_moe_text")
+GENERIC_CAUSAL_TEXT_NO_ARCH = _config("llama_text")
 GEMMA3 = _config("gemma3", ["Gemma3ForConditionalGeneration"], text_config=_config("gemma3_text"))
 GEMMA3_TEXT_ONLY = _config("gemma3_text", ["Gemma3ForCausalLM"])
 T5 = _config("t5", ["T5ForConditionalGeneration"], is_encoder_decoder=True)
@@ -41,6 +45,8 @@ MULTIMODAL_UNKNOWN_ARCH = _config("some_vlm", None, text_config=_config("llama")
     [
         (BERT, False), (ROBERTA, False), (DEBERTA_NO_ARCH, False),
         (GPT2, True), (LLAMA, True), (QWEN_NO_ARCH, True),
+        (QWEN3_5, True), (QWEN3_5_TEXT_NO_ARCH, True), (QWEN3_5_MOE_TEXT_NO_ARCH, True),
+        (GENERIC_CAUSAL_TEXT_NO_ARCH, True),
         (GEMMA3, True), (GEMMA3_TEXT_ONLY, True),
         (T5, False),
         (MULTIMODAL_UNKNOWN_ARCH, True),
@@ -109,6 +115,90 @@ def test_mask_token_is_only_the_last_resort(monkeypatch):
 
 def test_encoder_decoder_is_never_decoder_only():
     assert is_decoder_only_model(TextPredictionModelWithGradiend(T5)) is False
+
+
+def _config_without_model_type(**extra):
+    return SimpleNamespace(**extra)
+
+
+def test_encoder_decoder_without_model_type_is_never_decoder_only():
+    cfg = _config_without_model_type(is_encoder_decoder=True)
+    assert is_decoder_only_model(TextPredictionModelWithGradiend(cfg)) is False
+
+    class T5ForConditionalGeneration:
+        config = cfg
+
+    class CustomForConditionalGeneration:
+        config = cfg
+
+    for cls in (T5ForConditionalGeneration, CustomForConditionalGeneration):
+        wrapper = TextPredictionModelWithGradiend(cfg)
+        wrapper.base_model = cls()
+        assert is_decoder_only_model(wrapper) is False
+
+
+def test_config_for_name_respects_hf_offline_env(monkeypatch):
+    import transformers
+
+    calls = []
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    model_utils._config_for_name.cache_clear()
+    monkeypatch.setattr(
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda name, local_files_only=False: calls.append((name, local_files_only)) or (_ for _ in ()).throw(OSError("not cached")),
+    )
+    try:
+        assert model_utils._config_for_name("org/offline-only-model") is None
+        assert calls == [("org/offline-only-model", True)]
+    finally:
+        model_utils._config_for_name.cache_clear()
+
+
+def test_wrapper_falls_back_to_wrapped_base_model_class_name():
+    unknown_cfg = _config("unknown_brand_new_arch")
+
+    class BrandNewForCausalLM:
+        config = unknown_cfg
+
+    class BrandNewForConditionalGeneration:
+        config = unknown_cfg
+
+    class BrandNewForMaskedLM:
+        config = unknown_cfg
+
+    for cls, expected in [
+        (BrandNewForCausalLM, True),
+        (BrandNewForConditionalGeneration, True),
+        (BrandNewForMaskedLM, False),
+    ]:
+        wrapper = TextPredictionModelWithGradiend(unknown_cfg)
+        wrapper.base_model = cls()
+        assert is_decoder_only_model(wrapper) is expected
+
+
+def test_wrapper_falls_back_to_wrapped_tokenizer_mask_token():
+    unknown_cfg = _config("unknown_brand_new_arch")
+    assert is_decoder_only_model(
+        TextPredictionModelWithGradiend(unknown_cfg, tokenizer=SimpleNamespace(mask_token=None, mask_token_id=None))
+    ) is True
+    assert is_decoder_only_model(
+        TextPredictionModelWithGradiend(unknown_cfg, tokenizer=SimpleNamespace(mask_token="[MASK]", mask_token_id=103))
+    ) is False
+
+
+def test_wrapper_uses_repo_config_when_text_config_has_no_arch(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        model_utils,
+        "_config_for_name",
+        lambda name: seen.append(name) or _config("unknown_root", ["UnknownForConditionalGeneration"]),
+    )
+    wrapper = TextPredictionModelWithGradiend(
+        _config("unknown_text_subconfig", _name_or_path="org/qwen3.5-like")
+    )
+    assert is_decoder_only_model(wrapper) is True
+    assert seen == ["org/qwen3.5-like"]
 
 
 @pytest.mark.parametrize("config, expected_decoder_only", [(BERT, False), (GPT2, True)])

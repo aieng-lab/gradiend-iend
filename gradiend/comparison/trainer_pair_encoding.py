@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import pandas as pd
 import torch
@@ -55,34 +55,135 @@ def _extract_positive_mean(eval_result: Dict[str, Any], positive_class: str) -> 
     raise ValueError(f"Could not resolve positive class {positive_class!r} in mean_by_class result.")
 
 
-def _extract_positive_mean_from_df(encoder_df: Any, positive_class: str) -> float:
+def _resolve_column_poles(
+    trainer: object,
+    target_classes: Sequence[str],
+    explicit_positive: Optional[str],
+    all_known_classes: set[str],
+) -> Tuple[str, str, set[str], set[str], bool]:
+    """Resolve positive/negative display labels and raw class sets for a column trainer."""
+    from gradiend.comparison.seed_policy import unwrap_trainer
+
+    base = unwrap_trainer(trainer)
+    classes = [str(c) for c in target_classes]
+    cfg = getattr(base, "config", None)
+    training_args = getattr(base, "training_args", None) or getattr(base, "_training_args", None)
+
+    is_one_pole_fn = getattr(base, "_is_one_pole_config", None)
+    is_one_pole = callable(is_one_pole_fn) and bool(is_one_pole_fn())
+    cf_cfg = getattr(cfg, "counterfactual_classes", None) if cfg is not None else None
+    if cf_cfg is None and training_args is not None:
+        cf_cfg = getattr(training_args, "counterfactual_classes", None)
+    if not is_one_pole:
+        is_one_pole = len(classes) == 1 and cf_cfg is not None
+
+    if is_one_pole:
+        if not classes:
+            raise ValueError("One-pole trainer must define a positive class in target_classes.")
+        pos_label = classes[0]
+        if explicit_positive is not None and str(explicit_positive) != pos_label:
+            raise ValueError(
+                f"positive_class {explicit_positive!r} does not match one-pole target class {pos_label!r}"
+            )
+        neg_label = f"non_{pos_label}"
+        pos_set = {pos_label}
+        trainer_all_classes = [str(c) for c in (getattr(base, "all_classes", None) or [])]
+        if any(c not in pos_set for c in trainer_all_classes):
+            available = trainer_all_classes
+        else:
+            available = sorted(all_known_classes)
+
+        cf_fn = getattr(base, "_resolved_counterfactual_classes", None)
+        if callable(cf_fn):
+            resolved_cf = cf_fn(available)
+        elif cf_cfg == "all":
+            resolved_cf = [c for c in available if c not in pos_set]
+        elif cf_cfg is not None:
+            resolved_cf = [str(c) for c in cf_cfg if str(c) not in pos_set]
+        else:
+            resolved_cf = []
+        neg_set = {str(c) for c in (resolved_cf or []) if str(c) not in pos_set}
+        return pos_label, neg_label, pos_set, neg_set, True
+
+    pos_label = _infer_positive_class_from_pair(classes, explicit_positive)
+    neg_label = next(cls for cls in classes if cls != pos_label)
+    merge_map = getattr(cfg, "class_merge_map", None) if cfg is not None else None
+    if merge_map is None:
+        merge_map = getattr(base, "class_merge_map", None)
+    if isinstance(merge_map, dict):
+        pos_set = {pos_label} | {str(x) for x in merge_map.get(pos_label, [])}
+        neg_set = {neg_label} | {str(x) for x in merge_map.get(neg_label, [])}
+        has_merge = True
+    else:
+        pos_set = {pos_label}
+        neg_set = {neg_label}
+        has_merge = False
+    return pos_label, neg_label, pos_set, neg_set, has_merge
+
+
+def _extract_pole_mean_from_df(
+    encoder_df: Any,
+    pole_class: str,
+    *,
+    class_set: Optional[set[str]] = None,
+    label_sign: int,
+    role: str,
+) -> float:
     if not hasattr(encoder_df, "columns"):
-        raise TypeError("positive_mean requires a pandas DataFrame-like encoder_df")
+        raise TypeError(f"{role}_mean requires a pandas DataFrame-like encoder_df")
     df = encoder_df
     if "type" in df.columns:
         df = df[~df["type"].astype(str).str.contains("neutral", case=False, na=False)]
-    if "source_id" in df.columns:
-        df = df[df["source_id"].astype(str) == str(positive_class)]
+    classes = {str(c) for c in class_set} if class_set is not None else {str(pole_class)}
+    if "raw_source_id" in df.columns and bool(df["raw_source_id"].notna().any()):
+        src_series = (
+            df["raw_source_id"].where(df["raw_source_id"].notna(), df["source_id"])
+            if "source_id" in df.columns
+            else df["raw_source_id"]
+        )
+        filtered = df[src_series.astype(str).isin(classes)]
+        if len(filtered) > 0 or "source_id" not in df.columns:
+            df = filtered
+        else:
+            df = df[df["source_id"].astype(str).isin(classes)]
+    elif "source_id" in df.columns:
+        df = df[df["source_id"].astype(str).isin(classes)]
     elif "label" in df.columns:
-        df = df[df["label"].astype(float) > 0]
+        labels = df["label"].astype(float)
+        df = df[labels > 0] if label_sign > 0 else df[labels < 0]
     if len(df) == 0:
-        raise ValueError(f"No positive-class rows found for {positive_class!r} in encoder subset.")
+        raise ValueError(f"No {role}-class rows found for {pole_class!r} in encoder subset.")
     return float(df["encoded"].astype(float).mean())
 
 
-def _extract_negative_mean_from_df(encoder_df: Any, negative_class: str) -> float:
-    if not hasattr(encoder_df, "columns"):
-        raise TypeError("negative_mean requires a pandas DataFrame-like encoder_df")
-    df = encoder_df
-    if "type" in df.columns:
-        df = df[~df["type"].astype(str).str.contains("neutral", case=False, na=False)]
-    if "source_id" in df.columns:
-        df = df[df["source_id"].astype(str) == str(negative_class)]
-    elif "label" in df.columns:
-        df = df[df["label"].astype(float) < 0]
-    if len(df) == 0:
-        raise ValueError(f"No negative-class rows found for {negative_class!r} in encoder subset.")
-    return float(df["encoded"].astype(float).mean())
+def _extract_positive_mean_from_df(
+    encoder_df: Any,
+    positive_class: str,
+    *,
+    class_set: Optional[set[str]] = None,
+) -> float:
+    return _extract_pole_mean_from_df(
+        encoder_df,
+        positive_class,
+        class_set=class_set,
+        label_sign=1,
+        role="positive",
+    )
+
+
+def _extract_negative_mean_from_df(
+    encoder_df: Any,
+    negative_class: str,
+    *,
+    class_set: Optional[set[str]] = None,
+) -> float:
+    return _extract_pole_mean_from_df(
+        encoder_df,
+        negative_class,
+        class_set=class_set,
+        label_sign=-1,
+        role="negative",
+    )
 
 
 def _is_gradiend_checkpoint(path: Optional[str]) -> bool:
@@ -140,15 +241,28 @@ def _load_eval_model_for_trainer(trainer: object, *, load_directory: Optional[st
     return trainer.load_model(checkpoint_path, **kwargs)
 
 
+def _effective_encoder_eval_max_size(trainer: object, max_size: Optional[int]) -> Optional[int]:
+    if max_size is not None:
+        return max_size
+    from gradiend.comparison.seed_policy import unwrap_trainer
+
+    base = unwrap_trainer(trainer)
+    training_args = getattr(base, "training_args", None) or getattr(base, "_training_args", None)
+    if training_args is not None:
+        return getattr(training_args, "encoder_eval_max_size", None)
+    return None
+
+
 def _load_cached_encoder_df(trainer: object, *, split: str, max_size: Optional[int]) -> Optional[pd.DataFrame]:
     experiment_dir = getattr(trainer, "experiment_dir", None)
     if callable(experiment_dir):
         experiment_dir = experiment_dir()
     if not experiment_dir:
         return None
+    effective_max_size = _effective_encoder_eval_max_size(trainer, max_size)
     key_kwargs: Dict[str, Any] = {"split": split}
-    if max_size is not None:
-        key_kwargs["max_size"] = max_size
+    if effective_max_size is not None:
+        key_kwargs["max_size"] = effective_max_size
     cache_path = resolve_encoder_analysis_path(experiment_dir, None, **key_kwargs)
     if not cache_path or not os.path.isfile(cache_path):
         return None
@@ -158,20 +272,71 @@ def _load_cached_encoder_df(trainer: object, *, split: str, max_size: Optional[i
         return None
 
 
-def _subset_encoder_df_for_target_classes(encoder_df: Any, target_classes: Sequence[str]) -> Any:
-    classes = {str(c) for c in target_classes}
-    if len(classes) != 2:
-        raise ValueError(f"Cross-encoding currently requires exactly 2 target classes, got {list(target_classes)!r}")
+def _subset_encoder_df_for_target_classes(
+    encoder_df: Any,
+    target_classes: Sequence[str],
+    *,
+    pos_set: Optional[set[str]] = None,
+    neg_set: Optional[set[str]] = None,
+    cross_pole_only: bool = False,
+) -> Any:
+    if pos_set is None and neg_set is None:
+        classes = {str(c) for c in target_classes}
+        if len(classes) != 2:
+            raise ValueError(f"Cross-encoding currently requires exactly 2 target classes, got {list(target_classes)!r}")
+        pos_classes: set[str] = set()
+        neg_classes: set[str] = set()
+        all_classes = classes
+    else:
+        pos_classes = {str(c) for c in (pos_set or set())}
+        neg_classes = {str(c) for c in (neg_set or set())}
+        all_classes = pos_classes | neg_classes
+        if not all_classes:
+            raise ValueError(f"Cross-encoding requires non-empty target class sets, got {list(target_classes)!r}")
+
     if not hasattr(encoder_df, "columns"):
         raise TypeError("cross-encoding expects encoder_df to be a pandas DataFrame-like object")
-    if "source_id" in encoder_df.columns and "target_id" in encoder_df.columns:
-        source_vals = encoder_df["source_id"].astype(str)
-        target_vals = encoder_df["target_id"].astype(str)
-        mask = source_vals.isin(classes) & target_vals.isin(classes)
-        return encoder_df[mask].copy()
-    if "source_id" in encoder_df.columns:
-        source_vals = encoder_df["source_id"].astype(str)
-        return encoder_df[source_vals.isin(classes)].copy()
+
+    def _mask_for_cols(src_series: pd.Series, tgt_series: Optional[pd.Series]) -> pd.Series:
+        src_vals = src_series.astype(str)
+        if tgt_series is None:
+            return src_vals.isin(all_classes)
+        tgt_vals = tgt_series.astype(str)
+        if cross_pole_only and pos_classes and neg_classes:
+            return (src_vals.isin(pos_classes) & tgt_vals.isin(neg_classes)) | (
+                src_vals.isin(neg_classes) & tgt_vals.isin(pos_classes)
+            )
+        return src_vals.isin(all_classes) & tgt_vals.isin(all_classes)
+
+    has_raw_src = "raw_source_id" in encoder_df.columns and bool(encoder_df["raw_source_id"].notna().any())
+    has_raw_tgt = "raw_target_id" in encoder_df.columns and bool(encoder_df["raw_target_id"].notna().any())
+    has_src = "source_id" in encoder_df.columns
+    has_tgt = "target_id" in encoder_df.columns
+
+    if has_raw_src:
+        raw_src = (
+            encoder_df["raw_source_id"].where(encoder_df["raw_source_id"].notna(), encoder_df["source_id"])
+            if has_src
+            else encoder_df["raw_source_id"]
+        )
+        if has_raw_tgt:
+            raw_tgt: Optional[pd.Series] = (
+                encoder_df["raw_target_id"].where(encoder_df["raw_target_id"].notna(), encoder_df["target_id"])
+                if has_tgt
+                else encoder_df["raw_target_id"]
+            )
+        elif has_tgt:
+            raw_tgt = encoder_df["target_id"]
+        else:
+            raw_tgt = None
+        raw_mask = _mask_for_cols(raw_src, raw_tgt)
+        if bool(raw_mask.any()) or not has_src:
+            return encoder_df[raw_mask].copy()
+
+    if has_src and has_tgt:
+        return encoder_df[_mask_for_cols(encoder_df["source_id"], encoder_df["target_id"])].copy()
+    if has_src:
+        return encoder_df[_mask_for_cols(encoder_df["source_id"], None)].copy()
     raise ValueError(
         "Cross-encoding requires encoder outputs with source_id/target_id information so column-pair subsets can be extracted."
     )
@@ -383,28 +548,61 @@ def compute_trainer_pair_encoding_matrix(
         for key, value in (positive_class_by_trainer or {}).items()
         if value is not None
     }
+    from gradiend.comparison.seed_policy import unwrap_trainer
+
+    all_known_classes: set[str] = set()
+    for trainer in trainers.values():
+        base = unwrap_trainer(trainer)
+        for cls in (getattr(base, "target_classes", None) or []):
+            all_known_classes.add(str(cls))
+        for cls in (getattr(base, "all_classes", None) or []):
+            all_known_classes.add(str(cls))
+        cfg = getattr(base, "config", None)
+        merge_map = getattr(cfg, "class_merge_map", None) if cfg is not None else None
+        if merge_map is None:
+            merge_map = getattr(base, "class_merge_map", None)
+        if isinstance(merge_map, dict):
+            for k, vs in merge_map.items():
+                all_known_classes.add(str(k))
+                for v in vs:
+                    all_known_classes.add(str(v))
+
     positive_by_col: Dict[str, str] = {}
     negative_by_col: Dict[str, str] = {}
+    pos_set_by_col: Dict[str, set[str]] = {}
+    neg_set_by_col: Dict[str, set[str]] = {}
+    cross_pole_only_by_col: Dict[str, bool] = {}
     pair_by_col: Dict[str, List[str]] = {}
+    target_classes_by_id: Dict[str, List[str]] = {}
+    explicit_pos_by_id: Dict[str, Optional[str]] = {}
     row_encoder_dfs: Dict[str, Any] = {}
     for trainer_id in ids:
         trainer = trainers[trainer_id]
-        target_classes = [str(c) for c in (trainer.target_classes or [])]
-        training_args = getattr(trainer, "training_args", None) or getattr(trainer, "_training_args", None)
+        base = unwrap_trainer(trainer)
+        target_classes = [str(c) for c in (getattr(base, "target_classes", None) or [])]
+        training_args = getattr(base, "training_args", None) or getattr(base, "_training_args", None)
         explicit_positive = explicit_positive_by_trainer.get(str(trainer_id))
         if explicit_positive is None and training_args is not None:
             explicit_positive = getattr(training_args, "positive_class", None)
-        positive_by_col[trainer_id] = _infer_positive_class_from_pair(target_classes, explicit_positive)
-        negative_by_col[trainer_id] = next(
-            cls for cls in target_classes if str(cls) != str(positive_by_col[trainer_id])
-        )
+        target_classes_by_id[trainer_id] = target_classes
+        explicit_pos_by_id[trainer_id] = explicit_positive
+        # Validate pole structure up front before loading/evaluating models.
+        _resolve_column_poles(trainer, target_classes, explicit_positive, all_known_classes)
         pair_by_col[trainer_id] = target_classes
         if seed_selection == "best":
             encoder_df = (
-                _load_cached_encoder_df(trainer, split=split, max_size=max_size)
+                _load_cached_encoder_df(
+                    trainer,
+                    split=split,
+                    max_size=_effective_encoder_eval_max_size(trainer, max_size),
+                )
                 if encoder_eval in {"auto", "cached"} and use_cache
                 else None
             )
+            if encoder_df is not None and encoder_eval == "auto":
+                matcher = getattr(trainer, "_cached_encoder_df_matches_request", None)
+                if callable(matcher) and not matcher(encoder_df, include_other_classes=include_other_classes):
+                    encoder_df = None
             if encoder_df is None and encoder_eval in {"auto", "recompute"}:
                 eval_model = _load_eval_model_for_trainer(trainer)
                 try:
@@ -434,7 +632,15 @@ def compute_trainer_pair_encoding_matrix(
             best_seed_path = trainer.get_best_seed_run_path() if hasattr(trainer, "get_best_seed_run_path") else None
             reused_best_cache = False
             if encoder_eval in {"auto", "cached"} and use_cache and best_seed_path is not None:
-                cached_best_df = _load_cached_encoder_df(trainer, split=split, max_size=max_size)
+                cached_best_df = _load_cached_encoder_df(
+                    trainer,
+                    split=split,
+                    max_size=_effective_encoder_eval_max_size(trainer, max_size),
+                )
+                if cached_best_df is not None and encoder_eval == "auto":
+                    matcher = getattr(trainer, "_cached_encoder_df_matches_request", None)
+                    if callable(matcher) and not matcher(cached_best_df, include_other_classes=include_other_classes):
+                        cached_best_df = None
                 if cached_best_df is not None:
                     encoder_dfs.append(cached_best_df)
                     reused_best_cache = True
@@ -491,6 +697,29 @@ def compute_trainer_pair_encoding_matrix(
                 "Run suite.evaluate_encoder(split='test', full_eval=True, return_df=True) first, "
                 "or use encoder_eval='auto'."
             )
+
+    for row_df_value in row_encoder_dfs.values():
+        dfs = row_df_value if isinstance(row_df_value, list) else [row_df_value]
+        for df in dfs:
+            if df is None or not hasattr(df, "columns"):
+                continue
+            for col in ("raw_source_id", "raw_target_id", "source_id", "target_id"):
+                if col in df.columns:
+                    all_known_classes.update(df[col].dropna().astype(str).tolist())
+
+    for trainer_id in ids:
+        pos_label, neg_label, pos_set, neg_set, cross_pole_only = _resolve_column_poles(
+            trainers[trainer_id],
+            target_classes_by_id[trainer_id],
+            explicit_pos_by_id[trainer_id],
+            all_known_classes,
+        )
+        positive_by_col[trainer_id] = pos_label
+        negative_by_col[trainer_id] = neg_label
+        pos_set_by_col[trainer_id] = pos_set
+        neg_set_by_col[trainer_id] = neg_set
+        cross_pole_only_by_col[trainer_id] = cross_pole_only
+
     matrix = [[float("nan")] * len(ids) for _ in range(len(ids))]
     available_mask = [[False] * len(ids) for _ in range(len(ids))]
     n_matrix = [[0] * len(ids) for _ in range(len(ids))]
@@ -505,14 +734,28 @@ def compute_trainer_pair_encoding_matrix(
         for j, col_id in enumerate(ids):
             scores: List[float] = []
             for row_df in row_dfs:
-                subset_df = _subset_encoder_df_for_target_classes(row_df, pair_by_col[col_id])
+                subset_df = _subset_encoder_df_for_target_classes(
+                    row_df,
+                    pair_by_col[col_id],
+                    pos_set=pos_set_by_col[col_id],
+                    neg_set=neg_set_by_col[col_id],
+                    cross_pole_only=cross_pole_only_by_col[col_id],
+                )
                 if len(subset_df) == 0:
                     continue
-                positive_mean = _extract_positive_mean_from_df(subset_df, positive_by_col[col_id])
+                positive_mean = _extract_positive_mean_from_df(
+                    subset_df,
+                    positive_by_col[col_id],
+                    class_set=pos_set_by_col[col_id],
+                )
                 if metric == "positive_mean":
                     scores.append(positive_mean)
                     continue
-                negative_mean = _extract_negative_mean_from_df(subset_df, negative_by_col[col_id])
+                negative_mean = _extract_negative_mean_from_df(
+                    subset_df,
+                    negative_by_col[col_id],
+                    class_set=neg_set_by_col[col_id],
+                )
                 if metric == "negative_mean":
                     scores.append(negative_mean)
                 else:

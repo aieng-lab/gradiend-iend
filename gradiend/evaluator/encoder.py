@@ -49,6 +49,10 @@ def _rows_to_encoder_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         "target_id": [],
         "factual_id": [],
         "counterfactual_id": [],
+        "raw_source_id": [],
+        "raw_target_id": [],
+        "raw_factual_id": [],
+        "raw_counterfactual_id": [],
         "transition_id": [],
         "input_type": [],
         "feature_class_id": [],
@@ -76,6 +80,10 @@ def _rows_to_encoder_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         data["target_id"].append(r.get("target_id"))
         data["factual_id"].append(r.get("factual_id"))
         data["counterfactual_id"].append(r.get("counterfactual_id"))
+        data["raw_source_id"].append(r.get("raw_source_id"))
+        data["raw_target_id"].append(r.get("raw_target_id"))
+        data["raw_factual_id"].append(r.get("raw_factual_id"))
+        data["raw_counterfactual_id"].append(r.get("raw_counterfactual_id"))
         data["transition_id"].append(r.get("transition_id"))
         data["input_type"].append(r.get("input_type"))
         data["feature_class_id"].append(r.get("feature_class_id"))
@@ -96,6 +104,10 @@ def _rows_to_encoder_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         data["component_label"].append(r.get("component_label"))
     df = pd.DataFrame(data)
     for col in (
+        "raw_source_id",
+        "raw_target_id",
+        "raw_factual_id",
+        "raw_counterfactual_id",
         "source_token",
         "factual_token",
         "alternative_token",

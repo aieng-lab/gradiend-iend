@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import inspect
 import json
 import os
 import math
@@ -44,9 +45,14 @@ from gradiend.model.utils import (
 from gradiend.trainer.core.cache_policy import coerce_artifact_use_cache
 from gradiend.trainer.core.unified_schema import normalize_transition_id, transition_id
 from gradiend.trainer.text.prediction.dataset import TextTrainingDataset, resolve_mask_placeholder
+from gradiend.trainer.text.prediction.decoder_only_mlm import load_decoder_mlm_head_meta
 from gradiend.util.encoding_rows import encode_dataset_to_rows
 from gradiend.util.logging import get_logger
-from gradiend.util.paths import invalidate_encoder_metrics_cache, resolve_encoder_analysis_path
+from gradiend.util.paths import (
+    invalidate_encoder_metrics_cache,
+    resolve_decoder_mlm_head_dir,
+    resolve_encoder_analysis_path,
+)
 
 UNIFIED_MASKED = "masked"
 UNIFIED_SPLIT = "split"
@@ -313,23 +319,104 @@ def collect_unified_test_rows_by_feature_class(
     return out
 
 
+def _resolve_trainer_pole_sets(
+    trainer: object,
+    unified_df: Optional[pd.DataFrame] = None,
+) -> Tuple[set[str], set[str]]:
+    """Resolve positive and negative/counterfactual class sets for binary or one-pole trainers."""
+    trainer = unwrap_trainer(trainer)
+    target_classes = [str(c) for c in (getattr(trainer, "target_classes", None) or [])]
+
+    is_one_pole_fn = getattr(trainer, "_is_one_pole_config", None)
+    is_one_pole = callable(is_one_pole_fn) and bool(is_one_pole_fn())
+    if not is_one_pole:
+        cfg = getattr(trainer, "config", None)
+        cf_cfg = getattr(cfg, "counterfactual_classes", None) if cfg is not None else None
+        is_one_pole = len(target_classes) == 1 and cf_cfg is not None
+
+    if is_one_pole:
+        pos_fn = getattr(trainer, "_one_pole_positive_classes", None)
+        pos_list = pos_fn() if callable(pos_fn) else None
+        if pos_list:
+            pos_set = {str(c) for c in pos_list}
+        elif target_classes:
+            pos_set = {str(target_classes[0])}
+        else:
+            raise ValueError(
+                f"One-pole trainer {getattr(trainer, 'run_id', trainer)!r} has no positive target class."
+            )
+
+        available: List[str] = []
+        seen_avail: set[str] = set()
+        for cls in (getattr(trainer, "all_classes", None) or []):
+            cls_str = str(cls)
+            if cls_str not in seen_avail:
+                seen_avail.add(cls_str)
+                available.append(cls_str)
+
+        # Only discover counterfactual classes from unified_df if trainer.all_classes
+        # does not already specify non-positive classes (e.g. unloaded/mock trainers),
+        # so unrelated cross-task classes in unified_df stay label 0.0.
+        if not any(c not in pos_set for c in available) and isinstance(unified_df, pd.DataFrame) and not unified_df.empty:
+            for col in (
+                UNIFIED_FACTUAL_CLASS,
+                UNIFIED_ALTERNATIVE_CLASS,
+                "raw_label_class",
+                "raw_alternative_class",
+            ):
+                if col in unified_df.columns:
+                    for val in unified_df[col].dropna().astype(str).tolist():
+                        if val not in seen_avail:
+                            seen_avail.add(val)
+                            available.append(val)
+
+        cf_fn = getattr(trainer, "_resolved_counterfactual_classes", None)
+        if callable(cf_fn):
+            cf_list = cf_fn(available)
+            cf_set = {str(c) for c in (cf_list or []) if str(c) not in pos_set}
+        else:
+            cfg = getattr(trainer, "config", None)
+            cf_cfg = getattr(cfg, "counterfactual_classes", None) if cfg is not None else None
+            if cf_cfg == "all":
+                cf_set = {c for c in available if c not in pos_set}
+            elif cf_cfg is not None:
+                cf_set = {str(c) for c in cf_cfg if str(c) not in pos_set}
+            else:
+                cf_set = set()
+        return pos_set, cf_set
+
+    if len(target_classes) != 2:
+        raise ValueError(
+            f"Trainer {getattr(trainer, 'run_id', trainer)!r} must have exactly 2 target_classes "
+            "or be configured as a one-pole trainer"
+        )
+    c0, c1 = target_classes[0], target_classes[1]
+    merge_map = getattr(getattr(trainer, "config", None), "class_merge_map", None)
+    if merge_map is None:
+        merge_map = getattr(trainer, "class_merge_map", None)
+    if isinstance(merge_map, dict):
+        pos_set = {c0} | ({str(x) for x in merge_map.get(c0, [])} if c0 in merge_map else set())
+        neg_set = {c1} | ({str(x) for x in merge_map.get(c1, [])} if c1 in merge_map else set())
+    else:
+        pos_set = {c0}
+        neg_set = {c1}
+    return pos_set, neg_set
+
+
 def _build_probe_pairs_from_unified_df(
     trainer: object,
     unified_df: pd.DataFrame,
 ) -> List[Dict[str, Any]]:
-    target_classes = getattr(trainer, "target_classes", None) or []
-    if len(target_classes) != 2:
-        raise ValueError(
-            f"Trainer {getattr(trainer, 'run_id', trainer)!r} must have exactly 2 target_classes"
-        )
-    class_pair = (str(target_classes[0]), str(target_classes[1]))
+    pos_set, neg_set = _resolve_trainer_pole_sets(trainer, unified_df)
     pairs: List[Dict[str, Any]] = []
     for _, row in unified_df.iterrows():
         src = str(row[UNIFIED_FACTUAL_CLASS])
         tgt = str(row[UNIFIED_ALTERNATIVE_CLASS])
-        if src == class_pair[0]:
+        has_raw = "raw_label_class" in row.index and pd.notna(row["raw_label_class"])
+        cls_for_pole = str(row["raw_label_class"]) if has_raw else src
+        if cls_for_pole in pos_set:
             label = 1.0
-        elif src == class_pair[1]:
+        elif cls_for_pole in neg_set:
             label = -1.0
         else:
             label = 0.0
@@ -344,6 +431,10 @@ def _build_probe_pairs_from_unified_df(
         }
         if UNIFIED_SPLIT in row.index and pd.notna(row[UNIFIED_SPLIT]):
             entry[UNIFIED_SPLIT] = row[UNIFIED_SPLIT]
+        if "raw_label_class" in row.index and pd.notna(row["raw_label_class"]):
+            entry["raw_label_class"] = str(row["raw_label_class"])
+        if "raw_alternative_class" in row.index and pd.notna(row["raw_alternative_class"]):
+            entry["raw_alternative_class"] = str(row["raw_alternative_class"])
         pairs.append(entry)
     return pairs
 
@@ -379,6 +470,22 @@ def _gradient_dataset_for_unified_df(
         is_decoder_only_model = True
     elif objective_name == "seq2seq_decoder_sequence_cloze":
         is_decoder_only_model = False
+    args = getattr(trainer, "training_args", None) or getattr(trainer, "_training_args", None)
+    max_length = int(getattr(args, "max_length", 128) or 128) if args is not None else 128
+    label_token_protocol = (
+        trainer._label_token_protocol()
+        if callable(getattr(trainer, "_label_token_protocol", None))
+        else str(getattr(args, "label_token_protocol", "no_leading_space") or "no_leading_space")
+    )
+    mlm_head_target_labels = None
+    if objective_name == "clm_mlm_head" and getattr(trainer, "experiment_dir", None):
+        head_dir = resolve_decoder_mlm_head_dir(trainer.experiment_dir)
+        if head_dir:
+            try:
+                meta = load_decoder_mlm_head_meta(head_dir)
+                mlm_head_target_labels = meta.get("target_labels")
+            except OSError:
+                mlm_head_target_labels = None
     text_ds = TextTrainingDataset(
         unified_df.reset_index(drop=True),
         tokenizer,
@@ -387,14 +494,23 @@ def _gradient_dataset_for_unified_df(
         is_seq2seq_model=is_seq2seq,
         target_key="label",
         balance_column="feature_class_id",
+        max_length=max_length,
         seed=42,
         prediction_objective=objective_name,
-        rhs_window=getattr(getattr(trainer, "_training_args", None), "decoder_sequence_cloze_rhs_window", -1),
+        rhs_window=getattr(args, "decoder_sequence_cloze_rhs_window", -1) if args is not None else -1,
+        mlm_head_target_labels=mlm_head_target_labels,
         mask_placeholder=resolve_mask_placeholder(
             config=getattr(trainer, "config", None),
-            training_args=getattr(trainer, "_training_args", None),
+            training_args=args,
         ),
+        label_token_protocol=label_token_protocol,
     )
+    sig = inspect.signature(trainer.create_gradient_training_dataset)
+    accepts_target = "target" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    if accepts_target:
+        return trainer.create_gradient_training_dataset(text_ds, model, target=None)
     return trainer.create_gradient_training_dataset(text_ds, model)
 
 

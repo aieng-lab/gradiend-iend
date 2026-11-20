@@ -26,7 +26,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Literal, Optional, Sequence, Tuple, Type, Union
 
 import torch
 import pandas as pd
@@ -158,12 +158,13 @@ class SuitePairDefinition:
     positive_class is only meaningful for PositiveTrainerSuite analytics.
     """
 
-    target_classes: Tuple[str, str]
+    target_classes: Tuple[str, ...]
     positive_class: Optional[str] = None
     child_id: Optional[str] = None
     label: Optional[str] = None
     class_merge_map: Optional[Dict[str, List[str]]] = None
     class_merge_transition_groups: Optional[List[List[str]]] = None
+    counterfactual_classes: Optional[Union[List[str], Literal["all"]]] = None
 
 
 @dataclass(frozen=True)
@@ -228,7 +229,7 @@ def _normalize_target_pairs(value: Optional[Sequence[Sequence[Any]]]) -> Optiona
 def _normalize_class_merge_map(
     value: Optional[Dict[str, Sequence[Any]]],
     *,
-    target_classes: Tuple[str, str],
+    target_classes: Tuple[str, ...],
 ) -> Optional[Dict[str, List[str]]]:
     if value is None:
         return None
@@ -279,6 +280,23 @@ def _normalize_class_merge_transition_groups(
     return normalized
 
 
+def _normalize_counterfactual_classes(
+    value: Any,
+) -> Optional[Union[List[str], Literal["all"]]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value != "all":
+            raise ValueError(f"counterfactual_classes string must be 'all', got {value!r}")
+        return "all"
+    if isinstance(value, bytes) or not isinstance(value, Sequence):
+        raise TypeError("counterfactual_classes must be None, 'all', or a sequence of class names")
+    classes = [str(item) for item in value]
+    if not classes:
+        raise ValueError("counterfactual_classes sequence must not be empty")
+    return classes
+
+
 def _normalize_pair_definitions(
     value: Optional[Sequence[Any]],
     *,
@@ -291,41 +309,60 @@ def _normalize_pair_definitions(
     seen_ids = set()
     for item in value:
         if isinstance(item, SuitePairDefinition):
-            target_classes = tuple(str(v) for v in item.target_classes)
-            if len(target_classes) != 2 or target_classes[0] == target_classes[1]:
-                raise ValueError(f"Invalid SuitePairDefinition target_classes: {item.target_classes!r}")
-            child_id = str(item.child_id) if item.child_id is not None else pair_id_fn((target_classes[0], target_classes[1]))
-            label = str(item.label) if item.label is not None else pair_label_fn((target_classes[0], target_classes[1]))
-            positive_class = str(item.positive_class) if item.positive_class is not None else None
-            merge_map = _normalize_class_merge_map(item.class_merge_map, target_classes=(target_classes[0], target_classes[1]))
-            transition_groups = _normalize_class_merge_transition_groups(item.class_merge_transition_groups)
+            raw_target_classes = item.target_classes
+            raw_cf_classes = item.counterfactual_classes
+            raw_child_id = item.child_id
+            raw_label = item.label
+            raw_positive_class = item.positive_class
+            raw_merge_map = item.class_merge_map
+            raw_transition_groups = item.class_merge_transition_groups
         elif isinstance(item, dict):
             raw_target_classes = item.get("target_classes")
-            if not isinstance(raw_target_classes, Sequence) or isinstance(raw_target_classes, (str, bytes)) or len(raw_target_classes) != 2:
-                raise TypeError("pair_definitions entries must contain target_classes as a 2-item sequence")
-            target_classes = (str(raw_target_classes[0]), str(raw_target_classes[1]))
-            if target_classes[0] == target_classes[1]:
-                raise ValueError(f"pair_definitions cannot contain identical target classes: {target_classes!r}")
-            child_id = str(item.get("child_id")) if item.get("child_id") is not None else pair_id_fn(target_classes)
-            label = str(item.get("label")) if item.get("label") is not None else pair_label_fn(target_classes)
-            positive_class = str(item.get("positive_class")) if item.get("positive_class") is not None else None
-            merge_map = _normalize_class_merge_map(item.get("class_merge_map"), target_classes=target_classes)
-            transition_groups = _normalize_class_merge_transition_groups(
-                item.get("class_merge_transition_groups")
-            )
+            if not isinstance(raw_target_classes, Sequence) or isinstance(raw_target_classes, (str, bytes)):
+                raise TypeError("pair_definitions entries must contain target_classes as a 1- or 2-item sequence")
+            raw_cf_classes = item.get("counterfactual_classes")
+            raw_child_id = item.get("child_id")
+            raw_label = item.get("label")
+            raw_positive_class = item.get("positive_class")
+            raw_merge_map = item.get("class_merge_map")
+            raw_transition_groups = item.get("class_merge_transition_groups")
         else:
             raise TypeError("pair_definitions must contain dicts or SuitePairDefinition instances")
+
+        target_classes = tuple(str(v) for v in raw_target_classes)
+        cf_classes = _normalize_counterfactual_classes(raw_cf_classes)
+        if len(target_classes) == 1:
+            if cf_classes is None:
+                raise ValueError(
+                    f"Invalid SuitePairDefinition target_classes (single-target requires counterfactual_classes): {raw_target_classes!r}"
+                )
+            cf_desc = "all" if cf_classes == "all" else ",".join(cf_classes)
+            default_child_id = str(target_classes[0])
+            default_label = f"{target_classes[0]} vs {cf_desc}"
+        elif len(target_classes) == 2 and target_classes[0] != target_classes[1]:
+            pair = (target_classes[0], target_classes[1])
+            default_child_id = pair_id_fn(pair)
+            default_label = pair_label_fn(pair)
+        else:
+            raise ValueError(f"Invalid SuitePairDefinition target_classes: {raw_target_classes!r}")
+
+        child_id = str(raw_child_id) if raw_child_id is not None else default_child_id
+        label = str(raw_label) if raw_label is not None else default_label
+        positive_class = str(raw_positive_class) if raw_positive_class is not None else None
+        merge_map = _normalize_class_merge_map(raw_merge_map, target_classes=target_classes)
+        transition_groups = _normalize_class_merge_transition_groups(raw_transition_groups)
         if child_id in seen_ids:
             raise ValueError(f"Duplicate child_id in pair_definitions: {child_id!r}")
         seen_ids.add(child_id)
         normalized.append(
             SuitePairDefinition(
-                target_classes=(target_classes[0], target_classes[1]),
+                target_classes=target_classes,
                 positive_class=positive_class,
                 child_id=child_id,
                 label=label,
                 class_merge_map=merge_map,
                 class_merge_transition_groups=transition_groups,
+                counterfactual_classes=cf_classes,
             )
         )
     return normalized
@@ -427,6 +464,7 @@ def _feature_classes_from_tabular(
             UNIFIED_ALTERNATIVE_CLASS,
             "label_class",
             "alternative_class",
+            "target_class",
             "label_cls",
             "counterfactual_cls",
             "factual_cls",
@@ -549,6 +587,9 @@ def _infer_target_classes_from_pair_inputs(
             if isinstance(item, SuitePairDefinition):
                 for cls in item.target_classes:
                     add(cls)
+                if isinstance(item.counterfactual_classes, (list, tuple)):
+                    for cls in item.counterfactual_classes:
+                        add(cls)
                 if item.class_merge_map:
                     for raw_values in item.class_merge_map.values():
                         for cls in raw_values:
@@ -557,6 +598,10 @@ def _infer_target_classes_from_pair_inputs(
                 raw_target_classes = item.get("target_classes")
                 if isinstance(raw_target_classes, Sequence) and not isinstance(raw_target_classes, (str, bytes)):
                     for cls in raw_target_classes:
+                        add(cls)
+                cf_classes = item.get("counterfactual_classes")
+                if isinstance(cf_classes, Sequence) and not isinstance(cf_classes, (str, bytes)):
+                    for cls in cf_classes:
                         add(cls)
                 merge_map = item.get("class_merge_map")
                 if isinstance(merge_map, dict):
@@ -647,26 +692,37 @@ def _infer_target_classes_from_inputs(
     )
 
 
-def _infer_transition_columns(config: Optional[Any], data: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _infer_transition_columns(
+    config: Optional[Any],
+    data: Any,
+    trainer_kwargs: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     source_col = None
     target_col = None
     split_col = None
-    if config is not None:
-        for left_name, right_name in (
-            ("label_class_col", "alternative_class_col"),
-            ("factual_cls_col", "alternative_cls_col"),
-        ):
-            left = getattr(config, left_name, None)
-            right = getattr(config, right_name, None)
-            if isinstance(left, str) and isinstance(right, str):
-                source_col = left
-                target_col = right
-                break
-        split_value = getattr(config, "split_col", None)
-        if isinstance(split_value, str) and split_value != HELDOUT_SPLIT_COL:
-            split_col = split_value
+    for source in (config, trainer_kwargs):
+        if source is None:
+            continue
+        getter = source.get if isinstance(source, dict) else lambda name, default=None: getattr(source, name, default)
+        if source_col is None or target_col is None:
+            for left_name, right_name in (
+                ("label_class_col", "alternative_class_col"),
+                ("factual_cls_col", "alternative_cls_col"),
+            ):
+                left = getter(left_name)
+                right = getter(right_name)
+                if isinstance(left, str) and isinstance(right, str):
+                    source_col = left
+                    target_col = right
+                    break
+        if split_col is None:
+            split_value = getter("split_col")
+            if isinstance(split_value, str) and split_value != HELDOUT_SPLIT_COL:
+                split_col = split_value
     if hasattr(data, "columns"):
         fallback_pairs = (
+            ("label_class", "alternative_class"),
+            ("label_class", "target_class"),
             ("label_cls", "counterfactual_cls"),
             ("factual_cls", "alternative_cls"),
             ("label_feature_cls", "counterfactual_feature_cls"),
@@ -716,7 +772,11 @@ def _validate_pair_definitions_against_data(
     if not isinstance(data, pd.DataFrame):
         return
 
-    source_col, target_col, split_col = _infer_transition_columns(config, data)
+    source_col, target_col, split_col = _infer_transition_columns(
+        config,
+        data,
+        trainer_kwargs=trainer_kwargs,
+    )
     if (
         (source_col is None or target_col is None)
         and UNIFIED_FACTUAL_CLASS in data.columns
@@ -735,13 +795,41 @@ def _validate_pair_definitions_against_data(
         if bool(train_mask.any()):
             train_df = data[train_mask]
 
-    observed = set(
-        tuple(sorted((str(src), str(tgt))))
+    observed_directed = {
+        (str(src), str(tgt))
         for src, tgt in zip(train_df[source_col].astype(str), train_df[target_col].astype(str))
         if str(src) != str(tgt)
-    )
+    }
+    observed = {tuple(sorted(pair)) for pair in observed_directed}
     missing: List[str] = []
     for definition in pair_definitions:
+        if len(definition.target_classes) == 1:
+            if definition.counterfactual_classes is None:
+                raise ValueError(
+                    f"Single-target SuitePairDefinition requires counterfactual_classes: {definition!r}"
+                )
+            target = str(definition.target_classes[0])
+            merge_map = definition.class_merge_map or {target: [target]}
+            target_raw = [str(value) for value in merge_map[target]]
+            target_raw_set = set(target_raw)
+            if definition.counterfactual_classes == "all":
+                found = any(
+                    src in target_raw_set and tgt not in target_raw_set
+                    for src, tgt in observed_directed
+                )
+                cf_desc = "all"
+            else:
+                cf_raw = [str(value) for value in definition.counterfactual_classes if str(value) not in target_raw_set]
+                cf_raw_set = set(cf_raw)
+                found = any(
+                    src in target_raw_set and tgt in cf_raw_set
+                    for src, tgt in observed_directed
+                )
+                cf_desc = ",".join(str(value) for value in definition.counterfactual_classes)
+            if not found:
+                missing.append(f"{target} -> {cf_desc}")
+            continue
+
         left_name, right_name = definition.target_classes
         merge_map = definition.class_merge_map or {
             left_name: [left_name],
@@ -777,6 +865,11 @@ def _filter_generated_incomplete_pair_definition(
                 return None
             filtered[str(key)] = kept
         merge_map = filtered
+    cf_classes = copy.deepcopy(definition.counterfactual_classes)
+    if isinstance(cf_classes, list):
+        cf_classes = [str(value) for value in cf_classes if str(value) not in incomplete]
+        if not cf_classes:
+            return None
     return SuitePairDefinition(
         target_classes=target_classes,
         positive_class=definition.positive_class,
@@ -784,6 +877,7 @@ def _filter_generated_incomplete_pair_definition(
         label=definition.label,
         class_merge_map=merge_map,
         class_merge_transition_groups=copy.deepcopy(definition.class_merge_transition_groups),
+        counterfactual_classes=cf_classes,
     )
 
 

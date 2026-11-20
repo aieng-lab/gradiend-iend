@@ -335,6 +335,46 @@ def _compute_topk_overlap_similarity_matrix(models: Dict[str, object], *, part: 
     }
 
 
+def _sparse_cosine_between_aligned_vectors(
+    item_i: Dict[str, Any],
+    item_j: Dict[str, Any],
+    *,
+    take_abs: bool = False,
+) -> float:
+    flat_i = item_i["flat"]
+    flat_j = item_j["flat"]
+    norm_i = float(torch.linalg.vector_norm(flat_i).item())
+    norm_j = float(torch.linalg.vector_norm(flat_j).item())
+    if norm_i == 0.0 or norm_j == 0.0:
+        return 0.0
+
+    idx_i = item_i["base_indices"]
+    idx_j = item_j["base_indices"]
+    block_dim = int(item_i.get("block_dim", 1))
+
+    if not bool((idx_j[1:] >= idx_j[:-1]).all()):
+        sort_perm = torch.argsort(idx_j)
+        idx_j_sorted = idx_j[sort_perm]
+        flat_j_sorted = flat_j.view(-1, block_dim)[sort_perm]
+    else:
+        idx_j_sorted = idx_j
+        flat_j_sorted = flat_j.view(-1, block_dim)
+
+    mask_i = torch.isin(idx_i, idx_j_sorted)
+    if not bool(mask_i.any()):
+        return 0.0
+
+    matched_idx_i = idx_i[mask_i]
+    pos_in_j = torch.searchsorted(idx_j_sorted, matched_idx_i)
+
+    matched_flat_i = flat_i.view(-1, block_dim)[mask_i]
+    matched_flat_j = flat_j_sorted[pos_in_j]
+
+    dot = float((matched_flat_i * matched_flat_j).sum().item())
+    score = dot / (norm_i * norm_j)
+    return abs(score) if take_abs else score
+
+
 def _compute_cosine_like_matrix(models: Dict[str, object], *, part: str, topk: Optional[Union[int, float]], take_abs: bool, measure_name: str) -> Dict[str, Any]:
     logger.info(
         "Computing %s similarity matrix for %s models (part=%s, topk=%s).",
@@ -350,20 +390,20 @@ def _compute_cosine_like_matrix(models: Dict[str, object], *, part: str, topk: O
     matrix = _compute_aligned_cosine_like_matrix(aligned_extracted, take_abs=take_abs)
     model_ids = list(models.keys())
     if matrix is None:
-        logger.info("Selected coordinates are not identically aligned; falling back to sparse cosine computation.")
-        extracted = {mid: _extract_sparse_blocks(model, part=part, topk=topk) for mid, model in models.items()}
+        logger.info("Selected coordinates are not identically aligned; using tensor-based sparse cosine computation.")
         matrix = [[0.0] * len(model_ids) for _ in range(len(model_ids))]
-        total_pairs = len(model_ids) * len(model_ids)
-        done_pairs = 0
         for i, mi in enumerate(model_ids):
             for j, mj in enumerate(model_ids):
-                score = _cosine_from_blocks(extracted[mi]["blocks"], extracted[mj]["blocks"])
-                matrix[i][j] = abs(score) if take_abs else score
-                done_pairs += 1
-                if done_pairs == 1 or done_pairs == total_pairs or done_pairs % max(1, total_pairs // 10) == 0:
-                    logger.info("Computed %s/%s %s similarity cells.", done_pairs, total_pairs, measure_name)
-        resolved_topk = {mid: int(extracted[mid]["resolved_topk"]) for mid in model_ids}
-        block_dim = int(next(iter(extracted.values()))["block_dim"])
+                if i == j:
+                    matrix[i][j] = 1.0
+                elif j < i:
+                    matrix[i][j] = matrix[j][i]
+                else:
+                    matrix[i][j] = _sparse_cosine_between_aligned_vectors(
+                        aligned_extracted[mi], aligned_extracted[mj], take_abs=take_abs
+                    )
+        resolved_topk = {mid: int(aligned_extracted[mid]["resolved_topk"]) for mid in model_ids}
+        block_dim = int(next(iter(aligned_extracted.values()))["block_dim"])
     else:
         logger.info("Using aligned-vector cosine path for %s similarity.", measure_name)
         resolved_topk = {mid: int(aligned_extracted[mid]["resolved_topk"]) for mid in model_ids}

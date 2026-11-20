@@ -1271,7 +1271,7 @@ class Trainer(TrainerAnnotationMixin, FeatureLearningDefinition):
                 getattr(config, "selection_metric", None) or getattr(config, "convergent_metric", None)
             )
             selection_needs_rivals = metric_needs_rivals(selection_name)
-            if self._is_one_pole_config():
+            if self._is_one_pole_config() or bool(getattr(getattr(self, "config", None), "class_merge_map", None)):
                 # source=both already supplies target and configured rival
                 # poles for E. Do not add reverse/full-class factual contexts
                 # to periodic selection evaluation; those belong to the one-off

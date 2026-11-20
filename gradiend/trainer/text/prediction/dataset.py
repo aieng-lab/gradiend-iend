@@ -19,7 +19,7 @@ from gradiend.trainer.text.prediction.seq2seq import (
     mask_placeholder_for_tokenizer,
 )
 from gradiend.trainer.text.common.dataset_base import TextBatchedDatasetBase
-from gradiend.trainer.core.dataset import SignalTrainingDatasetBase
+from gradiend.trainer.core.dataset import SignalTrainingDatasetBase, _invert_numeric_label
 from gradiend.trainer.core.unified_schema import (
     UNIFIED_ALTERNATIVE,
     UNIFIED_FACTUAL,
@@ -1204,15 +1204,45 @@ class TextTrainingDataset(TextBatchedDataset):
         for key in ("is_identity_transition", "neutral_variant", "transition_type"):
             if key in entry:
                 out[key] = entry[key]
+        if "alternative_label" in entry:
+            alt_label = entry["alternative_label"]
+            if pd.isna(alt_label):
+                out["alternative_label"] = _invert_numeric_label(label)
+            else:
+                try:
+                    import numpy as _np
+                    if isinstance(alt_label, (_np.floating, float)) and float(alt_label).is_integer():
+                        alt_label = int(alt_label)
+                    elif isinstance(alt_label, _np.integer):
+                        alt_label = int(alt_label)
+                except Exception:
+                    pass
+                out["alternative_label"] = alt_label
         if "feature_pole" in entry:
             out["feature_pole"] = entry["feature_pole"]
         if "feature_class_id" in entry:
             out["feature_class_id"] = entry["feature_class_id"]
+        raw_factual_id = self._optional_raw_id(entry, "raw_factual_id", "raw_label_class")
+        if raw_factual_id is not None:
+            out["raw_factual_id"] = raw_factual_id
+        raw_alternative_id = self._optional_raw_id(entry, "raw_alternative_id", "raw_alternative_class")
+        if raw_alternative_id is not None:
+            out["raw_alternative_id"] = raw_alternative_id
         if UNIFIED_SPLIT in entry.index:
             out["data_split"] = normalize_split_name(str(entry[UNIFIED_SPLIT]))
         elif "split" in entry.index:
             out["data_split"] = normalize_split_name(str(entry["split"]))
         return out
+
+    @staticmethod
+    def _optional_raw_id(entry: Any, primary_key: str, fallback_key: str) -> Optional[str]:
+        """Return first non-null raw class ID from ``entry`` across primary/fallback keys."""
+        for key in (primary_key, fallback_key):
+            if key in entry:
+                val = entry[key]
+                if val is not None and not pd.isna(val):
+                    return str(val)
+        return None
 
 
 class TextActivationTrainingDataset(SignalTrainingDatasetBase):

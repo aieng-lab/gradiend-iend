@@ -157,6 +157,7 @@ class PredictionObjective:
         trainer: Any,
     ) -> Any:
         scoring_model = self.resolve_scoring_model(model, tokenizer, trainer)
+        t_args = getattr(trainer, "_training_args", None) or getattr(trainer, "args", None) or getattr(trainer, "training_args", None)
         return evaluate_probability_shift_score(
             scoring_model,
             tokenizer,
@@ -168,10 +169,10 @@ class PredictionObjective:
             use_row_wise=use_row_wise,
             return_per_row_df=return_per_row_df,
             objective=self.name,
-            rhs_window=getattr(getattr(trainer, "_training_args", None), "decoder_sequence_cloze_rhs_window", -1),
-            clm_unalignable_rows=getattr(getattr(trainer, "_training_args", None), "clm_unalignable_rows", "error"),
+            rhs_window=getattr(t_args, "decoder_sequence_cloze_rhs_window", -1),
+            clm_unalignable_rows=getattr(t_args, "clm_unalignable_rows", "error"),
             label_token_protocol=getattr(
-                getattr(trainer, "_training_args", None), "label_token_protocol", "first_differing_token"
+                t_args, "label_token_protocol", "first_differing_token"
             ),
         )
 

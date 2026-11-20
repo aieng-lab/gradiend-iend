@@ -47,8 +47,8 @@ class PositiveTrainerSuite(TrainerSuite):
         **trainer_kwargs: Any,
     ) -> None:
         self.mode = str(mode).strip().lower()
-        if self.mode not in {"single", "all_but_one"}:
-            raise ValueError("PositiveTrainerSuite mode must be one of: single, all_but_one")
+        if self.mode not in {"single", "all_but_one", "one_pole"}:
+            raise ValueError("PositiveTrainerSuite mode must be one of: single, all_but_one, one_pole")
         self.negative_class_fn = negative_class_fn or (lambda value: f"non_{value}")
         self.positive_feature_definitions = _normalize_positive_feature_definitions(positive_feature_definitions)
         super().__init__(trainer_cls, *trainer_args, **trainer_kwargs)
@@ -90,7 +90,39 @@ class PositiveTrainerSuite(TrainerSuite):
             raise ValueError("PositiveTrainerSuite could not resolve any positive feature definitions")
         return features
 
+    def _uses_complement_negatives(self, features: List[PositiveFeatureDefinition]) -> bool:
+        if self.positive_feature_definitions is not None or self.target_pairs is not None:
+            return False
+        target_set = {str(cls) for cls in self.target_classes}
+        return not any(feature.negative_feature_class in target_set for feature in features)
+
     def _build_single_pair_definitions(self, features: List[PositiveFeatureDefinition]) -> List[SuitePairDefinition]:
+        if self._uses_complement_negatives(features):
+            if len(features) < 2:
+                raise ValueError(
+                    "PositiveTrainerSuite mode='single' with complement negatives requires at least 2 feature classes"
+                )
+            definitions: List[SuitePairDefinition] = []
+            for feature in features:
+                other_positives = [
+                    other.positive_feature_class
+                    for other in features
+                    if other.positive_feature_class != feature.positive_feature_class
+                ]
+                pair = (feature.positive_feature_class, feature.negative_feature_class)
+                definitions.append(
+                    SuitePairDefinition(
+                        target_classes=pair,
+                        positive_class=feature.positive_feature_class,
+                        child_id=self.pair_id_fn(pair),
+                        label=self.pair_label_fn(pair),
+                        class_merge_map={
+                            feature.positive_feature_class: [feature.positive_feature_class],
+                            feature.negative_feature_class: other_positives,
+                        },
+                    )
+                )
+            return definitions
         return [
             SuitePairDefinition(
                 target_classes=(feature.positive_feature_class, feature.negative_feature_class),
@@ -102,12 +134,18 @@ class PositiveTrainerSuite(TrainerSuite):
         ]
 
     def _build_all_but_one_feature_pair_definitions(self, features: List[PositiveFeatureDefinition]) -> List[SuitePairDefinition]:
+        complement_negatives = self._uses_complement_negatives(features)
         definitions: List[SuitePairDefinition] = []
         for held_out in features:
             included = [feature for feature in features if feature.positive_feature_class != held_out.positive_feature_class]
             if not included:
                 continue
             child_id = f"holdout__{_default_child_id((held_out.positive_feature_class, held_out.negative_feature_class))}"
+            negative_classes = (
+                [held_out.positive_feature_class]
+                if complement_negatives
+                else [feature.negative_feature_class for feature in included]
+            )
             definitions.append(
                 SuitePairDefinition(
                     target_classes=("positive", "negative"),
@@ -116,13 +154,14 @@ class PositiveTrainerSuite(TrainerSuite):
                     label=f"All But {held_out.label or held_out.positive_feature_class}",
                     class_merge_map={
                         "positive": [feature.positive_feature_class for feature in included],
-                        "negative": [feature.negative_feature_class for feature in included],
+                        "negative": negative_classes,
                     },
                 )
             )
         return definitions
 
     def _build_all_but_one_feature_class_group_pair_definitions(self, features: List[PositiveFeatureDefinition]) -> List[SuitePairDefinition]:
+        complement_negatives = self._uses_complement_negatives(features)
         groups: Dict[str, List[PositiveFeatureDefinition]] = {}
         for feature in features:
             if feature.feature_class_group is None:
@@ -136,6 +175,11 @@ class PositiveTrainerSuite(TrainerSuite):
             included = [feature for feature in features if feature.positive_feature_class not in held_out_positive]
             if not included:
                 continue
+            negative_classes = (
+                [feature.positive_feature_class for feature in held_out_features]
+                if complement_negatives
+                else [feature.negative_feature_class for feature in included]
+            )
             definitions.append(
                 SuitePairDefinition(
                     target_classes=("positive", "negative"),
@@ -144,17 +188,34 @@ class PositiveTrainerSuite(TrainerSuite):
                     label=f"All But {group_name}",
                     class_merge_map={
                         "positive": [feature.positive_feature_class for feature in included],
-                        "negative": [feature.negative_feature_class for feature in included],
+                        "negative": negative_classes,
                     },
                 )
             )
         return definitions
 
+    def _build_one_pole_pair_definitions(self, features: List[PositiveFeatureDefinition]) -> List[SuitePairDefinition]:
+        return [
+            SuitePairDefinition(
+                target_classes=(feature.positive_feature_class,),
+                positive_class=feature.positive_feature_class,
+                child_id=feature.positive_feature_class,
+                label=feature.label or feature.positive_feature_class,
+                counterfactual_classes="all",
+            )
+            for feature in features
+        ]
+
     def _resolve_pair_definitions(self) -> List[SuitePairDefinition]:
         if self._input_pair_definitions is not None:
             resolved: List[SuitePairDefinition] = []
             for definition in self._input_pair_definitions:
-                positive_class = definition.positive_class or _infer_positive_class_for_pair(definition.target_classes)
+                if len(definition.target_classes) == 1:
+                    positive_class = definition.positive_class or str(definition.target_classes[0])
+                else:
+                    positive_class = definition.positive_class or _infer_positive_class_for_pair(
+                        (definition.target_classes[0], definition.target_classes[1])
+                    )
                 resolved.append(
                     SuitePairDefinition(
                         target_classes=definition.target_classes,
@@ -163,6 +224,7 @@ class PositiveTrainerSuite(TrainerSuite):
                         label=definition.label,
                         class_merge_map=definition.class_merge_map,
                         class_merge_transition_groups=definition.class_merge_transition_groups,
+                        counterfactual_classes=definition.counterfactual_classes,
                     )
                 )
             return resolved
@@ -178,6 +240,8 @@ class PositiveTrainerSuite(TrainerSuite):
             if features_with_group:
                 return self._build_all_but_one_feature_class_group_pair_definitions(features)
             return self._build_all_but_one_feature_pair_definitions(features)
+        if self.mode == "one_pole":
+            return self._build_one_pole_pair_definitions(features)
         raise ValueError(f"Unsupported PositiveTrainerSuite mode: {self.mode!r}")
 
     def _prepare_child_trainer_kwargs(
@@ -187,9 +251,23 @@ class PositiveTrainerSuite(TrainerSuite):
         definition: SuitePairDefinition,
         child_id: str,
     ) -> Dict[str, Any]:
-        args = child_kwargs.get("args")
+        args = child_kwargs.get("args") or child_kwargs.get("training_args")
         if args is not None and hasattr(args, "include_other_classes"):
             args.include_other_classes = True
+        if (
+            self.mode == "one_pole"
+            and args is not None
+            and getattr(args, "source", None) in ("factual", "alternative")
+            and getattr(self._trainer_kwargs.get("config"), "neutral_data", None) is None
+            and self._trainer_kwargs.get("neutral_data") is None
+        ):
+            logger.warning(
+                "PositiveTrainerSuite(mode='one_pole') for child %r has TrainingArguments(source=%r) "
+                "without neutral_data; mode='one_pole' without neutral_data typically requires "
+                "TrainingArguments(source='both').",
+                child_id,
+                getattr(args, "source", None),
+            )
         return child_kwargs
 
     def evaluate_encoder(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -318,8 +396,8 @@ class PositiveTrainerSuite(TrainerSuite):
             order=order,
             cluster=cluster,
             pretty_groups=pretty_groups,
-            row_label_mapping=row_label_mapping,
-            column_label_mapping=column_label_mapping,
+            row_label_mapping=row_label_mapping if row_label_mapping is not None else effective_labels,
+            column_label_mapping=column_label_mapping if column_label_mapping is not None else effective_labels,
             **plot_kwargs,
         )
 

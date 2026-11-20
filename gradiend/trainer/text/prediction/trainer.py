@@ -19,7 +19,14 @@ from gradiend.visualizer.plot_delegation import see_implementation
 
 from gradiend.util.tqdm_utils import gradiend_tqdm
 
-from gradiend.data.core import SplitGroupKey, SplitRatiosInput, normalize_split_ratios, resplit_unified_dataframe
+from gradiend.data.core import (
+    SplitGroupKey,
+    SplitRatiosInput,
+    apply_split_group_key,
+    min_vocabulary_keys_for_split_ratios,
+    normalize_split_ratios,
+    resplit_unified_dataframe,
+)
 from gradiend.data.core.dataframe_splitting import split_dataframe
 from gradiend.trainer.core.split_col_modes import (
     HELDOUT_SPLIT_COL,
@@ -61,6 +68,8 @@ from gradiend.trainer.core.unified_data import (
     UNIFIED_FACTUAL,
     UNIFIED_ALTERNATIVE,
     UNIFIED_TRANSITION,
+    RAW_LABEL_CLASS,
+    RAW_ALTERNATIVE_CLASS,
     transition_id,
 )
 from gradiend.trainer.text.prediction.model_with_gradiend import TextPredictionModelWithGradiend
@@ -259,11 +268,6 @@ class TextPredictionConfig(TrainerConfig):
     """
     label_col: str = "label"
     label_class_col: str = "label_class"
-    mask_placeholder: str = "[MASK]"
-    """Prediction-slot marker inside the masked column of your data (default ``"[MASK]"``).
-    It is a dataset-schema marker, independent of ``tokenizer.mask_token``: if your data uses
-    ``[PRONOUN]`` in the masked column, set ``mask_placeholder=\"[PRONOUN]\"``.
-    ``TrainingArguments.mask_placeholder`` may override when this stays at the default."""
     split_col: Optional[str] = "split"
     """Dataset split column. ``\"split\"`` (default) uses row-level splits from the data.
     ``None`` assigns random row-level train/validation/test splits (reshuffled when
@@ -856,18 +860,53 @@ class TextPredictionTrainer(Trainer):
             return True
         if not self.all_classes or len(self.all_classes) <= 2:
             return True
-        if not self.target_classes or len(self.target_classes) != 2:
-            return True
-        if "source_id" not in df.columns or "target_id" not in df.columns:
-            return False
         training_df = df[df["type"].astype(str) == "training"] if "type" in df.columns else df
         if training_df.empty:
             return False
-        target_set = {str(c) for c in self.target_classes}
-        source_vals = training_df["source_id"].dropna().astype(str)
-        target_vals = training_df["target_id"].dropna().astype(str)
-        if source_vals.empty or target_vals.empty:
+
+        if self._is_one_pole_config():
+            pos_set = {str(c) for c in (self._one_pole_positive_classes() or [])}
+            if len(pos_set) != 1 or len(self.all_classes) < 3:
+                return True
+            if "source_id" not in training_df.columns or "target_id" not in training_df.columns:
+                return False
+            valid = training_df[["source_id", "target_id"]].dropna()
+            if valid.empty:
+                return False
+            source_vals = valid["source_id"].astype(str)
+            target_vals = valid["target_id"].astype(str)
+            return bool((~(source_vals.isin(pos_set) | target_vals.isin(pos_set))).any())
+
+        merge_map = getattr(self.config, "class_merge_map", None)
+        if merge_map:
+            if not self.target_classes or len(self.target_classes) != 2:
+                return True
+            if "raw_source_id" not in training_df.columns or "raw_target_id" not in training_df.columns:
+                return False
+            valid_raw = training_df[["raw_source_id", "raw_target_id"]].dropna()
+            if valid_raw.empty:
+                return False
+            raw_src = valid_raw["raw_source_id"].astype(str)
+            raw_tgt = valid_raw["raw_target_id"].astype(str)
+            tc0, tc1 = str(self.target_classes[0]), str(self.target_classes[1])
+            pos_raw = {str(c) for c in merge_map.get(tc0, [tc0])}
+            neg_raw = {str(c) for c in merge_map.get(tc1, [tc1])}
+            target_pair_raw = (
+                (raw_src.isin(pos_raw) & raw_tgt.isin(neg_raw))
+                | (raw_src.isin(neg_raw) & raw_tgt.isin(pos_raw))
+            )
+            return bool((~target_pair_raw).any())
+
+        if not self.target_classes or len(self.target_classes) != 2:
+            return True
+        if "source_id" not in training_df.columns or "target_id" not in training_df.columns:
             return False
+        valid = training_df[["source_id", "target_id"]].dropna()
+        if valid.empty:
+            return False
+        source_vals = valid["source_id"].astype(str)
+        target_vals = valid["target_id"].astype(str)
+        target_set = {str(c) for c in self.target_classes}
         pair_local = source_vals.isin(target_set) & target_vals.isin(target_set)
         return bool((~pair_local).any())
 
@@ -1360,6 +1399,11 @@ class TextPredictionTrainer(Trainer):
         if pair_mask.any() and not pair_mask.all():
             pair_df = template[pair_mask].copy()
             other_df = template[~pair_mask].copy()
+            cycle_args = self._balanced_split_cycle_args(
+                seed_value,
+                split_cycle_index=split_cycle_index,
+                split_cycle_length=split_cycle_length,
+            )
             resplit_pair = resplit_unified_dataframe(
                 pair_df,
                 group_col=group_col,
@@ -1372,13 +1416,42 @@ class TextPredictionTrainer(Trainer):
                 feature_class_col=UNIFIED_FACTUAL_CLASS,
                 split_col=UNIFIED_SPLIT,
                 align_alternatives_with_split_vocab=True,
-                **self._balanced_split_cycle_args(
-                    seed_value,
-                    split_cycle_index=split_cycle_index,
-                    split_cycle_length=split_cycle_length,
-                ),
+                **cycle_args,
             )
-            self._combined_data = pd.concat([resplit_pair, other_df], ignore_index=True)
+            min_other_keys = min_vocabulary_keys_for_split_ratios(train_ratio, val_ratio, test_ratio)
+            other_keys = (
+                other_df[group_col]
+                .dropna()
+                .map(lambda v: apply_split_group_key(v, group_key))
+                .nunique()
+                if group_col in other_df.columns
+                else 0
+            )
+            if other_keys >= min_other_keys:
+                resplit_other = resplit_unified_dataframe(
+                    other_df,
+                    group_col=group_col,
+                    train_ratio=train_ratio,
+                    val_ratio=val_ratio,
+                    test_ratio=test_ratio,
+                    seed=int(seed),
+                    group_key=group_key,
+                    per_feature_class=False,
+                    feature_class_col=UNIFIED_FACTUAL_CLASS,
+                    split_col=UNIFIED_SPLIT,
+                    align_alternatives_with_split_vocab=False,
+                    **cycle_args,
+                )
+            else:
+                resplit_other = split_dataframe(
+                    other_df,
+                    train_ratio,
+                    val_ratio,
+                    test_ratio,
+                    int(seed),
+                    split_col=UNIFIED_SPLIT,
+                )
+            self._combined_data = pd.concat([resplit_pair, resplit_other], ignore_index=True)
         else:
             self._combined_data = resplit_unified_dataframe(
                 template,
@@ -1428,7 +1501,7 @@ class TextPredictionTrainer(Trainer):
         pair_mask = self._target_pair_transition_mask(template)
         if pair_mask.any() and not pair_mask.all():
             pair_df = _resplit_df(template[pair_mask])
-            other_df = template[~pair_mask].copy()
+            other_df = _resplit_df(template[~pair_mask])
             self._combined_data = pd.concat([pair_df, other_df], ignore_index=True)
         else:
             self._combined_data = _resplit_df(template)
@@ -1475,6 +1548,105 @@ class TextPredictionTrainer(Trainer):
         self._validate_required_splits(self._combined_data)
         self._check_and_filter_clm_alignment()
 
+    def _validate_merged_columns(self, df: pd.DataFrame, *, source: str) -> None:
+        config = self.config
+        split_col = loading_split_col(config.split_col)
+        required = [config.masked_col, config.label_class_col, config.label_col]
+        missing = [col for col in required if col not in df.columns]
+        if not missing:
+            return
+        configured = {
+            "masked_col": config.masked_col,
+            "label_class_col": config.label_class_col,
+            "label_col": config.label_col,
+            "split_col": split_col,
+        }
+        raise ValueError(
+            f"{source} is configured as merged text-prediction data, but it is missing "
+            f"required column(s) {missing}. Available columns: {list(df.columns)}. "
+            f"Configured column names: {configured}. "
+            "Pass the column names that exist in the data, or preprocess/rename the data."
+        )
+
+    def _infer_raw_all_classes_if_unset(self, data_df: pd.DataFrame) -> None:
+        if self._all_classes is not None:
+            return
+        config = self.config
+        raw_classes = set()
+        for col in (
+            config.label_class_col,
+            config.alternative_class_col,
+            RAW_LABEL_CLASS,
+            RAW_ALTERNATIVE_CLASS,
+        ):
+            if col and col in data_df.columns:
+                raw_classes.update(data_df[col].dropna().astype(str).tolist())
+        if raw_classes:
+            self._set_all_classes(sorted(raw_classes))
+
+    def _load_tabular_data_to_unified(
+        self,
+        data_df: pd.DataFrame,
+        *,
+        source_desc: str,
+        materialize_all_class_transitions: bool,
+    ) -> pd.DataFrame:
+        config = self.config
+        merge_map = getattr(config, "class_merge_map", None)
+        if merge_map and self._all_classes is None:
+            self._infer_raw_all_classes_if_unset(data_df)
+        if merge_map and not has_explicit_alternative_columns(
+            data_df,
+            alternative_col=config.alternative_col,
+            alternative_class_col=config.alternative_class_col,
+        ):
+            combined = unified_from_per_class_merge_map(
+                data_df,
+                merge_map=merge_map,
+                target_classes=config.target_classes,
+                masked_col=config.masked_col,
+                split_col=loading_split_col(config.split_col),
+                label_class_col=config.label_class_col,
+                use_class_names_as_columns=getattr(config, "use_class_names_as_columns", True),
+                pair=self.pair,
+                max_counterfactuals_per_sentence=getattr(
+                    config, "max_counterfactuals_per_sentence", 1
+                ),
+                random_state=getattr(config, "random_state", getattr(config, "seed", None)),
+            )
+        else:
+            self._validate_merged_columns(data_df, source=source_desc)
+            if merge_map and has_explicit_alternative_columns(
+                data_df,
+                alternative_col=config.alternative_col,
+                alternative_class_col=config.alternative_class_col,
+            ):
+                data_df = apply_class_merge_to_merged_df(
+                    data_df,
+                    merge_map,
+                    label_class_col=config.label_class_col,
+                    target_class_col=config.alternative_class_col,
+                    target_classes=config.target_classes,
+                    keep_raw=True,
+                    transition_groups=getattr(config, "class_merge_transition_groups", None),
+                    filter_to_target_pair=not materialize_all_class_transitions,
+                )
+            combined = merged_to_unified(
+                data_df,
+                masked_col=config.masked_col,
+                split_col=loading_split_col(config.split_col),
+                label_class_col=config.label_class_col,
+                label_col=config.label_col,
+                target_col=config.alternative_col,
+                target_class_col=config.alternative_class_col,
+                pair=self.pair,
+            )
+        if self._all_classes is None and not merge_map and combined is not None and not combined.empty:
+            src = combined[UNIFIED_FACTUAL_CLASS].unique().tolist()
+            tgt = combined[UNIFIED_ALTERNATIVE_CLASS].unique().tolist()
+            self._set_all_classes(sorted(set(src) | set(tgt)))
+        return combined
+
     def _ensure_data(self, *, materialize_all_class_transitions: Optional[bool] = None) -> None:
         """Load and normalize data on first use. Idempotent.
 
@@ -1493,6 +1665,7 @@ class TextPredictionTrainer(Trainer):
                 self._combined_data = None
                 self._combined_data_template = None
                 self._splits_resplit_seed = None
+                self._clm_alignment_checked = False
                 self._data_loaded = False
             else:
                 return
@@ -1504,25 +1677,6 @@ class TextPredictionTrainer(Trainer):
             if pair is None:
                 return None
             return pair if set(classes).issubset(set(pair)) else None
-
-        def _validate_merged_columns(df: pd.DataFrame, *, source: str) -> None:
-            split_col = loading_split_col(config.split_col)
-            required = [config.masked_col, config.label_class_col, config.label_col]
-            missing = [col for col in required if col not in df.columns]
-            if not missing:
-                return
-            configured = {
-                "masked_col": config.masked_col,
-                "label_class_col": config.label_class_col,
-                "label_col": config.label_col,
-                "split_col": split_col,
-            }
-            raise ValueError(
-                f"{source} is configured as merged text-prediction data, but it is missing "
-                f"required column(s) {missing}. Available columns: {list(df.columns)}. "
-                f"Configured column names: {configured}. "
-                "Pass the column names that exist in the data, or preprocess/rename the data."
-            )
 
         if materialize_all_class_transitions is None:
             materialize_all_class_transitions = bool(
@@ -1548,7 +1702,9 @@ class TextPredictionTrainer(Trainer):
             self.data = raw
             merge_map = config.class_merge_map
             data_df = raw
-            _validate_merged_columns(data_df, source=f"HF dataset {config.hf_dataset!r}")
+            self._validate_merged_columns(data_df, source=f"HF dataset {config.hf_dataset!r}")
+            if merge_map and self._all_classes is None:
+                self._infer_raw_all_classes_if_unset(data_df)
             if (
                 merge_map
                 and config.alternative_col
@@ -1564,6 +1720,7 @@ class TextPredictionTrainer(Trainer):
                     target_classes=config.target_classes,
                     keep_raw=True,
                     transition_groups=getattr(config, "class_merge_transition_groups", None),
+                    filter_to_target_pair=not materialize_all_class_transitions,
                 )
             self._combined_data = merged_to_unified(
                 data_df,
@@ -1575,6 +1732,10 @@ class TextPredictionTrainer(Trainer):
                 target_class_col=config.alternative_class_col,
                 pair=self.pair,
             )
+            if self._all_classes is None and not merge_map and self._combined_data is not None and not self._combined_data.empty:
+                src = self._combined_data[UNIFIED_FACTUAL_CLASS].unique().tolist()
+                tgt = self._combined_data[UNIFIED_ALTERNATIVE_CLASS].unique().tolist()
+                self._set_all_classes(sorted(set(src) | set(tgt)))
         elif is_hf_id:
             # HF per-class: load configs/subsets as class_dfs, merge by class_merge_map if set, then per_class_dict_to_unified
             cf_cfg = self._config_counterfactual_classes()
@@ -1680,112 +1841,21 @@ class TextPredictionTrainer(Trainer):
                 )
                 self._combined_data = unified
             elif isinstance(config.data, pd.DataFrame):
-                data_df = config.data
-                merge_map = getattr(config, "class_merge_map", None)
                 self.data = config.data
-                if merge_map and not has_explicit_alternative_columns(
-                    data_df,
-                    alternative_col=config.alternative_col,
-                    alternative_class_col=config.alternative_class_col,
-                ):
-                    self._combined_data = unified_from_per_class_merge_map(
-                        data_df,
-                        merge_map=merge_map,
-                        target_classes=config.target_classes,
-                        masked_col=config.masked_col,
-                        split_col=loading_split_col(config.split_col),
-                        label_class_col=config.label_class_col,
-                        use_class_names_as_columns=getattr(config, "use_class_names_as_columns", True),
-                        pair=self.pair,
-                        max_counterfactuals_per_sentence=getattr(
-                            config, "max_counterfactuals_per_sentence", 1
-                        ),
-                        random_state=getattr(config, "random_state", getattr(config, "seed", None)),
-                    )
-                else:
-                    _validate_merged_columns(data_df, source="DataFrame data")
-                    if merge_map and has_explicit_alternative_columns(
-                        data_df,
-                        alternative_col=config.alternative_col,
-                        alternative_class_col=config.alternative_class_col,
-                    ):
-                        data_df = apply_class_merge_to_merged_df(
-                            data_df,
-                            merge_map,
-                            label_class_col=config.label_class_col,
-                            target_class_col=config.alternative_class_col,
-                            target_classes=config.target_classes,
-                            keep_raw=True,
-                            transition_groups=getattr(config, "class_merge_transition_groups", None),
-                        )
-                    self._combined_data = merged_to_unified(
-                        data_df,
-                        masked_col=config.masked_col,
-                        split_col=loading_split_col(config.split_col),
-                        label_class_col=config.label_class_col,
-                        label_col=config.label_col,
-                        target_col=config.alternative_col,
-                        target_class_col=config.alternative_class_col,
-                        pair=self.pair,
-                    )
-                if self._combined_data is not None:
-                    src = self._combined_data[UNIFIED_FACTUAL_CLASS].unique().tolist()
-                    tgt = self._combined_data[UNIFIED_ALTERNATIVE_CLASS].unique().tolist()
-                    self._set_all_classes(sorted(set(src) | set(tgt)))
+                self._combined_data = self._load_tabular_data_to_unified(
+                    config.data,
+                    source_desc="DataFrame data",
+                    materialize_all_class_transitions=materialize_all_class_transitions,
+                )
             elif isinstance(config.data, (Path, str)):
                 data_df = resolve_training_data_path(config.data)
                 self._exclude_generated_incomplete_target_classes(config.data)
                 self.data = data_df
-                merge_map = getattr(config, "class_merge_map", None)
-                if merge_map and not has_explicit_alternative_columns(
+                self._combined_data = self._load_tabular_data_to_unified(
                     data_df,
-                    alternative_col=config.alternative_col,
-                    alternative_class_col=config.alternative_class_col,
-                ):
-                    self._combined_data = unified_from_per_class_merge_map(
-                        data_df,
-                        merge_map=merge_map,
-                        target_classes=config.target_classes,
-                        masked_col=config.masked_col,
-                        split_col=loading_split_col(config.split_col),
-                        label_class_col=config.label_class_col,
-                        use_class_names_as_columns=getattr(config, "use_class_names_as_columns", True),
-                        pair=self.pair,
-                        max_counterfactuals_per_sentence=getattr(
-                            config, "max_counterfactuals_per_sentence", 1
-                        ),
-                        random_state=getattr(config, "random_state", getattr(config, "seed", None)),
-                    )
-                else:
-                    _validate_merged_columns(data_df, source=f"training data {str(config.data)!r}")
-                    if merge_map and has_explicit_alternative_columns(
-                        data_df,
-                        alternative_col=config.alternative_col,
-                        alternative_class_col=config.alternative_class_col,
-                    ):
-                        data_df = apply_class_merge_to_merged_df(
-                            data_df,
-                            merge_map,
-                            label_class_col=config.label_class_col,
-                            target_class_col=config.alternative_class_col,
-                            target_classes=config.target_classes,
-                            keep_raw=True,
-                            transition_groups=getattr(config, "class_merge_transition_groups", None),
-                        )
-                    self._combined_data = merged_to_unified(
-                        data_df,
-                        masked_col=config.masked_col,
-                        split_col=loading_split_col(config.split_col),
-                        label_class_col=config.label_class_col,
-                        label_col=config.label_col,
-                        target_col=config.alternative_col,
-                        target_class_col=config.alternative_class_col,
-                        pair=self.pair,
-                    )
-                if self._combined_data is not None:
-                    src = self._combined_data[UNIFIED_FACTUAL_CLASS].unique().tolist()
-                    tgt = self._combined_data[UNIFIED_ALTERNATIVE_CLASS].unique().tolist()
-                    self._set_all_classes(sorted(set(src) | set(tgt)))
+                    source_desc=f"training data {str(config.data)!r}",
+                    materialize_all_class_transitions=materialize_all_class_transitions,
+                )
             else:
                 raise TypeError(
                     f"config.data must be a DataFrame, dict, local path, or HuggingFace dataset id; "
@@ -1804,7 +1874,12 @@ class TextPredictionTrainer(Trainer):
         self._data_loaded = True
         self._data_materialized_all_class_transitions = materialize_all_class_transitions
 
-        if self._all_classes is None and self._combined_data is not None:
+        if (
+            self._all_classes is None
+            and not getattr(config, "class_merge_map", None)
+            and self._combined_data is not None
+            and not self._combined_data.empty
+        ):
             src = self._combined_data[UNIFIED_FACTUAL_CLASS].unique().tolist()
             tgt = self._combined_data[UNIFIED_ALTERNATIVE_CLASS].unique().tolist()
             self._set_all_classes(sorted(set(src) | set(tgt)))
@@ -2860,6 +2935,7 @@ class TextPredictionTrainer(Trainer):
         for _, row in pair_data.iterrows():
             src = row[UNIFIED_FACTUAL_CLASS]
             tgt = row[UNIFIED_ALTERNATIVE_CLASS]
+            alt_label = None
             if fac_cfg and resolved_cf:
                 # One-pole: + class factual → +1; CF factual (reverse) → −1.
                 if str(src) in fac_set:
@@ -2868,8 +2944,12 @@ class TextPredictionTrainer(Trainer):
                     label = -1
                 else:
                     label = 0
+                alt_label = 1 if str(tgt) in fac_set else (-1 if str(tgt) in cf_set else 0)
             else:
-                label = 1 if src == class_pair[0] else (-1 if src == class_pair[1] else 0)
+                if str(src) == str(tgt):
+                    label = 0
+                else:
+                    label = 1 if src == class_pair[0] else (-1 if src == class_pair[1] else 0)
             pair_entry = self._attach_feature_pole_fields(
                 {
                     "masked": row[UNIFIED_MASKED],
@@ -2881,8 +2961,14 @@ class TextPredictionTrainer(Trainer):
                     "is_identity_transition": False,
                 }
             )
+            if alt_label is not None:
+                pair_entry["alternative_label"] = alt_label
             if UNIFIED_SPLIT in row.index and pd.notna(row[UNIFIED_SPLIT]):
                 pair_entry[UNIFIED_SPLIT] = row[UNIFIED_SPLIT]
+            if RAW_LABEL_CLASS in row.index and pd.notna(row[RAW_LABEL_CLASS]):
+                pair_entry["raw_factual_id"] = str(row[RAW_LABEL_CLASS])
+            if RAW_ALTERNATIVE_CLASS in row.index and pd.notna(row[RAW_ALTERNATIVE_CLASS]):
+                pair_entry["raw_alternative_id"] = str(row[RAW_ALTERNATIVE_CLASS])
             training_pairs.append(pair_entry)
 
         # Identity transitions only for classes in all_classes that are not target or CFs.
@@ -3086,18 +3172,15 @@ class TextPredictionTrainer(Trainer):
         target = kwargs.pop("target", GRADIENT_DATASET_KWARG_UNSET)
         args = getattr(self, "training_args", None)
         if source is GRADIENT_DATASET_KWARG_UNSET:
-            if args is not None:
-                source = None if getattr(args, "supervised_decoder", False) else getattr(args, "source", "factual")
-            else:
-                source = "factual"
+            source = getattr(args, "source", "factual") if args is not None else "factual"
         if source is None:
             source = "factual"
         if target is GRADIENT_DATASET_KWARG_UNSET:
-            if args is not None:
-                target = getattr(args, "target", "diff")
+            if args is not None and getattr(args, "supervised_encoder", False) and source != "both":
+                target = None
+            elif args is not None:
+                target = getattr(args, "target", "diff") or "diff"
             else:
-                target = "diff"
-            if target is None:
                 target = "diff"
         tokenizer = model_with_gradiend.tokenizer
         dtype = kwargs.pop("dtype", model_with_gradiend.gradiend.torch_dtype)
@@ -3740,6 +3823,46 @@ class TextPredictionTrainer(Trainer):
             "summary": summary,
         }
 
+    @staticmethod
+    def _build_encoded_training_row(
+        r: Dict[str, Any],
+        eval_group_value: Any,
+        *,
+        include_template: bool,
+        component: bool,
+    ) -> Dict[str, Any]:
+        """Build one normalized training or component row dict from encoder output."""
+        row_dict: Dict[str, Any] = {
+            "text": r.get("text"),
+            "encoded": r["encoded"],
+            "label": float(r["label"]),
+            "source_id": r.get("source_id"),
+            "target_id": r.get("target_id"),
+            "factual_id": r.get("factual_id"),
+            "counterfactual_id": r.get("counterfactual_id"),
+            "transition_id": r.get("transition_id"),
+            "feature_class_id": r.get("feature_class_id"),
+            "input_type": r.get("input_type"),
+            "eval_group": eval_group_value,
+            "type": "training",
+            "source_token": r.get("source_token"),
+            "factual_token": r.get("factual_token"),
+            "alternative_token": r.get("alternative_token"),
+            "data_split": r.get("data_split"),
+            "neutral_variant": r.get("neutral_variant"),
+            "transition_type": r.get("transition_type"),
+        }
+        if include_template:
+            row_dict["template"] = r.get("template")
+        if component:
+            row_dict["component_index"] = r.get("component_index")
+            row_dict["component_id"] = r.get("component_id")
+            row_dict["component_label"] = r.get("component_label")
+        for raw_key in ("raw_source_id", "raw_target_id", "raw_factual_id", "raw_counterfactual_id"):
+            if r.get(raw_key) is not None:
+                row_dict[raw_key] = r.get(raw_key)
+        return row_dict
+
     def _encode_training_rows(
             self,
             model_with_gradiend: Any,
@@ -3791,65 +3914,30 @@ class TextPredictionTrainer(Trainer):
                 return_component_rows=True,
             )
 
-        rows: List[Dict[str, Any]] = []
-        component_rows: List[Dict[str, Any]] = []
         resolved_eval_group = getattr(self, "eval_group", None)
-        for r in training_rows:
+
+        def _eval_group_value(r: Dict[str, Any]) -> Any:
             if resolved_eval_group == "factual_id":
-                eval_group_value = r.get("source_id")
-            elif resolved_eval_group == "feature_class_id":
-                eval_group_value = r.get("feature_class_id")
-            else:
-                raise ValueError(
-                    f"Unsupported eval_group {resolved_eval_group!r}. "
-                    "Expected one of: 'factual_id', 'feature_class_id'."
-                )
-            rows.append({
-                "text": r.get("text"),
-                "encoded": r["encoded"],
-                "label": float(r["label"]),
-                "source_id": r.get("source_id"),
-                "target_id": r.get("target_id"),
-                "feature_class_id": r.get("feature_class_id"),
-                "eval_group": eval_group_value,
-                "type": "training",
-                "source_token": r.get("source_token"),
-                "factual_token": r.get("factual_token"),
-                "alternative_token": r.get("alternative_token"),
-                "template": r.get("template"),
-                "data_split": r.get("data_split"),
-                "neutral_variant": r.get("neutral_variant"),
-                "transition_type": r.get("transition_type"),
-            })
-        for r in component_training_rows:
-            if resolved_eval_group == "factual_id":
-                eval_group_value = r.get("source_id")
-            elif resolved_eval_group == "feature_class_id":
-                eval_group_value = r.get("feature_class_id")
-            else:
-                raise ValueError(
-                    f"Unsupported eval_group {resolved_eval_group!r}. "
-                    "Expected one of: 'factual_id', 'feature_class_id'."
-                )
-            component_rows.append({
-                "text": r.get("text"),
-                "encoded": r["encoded"],
-                "label": float(r["label"]),
-                "source_id": r.get("source_id"),
-                "target_id": r.get("target_id"),
-                "feature_class_id": r.get("feature_class_id"),
-                "eval_group": eval_group_value,
-                "type": "training",
-                "source_token": r.get("source_token"),
-                "factual_token": r.get("factual_token"),
-                "alternative_token": r.get("alternative_token"),
-                "data_split": r.get("data_split"),
-                "neutral_variant": r.get("neutral_variant"),
-                "transition_type": r.get("transition_type"),
-                "component_index": r.get("component_index"),
-                "component_id": r.get("component_id"),
-                "component_label": r.get("component_label"),
-            })
+                return r.get("source_id")
+            if resolved_eval_group == "feature_class_id":
+                return r.get("feature_class_id")
+            raise ValueError(
+                f"Unsupported eval_group {resolved_eval_group!r}. "
+                "Expected one of: 'factual_id', 'feature_class_id'."
+            )
+
+        rows = [
+            self._build_encoded_training_row(
+                r, _eval_group_value(r), include_template=True, component=False
+            )
+            for r in training_rows
+        ]
+        component_rows = [
+            self._build_encoded_training_row(
+                r, _eval_group_value(r), include_template=False, component=True
+            )
+            for r in component_training_rows
+        ]
         logger.debug(f"Processed {len(rows)} training data entries")
         return rows, component_rows
 
@@ -4098,6 +4186,10 @@ class TextPredictionTrainer(Trainer):
         if neutral_data_df is None or len(neutral_data_df) == 0:
             return ([], []) if return_component_rows else []
 
+        _seed = getattr(getattr(self, "training_args", None), "seed", 0) or 0
+        if max_size is not None and max_size > 0 and len(neutral_data_df) > max_size:
+            neutral_data_df = neutral_data_df.sample(n=max_size, random_state=_seed).reset_index(drop=True)
+
         logger.info("Encoding neutral dataset data (size=%s)", len(neutral_data_df))
         logger.debug(f"neutral_data_df columns: {list(neutral_data_df.columns)}")
 
@@ -4135,11 +4227,7 @@ class TextPredictionTrainer(Trainer):
 
         # Create neutral eval pairs with one mask per entry
         neutral_pairs = []
-        _seed = getattr(getattr(self, "training_args", None), "seed", 0) or 0
-        random.seed(_seed)
         neutral_dataset_count = 0
-        if max_size is not None and max_size > 0 and len(neutral_data_df) > max_size:
-            neutral_data_df = neutral_data_df.sample(n=max_size, random_state=_seed).reset_index(drop=True)
         for idx, row in gradiend_tqdm(
             neutral_data_df.iterrows(),
             total=len(neutral_data_df),
@@ -4674,6 +4762,10 @@ class TextPredictionTrainer(Trainer):
 
         # Get neutral data if not provided (config first, then training_args); resolve HF id to DataFrame
         neutral_max_rows = getattr(self.config, "eval_neutral_max_rows", None)
+        if neutral_max_rows is None and getattr(self, "training_args", None) is not None:
+            neutral_max_rows = getattr(self.training_args, "eval_neutral_max_rows", None)
+        if neutral_max_rows is None:
+            neutral_max_rows = max_size
         if encoder_kwargs["neutral_data_df"] is None:
             encoder_kwargs["neutral_data_df"] = self._resolve_eval_neutral_dataframe(
                 split=split,

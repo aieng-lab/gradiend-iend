@@ -3,6 +3,7 @@ import shutil
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 from gradiend.trainer.core.arguments import TrainingArguments
@@ -341,3 +342,202 @@ def test_call_train_does_not_wrap_when_training_used_cache():
         assert not is_multi_seed_view(suite.trainers["child"])
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _dialect_df(classes=("US", "UK", "CA", "AU")):
+    rows = []
+    for src in classes:
+        for tgt in classes:
+            if src == tgt:
+                continue
+            rows.append(
+                {
+                    "masked": f"token [MASK] in {src}",
+                    "label": src.lower(),
+                    "label_class": src,
+                    "target_class": tgt,
+                    "split": "train",
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_positive_suite_multiclass_single_builds_complement_merge_maps():
+    _RecordingTrainer.calls = []
+    df_4dialects = _dialect_df()
+
+    suite = PositiveTrainerSuite(
+        _RecordingTrainer,
+        model="bert-base-uncased",
+        data=df_4dialects,
+        target_classes=["US", "UK", "CA", "AU"],
+        mode="single",
+    )
+
+    assert list(suite.trainers.keys()) == [
+        "US__non_US",
+        "UK__non_UK",
+        "CA__non_CA",
+        "AU__non_AU",
+    ]
+    assert suite.pair_definitions["US__non_US"].class_merge_map == {
+        "US": ["US"],
+        "non_US": ["UK", "CA", "AU"],
+    }
+    assert suite.pair_definitions["UK__non_UK"].class_merge_map == {
+        "UK": ["UK"],
+        "non_UK": ["US", "CA", "AU"],
+    }
+    assert _RecordingTrainer.calls[0]["target_classes"] == ["US", "non_US"]
+    assert _RecordingTrainer.calls[0]["class_merge_map"] == {
+        "US": ["US"],
+        "non_US": ["UK", "CA", "AU"],
+    }
+
+
+def test_positive_suite_multiclass_all_but_one_holds_out_positive_class():
+    _RecordingTrainer.calls = []
+    df_4dialects = _dialect_df()
+
+    suite = PositiveTrainerSuite(
+        _RecordingTrainer,
+        model="bert-base-uncased",
+        data=df_4dialects,
+        target_classes=["US", "UK", "CA", "AU"],
+        mode="all_but_one",
+    )
+
+    assert list(suite.trainers.keys()) == [
+        "holdout__US__non_US",
+        "holdout__UK__non_UK",
+        "holdout__CA__non_CA",
+        "holdout__AU__non_AU",
+    ]
+    assert suite.pair_definitions["holdout__US__non_US"].class_merge_map == {
+        "positive": ["UK", "CA", "AU"],
+        "negative": ["US"],
+    }
+    assert suite.pair_definitions["holdout__AU__non_AU"].class_merge_map == {
+        "positive": ["US", "UK", "CA"],
+        "negative": ["AU"],
+    }
+
+
+def test_positive_suite_one_pole_builds_single_target_children():
+    _RecordingTrainer.calls = []
+    df_4dialects = _dialect_df()
+
+    suite = PositiveTrainerSuite(
+        _RecordingTrainer,
+        model="bert-base-uncased",
+        data=df_4dialects,
+        target_classes=["US", "UK", "CA", "AU"],
+        mode="one_pole",
+    )
+
+    assert list(suite.trainers.keys()) == ["US", "UK", "CA", "AU"]
+    assert suite.pairs == [
+        ("US", "all"),
+        ("UK", "all"),
+        ("CA", "all"),
+        ("AU", "all"),
+    ]
+    for cls, call in zip(["US", "UK", "CA", "AU"], _RecordingTrainer.calls):
+        assert call["target_classes"] == [cls]
+        assert call["counterfactual_classes"] == "all"
+        assert suite.pair_definitions[cls].target_classes == (cls,)
+        assert suite.pair_definitions[cls].counterfactual_classes == "all"
+        assert suite.pair_definitions[cls].positive_class == cls
+
+
+def test_positive_suite_rejects_missing_pair_with_trainer_kwargs_columns():
+    df_missing = _dialect_df(classes=("US", "UK"))
+
+    with pytest.raises(ValueError, match="not present in the training data"):
+        PositiveTrainerSuite(
+            _RecordingTrainer,
+            model="bert-base-uncased",
+            data=df_missing,
+            target_classes=["US", "UK", "AU"],
+            mode="single",
+            label_class_col="label_class",
+            alternative_class_col="target_class",
+        )
+
+    with pytest.raises(ValueError, match="not present in the training data"):
+        PositiveTrainerSuite(
+            _RecordingTrainer,
+            model="bert-base-uncased",
+            data=df_missing,
+            target_classes=["US", "UK", "AU"],
+            mode="one_pole",
+            label_class_col="label_class",
+            alternative_class_col="target_class",
+        )
+
+
+def test_positive_suite_one_pole_requires_directed_transition_in_training_data():
+    df_asymmetric = pd.DataFrame(
+        [
+            {
+                "masked": "token [MASK] in UK",
+                "label": "uk",
+                "label_class": "UK",
+                "target_class": "US",
+                "split": "train",
+            }
+        ]
+    )
+
+    with pytest.raises(ValueError, match="US -> all"):
+        PositiveTrainerSuite(
+            _RecordingTrainer,
+            model="bert-base-uncased",
+            data=df_asymmetric,
+            target_classes=["US", "UK"],
+            mode="one_pole",
+            label_class_col="label_class",
+            alternative_class_col="target_class",
+        )
+
+
+def test_positive_suite_one_pole_warns_when_source_not_both_without_neutral_data(caplog):
+    _RecordingTrainer.calls = []
+    df_dialects = _dialect_df(classes=("US", "UK"))
+
+    with caplog.at_level("WARNING"):
+        PositiveTrainerSuite(
+            _RecordingTrainer,
+            model="bert-base-uncased",
+            data=df_dialects,
+            target_classes=["US", "UK"],
+            mode="one_pole",
+            training_args=TrainingArguments(source="factual"),
+        )
+
+    assert any("source='both'" in rec.message for rec in caplog.records)
+
+
+def test_positive_suite_plot_cross_encoding_heatmap_uses_effective_label_mapping(monkeypatch):
+    suite = object.__new__(PositiveTrainerSuite)
+    suite.label_mapping = {"us": "US Label", "uk": "UK Label"}
+    suite._resolve_suite_seed_selection = lambda seed_selection=None: "best"
+    suite._resolve_suite_dispersion = lambda dispersion=None: "none"
+    suite.compute_trainer_pair_encoding_matrix = lambda **kwargs: {
+        "model_ids": ["us", "uk"],
+        "column_ids": ["us", "uk"],
+        "matrix": [[1.0, 0.2], [0.3, 1.0]],
+    }
+
+    captured = {}
+
+    def _fake_plot(data, **kwargs):
+        captured.update(kwargs)
+        return data
+
+    monkeypatch.setattr("gradiend.trainer.suite.positive.plot_comparison_heatmap", _fake_plot)
+
+    suite.plot_cross_encoding_heatmap(label_mapping={"uk": "Custom UK"})
+
+    assert captured["row_label_mapping"] == {"us": "US Label", "uk": "Custom UK"}
+    assert captured["column_label_mapping"] == {"us": "US Label", "uk": "Custom UK"}
