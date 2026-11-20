@@ -4,7 +4,6 @@
 [![EMNLP 2026 Demos](https://img.shields.io/badge/EMNLP%202026-System%20Demonstrations-blue.svg)](https://aclanthology.org/2026.emnlp-demos.18/)
 [![arXiv:2609.32355](https://img.shields.io/badge/arXiv-2609.32355-blue.svg)](https://arxiv.org/abs/2609.32355)
 [![arXiv:2502.01406](https://img.shields.io/badge/arXiv-2502.01406-blue.svg)](https://arxiv.org/abs/2502.01406)
-[![arXiv:2601.09313](https://img.shields.io/badge/arXiv-2601.09313-blue.svg)](https://arxiv.org/abs/2601.09313)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Tests](https://github.com/aieng-lab/gradiend/actions/workflows/tests.yml/badge.svg)](https://github.com/aieng-lab/gradiend/actions/workflows/tests.yml)

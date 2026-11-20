@@ -8,7 +8,7 @@ We treat the encoding as a measure of how similar the feature classes are repres
 The following guide explains how to compute the matrix and how to interpret it.
 
 **Computation details:** [Oriented cross-encoding: computation](cross-encoding-matrix-computation.md)  
-**Formal notation:** [Oriented cross-encoding matrix (paper Appendix D)](https://arxiv.org/abs/2602.23993)
+**Formal notation:** [Oriented cross-encoding matrix (paper Appendix D)](https://aclanthology.org/2026.emnlp-demos.18/)
 
 !!! note "Planned null controls"
     Cross-encoding currently provides descriptive matrices and seed-level
