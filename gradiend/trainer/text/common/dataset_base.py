@@ -23,6 +23,9 @@ class TextBatchedDatasetBase(Dataset, ABC):
 
     Handles: DataFrame, tokenizer, batch_size, batch_criterion, max_size, seed,
     balance_column, shuffle_within; builds group_batches and total_samples.
+    When ``balance_column`` is set, iteration uses cyclic round-robin scheduling
+    across balance groups for training steps; single-pass unique-row evaluation
+    must pass ``balance_column=None``.
     Subclasses add modality-specific attributes (e.g. mask_token for prediction)
     and implement __getitem__ to return the item format expected by training.
     """
@@ -48,7 +51,11 @@ class TextBatchedDatasetBase(Dataset, ABC):
         self.shuffle_batches = shuffle_batches or batch_size > 1
         self.max_length = max_length
         self.balance_column = balance_column
-        self.shuffle_within = shuffle_within or batch_size > 1
+        self.shuffle_within = (
+            bool(shuffle_within)
+            if shuffle_within is not None
+            else bool(batch_size > 1 or balance_column is not None)
+        )
         rng = random.Random(seed)
 
         if max_size is not None:

@@ -496,7 +496,7 @@ def _gradient_dataset_for_unified_df(
         is_decoder_only_model=is_decoder_only_model,
         is_seq2seq_model=is_seq2seq,
         target_key="label",
-        balance_column="feature_class_id",
+        balance_column=None,
         max_length=max_length,
         seed=42,
         prediction_objective=objective_name,

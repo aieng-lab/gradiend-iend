@@ -267,8 +267,8 @@ class TrainingArguments:
     encoder_eval_max_size: Optional[int] = None
     """Max samples for encoder evaluation outside training (e.g. analysis, manual evaluate_encoder). None = use all available."""
 
-    encoder_eval_balance: bool = True
-    """If True, balance encoder evaluation data per feature_class_id. If False, use natural class distribution."""
+    encoder_eval_balance: bool = False
+    """If True, balance encoder evaluation data per eval group via deterministic shuffled undersampling (no duplicate rows). If False (default), evaluate the natural class distribution (all rows once when encoder_eval_max_size is None)."""
 
     include_other_classes: bool = False
     """If True, encoder evaluation includes all class transitions in the split, not just the trained target pair. Applies when ``all_classes`` has more than two entries. Affects encoder metrics, encoder plots, and suite cross-encoding plots built from encoder evaluation. Set on [`TrainingArguments`][gradiend.trainer.core.arguments.TrainingArguments] or pass ``include_other_classes=True`` to ``evaluate_encoder()``."""

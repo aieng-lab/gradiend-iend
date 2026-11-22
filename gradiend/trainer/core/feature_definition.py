@@ -509,10 +509,11 @@ class FeatureLearningDefinition(DataProvider, ABC):
         then wrap via create_gradient_training_dataset (legacy name; modality-specific
         signal dataset construction).
 
-        Uses encoder_eval_balance from training args to set balance_column for
-        create_training_data. For factual-source evaluation the natural balancing
-        unit is the factual class itself; for alternative/diff we keep the default
-        pair-level transition grouping.
+        Evaluation never uses cyclic ``balance_column`` scheduling (always passes
+        ``balance_column=None``) so held-out rows are visited once without modulo
+        duplication or silent tail drops. Instead, ``encoder_eval_balance``
+        controls DataFrame-level stratified undersampling across
+        ``group_cap_column=self.eval_group``.
 
         Args:
             model_with_gradiend:
@@ -556,7 +557,7 @@ class FeatureLearningDefinition(DataProvider, ABC):
         max_size = self._default_from_training_args(max_size, "encoder_eval_max_size")
         pre_load_gradients = self._default_from_training_args(pre_load_gradients, "use_cached_gradients", fallback=False)
         encoder_eval_balance = self._default_from_training_args(
-            kwargs.get("encoder_eval_balance"), "encoder_eval_balance", fallback=True
+            kwargs.get("encoder_eval_balance"), "encoder_eval_balance", fallback=False
         )
         include_other_classes = resolve_include_other_classes(
             include_other_classes=include_other_classes,
@@ -564,15 +565,18 @@ class FeatureLearningDefinition(DataProvider, ABC):
             default=self._default_from_training_args(None, "include_other_classes", fallback=False),
         )
         self._eval_group = self._resolve_eval_group(source)
-        if encoder_eval_balance:
-            balance_column = self.eval_group
-        else:
-            balance_column = None
 
         create_kwargs = {
             k: v
             for k, v in kwargs.items()
-            if k not in ("include_other_classes", "use_all_transitions", "transition_selection", "encoder_eval_balance")
+            if k not in (
+                "include_other_classes",
+                "use_all_transitions",
+                "transition_selection",
+                "encoder_eval_balance",
+                "group_cap_column",
+                "undersample_balance",
+            )
         }
         raw = self.create_training_data(
             model_with_gradiend,
@@ -580,7 +584,9 @@ class FeatureLearningDefinition(DataProvider, ABC):
             batch_size=1,
             max_size=max_size,
             is_decoder_only_model=is_decoder_only_model,
-            balance_column=balance_column,
+            balance_column=None,
+            group_cap_column=self.eval_group,
+            undersample_balance=bool(encoder_eval_balance),
             include_other_classes=include_other_classes,
             transition_selection=transition_selection,
             **create_kwargs,
@@ -593,7 +599,15 @@ class FeatureLearningDefinition(DataProvider, ABC):
         grad_kwargs = {
             k: v
             for k, v in kwargs.items()
-            if k not in ("include_other_classes", "use_all_transitions", "transition_selection", "encoder_eval_balance", "target")
+            if k not in (
+                "include_other_classes",
+                "use_all_transitions",
+                "transition_selection",
+                "encoder_eval_balance",
+                "group_cap_column",
+                "undersample_balance",
+                "target",
+            )
         }
         # One-pole only: expand fac/alt so correlation still sees ±1. Never for
         # normal two-pole gender/etc. (encode source texts only).

@@ -2822,6 +2822,8 @@ class TextPredictionTrainer(Trainer):
             use_all_transitions: bool = False,
             transition_selection: Optional[List[Union[TransitionSpec, Tuple[str, str]]]] = None,
             balance_column: Optional[str] = "feature_pole",
+            group_cap_column: Optional[str] = None,
+            undersample_balance: bool = False,
             **kwargs: Any,
     ) -> Any:
         """
@@ -2858,8 +2860,16 @@ class TextPredictionTrainer(Trainer):
                 active target pair. Non-target transitions keep label ``0``.
                 If set, ``include_other_classes`` / ``use_all_transitions`` are
                 ignored.
-            balance_column: Column used for balanced dataset scheduling and
-                per-group capping.
+            balance_column: Column used for balanced batch scheduling during
+                training. Pass ``None`` for single-pass evaluation datasets.
+            group_cap_column: Optional grouping column used for per-group
+                ``max_size`` capping and stratified undersampling when omitted
+                from ``balance_column`` (defaults to ``balance_column`` or
+                ``"feature_pole"``).
+            undersample_balance: If True, cap every group in
+                ``group_cap_column`` to ``min(min_group_size, max_size)`` via
+                deterministic shuffled sampling so groups are strictly balanced
+                without duplicate rows.
             **kwargs: Additional dataset-construction options, including
                 ``is_decoder_only_model``.
         """
@@ -3136,13 +3146,23 @@ class TextPredictionTrainer(Trainer):
         seed = getattr(args, "seed", 0) if args is not None else 0
         if seed is None:
             seed = 42
+        candidate_cap_col = group_cap_column if group_cap_column is not None else balance_column
         group_cap_col = (
-            balance_column
-            if balance_column is not None and balance_column in training_df.columns
+            candidate_cap_col
+            if candidate_cap_col is not None and candidate_cap_col in training_df.columns
             else "feature_pole"
         )
-        if max_size is not None and len(training_df) > max_size:
-            training_df = _sample_up_to_per_group(training_df, group_cap_col, max_size, seed)
+        if undersample_balance and not training_df.empty and group_cap_col in training_df.columns:
+            group_sizes = training_df.groupby(group_cap_col).size()
+            if len(group_sizes) > 0:
+                per_group_limit = int(group_sizes.min())
+                if max_size is not None:
+                    per_group_limit = min(per_group_limit, int(max_size))
+                training_df = _sample_up_to_per_group(training_df, group_cap_col, per_group_limit, seed)
+        elif max_size is not None and not training_df.empty and group_cap_col in training_df.columns:
+            group_sizes = training_df.groupby(group_cap_col).size()
+            if (group_sizes > int(max_size)).any():
+                training_df = _sample_up_to_per_group(training_df, group_cap_col, int(max_size), seed)
 
         # Get batch_size
         if batch_size is None:
@@ -4247,7 +4267,7 @@ class TextPredictionTrainer(Trainer):
                 prediction_objective=neutral_objective_name,
                 rhs_window=rhs_window,
                 target_key="label",
-                balance_column="feature_pole",
+                balance_column=None,
                 mask_placeholder=mask_placeholder,
                 max_length=max_length,
                 label_token_protocol=self._label_token_protocol(),
@@ -4415,7 +4435,7 @@ class TextPredictionTrainer(Trainer):
             prediction_objective=neutral_objective_name,
             rhs_window=rhs_window,
             target_key="label",
-            balance_column="feature_pole",
+            balance_column=None,
             max_length=max_length,
             label_token_protocol=self._label_token_protocol(),
         )
@@ -4711,6 +4731,8 @@ class TextPredictionTrainer(Trainer):
                 split=split,
                 batch_size=1,
                 max_size=max_size_training_like,
+                balance_column=None,
+                group_cap_column="feature_pole",
                 # One-pole training is target-factual only, but decoder
                 # evaluation must score that learned feature on every factual
                 # class. Keep the populations separate explicitly instead of
